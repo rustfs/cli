@@ -306,8 +306,17 @@ mod tests {
 
     #[test]
     fn test_parse_local_absolute_path() {
-        let result = parse_path("/tmp/file.txt").unwrap();
+        // Use platform-appropriate absolute path
+        #[cfg(unix)]
+        let path = "/tmp/file.txt";
+        #[cfg(windows)]
+        let path = "C:\\temp\\file.txt";
+
+        let result = parse_path(path).unwrap();
         assert!(matches!(result, ParsedPath::Local(_)));
+        if let ParsedPath::Local(p) = result {
+            assert!(p.is_absolute());
+        }
     }
 
     #[test]
