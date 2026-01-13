@@ -1,0 +1,51 @@
+[package]
+name = "rc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[[bin]]
+name = "rc"
+path = "src/main.rs"
+
+[dependencies]
+# Workspace crates
+rc-core = { path = "../core" }
+rc-s3 = { path = "../s3" }
+
+# Async runtime
+tokio.workspace = true
+
+# CLI
+clap.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Error handling
+thiserror.workspace = true
+anyhow.workspace = true
+
+# Logging
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# Output formatting
+indicatif.workspace = true
+comfy-table.workspace = true
+console.workspace = true
+
+# Utilities
+chrono.workspace = true
+humansize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+

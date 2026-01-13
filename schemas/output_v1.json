@@ -1,0 +1,200 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/rustfs/rc/schemas/output_v1.json",
+  "title": "rc CLI Output Schema v1",
+  "description": "JSON output schema for rc CLI commands. This file is protected - changes require Breaking Change process.",
+  "definitions": {
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO8601 UTC timestamp (e.g., 2024-01-15T10:30:00Z)"
+    },
+    "objectInfo": {
+      "type": "object",
+      "required": [
+        "key",
+        "is_dir"
+      ],
+      "properties": {
+        "key": {
+          "type": "string",
+          "description": "Object key or bucket name"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "description": "Size in bytes (null for directories/buckets)"
+        },
+        "size_human": {
+          "type": "string",
+          "description": "Human-readable size (e.g., '1.2 MiB')"
+        },
+        "last_modified": {
+          "$ref": "#/definitions/timestamp"
+        },
+        "etag": {
+          "type": "string",
+          "description": "ETag (usually MD5 for single-part uploads)"
+        },
+        "storage_class": {
+          "type": "string",
+          "description": "Storage class (STANDARD, GLACIER, etc.)"
+        },
+        "content_type": {
+          "type": "string",
+          "description": "MIME content type"
+        },
+        "is_dir": {
+          "type": "boolean",
+          "description": "Whether this is a directory/prefix/bucket"
+        }
+      }
+    },
+    "aliasInfo": {
+      "type": "object",
+      "required": [
+        "name",
+        "endpoint"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Alias name"
+        },
+        "endpoint": {
+          "type": "string",
+          "description": "S3 endpoint URL"
+        },
+        "region": {
+          "type": "string",
+          "description": "AWS region"
+        },
+        "bucket_lookup": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "path",
+            "dns"
+          ],
+          "description": "Bucket lookup style"
+        }
+      }
+    },
+    "errorResponse": {
+      "type": "object",
+      "required": [
+        "error"
+      ],
+      "properties": {
+        "error": {
+          "type": "string",
+          "description": "Error message"
+        },
+        "code": {
+          "type": "integer",
+          "description": "Exit code"
+        },
+        "details": {
+          "type": "object",
+          "description": "Additional error details"
+        }
+      }
+    }
+  },
+  "oneOf": [
+    {
+      "title": "ls",
+      "description": "List objects output",
+      "type": "object",
+      "required": [
+        "items",
+        "truncated"
+      ],
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/objectInfo"
+          }
+        },
+        "truncated": {
+          "type": "boolean",
+          "description": "Whether more results are available"
+        },
+        "continuation_token": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Token for fetching next page"
+        }
+      }
+    },
+    {
+      "title": "stat",
+      "description": "Object metadata output",
+      "$ref": "#/definitions/objectInfo"
+    },
+    {
+      "title": "alias list",
+      "description": "List aliases output",
+      "type": "object",
+      "required": [
+        "aliases"
+      ],
+      "properties": {
+        "aliases": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/aliasInfo"
+          }
+        }
+      }
+    },
+    {
+      "title": "alias set/remove",
+      "description": "Alias modification output",
+      "type": "object",
+      "required": [
+        "success",
+        "alias"
+      ],
+      "properties": {
+        "success": {
+          "type": "boolean"
+        },
+        "alias": {
+          "type": "string",
+          "description": "Alias name that was modified"
+        },
+        "message": {
+          "type": "string"
+        }
+      }
+    },
+    {
+      "title": "mb/rb",
+      "description": "Bucket creation/deletion output",
+      "type": "object",
+      "required": [
+        "success",
+        "bucket"
+      ],
+      "properties": {
+        "success": {
+          "type": "boolean"
+        },
+        "bucket": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        }
+      }
+    },
+    {
+      "title": "error",
+      "description": "Error response",
+      "$ref": "#/definitions/errorResponse"
+    }
+  ]
+}

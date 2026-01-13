@@ -1,0 +1,63 @@
+[workspace]
+resolver = "2"
+members = ["crates/cli", "crates/core", "crates/s3"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rustfs/rc"
+homepage = "https://github.com/rustfs/rc"
+description = "A Rust S3 CLI client inspired by minio/mc"
+keywords = ["s3", "cli", "storage", "aws", "minio"]
+categories = ["command-line-utilities", "filesystem"]
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+
+# AWS SDK
+aws-sdk-s3 = "1.65"
+aws-config = { version = "1.5", features = ["behavior-version-latest"] }
+aws-credential-types = "1.2"
+aws-smithy-types = "1.2"
+
+# CLI
+clap = { version = "4.4", features = ["derive", "env"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Output formatting
+indicatif = "0.17"
+comfy-table = "7.1"
+console = "0.15"
+
+# Utilities
+dirs = "5.0"
+chrono = { version = "0.4", features = ["serde"] }
+humansize = "2.1"
+url = "2.5"
+futures = "0.3"
+async-trait = "0.1"
+
+# Testing
+tempfile = "3.10"
+mockall = "0.12"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
