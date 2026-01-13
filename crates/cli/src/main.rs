@@ -1,7 +1,7 @@
 //! rc - Rust S3 CLI Client
 //!
 //! A command-line interface for S3-compatible object storage services.
-//! Inspired by minio/mc, designed for RustFS and other S3-compatible backends.
+//! Designed for RustFS and other S3-compatible backends.
 
 use clap::Parser;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};

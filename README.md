@@ -3,7 +3,7 @@
 [![CI](https://github.com/rustfs/cli/actions/workflows/ci.yml/badge.svg)](https://github.com/rustfs/cli/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
 
-A S3-compatible command-line client written in Rust, inspired by [minio/mc](https://github.com/minio/mc).
+A S3-compatible command-line client written in Rust.
 
 ## Features
 
@@ -44,8 +44,8 @@ cargo build --release
 ### Configure Aliases
 
 ```bash
-# Add MinIO service
-rc alias set minio http://localhost:9000 minioadmin minioadmin
+# Add local S3 service
+rc alias set local http://localhost:9000 accesskey secretkey
 
 # Add AWS S3
 rc alias set s3 https://s3.amazonaws.com AKIAIOSFODNN7EXAMPLE wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
@@ -58,44 +58,44 @@ rc alias list
 
 ```bash
 # List buckets
-rc ls minio/
+rc ls local/
 
 # Create bucket
-rc mb minio/my-bucket
+rc mb local/my-bucket
 
 # Upload file
-rc cp ./file.txt minio/my-bucket/
+rc cp ./file.txt local/my-bucket/
 
 # Download file
-rc cp minio/my-bucket/file.txt ./
+rc cp local/my-bucket/file.txt ./
 
 # View object info
-rc stat minio/my-bucket/file.txt
+rc stat local/my-bucket/file.txt
 
 # Delete object
-rc rm minio/my-bucket/file.txt
+rc rm local/my-bucket/file.txt
 
 # Delete bucket
-rc rb minio/my-bucket
+rc rb local/my-bucket
 ```
 
 ### Advanced Operations
 
 ```bash
 # Recursively copy directory
-rc cp -r ./local-dir/ minio/bucket/remote-dir/
+rc cp -r ./local-dir/ local/bucket/remote-dir/
 
 # Sync directories
-rc mirror ./local-dir minio/bucket/remote-dir
+rc mirror ./local-dir local/bucket/remote-dir
 
 # Find objects
-rc find minio/bucket --name "*.txt" --newer-than 1d
+rc find local/bucket --name "*.txt" --newer-than 1d
 
 # Generate download link
-rc share download minio/bucket/file.txt --expire 24h
+rc share download local/bucket/file.txt --expire 24h
 
 # Watch events
-rc watch minio/bucket
+rc watch local/bucket
 ```
 
 ## Command Overview
@@ -134,7 +134,7 @@ rc watch minio/bucket
 ### Human-Readable (default)
 
 ```bash
-rc ls minio/bucket
+rc ls local/bucket
 [2024-01-15 10:30:00]     0B dir/
 [2024-01-15 10:30:00] 1.2MiB file.txt
 ```
@@ -142,7 +142,7 @@ rc ls minio/bucket
 ### JSON Format
 
 ```bash
-rc ls minio/bucket --json
+rc ls local/bucket --json
 ```
 
 ```json
@@ -168,10 +168,10 @@ color = "auto"
 progress = true
 
 [[aliases]]
-name = "minio"
+name = "local"
 endpoint = "http://localhost:9000"
-access_key = "minioadmin"
-secret_key = "minioadmin"
+access_key = "accesskey"
+secret_key = "secretkey"
 region = "us-east-1"
 ```
 
@@ -218,7 +218,7 @@ cargo build --workspace
 # Unit tests
 cargo test --workspace
 
-# Integration tests (requires MinIO)
+# Integration tests (requires S3-compatible backend)
 docker compose -f docker/docker-compose.yml up -d
 cargo test --workspace --features integration
 docker compose -f docker/docker-compose.yml down
@@ -241,5 +241,4 @@ This project is dual-licensed under MIT or Apache-2.0. See [LICENSE-MIT](LICENSE
 
 ## Acknowledgments
 
-- [minio/mc](https://github.com/minio/mc) - Design inspiration
 - [aws-sdk-s3](https://crates.io/crates/aws-sdk-s3) - S3 SDK

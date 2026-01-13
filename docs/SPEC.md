@@ -6,16 +6,16 @@
 ## Overview
 
 `rc` is a command-line interface for S3-compatible object storage services. It is designed
-to work with RustFS, MinIO, AWS S3, and other S3-compatible backends.
+to work with RustFS, AWS S3, and other S3-compatible backends.
 
 ## General Conventions
 
 ### Path Syntax
 
 - **Remote path**: `<alias>/<bucket>[/<key>]`
-  - `minio/mybucket` - refers to a bucket
-  - `minio/mybucket/path/to/file.txt` - refers to an object
-  - `minio/mybucket/path/to/dir/` - trailing slash indicates directory semantics
+  - `local/mybucket` - refers to a bucket
+  - `local/mybucket/path/to/file.txt` - refers to an object
+  - `local/mybucket/path/to/dir/` - trailing slash indicates directory semantics
 
 - **Local path**: Standard filesystem path
   - `/home/user/file.txt` - absolute path
@@ -118,7 +118,7 @@ rc alias set <NAME> <ENDPOINT> <ACCESS_KEY> <SECRET_KEY> [OPTIONS]
 
 **Example:**
 ```bash
-rc alias set minio http://localhost:9000 minioadmin minioadmin
+rc alias set local http://localhost:9000 accesskey secretkey
 rc alias set s3 https://s3.amazonaws.com AKIAIOSFODNN7EXAMPLE wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
 ```
 
@@ -137,7 +137,7 @@ rc alias list [OPTIONS]
 
 **Output (human):**
 ```
-minio    http://localhost:9000
+local    http://localhost:9000
 s3       https://s3.amazonaws.com
 ```
 
@@ -145,7 +145,7 @@ s3       https://s3.amazonaws.com
 ```json
 {
   "aliases": [
-    {"name": "minio", "endpoint": "http://localhost:9000", "region": "us-east-1"},
+    {"name": "local", "endpoint": "http://localhost:9000", "region": "us-east-1"},
     {"name": "s3", "endpoint": "https://s3.amazonaws.com", "region": "us-east-1"}
   ]
 }
@@ -299,9 +299,9 @@ rc cp [OPTIONS] <SOURCE> <TARGET>
 | --no-clobber | Skip existing objects |
 
 **Supported Transfers:**
-- Local → Remote: `rc cp ./file.txt minio/bucket/`
-- Remote → Local: `rc cp minio/bucket/file.txt ./`
-- Remote → Remote: `rc cp minio/bucket1/file.txt minio/bucket2/`
+- Local → Remote: `rc cp ./file.txt local/bucket/`
+- Remote → Local: `rc cp local/bucket/file.txt ./`
+- Remote → Remote: `rc cp local/bucket1/file.txt local/bucket2/`
 
 **Exit Codes:** 0, 2 (invalid path), 4 (auth error), 5 (source not found)
 

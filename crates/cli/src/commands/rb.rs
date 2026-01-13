@@ -166,21 +166,21 @@ mod tests {
 
     #[test]
     fn test_parse_rb_path_valid() {
-        let (alias, bucket) = parse_rb_path("minio/mybucket").unwrap();
-        assert_eq!(alias, "minio");
+        let (alias, bucket) = parse_rb_path("myalias/mybucket").unwrap();
+        assert_eq!(alias, "myalias");
         assert_eq!(bucket, "mybucket");
     }
 
     #[test]
     fn test_parse_rb_path_trailing_slash() {
-        let (alias, bucket) = parse_rb_path("minio/mybucket/").unwrap();
-        assert_eq!(alias, "minio");
+        let (alias, bucket) = parse_rb_path("myalias/mybucket/").unwrap();
+        assert_eq!(alias, "myalias");
         assert_eq!(bucket, "mybucket");
     }
 
     #[test]
     fn test_parse_rb_path_no_bucket() {
-        assert!(parse_rb_path("minio").is_err());
+        assert!(parse_rb_path("myalias").is_err());
     }
 
     #[test]

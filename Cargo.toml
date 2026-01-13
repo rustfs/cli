@@ -9,8 +9,8 @@ rust-version = "1.75"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/rustfs/rc"
 homepage = "https://github.com/rustfs/rc"
-description = "A Rust S3 CLI client inspired by minio/mc"
-keywords = ["s3", "cli", "storage", "aws", "minio"]
+description = "A Rust S3 CLI client for S3-compatible object storage"
+keywords = ["s3", "cli", "storage", "aws", "object-storage"]
 categories = ["command-line-utilities", "filesystem"]
 
 [workspace.dependencies]

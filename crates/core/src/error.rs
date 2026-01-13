@@ -107,8 +107,8 @@ mod tests {
 
     #[test]
     fn test_error_display() {
-        let err = Error::AliasNotFound("minio".into());
-        assert_eq!(err.to_string(), "Alias not found: minio");
+        let err = Error::AliasNotFound("myalias".into());
+        assert_eq!(err.to_string(), "Alias not found: myalias");
 
         let err = Error::InvalidPath("/bad/path".into());
         assert_eq!(err.to_string(), "Invalid path: /bad/path");

@@ -586,7 +586,7 @@ mod tests {
 
     #[test]
     fn test_parse_remote_path() {
-        let result = parse_path("minio/bucket/file.txt").unwrap();
+        let result = parse_path("myalias/bucket/file.txt").unwrap();
         assert!(matches!(result, ParsedPath::Remote(_)));
     }
 }

@@ -24,7 +24,7 @@ mod stat;
 /// rc - Rust S3 CLI Client
 ///
 /// A command-line interface for S3-compatible object storage services.
-/// Supports RustFS, MinIO, AWS S3, and other S3-compatible backends.
+/// Supports RustFS, AWS S3, and other S3-compatible backends.
 #[derive(Parser, Debug)]
 #[command(name = "rc")]
 #[command(author, version, about, long_about = None)]

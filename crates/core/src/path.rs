@@ -228,11 +228,11 @@ mod tests {
 
     #[test]
     fn test_parse_remote_path() {
-        let path = parse_path("minio/bucket/file.txt").unwrap();
+        let path = parse_path("myalias/bucket/file.txt").unwrap();
         assert!(path.is_remote());
 
         let remote = path.as_remote().unwrap();
-        assert_eq!(remote.alias, "minio");
+        assert_eq!(remote.alias, "myalias");
         assert_eq!(remote.bucket, "bucket");
         assert_eq!(remote.key, "file.txt");
         assert!(!remote.is_dir);
@@ -240,7 +240,7 @@ mod tests {
 
     #[test]
     fn test_parse_remote_path_dir() {
-        let path = parse_path("minio/bucket/dir/").unwrap();
+        let path = parse_path("myalias/bucket/dir/").unwrap();
         let remote = path.as_remote().unwrap();
         assert_eq!(remote.key, "dir/");
         assert!(remote.is_dir);
@@ -248,9 +248,9 @@ mod tests {
 
     #[test]
     fn test_parse_remote_path_bucket_only() {
-        let path = parse_path("minio/bucket").unwrap();
+        let path = parse_path("myalias/bucket").unwrap();
         let remote = path.as_remote().unwrap();
-        assert_eq!(remote.alias, "minio");
+        assert_eq!(remote.alias, "myalias");
         assert_eq!(remote.bucket, "bucket");
         assert_eq!(remote.key, "");
         assert!(remote.is_dir);
@@ -283,13 +283,13 @@ mod tests {
 
     #[test]
     fn test_parse_alias_only() {
-        let result = parse_path("minio");
+        let result = parse_path("myalias");
         assert!(result.is_err());
     }
 
     #[test]
     fn test_remote_path_parent() {
-        let path = RemotePath::new("minio", "bucket", "a/b/c.txt");
+        let path = RemotePath::new("myalias", "bucket", "a/b/c.txt");
         let parent = path.parent().unwrap();
         assert_eq!(parent.key, "a/b/");
 
@@ -304,7 +304,7 @@ mod tests {
 
     #[test]
     fn test_remote_path_join() {
-        let path = RemotePath::new("minio", "bucket", "");
+        let path = RemotePath::new("myalias", "bucket", "");
         let child = path.join("dir/");
         assert_eq!(child.key, "dir/");
         assert!(child.is_dir);
@@ -316,8 +316,8 @@ mod tests {
 
     #[test]
     fn test_remote_path_display() {
-        let path = RemotePath::new("minio", "bucket", "key/file.txt");
-        assert_eq!(path.to_string(), "minio/bucket/key/file.txt");
+        let path = RemotePath::new("myalias", "bucket", "key/file.txt");
+        assert_eq!(path.to_string(), "myalias/bucket/key/file.txt");
     }
 
     #[test]

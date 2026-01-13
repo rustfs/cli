@@ -262,32 +262,32 @@ mod tests {
 
     #[test]
     fn test_parse_ls_path_alias_only() {
-        let (alias, bucket, prefix) = parse_ls_path("minio").unwrap();
-        assert_eq!(alias, "minio");
+        let (alias, bucket, prefix) = parse_ls_path("myalias").unwrap();
+        assert_eq!(alias, "myalias");
         assert!(bucket.is_none());
         assert!(prefix.is_none());
     }
 
     #[test]
     fn test_parse_ls_path_alias_bucket() {
-        let (alias, bucket, prefix) = parse_ls_path("minio/mybucket").unwrap();
-        assert_eq!(alias, "minio");
+        let (alias, bucket, prefix) = parse_ls_path("myalias/mybucket").unwrap();
+        assert_eq!(alias, "myalias");
         assert_eq!(bucket, Some("mybucket".to_string()));
         assert!(prefix.is_none());
     }
 
     #[test]
     fn test_parse_ls_path_with_prefix() {
-        let (alias, bucket, prefix) = parse_ls_path("minio/mybucket/path/to").unwrap();
-        assert_eq!(alias, "minio");
+        let (alias, bucket, prefix) = parse_ls_path("myalias/mybucket/path/to").unwrap();
+        assert_eq!(alias, "myalias");
         assert_eq!(bucket, Some("mybucket".to_string()));
         assert_eq!(prefix, Some("path/to/".to_string()));
     }
 
     #[test]
     fn test_parse_ls_path_trailing_slash() {
-        let (alias, bucket, prefix) = parse_ls_path("minio/mybucket/").unwrap();
-        assert_eq!(alias, "minio");
+        let (alias, bucket, prefix) = parse_ls_path("myalias/mybucket/").unwrap();
+        assert_eq!(alias, "myalias");
         assert_eq!(bucket, Some("mybucket".to_string()));
         assert!(prefix.is_none());
     }

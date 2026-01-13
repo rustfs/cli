@@ -25,7 +25,7 @@ pub enum AliasCommands {
 /// Arguments for the `alias set` command
 #[derive(clap::Args, Debug)]
 pub struct SetArgs {
-    /// Alias name (e.g., "minio", "s3", "rustfs")
+    /// Alias name (e.g., "local", "s3", "rustfs")
     pub name: String,
 
     /// S3 endpoint URL (e.g., "http://localhost:9000", "https://s3.amazonaws.com")
@@ -290,8 +290,8 @@ mod tests {
         let args = SetArgs {
             name: "test".to_string(),
             endpoint: "http://localhost:9000".to_string(),
-            access_key: "minioadmin".to_string(),
-            secret_key: "minioadmin".to_string(),
+            access_key: "accesskey".to_string(),
+            secret_key: "secretkey".to_string(),
             region: "us-east-1".to_string(),
             signature: "v4".to_string(),
             bucket_lookup: "auto".to_string(),

@@ -192,31 +192,31 @@ mod tests {
 
     #[test]
     fn test_parse_mb_path_valid() {
-        let (alias, bucket) = parse_mb_path("minio/mybucket").unwrap();
-        assert_eq!(alias, "minio");
+        let (alias, bucket) = parse_mb_path("myalias/mybucket").unwrap();
+        assert_eq!(alias, "myalias");
         assert_eq!(bucket, "mybucket");
     }
 
     #[test]
     fn test_parse_mb_path_trailing_slash() {
-        let (alias, bucket) = parse_mb_path("minio/mybucket/").unwrap();
-        assert_eq!(alias, "minio");
+        let (alias, bucket) = parse_mb_path("myalias/mybucket/").unwrap();
+        assert_eq!(alias, "myalias");
         assert_eq!(bucket, "mybucket");
     }
 
     #[test]
     fn test_parse_mb_path_no_bucket() {
-        assert!(parse_mb_path("minio").is_err());
+        assert!(parse_mb_path("myalias").is_err());
     }
 
     #[test]
     fn test_parse_mb_path_empty_bucket() {
-        assert!(parse_mb_path("minio/").is_err());
+        assert!(parse_mb_path("myalias/").is_err());
     }
 
     #[test]
     fn test_parse_mb_path_short_bucket() {
-        assert!(parse_mb_path("minio/ab").is_err());
+        assert!(parse_mb_path("myalias/ab").is_err());
     }
 
     #[test]

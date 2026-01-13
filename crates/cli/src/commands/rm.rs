@@ -331,31 +331,31 @@ mod tests {
 
     #[test]
     fn test_parse_rm_path_with_key() {
-        let (alias, bucket, key) = parse_rm_path("minio/mybucket/file.txt").unwrap();
-        assert_eq!(alias, "minio");
+        let (alias, bucket, key) = parse_rm_path("myalias/mybucket/file.txt").unwrap();
+        assert_eq!(alias, "myalias");
         assert_eq!(bucket, "mybucket");
         assert_eq!(key, "file.txt");
     }
 
     #[test]
     fn test_parse_rm_path_with_prefix() {
-        let (alias, bucket, key) = parse_rm_path("minio/mybucket/path/to/").unwrap();
-        assert_eq!(alias, "minio");
+        let (alias, bucket, key) = parse_rm_path("myalias/mybucket/path/to/").unwrap();
+        assert_eq!(alias, "myalias");
         assert_eq!(bucket, "mybucket");
         assert_eq!(key, "path/to/");
     }
 
     #[test]
     fn test_parse_rm_path_bucket_only() {
-        let (alias, bucket, key) = parse_rm_path("minio/mybucket").unwrap();
-        assert_eq!(alias, "minio");
+        let (alias, bucket, key) = parse_rm_path("myalias/mybucket").unwrap();
+        assert_eq!(alias, "myalias");
         assert_eq!(bucket, "mybucket");
         assert_eq!(key, "");
     }
 
     #[test]
     fn test_parse_rm_path_no_bucket() {
-        assert!(parse_rm_path("minio").is_err());
+        assert!(parse_rm_path("myalias").is_err());
     }
 
     #[test]

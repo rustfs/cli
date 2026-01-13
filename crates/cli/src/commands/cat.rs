@@ -131,23 +131,23 @@ mod tests {
 
     #[test]
     fn test_parse_cat_path_valid() {
-        let (alias, bucket, key) = parse_cat_path("minio/mybucket/file.txt").unwrap();
-        assert_eq!(alias, "minio");
+        let (alias, bucket, key) = parse_cat_path("myalias/mybucket/file.txt").unwrap();
+        assert_eq!(alias, "myalias");
         assert_eq!(bucket, "mybucket");
         assert_eq!(key, "file.txt");
     }
 
     #[test]
     fn test_parse_cat_path_with_prefix() {
-        let (alias, bucket, key) = parse_cat_path("minio/mybucket/path/to/file.txt").unwrap();
-        assert_eq!(alias, "minio");
+        let (alias, bucket, key) = parse_cat_path("myalias/mybucket/path/to/file.txt").unwrap();
+        assert_eq!(alias, "myalias");
         assert_eq!(bucket, "mybucket");
         assert_eq!(key, "path/to/file.txt");
     }
 
     #[test]
     fn test_parse_cat_path_no_key() {
-        assert!(parse_cat_path("minio/mybucket").is_err());
+        assert!(parse_cat_path("myalias/mybucket").is_err());
     }
 
     #[test]

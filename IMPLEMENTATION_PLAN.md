@@ -70,9 +70,9 @@
 ### 验收标准 (已通过)
 
 ```bash
-rc alias set minio http://localhost:9000 minioadmin minioadmin  # ✅
+rc alias set local http://localhost:9000 accesskey secretkey  # ✅
 rc alias list --json  # ✅ 验证 JSON schema
-rc alias remove minio  # ✅
+rc alias remove local  # ✅
 echo $?  # ✅ 退出码 0
 rc alias remove nonexistent  # ✅ 退出码 5 (NOT_FOUND)
 ```

@@ -1,23 +1,23 @@
-# Docker Compose 配置用于 rc CLI 的 E2E 测试
+# Docker Compose configuration for rc CLI E2E tests
 #
-# 使用方法:
-#   docker compose up -d      # 启动服务
-#   docker compose down -v    # 停止并清理
+# Usage:
+#   docker compose up -d      # Start services
+#   docker compose down -v    # Stop and cleanup
 
 services:
-  # MinIO - Tier 2 兼容后端
-  minio:
-    image: minio/minio:latest
-    container_name: rc-test-minio
+  # S3-compatible backend for testing (Tier 2)
+  s3-backend:
+    image: quay.io/minio/minio:latest
+    container_name: rc-test-s3
     command: server /data --console-address ":9001"
     ports:
       - "9000:9000"   # S3 API
       - "9001:9001"   # Console
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
+      MINIO_ROOT_USER: accesskey
+      MINIO_ROOT_PASSWORD: secretkey
     volumes:
-      - minio-data:/data
+      - s3-data:/data
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 10s
@@ -27,25 +27,25 @@ services:
     networks:
       - rc-test-network
 
-  # MinIO 初始化 - 创建测试用桶
-  minio-init:
-    image: minio/mc:latest
-    container_name: rc-test-minio-init
+  # Initialize S3 backend - create test buckets
+  s3-init:
+    image: quay.io/minio/mc:latest
+    container_name: rc-test-s3-init
     depends_on:
-      minio:
+      s3-backend:
         condition: service_healthy
     entrypoint: >
       /bin/sh -c "
-      mc alias set minio http://minio:9000 minioadmin minioadmin;
-      mc mb minio/test-bucket --ignore-existing;
-      mc mb minio/another-bucket --ignore-existing;
-      echo 'MinIO initialization complete';
+      mc alias set local http://s3-backend:9000 accesskey secretkey;
+      mc mb local/test-bucket --ignore-existing;
+      mc mb local/another-bucket --ignore-existing;
+      echo 'S3 backend initialization complete';
       exit 0;
       "
     networks:
       - rc-test-network
 
-  # RustFS - Tier 1 兼容后端 (当 RustFS 发布 Docker 镜像后取消注释)
+  # RustFS - Tier 1 backend (uncomment when RustFS Docker image is released)
   # rustfs:
   #   image: rustfs/rustfs:latest
   #   container_name: rc-test-rustfs
@@ -65,10 +65,9 @@ services:
   #     - rc-test-network
 
 volumes:
-  minio-data:
+  s3-data:
   # rustfs-data:
 
 networks:
   rc-test-network:
     driver: bridge
-

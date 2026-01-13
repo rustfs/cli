@@ -299,7 +299,7 @@ mod tests {
         assert!(matches!(local, ParsedPath::Local(_)));
 
         // Remote path
-        let remote = parse_path("minio/bucket/file.txt").unwrap();
+        let remote = parse_path("myalias/bucket/file.txt").unwrap();
         assert!(matches!(remote, ParsedPath::Remote(_)));
     }
 }

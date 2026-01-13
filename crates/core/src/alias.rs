@@ -258,11 +258,11 @@ mod tests {
     fn test_alias_manager_set_and_get() {
         let (manager, _temp_dir) = temp_alias_manager();
 
-        let alias = Alias::new("minio", "http://localhost:9000", "minioadmin", "minioadmin");
+        let alias = Alias::new("local", "http://localhost:9000", "accesskey", "secretkey");
         manager.set(alias).unwrap();
 
-        let retrieved = manager.get("minio").unwrap();
-        assert_eq!(retrieved.name, "minio");
+        let retrieved = manager.get("local").unwrap();
+        assert_eq!(retrieved.name, "local");
         assert_eq!(retrieved.endpoint, "http://localhost:9000");
     }
 

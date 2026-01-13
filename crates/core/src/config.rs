@@ -221,8 +221,8 @@ mod tests {
         config.aliases.push(Alias {
             name: "test".to_string(),
             endpoint: "http://localhost:9000".to_string(),
-            access_key: "minioadmin".to_string(),
-            secret_key: "minioadmin".to_string(),
+            access_key: "accesskey".to_string(),
+            secret_key: "secretkey".to_string(),
             region: "us-east-1".to_string(),
             signature: "v4".to_string(),
             bucket_lookup: "auto".to_string(),

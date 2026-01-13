@@ -9,7 +9,7 @@
 | 级别 | 服务 | 版本 | CI 状态 | 说明 |
 |------|------|------|---------|------|
 | Tier 1 | RustFS | latest | 每次 PR | 主要目标，必须 100% 通过 |
-| Tier 2 | MinIO | latest | 每次 PR | 完全支持，必须 100% 通过 |
+| Tier 2 | AWS S3 | - | 每次 PR | 完全支持，必须 100% 通过 |
 | Tier 3 | AWS S3 | - | 每周 | 尽力支持，定期测试 |
 | Best Effort | 其他 | - | 手动 | 不保证，欢迎 PR |
 
@@ -61,7 +61,7 @@ cargo test --workspace --features integration
 
 **运行时机**: 每日 + Release
 
-**环境**: Docker Compose (RustFS + MinIO)
+**环境**: Docker Compose (RustFS + S3-compatible)
 
 **覆盖范围**:
 - 完整命令流程
@@ -119,13 +119,13 @@ cargo test --features golden
 ```rust
 #[test]
 fn test_ls_success() {
-    let result = run_command(&["ls", "minio/bucket"]);
+    let result = run_command(&["ls", "local/bucket"]);
     assert_eq!(result.exit_code, 0);
 }
 
 #[test]
 fn test_ls_bucket_not_found() {
-    let result = run_command(&["ls", "minio/nonexistent"]);
+    let result = run_command(&["ls", "local/nonexistent"]);
     assert_eq!(result.exit_code, 5); // NOT_FOUND
 }
 
@@ -162,7 +162,7 @@ jobs:
   e2e:
     strategy:
       matrix:
-        backend: [rustfs, minio]
+        backend: [rustfs, local]
         command_group: [basic, transfer, advanced]
 ```
 
@@ -223,7 +223,7 @@ mock! {
 // tests/common/mod.rs
 
 pub fn setup_test_alias() -> Alias {
-    Alias::new("test", "http://localhost:9000", "minioadmin", "minioadmin")
+    Alias::new("test", "http://localhost:9000", "accesskey", "secretkey")
 }
 
 pub async fn setup_test_bucket(client: &S3Client, name: &str) {
