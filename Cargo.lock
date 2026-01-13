@@ -2035,32 +2035,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rc"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "clap_complete",
- "comfy-table",
- "console",
- "glob",
- "humansize",
- "indicatif",
- "insta",
- "jiff",
- "mime_guess",
- "rc-core",
- "rc-s3",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "rc-core"
 version = "0.1.0"
 dependencies = [
@@ -2191,6 +2165,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
 dependencies = [
  "semver",
+]
+
+[[package]]
+name = "rustfs-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "clap_complete",
+ "comfy-table",
+ "console",
+ "glob",
+ "humansize",
+ "indicatif",
+ "insta",
+ "jiff",
+ "mime_guess",
+ "rc-core",
+ "rc-s3",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

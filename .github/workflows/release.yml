@@ -245,6 +245,6 @@ jobs:
         run: sleep 30
 
       - name: Publish rc
-        run: cargo publish --package rc --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --package rustfs-cli --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
         continue-on-error: true
 

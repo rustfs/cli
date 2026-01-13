@@ -46,7 +46,7 @@ jobs:
           exit 1
 
       - name: Run integration tests
-        run: cargo test --package rc --test integration --features integration -- --test-threads=1
+        run: cargo test --package rustfs-cli --test integration --features integration -- --test-threads=1
         env:
           TEST_S3_ENDPOINT: http://localhost:9000
           TEST_S3_ACCESS_KEY: accesskey
@@ -67,7 +67,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run golden tests
-        run: cargo test --package rc --test golden --features golden
+        run: cargo test --package rustfs-cli --test golden --features golden
         env:
           # Golden tests use isolated config dir, no real S3 needed for alias tests
           RC_CONFIG_DIR: ${{ runner.temp }}/rc-test-config
