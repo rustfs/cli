@@ -197,7 +197,7 @@ rc alias remove nonexistent  # ✅ 退出码 5 (NOT_FOUND)
 
 **目标**: 完成发布准备工作
 
-**状态**: ⏳ 待开始
+**状态**: 🟡 进行中
 
 **预计时间**: Week 11-12
 
@@ -208,7 +208,7 @@ rc alias remove nonexistent  # ✅ 退出码 5 (NOT_FOUND)
 | 多平台构建 | ⏳ | Linux/macOS/Windows |
 | Shell 补全 | ✅ 完成 | bash/zsh/fish/powershell (`rc completions <shell>`) |
 | README | ✅ 完成 | 完整使用说明 |
-| CHANGELOG | ⏳ | 变更日志 |
+| CHANGELOG | ✅ 完成 | Keep a Changelog 格式 |
 | Release CI | ✅ 完成 | 阶段 0 已完成 |
 
 ### 验收标准
