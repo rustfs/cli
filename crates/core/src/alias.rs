@@ -171,9 +171,15 @@ pub struct AliasManager {
 }
 
 impl AliasManager {
-    /// Create a new AliasManager
-    pub fn new(config_manager: ConfigManager) -> Self {
+    /// Create a new AliasManager with a specific ConfigManager
+    pub fn with_config_manager(config_manager: ConfigManager) -> Self {
         Self { config_manager }
+    }
+
+    /// Create a new AliasManager using the default config location
+    pub fn new() -> Result<Self> {
+        let config_manager = ConfigManager::new()?;
+        Ok(Self { config_manager })
     }
 
     /// List all configured aliases
@@ -233,7 +239,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let config_path = temp_dir.path().join("config.toml");
         let config_manager = ConfigManager::with_path(config_path);
-        let alias_manager = AliasManager::new(config_manager);
+        let alias_manager = AliasManager::with_config_manager(config_manager);
         (alias_manager, temp_dir)
     }
 

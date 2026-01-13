@@ -7,8 +7,15 @@
 use clap::{Parser, Subcommand};
 
 use crate::exit_code::ExitCode;
+use crate::output::OutputConfig;
 
 mod alias;
+mod cat;
+mod head;
+mod ls;
+mod mb;
+mod rb;
+mod stat;
 
 /// rc - Rust S3 CLI Client
 ///
@@ -48,20 +55,25 @@ pub enum Commands {
     /// Manage storage service aliases
     #[command(subcommand)]
     Alias(alias::AliasCommands),
-    // Phase 2: Basic commands
-    // /// List objects and buckets
-    // Ls(ls::LsArgs),
-    // /// Create a bucket
-    // Mb(mb::MbArgs),
-    // /// Remove a bucket
-    // Rb(rb::RbArgs),
-    // /// Display object contents
-    // Cat(cat::CatArgs),
-    // /// Display first N lines of an object
-    // Head(head::HeadArgs),
-    // /// Show object metadata
-    // Stat(stat::StatArgs),
 
+    // Phase 2: Basic commands
+    /// List buckets and objects
+    Ls(ls::LsArgs),
+
+    /// Create a bucket
+    Mb(mb::MbArgs),
+
+    /// Remove a bucket
+    Rb(rb::RbArgs),
+
+    /// Display object contents
+    Cat(cat::CatArgs),
+
+    /// Display first N lines of an object
+    Head(head::HeadArgs),
+
+    /// Show object metadata
+    Stat(stat::StatArgs),
     // Phase 3: Transfer commands
     // /// Copy objects
     // Cp(cp::CpArgs),
@@ -99,7 +111,20 @@ pub enum Commands {
 
 /// Execute the CLI command and return an exit code
 pub async fn execute(cli: Cli) -> ExitCode {
+    let output_config = OutputConfig {
+        json: cli.json,
+        no_color: cli.no_color,
+        no_progress: cli.no_progress,
+        quiet: cli.quiet,
+    };
+
     match cli.command {
         Commands::Alias(cmd) => alias::execute(cmd, cli.json).await,
+        Commands::Ls(args) => ls::execute(args, output_config).await,
+        Commands::Mb(args) => mb::execute(args, output_config).await,
+        Commands::Rb(args) => rb::execute(args, output_config).await,
+        Commands::Cat(args) => cat::execute(args, output_config).await,
+        Commands::Head(args) => head::execute(args, output_config).await,
+        Commands::Stat(args) => stat::execute(args, output_config).await,
     }
 }

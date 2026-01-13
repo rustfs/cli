@@ -1,23 +1,23 @@
 # rc - Rust S3 CLI Client
 
-[![CI](https://github.com/rustfs/rc/actions/workflows/ci.yml/badge.svg)](https://github.com/rustfs/rc/actions/workflows/ci.yml)
+[![CI](https://github.com/rustfs/cli/actions/workflows/ci.yml/badge.svg)](https://github.com/rustfs/cli/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
 
-一个用 Rust 编写的 S3 兼容命令行客户端，灵感来自 [minio/mc](https://github.com/minio/mc)。
+A S3-compatible command-line client written in Rust, inspired by [minio/mc](https://github.com/minio/mc).
 
-## 特性
+## Features
 
-- 🚀 **高性能** - 使用 Rust 编写，支持异步并发操作
-- 🔧 **S3 兼容** - 支持 RustFS、MinIO、AWS S3 及其他 S3 兼容服务
-- 📦 **多平台** - 支持 Linux、macOS、Windows
-- 🎨 **友好输出** - 支持人类可读和 JSON 格式输出
-- 🔒 **安全** - 凭证安全存储，日志不泄露敏感信息
+- 🚀 **High Performance** - Written in Rust with async concurrent operations
+- 🔧 **S3 Compatible** - Supports RustFS, MinIO, AWS S3, and other S3-compatible services
+- 📦 **Cross-Platform** - Supports Linux, macOS, and Windows
+- 🎨 **Friendly Output** - Human-readable and JSON format output
+- 🔒 **Secure** - Secure credential storage, no sensitive data in logs
 
-## 安装
+## Installation
 
-### 二进制下载
+### Binary Download
 
-从 [Releases](https://github.com/rustfs/rc/releases) 页面下载适合您平台的二进制文件。
+Download the appropriate binary for your platform from the [Releases](https://github.com/rustfs/cli/releases) page.
 
 ### Homebrew (macOS/Linux)
 
@@ -31,107 +31,107 @@ brew install rustfs/tap/rc
 cargo install rc
 ```
 
-### 从源码构建
+### Build from Source
 
 ```bash
-git clone https://github.com/rustfs/rc.git
-cd rc
+git clone https://github.com/rustfs/cli.git
+cd cli
 cargo build --release
 ```
 
-## 快速开始
+## Quick Start
 
-### 配置别名
+### Configure Aliases
 
 ```bash
-# 添加 MinIO 服务
+# Add MinIO service
 rc alias set minio http://localhost:9000 minioadmin minioadmin
 
-# 添加 AWS S3
+# Add AWS S3
 rc alias set s3 https://s3.amazonaws.com AKIAIOSFODNN7EXAMPLE wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
 
-# 列出所有别名
+# List all aliases
 rc alias list
 ```
 
-### 基础操作
+### Basic Operations
 
 ```bash
-# 列出桶
+# List buckets
 rc ls minio/
 
-# 创建桶
+# Create bucket
 rc mb minio/my-bucket
 
-# 上传文件
+# Upload file
 rc cp ./file.txt minio/my-bucket/
 
-# 下载文件
+# Download file
 rc cp minio/my-bucket/file.txt ./
 
-# 查看对象信息
+# View object info
 rc stat minio/my-bucket/file.txt
 
-# 删除对象
+# Delete object
 rc rm minio/my-bucket/file.txt
 
-# 删除桶
+# Delete bucket
 rc rb minio/my-bucket
 ```
 
-### 高级操作
+### Advanced Operations
 
 ```bash
-# 递归复制目录
+# Recursively copy directory
 rc cp -r ./local-dir/ minio/bucket/remote-dir/
 
-# 同步目录
+# Sync directories
 rc mirror ./local-dir minio/bucket/remote-dir
 
-# 查找对象
+# Find objects
 rc find minio/bucket --name "*.txt" --newer-than 1d
 
-# 生成下载链接
+# Generate download link
 rc share download minio/bucket/file.txt --expire 24h
 
-# 监听事件
+# Watch events
 rc watch minio/bucket
 ```
 
-## 命令概览
+## Command Overview
 
-| 命令 | 说明 |
-|------|------|
-| `alias` | 管理存储服务别名 |
-| `ls` | 列出桶或对象 |
-| `mb` | 创建桶 |
-| `rb` | 删除桶 |
-| `cp` | 复制对象 |
-| `mv` | 移动对象 |
-| `rm` | 删除对象 |
-| `cat` | 输出对象内容 |
-| `head` | 显示对象头部 |
-| `stat` | 显示对象元数据 |
-| `find` | 查找对象 |
-| `diff` | 比较两个位置 |
-| `mirror` | 镜像同步 |
-| `tree` | 树形显示 |
-| `share` | 生成分享链接 |
-| `pipe` | 从标准输入上传 |
+| Command | Description |
+|---------|-------------|
+| `alias` | Manage storage service aliases |
+| `ls` | List buckets or objects |
+| `mb` | Make bucket |
+| `rb` | Remove bucket |
+| `cp` | Copy objects |
+| `mv` | Move objects |
+| `rm` | Remove objects |
+| `cat` | Display object contents |
+| `head` | Display object header |
+| `stat` | Display object metadata |
+| `find` | Find objects |
+| `diff` | Compare two locations |
+| `mirror` | Mirror sync |
+| `tree` | Tree view display |
+| `share` | Generate share links |
+| `pipe` | Upload from stdin |
 
-### 可选命令（需要后端支持）
+### Optional Commands (requires backend support)
 
-| 命令 | 说明 |
-|------|------|
-| `version` | 管理桶版本控制 |
-| `retention` | 管理对象保留策略 |
-| `tag` | 管理对象标签 |
-| `watch` | 监听对象事件 |
-| `sql` | 执行 S3 Select 查询 |
+| Command | Description |
+|---------|-------------|
+| `version` | Manage bucket versioning |
+| `retention` | Manage object retention policy |
+| `tag` | Manage object tags |
+| `watch` | Watch object events |
+| `sql` | Execute S3 Select queries |
 
-## 输出格式
+## Output Format
 
-### 人类可读（默认）
+### Human-Readable (default)
 
 ```bash
 rc ls minio/bucket
@@ -139,7 +139,7 @@ rc ls minio/bucket
 [2024-01-15 10:30:00] 1.2MiB file.txt
 ```
 
-### JSON 格式
+### JSON Format
 
 ```bash
 rc ls minio/bucket --json
@@ -155,9 +155,9 @@ rc ls minio/bucket --json
 }
 ```
 
-## 配置文件
+## Configuration
 
-配置文件位于 `~/.config/rc/config.toml`：
+Configuration file is located at `~/.config/rc/config.toml`:
 
 ```toml
 schema_version = 1
@@ -175,72 +175,71 @@ secret_key = "minioadmin"
 region = "us-east-1"
 ```
 
-## 退出码
+## Exit Codes
 
-| 码 | 说明 |
-|----|------|
-| 0 | 成功 |
-| 1 | 一般错误 |
-| 2 | 参数/路径错误 |
-| 3 | 网络错误（可重试） |
-| 4 | 认证/权限错误 |
-| 5 | 资源不存在 |
-| 6 | 冲突/前置条件失败 |
-| 7 | 功能不支持 |
-| 130 | 被中断 (Ctrl+C) |
+| Code | Description |
+|------|-------------|
+| 0 | Success |
+| 1 | General error |
+| 2 | Usage/path error |
+| 3 | Network error (retryable) |
+| 4 | Authentication/permission error |
+| 5 | Resource not found |
+| 6 | Conflict/precondition failed |
+| 7 | Feature not supported |
+| 130 | Interrupted (Ctrl+C) |
 
-## 兼容性
+## Compatibility
 
-### 支持的后端
+### Supported Backends
 
-| 后端 | 级别 | 说明 |
-|------|------|------|
-| RustFS | Tier 1 | 完全支持 |
-| MinIO | Tier 2 | 完全支持 |
-| AWS S3 | Tier 3 | 尽力支持 |
-| 其他 S3 兼容 | Best Effort | 不保证 |
+| Backend | Tier | Description |
+|---------|------|-------------|
+| RustFS | Tier 1 | Fully supported |
+| MinIO | Tier 2 | Fully supported |
+| AWS S3 | Tier 3 | Best effort support |
+| Other S3-compatible | Best Effort | No guarantee |
 
-### 最低 Rust 版本
+### Minimum Rust Version
 
-- Rust 1.75 或更高
+- Rust 1.75 or higher
 
-## 开发
+## Development
 
-### 构建
+### Build
 
 ```bash
 cargo build --workspace
 ```
 
-### 测试
+### Test
 
 ```bash
-# 单元测试
+# Unit tests
 cargo test --workspace
 
-# 集成测试（需要 MinIO）
+# Integration tests (requires MinIO)
 docker compose -f docker/docker-compose.yml up -d
 cargo test --workspace --features integration
 docker compose -f docker/docker-compose.yml down
 ```
 
-### 格式检查
+### Lint
 
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace -- -D warnings
 ```
 
-## 贡献
+## Contributing
 
-欢迎贡献！请阅读 [AGENTS.md](AGENTS.md) 了解开发规范。
+Contributions are welcome! Please read [AGENTS.md](AGENTS.md) for development guidelines.
 
-## 许可证
+## License
 
-本项目采用 MIT 或 Apache-2.0 双许可证。详见 [LICENSE-MIT](LICENSE-MIT) 和 [LICENSE-APACHE](LICENSE-APACHE)。
+This project is dual-licensed under MIT or Apache-2.0. See [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
 
-## 致谢
+## Acknowledgments
 
-- [minio/mc](https://github.com/minio/mc) - 设计灵感来源
+- [minio/mc](https://github.com/minio/mc) - Design inspiration
 - [aws-sdk-s3](https://crates.io/crates/aws-sdk-s3) - S3 SDK
-

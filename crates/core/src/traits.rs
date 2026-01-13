@@ -166,8 +166,10 @@ pub trait ObjectStore: Send + Sync {
     /// Get backend capabilities
     async fn capabilities(&self) -> Result<Capabilities>;
 
-    // Phase 3: Transfer operations
-    // async fn get_object(&self, path: &RemotePath) -> Result<impl AsyncRead>;
+    /// Get object content as bytes
+    async fn get_object(&self, path: &RemotePath) -> Result<Vec<u8>>;
+
+    // Phase 3: Transfer operations (remaining)
     // async fn put_object(&self, path: &RemotePath, data: impl AsyncRead) -> Result<()>;
     // async fn delete_object(&self, path: &RemotePath) -> Result<()>;
     // async fn copy_object(&self, src: &RemotePath, dst: &RemotePath) -> Result<()>;

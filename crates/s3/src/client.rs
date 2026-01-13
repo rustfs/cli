@@ -256,6 +256,34 @@ impl ObjectStore for S3Client {
             notifications: false,
         })
     }
+
+    async fn get_object(&self, path: &RemotePath) -> Result<Vec<u8>> {
+        let response = self
+            .inner
+            .get_object()
+            .bucket(&path.bucket)
+            .key(&path.key)
+            .send()
+            .await
+            .map_err(|e| {
+                let err_str = e.to_string();
+                if err_str.contains("NotFound") || err_str.contains("NoSuchKey") {
+                    Error::NotFound(path.to_string())
+                } else {
+                    Error::Network(err_str)
+                }
+            })?;
+
+        let data = response
+            .body
+            .collect()
+            .await
+            .map_err(|e| Error::Network(e.to_string()))?
+            .into_bytes()
+            .to_vec();
+
+        Ok(data)
+    }
 }
 
 #[cfg(test)]

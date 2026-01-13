@@ -7,7 +7,7 @@ use clap::Subcommand;
 use serde::Serialize;
 
 use crate::exit_code::ExitCode;
-use rc_core::{Alias, AliasManager, ConfigManager};
+use rc_core::{Alias, AliasManager};
 
 /// Alias subcommands for managing storage service connections
 #[derive(Subcommand, Debug)]
@@ -105,8 +105,8 @@ struct AliasOperationOutput {
 
 /// Execute an alias subcommand
 pub async fn execute(cmd: AliasCommands, json_output: bool) -> ExitCode {
-    let config_manager = match ConfigManager::new() {
-        Ok(cm) => cm,
+    let alias_manager = match AliasManager::new() {
+        Ok(am) => am,
         Err(e) => {
             if json_output {
                 eprintln!("{}", serde_json::json!({"error": e.to_string()}));
@@ -116,8 +116,6 @@ pub async fn execute(cmd: AliasCommands, json_output: bool) -> ExitCode {
             return ExitCode::GeneralError;
         }
     };
-
-    let alias_manager = AliasManager::new(config_manager);
 
     match cmd {
         AliasCommands::Set(args) => execute_set(args, &alias_manager, json_output).await,

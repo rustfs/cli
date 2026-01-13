@@ -108,6 +108,24 @@ impl Formatter {
             eprintln!("⚠ {message}");
         }
     }
+
+    /// Output JSON directly
+    ///
+    /// Used when you want to output a pre-built JSON structure.
+    pub fn json<T: Serialize>(&self, value: &T) {
+        match serde_json::to_string_pretty(value) {
+            Ok(json) => println!("{json}"),
+            Err(e) => eprintln!("Error serializing output: {e}"),
+        }
+    }
+
+    /// Print a line of text (respects quiet mode)
+    pub fn println(&self, message: &str) {
+        if self.config.quiet {
+            return;
+        }
+        println!("{message}");
+    }
 }
 
 impl Default for Formatter {
