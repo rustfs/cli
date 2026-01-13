@@ -62,7 +62,7 @@ glob = "0.3"
 
 # Testing
 tempfile = "3.24"
-mockall = "0.13"
+mockall = "0.14"
 insta = { version = "1.46", features = ["json"] }
 
 [profile.release]
