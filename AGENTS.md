@@ -1,128 +1,128 @@
-# AGENTS.md - AI 开发规范
+# AGENTS.md - AI Development Guidelines
 
-本文档定义了 AI 助手在开发 rc 项目时必须遵循的规范和约束。
+This document defines the standards and constraints that AI assistants must follow when developing the rc project.
 
-## 语言规范
+## Language Requirements
 
-**重要**：除了与 AI 助手的对话可以使用中文外，所有其他内容必须使用英文：
+**Important**: All content must be in English, except for conversations with AI assistants which may use Chinese:
 
-- Code comments (代码注释)
-- Commit messages (提交消息)
-- PR titles and descriptions (PR 标题和描述)
-- Documentation in code (代码文档)
-- Error messages in code (代码中的错误消息)
-- Log messages (日志消息)
-- Variable and function names (变量和函数名)
+- Code comments
+- Commit messages
+- PR titles and descriptions
+- Documentation in code
+- Error messages in code
+- Log messages
+- Variable and function names
 
-## 工作流程
+## Workflow
 
-### 1. 开始前
+### 1. Before Starting
 
-1. 读取 `IMPLEMENTATION_PLAN.md` 确认当前阶段
-2. 检查当前阶段的状态是否为 "进行中"
-3. 理解当前阶段的目标和验收标准
+1. Read `IMPLEMENTATION_PLAN.md` to confirm the current phase
+2. Check if the current phase status is "In Progress"
+3. Understand the goals and acceptance criteria for the current phase
 
-### 2. 修改前
+### 2. Before Modifying
 
-1. 检查目标文件是否为受保护文件
-2. 如果是受保护文件，必须遵循 Breaking Change 流程
-3. 阅读相关的现有代码，理解模式和约定
+1. Check if the target file is a protected file
+2. If it's a protected file, follow the Breaking Change process
+3. Read related existing code to understand patterns and conventions
 
-### 3. 实现时
+### 3. During Implementation
 
-1. 先写测试（红灯）
-2. 实现最少代码通过测试（绿灯）
-3. 重构清理代码
-4. 确保所有测试通过
+1. Write tests first (red)
+2. Implement minimum code to pass tests (green)
+3. Refactor and clean up code
+4. Ensure all tests pass
 
-### 4. 完成后
+### 4. After Completion
 
-**⚠️ 重要：每次提交前必须通过所有检查！**
+**⚠️ Important: All checks must pass before each commit!**
 
-1. 运行 `cargo fmt --all` - 代码格式化
-2. 运行 `cargo clippy --workspace -- -D warnings` - 静态检查，**必须零警告**
-3. 运行 `cargo test --workspace` - 单元测试，**必须全部通过**
-4. 更新 `IMPLEMENTATION_PLAN.md` 状态
-5. **只有上述检查全部通过后，才能创建 git commit**
+1. Run `cargo fmt --all` - Code formatting
+2. Run `cargo clippy --workspace -- -D warnings` - Static analysis, **must have zero warnings**
+3. Run `cargo test --workspace` - Unit tests, **must all pass**
+4. Update `IMPLEMENTATION_PLAN.md` status
+5. **Only create a git commit after all above checks pass**
    - Commit message format: `feat(phase-N): <description>`
    - Example: `feat(phase-1): implement alias commands and core infrastructure`
 
-**禁止在检查未通过的情况下提交代码！**
+**Do not commit code when checks have not passed!**
 
 ---
 
-## 受保护文件
+## Protected Files
 
-以下文件的修改需要 Breaking Change 流程：
+The following files require the Breaking Change process for modifications:
 
-| 文件 | 说明 |
-|------|------|
-| `docs/SPEC.md` | CLI 行为合同 |
-| `schemas/output_v1.json` | JSON 输出 schema |
-| `crates/cli/src/exit_code.rs` | 退出码定义 |
-| `crates/core/src/config.rs` | 配置 schema_version 相关 |
+| File | Description |
+|------|-------------|
+| `docs/SPEC.md` | CLI behavior contract |
+| `schemas/output_v1.json` | JSON output schema |
+| `crates/cli/src/exit_code.rs` | Exit code definitions |
+| `crates/core/src/config.rs` | Config schema_version related |
 
-### Breaking Change 流程
+### Breaking Change Process
 
-修改受保护文件必须同时：
+Modifying protected files requires:
 
-1. **更新版本号**
-   - 配置变更：bump `schema_version`
-   - 输出变更：创建新的 `output_v2.json` schema
+1. **Update version number**
+   - Config changes: bump `schema_version`
+   - Output changes: create new `output_v2.json` schema
 
-2. **提供迁移方案**
-   - 配置迁移：添加 `migrations/v{N}_to_v{N+1}.rs`
-   - 文档更新：更新 SPEC.md 相关章节
+2. **Provide migration path**
+   - Config migration: add `migrations/v{N}_to_v{N+1}.rs`
+   - Documentation update: update relevant SPEC.md sections
 
-3. **更新 CHANGELOG**
-   - 在 CHANGELOG.md 中添加 BREAKING CHANGE 条目
+3. **Update CHANGELOG**
+   - Add BREAKING CHANGE entry in CHANGELOG.md
 
-4. **PR 标记**
-   - 在 PR 标题或描述中包含 `BREAKING`
-
----
-
-## 绝对禁止
-
-### 代码层面
-
-1. **在 `cli` crate 中直接 `use aws_sdk_s3`**
-   - 必须通过 `core` 的 trait 抽象访问 S3 功能
-   - 违反：破坏依赖边界
-
-2. **使用 `.unwrap()`**（测试代码除外）
-   - 必须使用 `?` 或 `expect("reason")`
-   - 违反：可能导致 panic
-
-3. **使用 `unsafe` 代码**
-   - 无例外
-   - 违反：安全风险
-
-4. **在日志/错误中打印凭证信息**
-   - 包括：access_key, secret_key, Authorization 头
-   - 违反：安全风险
-
-### 流程层面
-
-5. **修改受保护文件而不走 Breaking Change 流程**
-   - 违反：破坏向后兼容性
-
-6. **删除或禁用测试来"修复" CI**
-   - 必须修复测试失败的根本原因
-   - 违反：降低代码质量
-
-7. **跨层重构未经 ADR**
-   - 例如：把 s3 逻辑移到 cli
-   - 需要在 `docs/ADR/` 中记录决策
-
-8. **使用 `--no-verify` 绕过 commit hooks**
-   - 无例外
+4. **PR marking**
+   - Include `BREAKING` in PR title or description
 
 ---
 
-## 代码风格
+## Absolute Prohibitions
 
-### 错误处理
+### Code Level
+
+1. **Using `use aws_sdk_s3` directly in `cli` crate**
+   - Must access S3 functionality through `core` trait abstractions
+   - Violation: breaks dependency boundaries
+
+2. **Using `.unwrap()`** (except in test code)
+   - Must use `?` or `expect("reason")`
+   - Violation: may cause panic
+
+3. **Using `unsafe` code**
+   - No exceptions
+   - Violation: security risk
+
+4. **Printing credentials in logs/errors**
+   - Includes: access_key, secret_key, Authorization headers
+   - Violation: security risk
+
+### Process Level
+
+5. **Modifying protected files without following Breaking Change process**
+   - Violation: breaks backward compatibility
+
+6. **Deleting or disabling tests to "fix" CI**
+   - Must fix the root cause of test failures
+   - Violation: reduces code quality
+
+7. **Cross-layer refactoring without ADR**
+   - Example: moving s3 logic to cli
+   - Requires recording decision in `docs/ADR/`
+
+8. **Using `--no-verify` to bypass commit hooks**
+   - No exceptions
+
+---
+
+## Code Style
+
+### Error Handling
 
 ```rust
 // Recommended: Use thiserror to define error types
@@ -155,7 +155,7 @@ fn ok() {
 }
 ```
 
-### 异步代码
+### Async Code
 
 ```rust
 // Recommended: Use tokio
@@ -172,7 +172,7 @@ fn bad() {
 }
 ```
 
-### 日志
+### Logging
 
 ```rust
 use tracing::{debug, info, warn, error};
@@ -188,7 +188,7 @@ error!("Auth failed: key={}", secret_key); // ❌ Absolutely forbidden
 error!("Auth failed: endpoint={}", endpoint); // ✓ Non-sensitive info is OK
 ```
 
-### 注释
+### Comments
 
 ```rust
 // Recommended: Comments explain WHY, not just WHAT
@@ -204,9 +204,9 @@ counter += 1; // ❌ This comment adds no value
 
 ---
 
-## 命令实现模板
+## Command Implementation Template
 
-新命令必须遵循此模板：
+New commands must follow this template:
 
 ```rust
 // crates/cli/src/commands/example.rs
@@ -273,13 +273,13 @@ mod tests {
 
 ## PR Checklist
 
-**⚠️ 每次提交前必须确认以下所有检查项通过：**
+**⚠️ All checklist items must pass before each commit:**
 
 Before submitting a PR, confirm all of the following:
 
-- [ ] `cargo fmt --all --check` passes (**必须**)
-- [ ] `cargo clippy --workspace -- -D warnings` passes (**必须，零警告**)
-- [ ] `cargo test --workspace` passes (**必须，全部通过**)
+- [ ] `cargo fmt --all --check` passes (**required**)
+- [ ] `cargo clippy --workspace -- -D warnings` passes (**required, zero warnings**)
+- [ ] `cargo test --workspace` passes (**required, all must pass**)
 - [ ] No changes to CLI/JSON/config contracts (or followed Breaking Change process)
 - [ ] New behaviors have unit tests
 - [ ] Each new command has at least 2 exit code test scenarios
@@ -289,11 +289,11 @@ Before submitting a PR, confirm all of the following:
 - [ ] Updated IMPLEMENTATION_PLAN.md status (if applicable)
 - [ ] Commit message and PR description are in English
 
-**禁止跳过检查直接提交！CI 失败的代码不应被合并。**
+**Do not skip checks and commit directly! Code that fails CI should not be merged.**
 
 ---
 
-## 依赖边界 (Dependency Boundaries)
+## Dependency Boundaries
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -324,7 +324,7 @@ Before submitting a PR, confirm all of the following:
 
 ---
 
-## 常见错误及修复 (Common Errors and Fixes)
+## Common Errors and Fixes
 
 ### Compilation Errors
 
@@ -344,7 +344,7 @@ Before submitting a PR, confirm all of the following:
 
 ---
 
-## 阶段工作指南 (Phase Work Guidelines)
+## Phase Work Guidelines
 
 ### Phase 0: Project Initialization
 - Create workspace structure
@@ -370,4 +370,3 @@ Each completed phase should have a commit:
 - Format: `feat(phase-N): <brief description>`
 - Example: `feat(phase-0): initialize project structure and CI`
 - Example: `feat(phase-1): implement core infrastructure and alias commands`
-
