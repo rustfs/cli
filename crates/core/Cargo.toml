@@ -4,7 +4,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Core library for rc S3 CLI client"
+repository.workspace = true
+homepage.workspace = true
+description = "Core library for rustfs-cli S3 CLI client"
+keywords = ["s3", "storage", "object-storage"]
+categories = ["filesystem"]
 
 [dependencies]
 # Async

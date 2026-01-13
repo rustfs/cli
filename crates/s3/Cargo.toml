@@ -4,7 +4,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "S3 SDK adapter for rc CLI client"
+repository.workspace = true
+homepage.workspace = true
+description = "S3 SDK adapter for rustfs-cli"
+keywords = ["s3", "aws", "storage", "object-storage"]
+categories = ["filesystem", "api-bindings"]
 
 [dependencies]
 # Workspace crates
