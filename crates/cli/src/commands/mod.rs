@@ -11,6 +11,7 @@ use crate::output::OutputConfig;
 
 mod alias;
 mod cat;
+mod completions;
 pub mod cp;
 pub mod diff;
 mod find;
@@ -123,6 +124,10 @@ pub enum Commands {
     /// Manage object tags
     #[command(subcommand)]
     Tag(tag::TagCommands),
+
+    // Phase 6: Utilities
+    /// Generate shell completion scripts
+    Completions(completions::CompletionsArgs),
     // /// Manage object retention
     // Retention(retention::RetentionArgs),
     // /// Watch for object events
@@ -161,5 +166,6 @@ pub async fn execute(cli: Cli) -> ExitCode {
             version::execute(version::VersionArgs { command: cmd }, output_config).await
         }
         Commands::Tag(cmd) => tag::execute(tag::TagArgs { command: cmd }, output_config).await,
+        Commands::Completions(args) => completions::execute(args),
     }
 }
