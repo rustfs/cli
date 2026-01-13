@@ -4,7 +4,7 @@
 //! It allows the CLI to be decoupled from the specific S3 SDK implementation.
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
@@ -26,7 +26,7 @@ pub struct ObjectInfo {
 
     /// Last modified timestamp
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_modified: Option<DateTime<Utc>>,
+    pub last_modified: Option<Timestamp>,
 
     /// ETag (usually MD5 for single-part uploads)
     #[serde(skip_serializing_if = "Option::is_none")]

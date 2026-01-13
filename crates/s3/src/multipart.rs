@@ -103,7 +103,7 @@ pub struct UploadState {
     pub completed_parts: Vec<CompletedPart>,
 
     /// Timestamp of last update
-    pub last_updated: chrono::DateTime<chrono::Utc>,
+    pub last_updated: jiff::Timestamp,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -127,7 +127,7 @@ impl UploadState {
             total_size,
             part_size,
             completed_parts: Vec::new(),
-            last_updated: chrono::Utc::now(),
+            last_updated: jiff::Timestamp::now(),
         }
     }
 
@@ -141,7 +141,7 @@ impl UploadState {
     pub fn add_completed_part(&mut self, part_number: i32, etag: String) {
         self.completed_parts
             .push(CompletedPart { part_number, etag });
-        self.last_updated = chrono::Utc::now();
+        self.last_updated = jiff::Timestamp::now();
     }
 
     /// Get the next part number to upload

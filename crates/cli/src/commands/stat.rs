@@ -91,7 +91,7 @@ pub async fn execute(args: StatArgs, output_config: OutputConfig) -> ExitCode {
             if formatter.is_json() {
                 let output = StatOutput {
                     name: info.key.clone(),
-                    last_modified: info.last_modified.map(|d| d.to_rfc3339()),
+                    last_modified: info.last_modified.map(|d| d.to_string()),
                     size_bytes: info.size_bytes,
                     size_human: info.size_human.clone(),
                     etag: info.etag.clone(),
@@ -105,7 +105,7 @@ pub async fn execute(args: StatArgs, output_config: OutputConfig) -> ExitCode {
                 if let Some(modified) = info.last_modified {
                     formatter.println(&format!(
                         "Date      : {}",
-                        modified.format("%Y-%m-%d %H:%M:%S UTC")
+                        modified.strftime("%Y-%m-%d %H:%M:%S UTC")
                     ));
                 }
                 if let Some(size) = info.size_bytes {

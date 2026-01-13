@@ -76,10 +76,7 @@ impl ObjectStore for S3Client {
             .map(|b| {
                 let mut info = ObjectInfo::bucket(b.name().unwrap_or_default());
                 if let Some(creation_date) = b.creation_date() {
-                    info.last_modified = Some(
-                        chrono::DateTime::from_timestamp(creation_date.secs(), 0)
-                            .unwrap_or_default(),
-                    );
+                    info.last_modified = jiff::Timestamp::from_second(creation_date.secs()).ok();
                 }
                 info
             })
@@ -140,8 +137,7 @@ impl ObjectStore for S3Client {
             let mut info = ObjectInfo::file(&key, size);
 
             if let Some(modified) = object.last_modified() {
-                info.last_modified =
-                    Some(chrono::DateTime::from_timestamp(modified.secs(), 0).unwrap_or_default());
+                info.last_modified = jiff::Timestamp::from_second(modified.secs()).ok();
             }
 
             if let Some(etag) = object.e_tag() {
@@ -183,8 +179,7 @@ impl ObjectStore for S3Client {
         let mut info = ObjectInfo::file(&path.key, size);
 
         if let Some(modified) = response.last_modified() {
-            info.last_modified =
-                Some(chrono::DateTime::from_timestamp(modified.secs(), 0).unwrap_or_default());
+            info.last_modified = jiff::Timestamp::from_second(modified.secs()).ok();
         }
 
         if let Some(etag) = response.e_tag() {
@@ -314,7 +309,7 @@ impl ObjectStore for S3Client {
         if let Some(etag) = response.e_tag() {
             info.etag = Some(etag.trim_matches('"').to_string());
         }
-        info.last_modified = Some(chrono::Utc::now());
+        info.last_modified = Some(jiff::Timestamp::now());
 
         Ok(info)
     }

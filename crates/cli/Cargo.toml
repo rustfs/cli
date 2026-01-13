@@ -43,7 +43,7 @@ comfy-table.workspace = true
 console.workspace = true
 
 # Utilities
-chrono.workspace = true
+jiff.workspace = true
 humansize.workspace = true
 mime_guess.workspace = true
 

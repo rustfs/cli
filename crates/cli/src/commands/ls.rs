@@ -125,7 +125,7 @@ async fn list_buckets(client: &S3Client, formatter: &Formatter, summarize: bool)
                 for bucket in &buckets {
                     let date = bucket
                         .last_modified
-                        .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
+                        .map(|d| d.strftime("%Y-%m-%d %H:%M:%S").to_string())
                         .unwrap_or_else(|| "                   ".to_string());
                     formatter.println(&format!("[{date}]     0B {}/", bucket.key));
                 }
@@ -211,7 +211,7 @@ async fn list_objects(
         for item in &all_items {
             let date = item
                 .last_modified
-                .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
+                .map(|d| d.strftime("%Y-%m-%d %H:%M:%S").to_string())
                 .unwrap_or_else(|| "                   ".to_string());
 
             if item.is_dir {
