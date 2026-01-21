@@ -7,14 +7,14 @@
 services:
   # RustFS - S3-compatible object storage (Tier 1)
   rustfs:
-    image: rustfs/rustfs:latest
-    container_name: rc-test-rustfs
+    image: rustfs/rustfs:1.0.0-alpha.80
+    container_name: rustfs
     ports:
       - "9000:9000"   # S3 API
       - "9001:9001"   # Console
     environment:
-      RUSTFS_ROOT_USER: accesskey
-      RUSTFS_ROOT_PASSWORD: secretkey
+      RUSTFS_ROOT_USER: rustfsadmin
+      RUSTFS_ROOT_PASSWORD: rustfsadmin
       RUSTFS_VOLUMES: /data
       RUSTFS_ADDRESS: ":9000"
       RUSTFS_CONSOLE_ENABLE: "true"
@@ -22,7 +22,7 @@ services:
     volumes:
       - rustfs-data:/data
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:9000/minio/health/live"]
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:9000/health"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -32,18 +32,17 @@ services:
 
   # Initialize RustFS - create test buckets using mc client
   rustfs-init:
-    image: quay.io/minio/mc:latest
-    container_name: rc-test-rustfs-init
+    image: rustfs/rc:latest
+    container_name: rc-init
     depends_on:
-      rustfs:
-        condition: service_healthy
+      - rustfs
     entrypoint: >
       /bin/sh -c "
-      mc alias set local http://rustfs:9000 accesskey secretkey;
-      mc mb local/test-bucket --ignore-existing;
-      mc mb local/another-bucket --ignore-existing;
+      until (/usr/bin/rc alias set rustfs http://rustfs:9000 rustfsadmin rustfsadmin) do echo '...waiting...' && sleep 1; done;
+      /usr/bin/rc mb rustfs/test-bucket;
+      /usr/bin/rc mb rustfs/another-bucket;
       echo 'RustFS initialization complete';
-      exit 0;
+      tail -f /dev/null
       "
     networks:
       - rc-test-network
