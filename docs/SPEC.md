@@ -1,4 +1,4 @@
-# rc CLI Specification v1
+# rc CLI Specification v2
 
 > **PROTECTED FILE**: Changes to this specification require the Breaking Change process.
 > See AGENTS.md for the required workflow.
@@ -61,7 +61,7 @@ Default behavior depends on the mode:
 
 When `--json` is specified:
 
-1. Output is valid JSON following `schemas/output_v1.json`
+1. Output is valid JSON following `schemas/output_v2.json`
 2. No ANSI color codes or escape sequences
 3. No progress bars or spinners
 4. Timestamps are ISO8601 UTC: `2024-01-15T10:30:00Z`
@@ -165,6 +165,71 @@ rc alias remove <NAME>
 
 ---
 
+### admin - Administrative Operations
+
+Administrative commands for cluster management.
+
+#### admin info
+
+Display cluster, server, or disk information.
+
+```
+rc admin info cluster <ALIAS>
+rc admin info server <ALIAS>
+rc admin info disk <ALIAS> [OPTIONS]
+```
+
+**Arguments:**
+| Argument | Description |
+|----------|-------------|
+| ALIAS | Alias name of the server |
+
+**Options (disk):**
+| Option | Description |
+|--------|-------------|
+| --offline | Show only offline disks |
+| --healing | Show only healing disks |
+
+**Output (--json):**
+- `admin info cluster`: See `schemas/output_v2.json#admin-info-cluster`
+- `admin info server`: See `schemas/output_v2.json#admin-info-server`
+- `admin info disk`: See `schemas/output_v2.json#admin-info-disk`
+
+**Exit Codes:** 0, 4 (auth error), 5 (alias not found)
+
+#### admin heal
+
+Manage cluster healing operations.
+
+```
+rc admin heal status <ALIAS>
+rc admin heal start <ALIAS> [OPTIONS]
+rc admin heal stop <ALIAS>
+```
+
+**Arguments:**
+| Argument | Description |
+|----------|-------------|
+| ALIAS | Alias name of the server |
+
+**Options (start):**
+| Option | Default | Description |
+|--------|---------|-------------|
+| -b, --bucket | (all) | Specific bucket to heal |
+| -p, --prefix | (none) | Object prefix to heal |
+| --scan-mode | normal | Scan mode: normal, deep |
+| --remove | false | Remove dangling objects/parts |
+| --recreate | false | Recreate missing data |
+| --dry-run | false | Show what would be healed without healing |
+
+**Output (--json):**
+- `admin heal status`: See `schemas/output_v2.json#admin-heal-status`
+- `admin heal start/stop`: See `schemas/output_v2.json#admin-heal-operation`
+
+**Exit Codes:** 0, 2 (invalid input), 4 (auth error), 5 (alias not found)
+
+---
+
 ### ls - List Objects
 
 List buckets or objects.
@@ -191,7 +256,7 @@ rc ls [OPTIONS] <PATH>
 [2024-01-15 10:30:00] 1.2MiB file.txt
 ```
 
-**Output (--json):** See `schemas/output_v1.json#ls`
+**Output (--json):** See `schemas/output_v2.json#ls`
 
 **Exit Codes:** 0, 2 (invalid path), 4 (auth error), 5 (bucket not found)
 
@@ -277,7 +342,7 @@ ETag      : d41d8cd98f00b204e9800998ecf8427e
 Modified  : 2024-01-15T10:30:00Z
 ```
 
-**Output (--json):** See `schemas/output_v1.json#stat`
+**Output (--json):** See `schemas/output_v2.json#stat`
 
 **Exit Codes:** 0, 4 (auth error), 5 (not found)
 
@@ -456,4 +521,3 @@ rc sql [OPTIONS] <PATH>
 Configuration is stored in `~/.config/rc/config.toml`.
 
 See the plan document for full configuration schema.
-

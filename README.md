@@ -117,12 +117,31 @@ rc admin policy attach local/ readonly --user newuser
 rc admin service-account add local/ myuser
 ```
 
+### Admin Operations (Cluster)
+
+```bash
+# Cluster information
+rc admin info cluster local
+rc admin info server local
+rc admin info disk local --offline
+
+# Heal operations
+rc admin heal status local
+rc admin heal start local --bucket mybucket --scan-mode deep
+rc admin heal start local --dry-run
+rc admin heal stop local
+
+# JSON output
+rc admin info cluster local --json
+rc admin heal status local --json
+```
+
 ## Command Overview
 
 | Command | Description |
 |---------|-------------|
 | `alias` | Manage storage service aliases |
-| `admin` | Manage IAM users, policies, groups, and service accounts |
+| `admin` | Manage IAM users, policies, groups, service accounts, and cluster operations |
 | `ls` | List buckets or objects |
 | `mb` | Make bucket |
 | `rb` | Remove bucket |
@@ -150,6 +169,8 @@ rc admin service-account add local/ myuser
 | `admin policy` | Manage IAM policies (create, remove, list, info, attach, detach) |
 | `admin group` | Manage IAM groups (add, remove, list, info, member) |
 | `admin service-account` | Manage service accounts (add, remove, list, info, edit) |
+| `admin info` | Display cluster information (cluster, server, disk) |
+| `admin heal` | Manage cluster healing operations (status, start, stop) |
 
 ## Output Format
 

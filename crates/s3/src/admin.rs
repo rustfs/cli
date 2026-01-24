@@ -10,8 +10,9 @@ use aws_sigv4::http_request::{
 };
 use aws_sigv4::sign::v4;
 use rc_core::admin::{
-    AdminApi, CreateServiceAccountRequest, Group, GroupStatus, Policy, PolicyEntity, PolicyInfo,
-    ServiceAccount, UpdateGroupMembersRequest, User, UserStatus,
+    AdminApi, ClusterInfo, CreateServiceAccountRequest, Group, GroupStatus, HealStartRequest,
+    HealStatus, Policy, PolicyEntity, PolicyInfo, ServiceAccount, UpdateGroupMembersRequest, User,
+    UserStatus,
 };
 use rc_core::{Alias, Error, Result};
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
@@ -344,6 +345,27 @@ struct SetPolicyApiRequest {
 
 #[async_trait]
 impl AdminApi for AdminClient {
+    // ==================== Cluster Operations ====================
+
+    async fn cluster_info(&self) -> Result<ClusterInfo> {
+        self.request(Method::GET, "/info", None, None).await
+    }
+
+    async fn heal_status(&self) -> Result<HealStatus> {
+        self.request(Method::GET, "/heal/status", None, None).await
+    }
+
+    async fn heal_start(&self, request: HealStartRequest) -> Result<HealStatus> {
+        let body = serde_json::to_vec(&request).map_err(Error::Json)?;
+        self.request(Method::POST, "/heal/start", None, Some(&body))
+            .await
+    }
+
+    async fn heal_stop(&self) -> Result<()> {
+        self.request_no_response(Method::POST, "/heal/stop", None, None)
+            .await
+    }
+
     // ==================== User Operations ====================
 
     async fn list_users(&self) -> Result<Vec<User>> {

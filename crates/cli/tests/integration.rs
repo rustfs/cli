@@ -20,28 +20,33 @@
 #![cfg(feature = "integration")]
 
 use std::process::{Command, Output};
+use std::time::Duration;
 use tempfile::TempDir;
 
 /// Get the path to the rc binary
 fn rc_binary() -> std::path::PathBuf {
-    // Try release first, then debug
-    let release = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("target/release/rc");
-
-    if release.exists() {
-        release
-    } else {
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("target/debug/rc")
+    if let Ok(path) = std::env::var("CARGO_BIN_EXE_rc") {
+        return std::path::PathBuf::from(path);
     }
+
+    // Try release first, then debug
+    let debug = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("target/debug/rc");
+
+    if debug.exists() {
+        return debug;
+    }
+
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("target/release/rc")
 }
 
 /// Set up isolated test environment with custom config directory
@@ -62,6 +67,18 @@ fn run_rc(args: &[&str], config_dir: &std::path::Path) -> Output {
     }
 
     cmd.output().expect("Failed to execute rc command")
+}
+
+/// Wait for the S3 service to respond to list requests
+fn wait_for_s3_ready(config_dir: &std::path::Path) -> bool {
+    for _ in 0..30 {
+        let output = run_rc(&["ls", "test/", "--json"], config_dir);
+        if output.status.success() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    false
 }
 
 /// Get S3 test configuration from environment
@@ -101,6 +118,11 @@ fn setup_with_alias(bucket: &str) -> Option<(TempDir, String)> {
         return None;
     }
 
+    if !wait_for_s3_ready(config_dir.path()) {
+        eprintln!("S3 service did not become ready in time");
+        return None;
+    }
+
     // Create test bucket
     let output = run_rc(&["mb", &format!("test/{}", bucket_name)], config_dir.path());
 
@@ -113,6 +135,41 @@ fn setup_with_alias(bucket: &str) -> Option<(TempDir, String)> {
     }
 
     Some((config_dir, bucket_name))
+}
+
+/// Test helper: setup alias only
+fn setup_alias_only() -> Option<TempDir> {
+    let config = get_test_config()?;
+    let config_dir = tempfile::tempdir().ok()?;
+
+    let output = run_rc(
+        &[
+            "alias",
+            "set",
+            "test",
+            &config.0,
+            &config.1,
+            &config.2,
+            "--bucket-lookup",
+            "path",
+        ],
+        config_dir.path(),
+    );
+
+    if !output.status.success() {
+        eprintln!(
+            "Failed to set alias: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return None;
+    }
+
+    if !wait_for_s3_ready(config_dir.path()) {
+        eprintln!("S3 service did not become ready in time");
+        return None;
+    }
+
+    Some(config_dir)
 }
 
 /// Generate unique suffix for test resources
@@ -167,6 +224,11 @@ mod bucket_operations {
             config_dir.path(),
         );
         assert!(output.status.success(), "Failed to set alias");
+
+        assert!(
+            wait_for_s3_ready(config_dir.path()),
+            "S3 service did not become ready in time"
+        );
 
         // Create bucket
         let output = run_rc(
@@ -683,6 +745,121 @@ mod listing_operations {
 
         // Cleanup
         cleanup_bucket(config_dir.path(), &bucket_name);
+    }
+}
+
+mod admin_operations {
+    use super::*;
+
+    #[test]
+    fn test_admin_info_cluster() {
+        let config_dir = match setup_alias_only() {
+            Some(v) => v,
+            None => {
+                eprintln!("Skipping: S3 test config not available");
+                return;
+            }
+        };
+
+        let output = run_rc(
+            &["admin", "info", "cluster", "test", "--json"],
+            config_dir.path(),
+        );
+        assert!(
+            output.status.success(),
+            "Failed to run admin info cluster: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let json: serde_json::Value = serde_json::from_str(&stdout).expect("Invalid JSON output");
+        assert!(json.get("mode").is_some(), "Expected mode in output");
+        assert!(
+            json.get("deploymentId").is_some(),
+            "Expected deploymentId in output"
+        );
+    }
+
+    #[test]
+    fn test_admin_info_server() {
+        let config_dir = match setup_alias_only() {
+            Some(v) => v,
+            None => {
+                eprintln!("Skipping: S3 test config not available");
+                return;
+            }
+        };
+
+        let output = run_rc(
+            &["admin", "info", "server", "test", "--json"],
+            config_dir.path(),
+        );
+        assert!(
+            output.status.success(),
+            "Failed to run admin info server: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let json: serde_json::Value = serde_json::from_str(&stdout).expect("Invalid JSON output");
+        assert!(json.get("servers").is_some(), "Expected servers in output");
+    }
+
+    #[test]
+    fn test_admin_info_disk() {
+        let config_dir = match setup_alias_only() {
+            Some(v) => v,
+            None => {
+                eprintln!("Skipping: S3 test config not available");
+                return;
+            }
+        };
+
+        let output = run_rc(
+            &["admin", "info", "disk", "test", "--json"],
+            config_dir.path(),
+        );
+        assert!(
+            output.status.success(),
+            "Failed to run admin info disk: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let json: serde_json::Value = serde_json::from_str(&stdout).expect("Invalid JSON output");
+        assert!(json.get("disks").is_some(), "Expected disks in output");
+    }
+
+    #[test]
+    fn test_admin_heal_status() {
+        let config_dir = match setup_alias_only() {
+            Some(v) => v,
+            None => {
+                eprintln!("Skipping: S3 test config not available");
+                return;
+            }
+        };
+
+        let output = run_rc(
+            &["admin", "heal", "status", "test", "--json"],
+            config_dir.path(),
+        );
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let combined = format!("{stdout}{stderr}");
+            if combined.contains("NotImplemented") || combined.contains("Not Implemented") {
+                eprintln!("Skipping: heal status not supported by backend");
+                return;
+            }
+            panic!("Failed to run admin heal status: {stderr}");
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let json: serde_json::Value = serde_json::from_str(&stdout).expect("Invalid JSON output");
+        assert!(json.get("healId").is_some(), "Expected healId in output");
+        assert!(json.get("healing").is_some(), "Expected healing in output");
     }
 }
 

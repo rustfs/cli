@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking
+
+- Updated JSON output schema to `schemas/output_v2.json` to cover admin cluster info and heal outputs
+
 ### Added
 
 - Shell completion generation command (`rc completions <shell>`)
@@ -14,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Golden test infrastructure using insta for snapshot testing
 - `RC_CONFIG_DIR` environment variable for custom config location
 - MIT and Apache-2.0 license files
+- Admin cluster commands (`rc admin info` and `rc admin heal`)
 
 ### Changed
 

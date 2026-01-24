@@ -1,10 +1,16 @@
 //! Admin API module
 //!
 //! This module provides the AdminApi trait and types for managing
-//! IAM users, policies, groups, and service accounts.
+//! IAM users, policies, groups, service accounts, and cluster operations.
 
+mod cluster;
 mod types;
 
+pub use cluster::{
+    BackendInfo, BackendType, BucketsInfo, ClusterInfo, DiskInfo, HealDriveInfo, HealDriveInfos,
+    HealResultItem, HealScanMode, HealStartRequest, HealStatus, HealingDiskInfo, MemStats,
+    ObjectsInfo, ServerInfo, UsageInfo,
+};
 pub use types::{
     CreateServiceAccountRequest, Group, GroupStatus, Policy, PolicyEntity, PolicyInfo,
     ServiceAccount, SetPolicyRequest, UpdateGroupMembersRequest, User, UserStatus,
@@ -14,13 +20,27 @@ use async_trait::async_trait;
 
 use crate::error::Result;
 
-/// Admin API trait for IAM management operations
+/// Admin API trait for IAM and cluster management operations
 ///
 /// This trait defines the interface for managing users, policies, groups,
-/// and service accounts on S3-compatible storage systems that support
-/// the RustFS/MinIO Admin API.
+/// service accounts, and cluster operations on S3-compatible storage systems
+/// that support the RustFS/MinIO Admin API.
 #[async_trait]
 pub trait AdminApi: Send + Sync {
+    // ==================== Cluster Operations ====================
+
+    /// Get cluster information including servers, disks, and usage
+    async fn cluster_info(&self) -> Result<ClusterInfo>;
+
+    /// Get current heal status
+    async fn heal_status(&self) -> Result<HealStatus>;
+
+    /// Start a heal operation
+    async fn heal_start(&self, request: HealStartRequest) -> Result<HealStatus>;
+
+    /// Stop a running heal operation
+    async fn heal_stop(&self) -> Result<()>;
+
     // ==================== User Operations ====================
 
     /// List all users

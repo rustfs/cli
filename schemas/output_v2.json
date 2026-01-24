@@ -1,0 +1,481 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/rustfs/rc/schemas/output_v2.json",
+  "title": "rc CLI Output Schema v2",
+  "description": "JSON output schema for rc CLI commands. This file is protected - changes require Breaking Change process.",
+  "definitions": {
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO8601 UTC timestamp (e.g., 2024-01-15T10:30:00Z)"
+    },
+    "objectInfo": {
+      "type": "object",
+      "required": [
+        "key",
+        "is_dir"
+      ],
+      "properties": {
+        "key": {
+          "type": "string",
+          "description": "Object key or bucket name"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "description": "Size in bytes (null for directories/buckets)"
+        },
+        "size_human": {
+          "type": "string",
+          "description": "Human-readable size (e.g., '1.2 MiB')"
+        },
+        "last_modified": {
+          "$ref": "#/definitions/timestamp"
+        },
+        "etag": {
+          "type": "string",
+          "description": "ETag (usually MD5 for single-part uploads)"
+        },
+        "storage_class": {
+          "type": "string",
+          "description": "Storage class (STANDARD, GLACIER, etc.)"
+        },
+        "content_type": {
+          "type": "string",
+          "description": "MIME content type"
+        },
+        "is_dir": {
+          "type": "boolean",
+          "description": "Whether this is a directory/prefix/bucket"
+        }
+      }
+    },
+    "aliasInfo": {
+      "type": "object",
+      "required": [
+        "name",
+        "endpoint"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Alias name"
+        },
+        "endpoint": {
+          "type": "string",
+          "description": "S3 endpoint URL"
+        },
+        "region": {
+          "type": "string",
+          "description": "AWS region"
+        },
+        "bucket_lookup": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "path",
+            "dns"
+          ],
+          "description": "Bucket lookup style"
+        }
+      }
+    },
+    "clusterInfo": {
+      "type": "object",
+      "required": [
+        "mode",
+        "deploymentId",
+        "region",
+        "servers",
+        "onlineDisks",
+        "offlineDisks",
+        "totalCapacity",
+        "usedCapacity",
+        "buckets",
+        "objects"
+      ],
+      "properties": {
+        "mode": {
+          "type": "string",
+          "description": "Cluster mode (standalone or distributed)"
+        },
+        "deploymentId": {
+          "type": "string",
+          "description": "Cluster deployment identifier"
+        },
+        "region": {
+          "type": "string",
+          "description": "Cluster region"
+        },
+        "servers": {
+          "type": "integer",
+          "description": "Number of servers"
+        },
+        "onlineDisks": {
+          "type": "integer",
+          "description": "Number of online disks"
+        },
+        "offlineDisks": {
+          "type": "integer",
+          "description": "Number of offline disks"
+        },
+        "totalCapacity": {
+          "type": "integer",
+          "description": "Total capacity in bytes"
+        },
+        "usedCapacity": {
+          "type": "integer",
+          "description": "Used capacity in bytes"
+        },
+        "buckets": {
+          "type": "integer",
+          "description": "Total bucket count"
+        },
+        "objects": {
+          "type": "integer",
+          "description": "Total object count"
+        }
+      }
+    },
+    "serverInfo": {
+      "type": "object",
+      "required": [
+        "endpoint",
+        "state",
+        "version",
+        "uptime",
+        "disks",
+        "onlineDisks",
+        "offlineDisks"
+      ],
+      "properties": {
+        "endpoint": {
+          "type": "string",
+          "description": "Server endpoint"
+        },
+        "state": {
+          "type": "string",
+          "description": "Server state"
+        },
+        "version": {
+          "type": "string",
+          "description": "Server version"
+        },
+        "uptime": {
+          "type": "integer",
+          "description": "Server uptime in seconds"
+        },
+        "disks": {
+          "type": "integer",
+          "description": "Total disks"
+        },
+        "onlineDisks": {
+          "type": "integer",
+          "description": "Online disks"
+        },
+        "offlineDisks": {
+          "type": "integer",
+          "description": "Offline disks"
+        }
+      }
+    },
+    "diskInfo": {
+      "type": "object",
+      "required": [
+        "endpoint",
+        "path",
+        "state",
+        "uuid",
+        "totalSpace",
+        "usedSpace",
+        "availableSpace",
+        "healing",
+        "poolIndex",
+        "setIndex",
+        "diskIndex"
+      ],
+      "properties": {
+        "endpoint": {
+          "type": "string",
+          "description": "Server endpoint"
+        },
+        "path": {
+          "type": "string",
+          "description": "Disk path"
+        },
+        "state": {
+          "type": "string",
+          "description": "Disk state"
+        },
+        "uuid": {
+          "type": "string",
+          "description": "Disk UUID"
+        },
+        "totalSpace": {
+          "type": "integer",
+          "description": "Total space in bytes"
+        },
+        "usedSpace": {
+          "type": "integer",
+          "description": "Used space in bytes"
+        },
+        "availableSpace": {
+          "type": "integer",
+          "description": "Available space in bytes"
+        },
+        "healing": {
+          "type": "boolean",
+          "description": "Whether disk is healing"
+        },
+        "poolIndex": {
+          "type": "integer",
+          "description": "Pool index"
+        },
+        "setIndex": {
+          "type": "integer",
+          "description": "Set index"
+        },
+        "diskIndex": {
+          "type": "integer",
+          "description": "Disk index"
+        }
+      }
+    },
+    "healStatus": {
+      "type": "object",
+      "required": [
+        "healId",
+        "healing",
+        "bucket",
+        "object",
+        "itemsScanned",
+        "itemsHealed",
+        "itemsFailed",
+        "bytesScanned",
+        "bytesHealed"
+      ],
+      "properties": {
+        "healId": {
+          "type": "string",
+          "description": "Heal operation identifier"
+        },
+        "healing": {
+          "type": "boolean",
+          "description": "Whether a heal operation is active"
+        },
+        "bucket": {
+          "type": "string",
+          "description": "Bucket being healed"
+        },
+        "object": {
+          "type": "string",
+          "description": "Object prefix being healed"
+        },
+        "itemsScanned": {
+          "type": "integer",
+          "description": "Items scanned"
+        },
+        "itemsHealed": {
+          "type": "integer",
+          "description": "Items healed"
+        },
+        "itemsFailed": {
+          "type": "integer",
+          "description": "Items failed"
+        },
+        "bytesScanned": {
+          "type": "integer",
+          "description": "Bytes scanned"
+        },
+        "bytesHealed": {
+          "type": "integer",
+          "description": "Bytes healed"
+        },
+        "started": {
+          "$ref": "#/definitions/timestamp"
+        },
+        "lastUpdate": {
+          "$ref": "#/definitions/timestamp"
+        }
+      }
+    },
+    "errorResponse": {
+      "type": "object",
+      "required": [
+        "error"
+      ],
+      "properties": {
+        "error": {
+          "type": "string",
+          "description": "Error message"
+        },
+        "code": {
+          "type": "integer",
+          "description": "Exit code"
+        },
+        "details": {
+          "type": "object",
+          "description": "Additional error details"
+        }
+      }
+    }
+  },
+  "oneOf": [
+    {
+      "title": "ls",
+      "description": "List objects output",
+      "type": "object",
+      "required": [
+        "items",
+        "truncated"
+      ],
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/objectInfo"
+          }
+        },
+        "truncated": {
+          "type": "boolean",
+          "description": "Whether more results are available"
+        },
+        "continuation_token": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Token for fetching next page"
+        }
+      }
+    },
+    {
+      "title": "stat",
+      "description": "Object metadata output",
+      "$ref": "#/definitions/objectInfo"
+    },
+    {
+      "title": "alias list",
+      "description": "List aliases output",
+      "type": "object",
+      "required": [
+        "aliases"
+      ],
+      "properties": {
+        "aliases": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/aliasInfo"
+          }
+        }
+      }
+    },
+    {
+      "title": "alias set/remove",
+      "description": "Alias modification output",
+      "type": "object",
+      "required": [
+        "success",
+        "alias"
+      ],
+      "properties": {
+        "success": {
+          "type": "boolean"
+        },
+        "alias": {
+          "type": "string",
+          "description": "Alias name that was modified"
+        },
+        "message": {
+          "type": "string"
+        }
+      }
+    },
+    {
+      "title": "mb/rb",
+      "description": "Bucket creation/deletion output",
+      "type": "object",
+      "required": [
+        "success",
+        "bucket"
+      ],
+      "properties": {
+        "success": {
+          "type": "boolean"
+        },
+        "bucket": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        }
+      }
+    },
+    {
+      "title": "admin info cluster",
+      "description": "Cluster overview output",
+      "$ref": "#/definitions/clusterInfo"
+    },
+    {
+      "title": "admin info server",
+      "description": "Server list output",
+      "type": "object",
+      "required": [
+        "servers"
+      ],
+      "properties": {
+        "servers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/serverInfo"
+          }
+        }
+      }
+    },
+    {
+      "title": "admin info disk",
+      "description": "Disk list output",
+      "type": "object",
+      "required": [
+        "disks"
+      ],
+      "properties": {
+        "disks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/diskInfo"
+          }
+        }
+      }
+    },
+    {
+      "title": "admin heal status",
+      "description": "Heal status output",
+      "$ref": "#/definitions/healStatus"
+    },
+    {
+      "title": "admin heal operation",
+      "description": "Heal operation output",
+      "type": "object",
+      "required": [
+        "success",
+        "message"
+      ],
+      "properties": {
+        "success": {
+          "type": "boolean"
+        },
+        "message": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/definitions/healStatus"
+        }
+      }
+    },
+    {
+      "title": "error",
+      "description": "Error response",
+      "$ref": "#/definitions/errorResponse"
+    }
+  ]
+}
