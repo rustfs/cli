@@ -4,12 +4,18 @@ on:
   workflow_run:
     workflows: [ "Build and Release" ]
     types: [ completed ]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Image tag to build and push'
+        required: true
+        default: 'latest'
 
 permissions:
   contents: read
 
 env:
-  image_tag: ${{ github.event.workflow_run.head_branch }}
+  image_tag: ${{ github.event.inputs.tag || github.event.workflow_run.head_branch || 'latest' }}
 
 jobs:
   build-and-push:
