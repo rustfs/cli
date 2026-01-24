@@ -85,11 +85,11 @@ rc rb local/my-bucket
 # Recursively copy directory
 rc cp -r ./local-dir/ local/bucket/remote-dir/
 
-# Sync directories
-rc mirror ./local-dir local/bucket/remote-dir
+# Mirror between S3 locations
+rc mirror local/bucket1/ local/bucket2/
 
 # Find objects
-rc find local/bucket --name "*.txt" --newer-than 1d
+rc find local/bucket --name "*.txt" --newer 1d
 
 # Generate download link
 rc share download local/bucket/file.txt --expire 24h
@@ -98,11 +98,31 @@ rc share download local/bucket/file.txt --expire 24h
 rc tree local/bucket -L 3
 ```
 
+### Admin Operations (IAM)
+
+```bash
+# List users
+rc admin user list local/
+
+# Add a new user
+rc admin user add local/ newuser secretpassword
+
+# Create a policy
+rc admin policy create local/ readonly --file policy.json
+
+# Attach policy to user
+rc admin policy attach local/ readonly --user newuser
+
+# Create a service account
+rc admin service-account add local/ myuser
+```
+
 ## Command Overview
 
 | Command | Description |
 |---------|-------------|
 | `alias` | Manage storage service aliases |
+| `admin` | Manage IAM users, policies, groups, and service accounts |
 | `ls` | List buckets or objects |
 | `mb` | Make bucket |
 | `rb` | Remove bucket |
@@ -110,22 +130,26 @@ rc tree local/bucket -L 3
 | `mv` | Move objects |
 | `rm` | Remove objects |
 | `cat` | Display object contents |
-| `head` | Display object header |
+| `head` | Display first N lines of object |
 | `stat` | Display object metadata |
 | `find` | Find objects |
 | `diff` | Compare two locations |
-| `mirror` | Mirror sync |
+| `mirror` | Mirror sync between S3 locations |
 | `tree` | Tree view display |
-| `share` | Generate share links |
+| `share` | Generate presigned URLs |
 | `pipe` | Upload from stdin |
+| `version` | Manage bucket versioning |
+| `tag` | Manage object tags |
 | `completions` | Generate shell completion scripts |
 
-### Optional Commands (requires backend support)
+### Admin Subcommands
 
 | Command | Description |
 |---------|-------------|
-| `version` | Manage bucket versioning |
-| `tag` | Manage object tags |
+| `admin user` | Manage IAM users (add, remove, list, info, enable, disable) |
+| `admin policy` | Manage IAM policies (create, remove, list, info, attach, detach) |
+| `admin group` | Manage IAM groups (add, remove, list, info, member) |
+| `admin service-account` | Manage service accounts (add, remove, list, info, edit) |
 
 ## Output Format
 
