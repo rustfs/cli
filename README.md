@@ -31,6 +31,17 @@ brew install rustfs/tap/rc
 cargo install rustfs-cli
 ```
 
+### Docker
+
+```bash
+# Show help
+docker run --rm rustfs/rc:latest --help
+
+# Run a command with a local RustFS instance
+docker run --rm --network host rustfs/rc:latest \
+  alias set local http://localhost:9000 accesskey secretkey
+```
+
 ### Build from Source
 
 ```bash
