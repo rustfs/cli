@@ -90,6 +90,27 @@ impl S3Client {
     }
 }
 
+fn build_tagging(
+    tags: std::collections::HashMap<String, String>,
+) -> Result<aws_sdk_s3::types::Tagging> {
+    use aws_sdk_s3::types::{Tag, Tagging};
+
+    let mut tag_set = Vec::with_capacity(tags.len());
+    for (key, value) in tags {
+        let tag = Tag::builder()
+            .key(key)
+            .value(value)
+            .build()
+            .map_err(|e| Error::General(format!("invalid tag: {e}")))?;
+        tag_set.push(tag);
+    }
+
+    Tagging::builder()
+        .set_tag_set(Some(tag_set))
+        .build()
+        .map_err(|e| Error::General(format!("invalid tagging payload: {e}")))
+}
+
 #[async_trait]
 impl ObjectStore for S3Client {
     async fn list_buckets(&self) -> Result<Vec<ObjectInfo>> {
@@ -593,14 +614,46 @@ impl ObjectStore for S3Client {
         &self,
         path: &RemotePath,
     ) -> Result<std::collections::HashMap<String, String>> {
-        let response = self
+        let response = match self
             .inner
             .get_object_tagging()
             .bucket(&path.bucket)
             .key(&path.key)
             .send()
             .await
-            .map_err(|e| Error::General(format!("get_object_tags: {e}")))?;
+        {
+            Ok(response) => response,
+            Err(e) => {
+                if e.to_string().contains("NoSuchTagSet") {
+                    return Ok(std::collections::HashMap::new());
+                }
+                return Err(Error::General(format!("get_object_tags: {e}")));
+            }
+        };
+
+        let mut tags = std::collections::HashMap::new();
+        for tag in response.tag_set() {
+            let key = tag.key();
+            let value = tag.value();
+            tags.insert(key.to_string(), value.to_string());
+        }
+
+        Ok(tags)
+    }
+
+    async fn get_bucket_tags(
+        &self,
+        bucket: &str,
+    ) -> Result<std::collections::HashMap<String, String>> {
+        let response = match self.inner.get_bucket_tagging().bucket(bucket).send().await {
+            Ok(response) => response,
+            Err(e) => {
+                if e.to_string().contains("NoSuchTagSet") {
+                    return Ok(std::collections::HashMap::new());
+                }
+                return Err(Error::General(format!("get_bucket_tags: {e}")));
+            }
+        };
 
         let mut tags = std::collections::HashMap::new();
         for tag in response.tag_set() {
@@ -617,17 +670,7 @@ impl ObjectStore for S3Client {
         path: &RemotePath,
         tags: std::collections::HashMap<String, String>,
     ) -> Result<()> {
-        use aws_sdk_s3::types::{Tag, Tagging};
-
-        let tag_set: Vec<Tag> = tags
-            .into_iter()
-            .map(|(k, v)| Tag::builder().key(k).value(v).build().expect("valid tag"))
-            .collect();
-
-        let tagging = Tagging::builder()
-            .set_tag_set(Some(tag_set))
-            .build()
-            .expect("valid tagging");
+        let tagging = build_tagging(tags)?;
 
         self.inner
             .put_object_tagging()
@@ -641,6 +684,24 @@ impl ObjectStore for S3Client {
         Ok(())
     }
 
+    async fn set_bucket_tags(
+        &self,
+        bucket: &str,
+        tags: std::collections::HashMap<String, String>,
+    ) -> Result<()> {
+        let tagging = build_tagging(tags)?;
+
+        self.inner
+            .put_bucket_tagging()
+            .bucket(bucket)
+            .tagging(tagging)
+            .send()
+            .await
+            .map_err(|e| Error::General(format!("set_bucket_tags: {e}")))?;
+
+        Ok(())
+    }
+
     async fn delete_object_tags(&self, path: &RemotePath) -> Result<()> {
         self.inner
             .delete_object_tagging()
@@ -649,6 +710,17 @@ impl ObjectStore for S3Client {
             .send()
             .await
             .map_err(|e| Error::General(format!("delete_object_tags: {e}")))?;
+
+        Ok(())
+    }
+
+    async fn delete_bucket_tags(&self, bucket: &str) -> Result<()> {
+        self.inner
+            .delete_bucket_tagging()
+            .bucket(bucket)
+            .send()
+            .await
+            .map_err(|e| Error::General(format!("delete_bucket_tags: {e}")))?;
 
         Ok(())
     }

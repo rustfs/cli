@@ -246,6 +246,12 @@ pub trait ObjectStore: Send + Sync {
         path: &RemotePath,
     ) -> Result<std::collections::HashMap<String, String>>;
 
+    /// Get bucket tags
+    async fn get_bucket_tags(
+        &self,
+        bucket: &str,
+    ) -> Result<std::collections::HashMap<String, String>>;
+
     /// Set object tags
     async fn set_object_tags(
         &self,
@@ -253,8 +259,18 @@ pub trait ObjectStore: Send + Sync {
         tags: std::collections::HashMap<String, String>,
     ) -> Result<()>;
 
+    /// Set bucket tags
+    async fn set_bucket_tags(
+        &self,
+        bucket: &str,
+        tags: std::collections::HashMap<String, String>,
+    ) -> Result<()>;
+
     /// Delete object tags
     async fn delete_object_tags(&self, path: &RemotePath) -> Result<()>;
+
+    /// Delete bucket tags
+    async fn delete_bucket_tags(&self, bucket: &str) -> Result<()>;
     // async fn get_versioning(&self, bucket: &str) -> Result<bool>;
     // async fn set_versioning(&self, bucket: &str, enabled: bool) -> Result<()>;
     // async fn get_tags(&self, path: &RemotePath) -> Result<HashMap<String, String>>;

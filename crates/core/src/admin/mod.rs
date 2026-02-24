@@ -12,7 +12,7 @@ pub use cluster::{
     ObjectsInfo, ServerInfo, UsageInfo,
 };
 pub use types::{
-    CreateServiceAccountRequest, Group, GroupStatus, Policy, PolicyEntity, PolicyInfo,
+    BucketQuota, CreateServiceAccountRequest, Group, GroupStatus, Policy, PolicyEntity, PolicyInfo,
     ServiceAccount, SetPolicyRequest, UpdateGroupMembersRequest, User, UserStatus,
 };
 
@@ -127,6 +127,17 @@ pub trait AdminApi: Send + Sync {
 
     /// Delete a service account
     async fn delete_service_account(&self, access_key: &str) -> Result<()>;
+
+    // ==================== Bucket Quota Operations ====================
+
+    /// Set bucket quota in bytes
+    async fn set_bucket_quota(&self, bucket: &str, quota: u64) -> Result<BucketQuota>;
+
+    /// Get bucket quota information
+    async fn get_bucket_quota(&self, bucket: &str) -> Result<BucketQuota>;
+
+    /// Clear bucket quota
+    async fn clear_bucket_quota(&self, bucket: &str) -> Result<BucketQuota>;
 }
 
 #[cfg(test)]

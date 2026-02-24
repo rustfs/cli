@@ -169,7 +169,8 @@ rc admin heal status local --json
 | `share` | Generate presigned URLs |
 | `pipe` | Upload from stdin |
 | `version` | Manage bucket versioning |
-| `tag` | Manage object tags |
+| `tag` | Manage bucket and object tags |
+| `quota` | Manage bucket quota |
 | `completions` | Generate shell completion scripts |
 
 ### Admin Subcommands

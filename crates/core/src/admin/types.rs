@@ -299,6 +299,23 @@ pub struct CreateServiceAccountRequest {
     pub description: Option<String>,
 }
 
+/// Bucket quota information returned by Admin API
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BucketQuota {
+    /// Bucket name
+    pub bucket: String,
+
+    /// Quota limit in bytes (None means unlimited)
+    pub quota: Option<u64>,
+
+    /// Current bucket usage in bytes
+    pub size: u64,
+
+    /// Quota type (currently only HARD)
+    pub quota_type: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,5 +442,23 @@ mod tests {
             GroupStatus::Disabled
         );
         assert!("invalid".parse::<GroupStatus>().is_err());
+    }
+
+    #[test]
+    fn test_bucket_quota_serialization() {
+        let quota = BucketQuota {
+            bucket: "my-bucket".to_string(),
+            quota: Some(1024),
+            size: 512,
+            quota_type: "HARD".to_string(),
+        };
+
+        let json = serde_json::to_string(&quota).unwrap();
+        assert!(json.contains("my-bucket"));
+        assert!(json.contains("quotaType"));
+
+        let decoded: BucketQuota = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.bucket, "my-bucket");
+        assert_eq!(decoded.quota, Some(1024));
     }
 }

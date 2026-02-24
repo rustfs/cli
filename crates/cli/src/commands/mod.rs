@@ -22,6 +22,7 @@ mod mb;
 mod mirror;
 mod mv;
 mod pipe;
+mod quota;
 mod rb;
 mod rm;
 mod share;
@@ -126,9 +127,13 @@ pub enum Commands {
     #[command(subcommand)]
     Version(version::VersionCommands),
 
-    /// Manage object tags
+    /// Manage bucket and object tags
     #[command(subcommand)]
     Tag(tag::TagCommands),
+
+    /// Manage bucket quota
+    #[command(subcommand)]
+    Quota(quota::QuotaCommands),
 
     // Phase 6: Utilities
     /// Generate shell completion scripts
@@ -172,6 +177,9 @@ pub async fn execute(cli: Cli) -> ExitCode {
             version::execute(version::VersionArgs { command: cmd }, output_config).await
         }
         Commands::Tag(cmd) => tag::execute(tag::TagArgs { command: cmd }, output_config).await,
+        Commands::Quota(cmd) => {
+            quota::execute(quota::QuotaArgs { command: cmd }, output_config).await
+        }
         Commands::Completions(args) => completions::execute(args),
     }
 }

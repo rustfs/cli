@@ -10,9 +10,9 @@ use aws_sigv4::http_request::{
 };
 use aws_sigv4::sign::v4;
 use rc_core::admin::{
-    AdminApi, ClusterInfo, CreateServiceAccountRequest, Group, GroupStatus, HealStartRequest,
-    HealStatus, Policy, PolicyEntity, PolicyInfo, ServiceAccount, UpdateGroupMembersRequest, User,
-    UserStatus,
+    AdminApi, BucketQuota, ClusterInfo, CreateServiceAccountRequest, Group, GroupStatus,
+    HealStartRequest, HealStatus, Policy, PolicyEntity, PolicyInfo, ServiceAccount,
+    UpdateGroupMembersRequest, User, UserStatus,
 };
 use rc_core::{Alias, Error, Result};
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
@@ -343,6 +343,14 @@ struct SetPolicyApiRequest {
     entity_name: String,
 }
 
+/// Request body for setting bucket quota
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SetBucketQuotaApiRequest {
+    quota: u64,
+    quota_type: String,
+}
+
 #[async_trait]
 impl AdminApi for AdminClient {
     // ==================== Cluster Operations ====================
@@ -648,6 +656,29 @@ impl AdminApi for AdminClient {
             None,
         )
         .await
+    }
+
+    // ==================== Bucket Quota Operations ====================
+
+    async fn set_bucket_quota(&self, bucket: &str, quota: u64) -> Result<BucketQuota> {
+        let path = format!("/quota/{}", urlencoding::encode(bucket));
+        let body = serde_json::to_vec(&SetBucketQuotaApiRequest {
+            quota,
+            quota_type: "HARD".to_string(),
+        })
+        .map_err(Error::Json)?;
+
+        self.request(Method::PUT, &path, None, Some(&body)).await
+    }
+
+    async fn get_bucket_quota(&self, bucket: &str) -> Result<BucketQuota> {
+        let path = format!("/quota/{}", urlencoding::encode(bucket));
+        self.request(Method::GET, &path, None, None).await
+    }
+
+    async fn clear_bucket_quota(&self, bucket: &str) -> Result<BucketQuota> {
+        let path = format!("/quota/{}", urlencoding::encode(bucket));
+        self.request(Method::DELETE, &path, None, None).await
     }
 }
 

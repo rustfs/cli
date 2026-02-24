@@ -20,7 +20,7 @@
 | basic | ls, mb, rb, cat, head, stat | core |
 | transfer | cp, mv, rm, pipe | core |
 | advanced | find, diff, mirror, tree, share | core |
-| optional | version, retention, tag, watch, sql | optional |
+| optional | version, quota, retention, tag, watch, sql | optional |
 
 ## 测试层级
 
@@ -250,4 +250,3 @@ pub fn run_command(args: &[&str]) -> CommandResult {
 ```bash
 cargo tarpaulin --workspace --out html
 ```
-
