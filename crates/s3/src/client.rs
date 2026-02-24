@@ -193,6 +193,11 @@ impl HttpClient for ReqwestConnector {
         _settings: &HttpConnectorSettings,
         _components: &RuntimeComponents,
     ) -> SharedHttpConnector {
+        // NOTE: `ReqwestConnector` is preconfigured (e.g., insecure/CA-bundle options) when it
+        // is constructed, and does not currently apply `HttpConnectorSettings`. This means
+        // behavior in this mode may differ from the default connector w.r.t. SDK HTTP settings.
+        // If alignment is required, map relevant fields from `HttpConnectorSettings` onto the
+        // internal `reqwest::Client` when constructing the connector.
         SharedHttpConnector::new(self.clone())
     }
 }
