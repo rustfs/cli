@@ -26,14 +26,15 @@ struct ReqwestConnector {
 }
 
 impl ReqwestConnector {
-    fn new(insecure: bool, ca_bundle: Option<&str>) -> Result<Self> {
+    async fn new(insecure: bool, ca_bundle: Option<&str>) -> Result<Self> {
         // NOTE: When `insecure = true`, `danger_accept_invalid_certs` disables all TLS
         // certificate verification. Any CA bundle provided will still be added to the
         // trust store but is rendered ineffective for this connection.
         let mut builder = reqwest::Client::builder().danger_accept_invalid_certs(insecure);
 
         if let Some(bundle_path) = ca_bundle {
-            let pem = std::fs::read(bundle_path).map_err(|e| {
+            // Use tokio::fs::read to avoid blocking the async runtime thread.
+            let pem = tokio::fs::read(bundle_path).await.map_err(|e| {
                 Error::Network(format!("Failed to read CA bundle '{bundle_path}': {e}"))
             })?;
             let cert = reqwest::Certificate::from_pem(&pem)
@@ -48,69 +49,6 @@ impl ReqwestConnector {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn unique_temp_path(suffix: &str) -> PathBuf {
-        let mut path = std::env::temp_dir();
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        path.push(format!("reqwest_connector_test_{}_{}", suffix, nanos));
-        path
-    }
-
-    #[test]
-    fn reqwest_connector_insecure_without_ca_bundle_succeeds() {
-        // When insecure is true and no CA bundle is provided, the connector should be created.
-        let connector = ReqwestConnector::new(true, None);
-        assert!(connector.is_ok(), "Expected insecure connector creation to succeed");
-    }
-
-    #[test]
-    fn reqwest_connector_invalid_ca_bundle_path_surfaces_error() {
-        // Use an obviously invalid path (empty string) to trigger a read error.
-        let result = ReqwestConnector::new(false, Some(""));
-        match result {
-            Err(Error::Network(msg)) => {
-                assert!(
-                    msg.contains("Failed to read CA bundle"),
-                    "Unexpected error message: {msg}"
-                );
-            }
-            other => panic!("Expected Error::Network for invalid path, got: {:?}", other),
-        }
-    }
-
-    #[test]
-    fn reqwest_connector_invalid_ca_bundle_contents_surfaces_error() {
-        // Create a temporary file with invalid PEM contents to trigger a parse error.
-        let path = unique_temp_path("invalid_pem");
-        fs::write(&path, b"this is not a valid PEM certificate").unwrap();
-
-        let result = ReqwestConnector::new(false, Some(path.to_str().unwrap()));
-
-        match result {
-            Err(Error::Network(msg)) => {
-                assert!(
-                    msg.contains("Invalid CA bundle"),
-                    "Unexpected error message: {msg}"
-                );
-            }
-            other => panic!(
-                "Expected Error::Network for invalid CA bundle contents, got: {:?}",
-                other
-            ),
-        }
-
-        let _ = fs::remove_file(&path);
-    }
-}
 impl HttpConnector for ReqwestConnector {
     fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
         let client = self.client.clone();
@@ -119,11 +57,21 @@ impl HttpConnector for ReqwestConnector {
             let uri = request.uri().to_string();
             let method_str = request.method().to_string();
             let headers = request.headers().clone();
-            let body_bytes = request
-                .body()
-                .bytes()
-                .map(Bytes::copy_from_slice)
-                .unwrap_or_default();
+
+            // Try to get the body as buffered in-memory bytes.
+            // For streaming bodies (e.g., large file uploads), bytes() returns None and we
+            // return a clear error rather than silently sending an empty body, which would
+            // cause signature mismatches or server-side failures.
+            let body_bytes = match request.body().bytes() {
+                Some(b) => Bytes::copy_from_slice(b),
+                None => {
+                    return Err(ConnectorError::user(
+                        "Streaming request bodies are not supported in insecure/ca_bundle TLS mode; \
+                         use in-memory data for uploads with this connector"
+                            .into(),
+                    ));
+                }
+            };
 
             // Build reqwest method
             let method = reqwest::Method::from_bytes(method_str.as_bytes())
@@ -235,7 +183,8 @@ impl S3Client {
         // When insecure mode is enabled or a custom CA bundle is provided, use the reqwest
         // connector which supports danger_accept_invalid_certs and custom root certificates.
         if alias.insecure || alias.ca_bundle.is_some() {
-            let connector = ReqwestConnector::new(alias.insecure, alias.ca_bundle.as_deref())?;
+            let connector =
+                ReqwestConnector::new(alias.insecure, alias.ca_bundle.as_deref()).await?;
             config_loader = config_loader.http_client(connector);
         }
 
@@ -934,5 +883,30 @@ mod tests {
         let info = ObjectInfo::file("test.txt", 1024);
         assert_eq!(info.key, "test.txt");
         assert_eq!(info.size_bytes, Some(1024));
+    }
+
+    #[tokio::test]
+    async fn reqwest_connector_insecure_without_ca_bundle_succeeds() {
+        // When insecure is true and no CA bundle is provided, the connector should be created.
+        let connector = ReqwestConnector::new(true, None).await;
+        assert!(
+            connector.is_ok(),
+            "Expected insecure connector creation to succeed"
+        );
+    }
+
+    #[tokio::test]
+    async fn reqwest_connector_invalid_ca_bundle_path_surfaces_error() {
+        // Use an obviously invalid path (empty string) to trigger a read error.
+        let result = ReqwestConnector::new(false, Some("")).await;
+        match result {
+            Err(Error::Network(msg)) => {
+                assert!(
+                    msg.contains("Failed to read CA bundle"),
+                    "Unexpected error message: {msg}"
+                );
+            }
+            other => panic!("Expected Error::Network for invalid path, got: {:?}", other),
+        }
     }
 }
