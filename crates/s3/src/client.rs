@@ -48,6 +48,69 @@ impl ReqwestConnector {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_path(suffix: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        path.push(format!("reqwest_connector_test_{}_{}", suffix, nanos));
+        path
+    }
+
+    #[test]
+    fn reqwest_connector_insecure_without_ca_bundle_succeeds() {
+        // When insecure is true and no CA bundle is provided, the connector should be created.
+        let connector = ReqwestConnector::new(true, None);
+        assert!(connector.is_ok(), "Expected insecure connector creation to succeed");
+    }
+
+    #[test]
+    fn reqwest_connector_invalid_ca_bundle_path_surfaces_error() {
+        // Use an obviously invalid path (empty string) to trigger a read error.
+        let result = ReqwestConnector::new(false, Some(""));
+        match result {
+            Err(Error::Network(msg)) => {
+                assert!(
+                    msg.contains("Failed to read CA bundle"),
+                    "Unexpected error message: {msg}"
+                );
+            }
+            other => panic!("Expected Error::Network for invalid path, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn reqwest_connector_invalid_ca_bundle_contents_surfaces_error() {
+        // Create a temporary file with invalid PEM contents to trigger a parse error.
+        let path = unique_temp_path("invalid_pem");
+        fs::write(&path, b"this is not a valid PEM certificate").unwrap();
+
+        let result = ReqwestConnector::new(false, Some(path.to_str().unwrap()));
+
+        match result {
+            Err(Error::Network(msg)) => {
+                assert!(
+                    msg.contains("Invalid CA bundle"),
+                    "Unexpected error message: {msg}"
+                );
+            }
+            other => panic!(
+                "Expected Error::Network for invalid CA bundle contents, got: {:?}",
+                other
+            ),
+        }
+
+        let _ = fs::remove_file(&path);
+    }
+}
 impl HttpConnector for ReqwestConnector {
     fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
         let client = self.client.clone();
