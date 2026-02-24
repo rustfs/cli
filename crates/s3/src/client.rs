@@ -3,12 +3,136 @@
 //! Wraps aws-sdk-s3 and implements the ObjectStore trait from rc-core.
 
 use async_trait::async_trait;
-
+use aws_smithy_runtime_api::client::http::{
+    HttpClient, HttpConnector, HttpConnectorFuture, HttpConnectorSettings, SharedHttpConnector,
+};
+use aws_smithy_runtime_api::client::orchestrator::HttpRequest;
+use aws_smithy_runtime_api::client::result::ConnectorError;
+use aws_smithy_runtime_api::client::runtime_components::RuntimeComponents;
+use aws_smithy_runtime_api::http::{Response, StatusCode};
+use aws_smithy_types::body::SdkBody;
+use bytes::Bytes;
 use jiff::Timestamp;
 use rc_core::{
     Alias, Capabilities, Error, ListOptions, ListResult, ObjectInfo, ObjectStore, ObjectVersion,
     RemotePath, Result,
 };
+
+/// Custom HTTP connector using reqwest, supporting insecure TLS (skip cert verification)
+/// and custom CA bundles. Used when `alias.insecure = true`.
+#[derive(Debug, Clone)]
+struct ReqwestConnector {
+    client: reqwest::Client,
+}
+
+impl ReqwestConnector {
+    fn new(insecure: bool, ca_bundle: Option<&str>) -> Result<Self> {
+        // NOTE: When `insecure = true`, `danger_accept_invalid_certs` disables all TLS
+        // certificate verification. Any CA bundle provided will still be added to the
+        // trust store but is rendered ineffective for this connection.
+        let mut builder = reqwest::Client::builder().danger_accept_invalid_certs(insecure);
+
+        if let Some(bundle_path) = ca_bundle {
+            let pem = std::fs::read(bundle_path).map_err(|e| {
+                Error::Network(format!("Failed to read CA bundle '{bundle_path}': {e}"))
+            })?;
+            let cert = reqwest::Certificate::from_pem(&pem)
+                .map_err(|e| Error::Network(format!("Invalid CA bundle '{bundle_path}': {e}")))?;
+            builder = builder.add_root_certificate(cert);
+        }
+
+        let client = builder
+            .build()
+            .map_err(|e| Error::Network(format!("Failed to build HTTP client: {e}")))?;
+        Ok(Self { client })
+    }
+}
+
+impl HttpConnector for ReqwestConnector {
+    fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+        let client = self.client.clone();
+        HttpConnectorFuture::new(async move {
+            // Extract request parts before consuming the request
+            let uri = request.uri().to_string();
+            let method_str = request.method().to_string();
+            let headers = request.headers().clone();
+            let body_bytes = request
+                .body()
+                .bytes()
+                .map(Bytes::copy_from_slice)
+                .unwrap_or_default();
+
+            // Build reqwest method
+            let method = reqwest::Method::from_bytes(method_str.as_bytes())
+                .map_err(|e| ConnectorError::user(Box::new(e)))?;
+
+            // Build reqwest URL
+            let url = reqwest::Url::parse(&uri).map_err(|e| ConnectorError::user(Box::new(e)))?;
+
+            // Build reqwest request
+            let mut req = reqwest::Request::new(method, url);
+
+            // Copy headers; S3 headers are all ASCII so failures here are unexpected
+            for (name, value) in headers.iter() {
+                match (
+                    reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+                    reqwest::header::HeaderValue::from_bytes(value.as_bytes()),
+                ) {
+                    (Ok(header_name), Ok(header_value)) => {
+                        req.headers_mut().append(header_name, header_value);
+                    }
+                    _ => {
+                        tracing::warn!("Skipping non-convertible request header: {}", name);
+                    }
+                }
+            }
+
+            // Set body
+            *req.body_mut() = Some(reqwest::Body::from(body_bytes));
+
+            // Execute
+            let resp = client
+                .execute(req)
+                .await
+                .map_err(|e| ConnectorError::io(Box::new(e)))?;
+
+            // Convert response
+            let status = StatusCode::try_from(resp.status().as_u16())
+                .map_err(|e| ConnectorError::other(Box::new(e), None))?;
+            let resp_headers = resp.headers().clone();
+            let body = resp
+                .bytes()
+                .await
+                .map_err(|e| ConnectorError::io(Box::new(e)))?;
+
+            let mut sdk_response = Response::new(status, SdkBody::from(body));
+            for (name, value) in &resp_headers {
+                match value.to_str() {
+                    Ok(value_str) => {
+                        sdk_response
+                            .headers_mut()
+                            .append(name.as_str().to_owned(), value_str.to_owned());
+                    }
+                    Err(_) => {
+                        tracing::warn!("Skipping non-UTF8 response header: {}", name.as_str());
+                    }
+                }
+            }
+
+            Ok(sdk_response)
+        })
+    }
+}
+
+impl HttpClient for ReqwestConnector {
+    fn http_connector(
+        &self,
+        _settings: &HttpConnectorSettings,
+        _components: &RuntimeComponents,
+    ) -> SharedHttpConnector {
+        SharedHttpConnector::new(self.clone())
+    }
+}
 
 /// S3 client wrapper
 pub struct S3Client {
@@ -34,13 +158,20 @@ impl S3Client {
             "rc-static-credentials",
         );
 
-        // Build SDK config
-        let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        // Build SDK config loader
+        let mut config_loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
             .credentials_provider(credentials)
             .region(aws_config::Region::new(region))
-            .endpoint_url(&endpoint)
-            .load()
-            .await;
+            .endpoint_url(&endpoint);
+
+        // When insecure mode is enabled or a custom CA bundle is provided, use the reqwest
+        // connector which supports danger_accept_invalid_certs and custom root certificates.
+        if alias.insecure || alias.ca_bundle.is_some() {
+            let connector = ReqwestConnector::new(alias.insecure, alias.ca_bundle.as_deref())?;
+            config_loader = config_loader.http_client(connector);
+        }
+
+        let config = config_loader.load().await;
 
         // Build S3 client with path-style addressing for compatibility
         let s3_config = aws_sdk_s3::config::Builder::from(&config)
