@@ -19,7 +19,7 @@ use rc_core::{
 };
 
 /// Custom HTTP connector using reqwest, supporting insecure TLS (skip cert verification)
-/// and custom CA bundles. Used when `alias.insecure = true`.
+/// and custom CA bundles. Used when `alias.insecure = true` or `alias.ca_bundle.is_some()`.
 #[derive(Debug, Clone)]
 struct ReqwestConnector {
     client: reqwest::Client,
