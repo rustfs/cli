@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-02-24
+
 ### Breaking
 
 - Updated JSON output schema to `schemas/output_v2.json` to cover admin cluster info and heal outputs
@@ -84,5 +86,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Secure credential storage in config file (600 permissions on Unix)
 - No sensitive data logged in error messages
 
-[Unreleased]: https://github.com/rustfs/cli/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/rustfs/cli/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/rustfs/cli/compare/v0.1.0...v0.1.4
 [0.1.0]: https://github.com/rustfs/cli/releases/tag/v0.1.0
