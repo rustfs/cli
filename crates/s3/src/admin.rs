@@ -335,14 +335,6 @@ struct ServiceAccountInfo {
     expiration: Option<String>,
 }
 
-/// Request body for set policy
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SetPolicyApiRequest {
-    policy_name: String,
-    entity_name: String,
-}
-
 /// Request body for setting bucket quota
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -498,19 +490,15 @@ impl AdminApi for AdminClient {
         entity_name: &str,
     ) -> Result<()> {
         let policy_name = policy_names.join(",");
-        let entity_type_str = match entity_type {
-            PolicyEntity::User => "user",
-            PolicyEntity::Group => "group",
-        };
+        let is_group = entity_type == PolicyEntity::Group;
 
-        let body = serde_json::to_vec(&SetPolicyApiRequest {
-            policy_name,
-            entity_name: entity_name.to_string(),
-        })
-        .map_err(Error::Json)?;
+        let query = [
+            ("policyName", policy_name.as_str()),
+            ("userOrGroup", entity_name),
+            ("isGroup", if is_group { "true" } else { "false" }),
+        ];
 
-        let query = [("entityType", entity_type_str)];
-        self.request_no_response(Method::PUT, "/set-policy", Some(&query), Some(&body))
+        self.request_no_response(Method::PUT, "/set-user-or-group-policy", Some(&query), None)
             .await
     }
 
