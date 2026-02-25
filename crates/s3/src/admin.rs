@@ -12,7 +12,7 @@ use aws_sigv4::sign::v4;
 use rc_core::admin::{
     AdminApi, BucketQuota, ClusterInfo, CreateServiceAccountRequest, Group, GroupStatus,
     HealStartRequest, HealStatus, Policy, PolicyEntity, PolicyInfo, ServiceAccount,
-    UpdateGroupMembersRequest, User, UserStatus,
+    ServiceAccountCreateResponse, UpdateGroupMembersRequest, User, UserStatus,
 };
 use rc_core::{Alias, Error, Result};
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
@@ -333,6 +333,12 @@ struct ServiceAccountInfo {
     account_status: Option<String>,
     #[serde(default)]
     expiration: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    implied_policy: Option<bool>,
 }
 
 /// Request body for setting bucket quota
@@ -473,7 +479,7 @@ impl AdminApi for AdminClient {
     async fn create_policy(&self, name: &str, policy_document: &str) -> Result<()> {
         let query = [("name", name)];
         let body = policy_document.as_bytes();
-        self.request_no_response(Method::POST, "/add-canned-policy", Some(&query), Some(body))
+        self.request_no_response(Method::PUT, "/add-canned-policy", Some(&query), Some(body))
             .await
     }
 
@@ -572,6 +578,7 @@ impl AdminApi for AdminClient {
             group: group.to_string(),
             members: members.to_vec(),
             is_remove: false,
+            status: "enabled".to_string(),
         })
         .map_err(Error::Json)?;
 
@@ -584,6 +591,7 @@ impl AdminApi for AdminClient {
             group: group.to_string(),
             members: members.to_vec(),
             is_remove: true,
+            status: "enabled".to_string(),
         })
         .map_err(Error::Json)?;
 
@@ -612,6 +620,9 @@ impl AdminApi for AdminClient {
                 policy: None,
                 account_status: sa.account_status,
                 expiration: sa.expiration,
+                name: sa.name,
+                description: sa.description,
+                implied_policy: sa.implied_policy,
             })
             .collect())
     }
@@ -621,6 +632,11 @@ impl AdminApi for AdminClient {
         let response: ServiceAccount = self
             .request(Method::GET, "/info-service-account", Some(&query), None)
             .await?;
+
+        let mut response = response;
+        if response.access_key.is_empty() {
+            response.access_key = access_key.to_string();
+        }
         Ok(response)
     }
 
@@ -629,17 +645,28 @@ impl AdminApi for AdminClient {
         request: CreateServiceAccountRequest,
     ) -> Result<ServiceAccount> {
         let body = serde_json::to_vec(&request).map_err(Error::Json)?;
-        let response: ServiceAccount = self
-            .request(Method::PUT, "/add-service-account", None, Some(&body))
+        let response: ServiceAccountCreateResponse = self
+            .request(Method::PUT, "/add-service-accounts", None, Some(&body))
             .await?;
-        Ok(response)
+
+        Ok(ServiceAccount {
+            access_key: response.credentials.access_key,
+            secret_key: Some(response.credentials.secret_key),
+            expiration: response.credentials.expiration,
+            parent_user: None,
+            policy: None,
+            account_status: None,
+            name: None,
+            description: None,
+            implied_policy: None,
+        })
     }
 
     async fn delete_service_account(&self, access_key: &str) -> Result<()> {
         let query = [("accessKey", access_key)];
         self.request_no_response(
             Method::DELETE,
-            "/delete-service-account",
+            "/delete-service-accounts",
             Some(&query),
             None,
         )

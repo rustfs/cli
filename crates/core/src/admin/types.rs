@@ -192,32 +192,35 @@ pub struct PolicyInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServiceAccount {
-    /// Access key ID
+    #[serde(default)]
     pub access_key: String,
 
-    /// Secret access key (only present on creation)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secret_key: Option<String>,
 
-    /// Parent user (owner of this service account)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_user: Option<String>,
 
-    /// Policy attached to this service account
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy: Option<String>,
 
-    /// Account status
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_status: Option<String>,
 
-    /// Expiration time (if any)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expiration: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub implied_policy: Option<bool>,
 }
 
 impl ServiceAccount {
-    /// Create a new service account with the given access key
     pub fn new(access_key: impl Into<String>) -> Self {
         Self {
             access_key: access_key.into(),
@@ -226,8 +229,30 @@ impl ServiceAccount {
             policy: None,
             account_status: None,
             expiration: None,
+            name: None,
+            description: None,
+            implied_policy: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceAccountCreateResponse {
+    pub credentials: ServiceAccountCredentials,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceAccountCredentials {
+    pub access_key: String,
+    pub secret_key: String,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expiration: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_token: Option<String>,
 }
 
 /// Entity type for policy attachment
@@ -276,6 +301,10 @@ pub struct UpdateGroupMembersRequest {
     /// Whether to remove (true) or add (false) members
     #[serde(default)]
     pub is_remove: bool,
+
+    /// Group status
+    #[serde(rename = "groupStatus", default)]
+    pub status: String,
 }
 
 /// Request to create a service account
@@ -286,8 +315,8 @@ pub struct CreateServiceAccountRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy: Option<String>,
 
-    /// Optional expiration time
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Optional expiration time (ISO 8601 format)
+    #[serde(rename = "expiration", skip_serializing_if = "Option::is_none")]
     pub expiry: Option<String>,
 
     /// Optional name/description
@@ -297,6 +326,14 @@ pub struct CreateServiceAccountRequest {
     /// Optional description
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+
+    /// Access key (required)
+    #[serde(rename = "accessKey")]
+    pub access_key: String,
+
+    /// Secret key (required)
+    #[serde(rename = "secretKey")]
+    pub secret_key: String,
 }
 
 /// Bucket quota information returned by Admin API

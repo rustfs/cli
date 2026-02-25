@@ -13,7 +13,8 @@ pub use cluster::{
 };
 pub use types::{
     BucketQuota, CreateServiceAccountRequest, Group, GroupStatus, Policy, PolicyEntity, PolicyInfo,
-    ServiceAccount, SetPolicyRequest, UpdateGroupMembersRequest, User, UserStatus,
+    ServiceAccount, ServiceAccountCreateResponse, ServiceAccountCredentials, SetPolicyRequest,
+    UpdateGroupMembersRequest, User, UserStatus,
 };
 
 use async_trait::async_trait;

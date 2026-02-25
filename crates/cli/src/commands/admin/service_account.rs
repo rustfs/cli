@@ -43,6 +43,12 @@ pub struct CreateArgs {
     /// Alias name of the server
     pub alias: String,
 
+    /// Access key for the service account
+    pub access_key: String,
+
+    /// Secret key for the service account
+    pub secret_key: String,
+
     /// Optional name for the service account
     #[arg(long)]
     pub name: Option<String>,
@@ -204,6 +210,8 @@ async fn execute_create(args: CreateArgs, formatter: &Formatter) -> ExitCode {
         expiry: args.expiry,
         name: args.name,
         description: args.description,
+        access_key: args.access_key.clone(),
+        secret_key: args.secret_key.clone(),
     };
 
     match client.create_service_account(request).await {
@@ -328,6 +336,9 @@ mod tests {
             policy: None,
             account_status: Some("on".to_string()),
             expiration: None,
+            name: None,
+            description: None,
+            implied_policy: None,
         };
 
         let info = ServiceAccountInfo::from(sa);

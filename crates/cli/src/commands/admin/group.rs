@@ -210,31 +210,50 @@ async fn execute_add(args: AddArgs, formatter: &Formatter) -> ExitCode {
         return ExitCode::UsageError;
     }
 
-    let members: Option<Vec<String>> = args.members.as_ref().map(|m| {
-        m.split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect()
-    });
+    let members: Vec<String> = args
+        .members
+        .as_ref()
+        .map(|m| {
+            m.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
 
-    match client.create_group(&args.name, members.as_deref()).await {
-        Ok(group) => {
-            if formatter.is_json() {
-                let output = GroupOperationOutput {
-                    success: true,
-                    name: group.name.clone(),
-                    message: format!("Group '{}' created successfully", group.name),
-                };
-                formatter.json(&output);
-            } else {
-                let styled_name = formatter.style_name(&group.name);
-                formatter.success(&format!("Group '{styled_name}' created successfully."));
-            }
-            ExitCode::Success
+    if members.is_empty() {
+        if formatter.is_json() {
+            let output = GroupOperationOutput {
+                success: true,
+                name: args.name.clone(),
+                message: format!("Group '{}' created successfully", args.name),
+            };
+            formatter.json(&output);
+        } else {
+            let styled_name = formatter.style_name(&args.name);
+            formatter.success(&format!("Group '{styled_name}' created successfully."));
         }
-        Err(e) => {
-            formatter.error(&format!("Failed to create group: {e}"));
-            ExitCode::GeneralError
+        ExitCode::Success
+    } else {
+        match client.add_group_members(&args.name, &members).await {
+            Ok(()) => {
+                if formatter.is_json() {
+                    let output = GroupOperationOutput {
+                        success: true,
+                        name: args.name.clone(),
+                        message: format!("Group '{}' created successfully with members", args.name),
+                    };
+                    formatter.json(&output);
+                } else {
+                    let styled_name = formatter.style_name(&args.name);
+                    formatter.success(&format!("Group '{styled_name}' created successfully."));
+                }
+                ExitCode::Success
+            }
+            Err(e) => {
+                formatter.error(&format!("Failed to create group: {e}"));
+                ExitCode::GeneralError
+            }
         }
     }
 }
