@@ -97,9 +97,9 @@ pub async fn execute(args: MbArgs, output_config: OutputConfig) -> ExitCode {
                 return ExitCode::Success;
             }
             Ok(false) => {}
-            Err(e) => {
-                formatter.error(&format!("Failed to check bucket existence: {e}"));
-                return ExitCode::NetworkError;
+            Err(_) => {
+                // Failed to check existence, proceed to try creating the bucket.
+                // If there is a real error, create_bucket will surface it.
             }
         }
     }
