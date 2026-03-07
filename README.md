@@ -124,7 +124,7 @@ rc admin policy create local/ readonly --file policy.json
 # Attach policy to user
 rc admin policy attach local/ readonly --user newuser
 
-# Create a service account
+# Create a service account (access_key + secret_key)
 rc admin service-account create local/ AKIAIOSFODNN7EXAMPLE wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
 ```
 
