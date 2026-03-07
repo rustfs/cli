@@ -6,7 +6,7 @@ use clap::Args;
 use rc_core::{AliasManager, ObjectStore as _, ParsedPath, RemotePath, parse_path};
 use rc_s3::S3Client;
 use serde::Serialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::exit_code::ExitCode;
 use crate::output::{Formatter, OutputConfig};
@@ -63,9 +63,10 @@ struct CpOutput {
 /// Execute the cp command
 pub async fn execute(args: CpArgs, output_config: OutputConfig) -> ExitCode {
     let formatter = Formatter::new(output_config);
+    let alias_manager = AliasManager::new().ok();
 
     // Parse source and target paths
-    let source = match parse_path(&args.source) {
+    let source = match parse_cp_path(&args.source, alias_manager.as_ref()) {
         Ok(p) => p,
         Err(e) => {
             formatter.error(&format!("Invalid source path: {e}"));
@@ -73,7 +74,7 @@ pub async fn execute(args: CpArgs, output_config: OutputConfig) -> ExitCode {
         }
     };
 
-    let target = match parse_path(&args.target) {
+    let target = match parse_cp_path(&args.target, alias_manager.as_ref()) {
         Ok(p) => p,
         Err(e) => {
             formatter.error(&format!("Invalid target path: {e}"));
@@ -100,6 +101,28 @@ pub async fn execute(args: CpArgs, output_config: OutputConfig) -> ExitCode {
             ExitCode::UsageError
         }
     }
+}
+
+fn parse_cp_path(path: &str, alias_manager: Option<&AliasManager>) -> rc_core::Result<ParsedPath> {
+    let parsed = parse_path(path)?;
+
+    let ParsedPath::Remote(remote) = &parsed else {
+        return Ok(parsed);
+    };
+
+    if let Some(manager) = alias_manager {
+        if matches!(manager.exists(&remote.alias), Ok(true)) {
+            return Ok(parsed);
+        }
+    } else {
+        return Ok(parsed);
+    }
+
+    if Path::new(path).exists() {
+        return Ok(ParsedPath::Local(PathBuf::from(path)));
+    }
+
+    Ok(parsed)
 }
 
 async fn copy_local_to_s3(
@@ -583,6 +606,16 @@ async fn copy_s3_to_s3(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rc_core::{Alias, ConfigManager};
+    use tempfile::TempDir;
+
+    fn temp_alias_manager() -> (AliasManager, TempDir) {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let config_path = temp_dir.path().join("config.toml");
+        let config_manager = ConfigManager::with_path(config_path);
+        let alias_manager = AliasManager::with_config_manager(config_manager);
+        (alias_manager, temp_dir)
+    }
 
     #[test]
     fn test_parse_local_path() {
@@ -637,6 +670,43 @@ mod tests {
             assert_eq!(r.bucket, "bucket");
             assert_eq!(r.key, "dir1/dir2/file.txt");
         }
+    }
+
+    #[test]
+    fn test_parse_cp_path_prefers_existing_local_path_when_alias_missing() {
+        let (alias_manager, _temp_dir) = temp_alias_manager();
+        let relative = format!("target/issue-2094-{}-local/file.txt", std::process::id());
+        let full = Path::new(&relative);
+
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent).expect("create parent dirs");
+        }
+        std::fs::write(full, b"test").expect("write local file");
+
+        let parsed = parse_cp_path(&relative, Some(&alias_manager)).expect("parse path");
+        assert!(matches!(parsed, ParsedPath::Local(_)));
+
+        std::fs::remove_file(full).expect("remove temp file");
+    }
+
+    #[test]
+    fn test_parse_cp_path_keeps_remote_when_alias_exists() {
+        let (alias_manager, _temp_dir) = temp_alias_manager();
+        alias_manager
+            .set(Alias::new("target", "http://localhost:9000", "a", "b"))
+            .expect("set alias");
+
+        let parsed = parse_cp_path("target/bucket/file.txt", Some(&alias_manager))
+            .expect("parse remote path");
+        assert!(matches!(parsed, ParsedPath::Remote(_)));
+    }
+
+    #[test]
+    fn test_parse_cp_path_keeps_remote_when_local_missing() {
+        let (alias_manager, _temp_dir) = temp_alias_manager();
+        let parsed = parse_cp_path("missing/bucket/file.txt", Some(&alias_manager))
+            .expect("parse remote path");
+        assert!(matches!(parsed, ParsedPath::Remote(_)));
     }
 
     #[test]
