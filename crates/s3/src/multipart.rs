@@ -335,4 +335,41 @@ mod tests {
         assert_eq!(start, 200);
         assert_eq!(end, 250);
     }
+
+    #[test]
+    fn test_calculate_part_size_default_is_sufficient_for_common_sizes() {
+        let config = MultipartConfig::default();
+
+        // 100 MiB file: default part size should work
+        let size = config.calculate_part_size(100 * 1024 * 1024);
+        assert_eq!(size, DEFAULT_PART_SIZE);
+
+        // 1 GiB file: default part size should work
+        let size = config.calculate_part_size(1024 * 1024 * 1024);
+        assert_eq!(size, DEFAULT_PART_SIZE);
+
+        // 500 GiB file: needs bigger parts
+        let size_500g = 500 * 1024 * 1024 * 1024_u64;
+        let size = config.calculate_part_size(size_500g);
+        let parts = calculate_parts(size_500g, size);
+        assert!(parts <= MAX_PARTS);
+        assert!(size >= MIN_PART_SIZE);
+    }
+
+    #[test]
+    fn test_part_byte_range_covers_full_file() {
+        let total = 250_u64;
+        let part_size = 100_u64;
+        let num_parts = calculate_parts(total, part_size);
+        assert_eq!(num_parts, 3);
+
+        // Verify all byte ranges cover the full file without gaps
+        let mut covered = 0_u64;
+        for part in 1..=(num_parts as i32) {
+            let (start, end) = part_byte_range(part, part_size, total);
+            assert_eq!(start, covered);
+            covered = end;
+        }
+        assert_eq!(covered, total);
+    }
 }

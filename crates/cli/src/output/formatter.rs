@@ -115,6 +115,11 @@ impl Formatter {
         &self.theme
     }
 
+    /// Get a clone of the output configuration
+    pub fn output_config(&self) -> OutputConfig {
+        self.config.clone()
+    }
+
     // ========== Style helper methods ==========
 
     /// Style a directory name (blue + bold)

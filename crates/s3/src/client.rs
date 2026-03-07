@@ -236,6 +236,167 @@ impl S3Client {
             _ => error.to_string(),
         }
     }
+
+    /// Upload a file using multipart upload.
+    ///
+    /// Reads the file in chunks and uploads each part separately,
+    /// avoiding loading the entire file into memory. Calls `on_progress`
+    /// after each part is uploaded with the number of bytes sent so far.
+    pub async fn multipart_upload_file(
+        &self,
+        path: &RemotePath,
+        file_path: &std::path::Path,
+        content_type: Option<&str>,
+        config: &crate::multipart::MultipartConfig,
+        on_progress: impl Fn(u64) + Send,
+    ) -> Result<ObjectInfo> {
+        use tokio::io::AsyncReadExt;
+
+        let file_size = tokio::fs::metadata(file_path)
+            .await
+            .map_err(Error::Io)?
+            .len();
+
+        let part_size = config.calculate_part_size(file_size);
+        let total_parts = crate::multipart::calculate_parts(file_size, part_size);
+
+        tracing::debug!(
+            file_size,
+            part_size,
+            total_parts,
+            "Starting multipart upload"
+        );
+
+        // Initiate multipart upload
+        let mut create_request = self
+            .inner
+            .create_multipart_upload()
+            .bucket(&path.bucket)
+            .key(&path.key);
+
+        if let Some(ct) = content_type {
+            create_request = create_request.content_type(ct);
+        }
+
+        let create_response = create_request
+            .send()
+            .await
+            .map_err(|e| Error::Network(Self::format_sdk_error(&e)))?;
+
+        let upload_id = create_response
+            .upload_id()
+            .ok_or_else(|| Error::Network("No upload ID returned".to_string()))?
+            .to_string();
+
+        tracing::debug!(upload_id = %upload_id, "Multipart upload initiated");
+
+        // Upload parts
+        let mut completed_parts: Vec<aws_sdk_s3::types::CompletedPart> = Vec::new();
+        let mut file = tokio::fs::File::open(file_path).await.map_err(Error::Io)?;
+        let mut bytes_uploaded: u64 = 0;
+
+        for part_number in 1..=(total_parts as i32) {
+            let (start, end) = crate::multipart::part_byte_range(part_number, part_size, file_size);
+            let chunk_size = (end - start) as usize;
+
+            let mut buf = vec![0u8; chunk_size];
+            file.read_exact(&mut buf).await.map_err(Error::Io)?;
+
+            tracing::debug!(part_number, chunk_size, "Uploading part");
+
+            let body = aws_sdk_s3::primitives::ByteStream::from(buf);
+
+            let upload_result = self
+                .inner
+                .upload_part()
+                .bucket(&path.bucket)
+                .key(&path.key)
+                .upload_id(&upload_id)
+                .part_number(part_number)
+                .body(body)
+                .send()
+                .await;
+
+            match upload_result {
+                Ok(response) => {
+                    let etag = response.e_tag().unwrap_or_default().to_string();
+
+                    completed_parts.push(
+                        aws_sdk_s3::types::CompletedPart::builder()
+                            .part_number(part_number)
+                            .e_tag(&etag)
+                            .build(),
+                    );
+
+                    bytes_uploaded += chunk_size as u64;
+                    on_progress(bytes_uploaded);
+
+                    tracing::debug!(part_number, bytes_uploaded, "Part uploaded");
+                }
+                Err(e) => {
+                    // Abort the multipart upload on failure
+                    tracing::debug!(
+                        upload_id = %upload_id,
+                        part_number,
+                        "Aborting multipart upload due to error"
+                    );
+
+                    let _ = self
+                        .inner
+                        .abort_multipart_upload()
+                        .bucket(&path.bucket)
+                        .key(&path.key)
+                        .upload_id(&upload_id)
+                        .send()
+                        .await;
+
+                    return Err(Error::Network(Self::format_sdk_error(&e)));
+                }
+            }
+        }
+
+        // Complete multipart upload
+        let completed_upload = aws_sdk_s3::types::CompletedMultipartUpload::builder()
+            .set_parts(Some(completed_parts))
+            .build();
+
+        let complete_response = self
+            .inner
+            .complete_multipart_upload()
+            .bucket(&path.bucket)
+            .key(&path.key)
+            .upload_id(&upload_id)
+            .multipart_upload(completed_upload)
+            .send()
+            .await
+            .map_err(|e| {
+                // Try to abort on completion failure
+                let client = self.inner.clone();
+                let bucket = path.bucket.clone();
+                let key = path.key.clone();
+                let uid = upload_id.clone();
+                tokio::spawn(async move {
+                    let _ = client
+                        .abort_multipart_upload()
+                        .bucket(bucket)
+                        .key(key)
+                        .upload_id(uid)
+                        .send()
+                        .await;
+                });
+                Error::Network(Self::format_sdk_error(&e))
+            })?;
+
+        tracing::debug!("Multipart upload completed");
+
+        let mut info = ObjectInfo::file(&path.key, file_size as i64);
+        if let Some(etag) = complete_response.e_tag() {
+            info.etag = Some(etag.trim_matches('"').to_string());
+        }
+        info.last_modified = Some(jiff::Timestamp::now());
+
+        Ok(info)
+    }
 }
 
 fn build_tagging(

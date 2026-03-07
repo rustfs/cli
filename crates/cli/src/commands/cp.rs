@@ -4,12 +4,12 @@
 
 use clap::Args;
 use rc_core::{AliasManager, ObjectStore as _, ParsedPath, RemotePath, parse_path};
-use rc_s3::S3Client;
+use rc_s3::{MultipartConfig, S3Client};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
 use crate::exit_code::ExitCode;
-use crate::output::{Formatter, OutputConfig};
+use crate::output::{Formatter, OutputConfig, ProgressBar};
 
 /// Copy objects
 #[derive(Args, Debug)]
@@ -175,6 +175,9 @@ async fn copy_local_to_s3(
     }
 }
 
+/// Multipart upload threshold: files larger than this use multipart upload (64 MiB)
+const MULTIPART_THRESHOLD: u64 = 64 * 1024 * 1024;
+
 async fn upload_file(
     client: &S3Client,
     src: &Path,
@@ -202,16 +205,14 @@ async fn upload_file(
         return ExitCode::Success;
     }
 
-    // Read file content
-    let data = match std::fs::read(src) {
-        Ok(d) => d,
+    // Get file size
+    let file_size = match std::fs::metadata(src) {
+        Ok(m) => m.len(),
         Err(e) => {
             formatter.error(&format!("Failed to read {src_display}: {e}"));
             return ExitCode::GeneralError;
         }
     };
-
-    let size = data.len() as i64;
 
     // Determine content type
     let guessed_type: Option<String> = mime_guess::from_path(src)
@@ -219,29 +220,85 @@ async fn upload_file(
         .map(|m| m.essence_str().to_string());
     let content_type = args.content_type.as_deref().or(guessed_type.as_deref());
 
-    // Upload
-    match client.put_object(&target, data, content_type).await {
-        Ok(info) => {
-            if formatter.is_json() {
-                let output = CpOutput {
-                    status: "success",
-                    source: src_display,
-                    target: dst_display,
-                    size_bytes: Some(size),
-                    size_human: Some(humansize::format_size(size as u64, humansize::BINARY)),
-                };
-                formatter.json(&output);
-            } else {
-                let styled_src = formatter.style_file(&src_display);
-                let styled_dst = formatter.style_file(&dst_display);
-                let styled_size = formatter.style_size(&info.size_human.unwrap_or_default());
-                formatter.println(&format!("{styled_src} -> {styled_dst} ({styled_size})"));
+    let size = file_size as i64;
+
+    if file_size >= MULTIPART_THRESHOLD {
+        // Use multipart upload for large files
+        tracing::debug!(
+            file_size,
+            threshold = MULTIPART_THRESHOLD,
+            "Using multipart upload for large file"
+        );
+
+        let config = MultipartConfig::default();
+        let progress = ProgressBar::new(formatter.output_config(), file_size);
+
+        match client
+            .multipart_upload_file(&target, src, content_type, &config, |bytes_sent| {
+                progress.set_position(bytes_sent);
+            })
+            .await
+        {
+            Ok(info) => {
+                progress.finish_and_clear();
+                if formatter.is_json() {
+                    let output = CpOutput {
+                        status: "success",
+                        source: src_display,
+                        target: dst_display,
+                        size_bytes: Some(size),
+                        size_human: Some(humansize::format_size(size as u64, humansize::BINARY)),
+                    };
+                    formatter.json(&output);
+                } else {
+                    let styled_src = formatter.style_file(&src_display);
+                    let styled_dst = formatter.style_file(&dst_display);
+                    let styled_size = formatter.style_size(&info.size_human.unwrap_or_default());
+                    formatter.println(&format!("{styled_src} -> {styled_dst} ({styled_size})"));
+                }
+                ExitCode::Success
             }
-            ExitCode::Success
+            Err(e) => {
+                progress.finish_and_clear();
+                formatter.error(&format!("Failed to upload {src_display}: {e}"));
+                ExitCode::NetworkError
+            }
         }
-        Err(e) => {
-            formatter.error(&format!("Failed to upload {src_display}: {e}"));
-            ExitCode::NetworkError
+    } else {
+        // Use single put_object for small files
+        tracing::debug!(file_size, "Using single put_object for small file");
+
+        let data = match std::fs::read(src) {
+            Ok(d) => d,
+            Err(e) => {
+                formatter.error(&format!("Failed to read {src_display}: {e}"));
+                return ExitCode::GeneralError;
+            }
+        };
+
+        match client.put_object(&target, data, content_type).await {
+            Ok(info) => {
+                if formatter.is_json() {
+                    let output = CpOutput {
+                        status: "success",
+                        source: src_display,
+                        target: dst_display,
+                        size_bytes: Some(size),
+                        size_human: Some(humansize::format_size(size as u64, humansize::BINARY)),
+                    };
+                    formatter.json(&output);
+                } else {
+                    let styled_src = formatter.style_file(&src_display);
+                    let styled_dst = formatter.style_file(&dst_display);
+                    let styled_size = formatter.style_size(&info.size_human.unwrap_or_default());
+                    formatter.println(&format!("{styled_src} -> {styled_dst} ({styled_size})"));
+                }
+                ExitCode::Success
+            }
+            Err(e) => {
+                formatter.error(&format!("Failed to upload {src_display}: {e}"));
+                ExitCode::NetworkError
+            }
         }
     }
 }
