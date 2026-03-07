@@ -397,6 +397,12 @@ impl ObjectStore for S3Client {
             info.storage_class = Some(sc.as_str().to_string());
         }
 
+        if let Some(meta) = response.metadata()
+            && !meta.is_empty()
+        {
+            info.metadata = Some(meta.clone());
+        }
+
         Ok(info)
     }
 

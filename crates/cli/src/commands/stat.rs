@@ -6,6 +6,7 @@ use clap::Args;
 use rc_core::{AliasManager, ObjectStore as _, RemotePath};
 use rc_s3::S3Client;
 use serde::Serialize;
+use std::collections::HashMap;
 
 use crate::exit_code::ExitCode;
 use crate::output::{Formatter, OutputConfig};
@@ -42,6 +43,8 @@ struct StatOutput {
     storage_class: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     version_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<HashMap<String, String>>,
 }
 
 /// Execute the stat command
@@ -98,6 +101,7 @@ pub async fn execute(args: StatArgs, output_config: OutputConfig) -> ExitCode {
                     content_type: info.content_type.clone(),
                     storage_class: info.storage_class.clone(),
                     version_id: args.version_id,
+                    metadata: info.metadata.clone(),
                 };
                 formatter.json(&output);
             } else {
@@ -132,6 +136,14 @@ pub async fn execute(args: StatArgs, output_config: OutputConfig) -> ExitCode {
                 }
                 if let Some(sc) = &info.storage_class {
                     formatter.println(&format_kv("Class", sc));
+                }
+                if let Some(metadata) = &info.metadata {
+                    for (key, value) in metadata {
+                        formatter.println(&format_kv(
+                            &format!("X-Amz-Meta-{}", capitalize_first(key)),
+                            value,
+                        ));
+                    }
                 }
             }
             ExitCode::Success
@@ -181,6 +193,15 @@ fn parse_stat_path(path: &str) -> Result<(String, String, String), String> {
     Ok((alias, bucket, key))
 }
 
+/// Capitalize the first letter of a string
+fn capitalize_first(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(c) => c.to_uppercase().to_string() + chars.as_str(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,5 +235,51 @@ mod tests {
     #[test]
     fn test_parse_stat_path_empty() {
         assert!(parse_stat_path("").is_err());
+    }
+
+    #[test]
+    fn test_capitalize_first() {
+        assert_eq!(capitalize_first("content-type"), "Content-type");
+        assert_eq!(capitalize_first("a"), "A");
+        assert_eq!(capitalize_first(""), "");
+        assert_eq!(capitalize_first("Already"), "Already");
+    }
+
+    #[test]
+    fn test_stat_output_serialization_with_metadata() {
+        let mut meta = HashMap::new();
+        meta.insert("content-disposition".to_string(), "attachment".to_string());
+        let output = StatOutput {
+            name: "file.txt".to_string(),
+            last_modified: None,
+            size_bytes: Some(1024),
+            size_human: Some("1 KiB".to_string()),
+            etag: None,
+            content_type: None,
+            storage_class: None,
+            version_id: None,
+            metadata: Some(meta),
+        };
+        let json = serde_json::to_string(&output).expect("should serialize");
+        assert!(json.contains("\"metadata\""));
+        assert!(json.contains("content-disposition"));
+        assert!(json.contains("attachment"));
+    }
+
+    #[test]
+    fn test_stat_output_serialization_without_metadata() {
+        let output = StatOutput {
+            name: "file.txt".to_string(),
+            last_modified: None,
+            size_bytes: Some(1024),
+            size_human: Some("1 KiB".to_string()),
+            etag: None,
+            content_type: None,
+            storage_class: None,
+            version_id: None,
+            metadata: None,
+        };
+        let json = serde_json::to_string(&output).expect("should serialize");
+        assert!(!json.contains("metadata"));
     }
 }
