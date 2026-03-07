@@ -140,7 +140,7 @@ pub async fn execute(args: StatArgs, output_config: OutputConfig) -> ExitCode {
                 if let Some(metadata) = &info.metadata {
                     for (key, value) in metadata {
                         formatter.println(&format_kv(
-                            &format!("X-Amz-Meta-{}", capitalize_first(key)),
+                            &format!("X-Amz-Meta-{}", capitalize_meta_key(key)),
                             value,
                         ));
                     }
@@ -193,13 +193,18 @@ fn parse_stat_path(path: &str) -> Result<(String, String, String), String> {
     Ok((alias, bucket, key))
 }
 
-/// Capitalize the first letter of a string
-fn capitalize_first(s: &str) -> String {
-    let mut chars = s.chars();
-    match chars.next() {
-        None => String::new(),
-        Some(c) => c.to_uppercase().to_string() + chars.as_str(),
-    }
+/// Capitalize the first letter of each hyphen-separated segment
+fn capitalize_meta_key(s: &str) -> String {
+    s.split('-')
+        .map(|segment| {
+            let mut chars = segment.chars();
+            match chars.next() {
+                None => String::new(),
+                Some(c) => c.to_uppercase().to_string() + chars.as_str(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
 #[cfg(test)]
@@ -238,11 +243,16 @@ mod tests {
     }
 
     #[test]
-    fn test_capitalize_first() {
-        assert_eq!(capitalize_first("content-type"), "Content-type");
-        assert_eq!(capitalize_first("a"), "A");
-        assert_eq!(capitalize_first(""), "");
-        assert_eq!(capitalize_first("Already"), "Already");
+    fn test_capitalize_meta_key() {
+        assert_eq!(capitalize_meta_key("content-type"), "Content-Type");
+        assert_eq!(
+            capitalize_meta_key("content-disposition"),
+            "Content-Disposition"
+        );
+        assert_eq!(capitalize_meta_key("a"), "A");
+        assert_eq!(capitalize_meta_key(""), "");
+        assert_eq!(capitalize_meta_key("already"), "Already");
+        assert_eq!(capitalize_meta_key("x-custom-key"), "X-Custom-Key");
     }
 
     #[test]
