@@ -315,7 +315,7 @@ pub struct CreateServiceAccountRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy: Option<String>,
 
-    /// Optional expiration time (ISO 8601 format)
+    /// Expiration time (ISO 8601). The `expiration` field must be present in the request body; use null when no expiration is set.
     #[serde(rename = "expiration")]
     pub expiry: Option<String>,
 
