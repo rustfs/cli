@@ -365,8 +365,8 @@ mod tests {
 
         // Verify all byte ranges cover the full file without gaps
         let mut covered = 0_u64;
-        for part in 1..=(num_parts as i32) {
-            let (start, end) = part_byte_range(part, part_size, total);
+        for part_number in 1..=(num_parts as i32) {
+            let (start, end) = part_byte_range(part_number, part_size, total);
             assert_eq!(start, covered);
             covered = end;
         }

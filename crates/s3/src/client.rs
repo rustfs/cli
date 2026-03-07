@@ -319,7 +319,23 @@ impl S3Client {
 
             match upload_result {
                 Ok(response) => {
-                    let etag = response.e_tag().unwrap_or_default().to_string();
+                    let etag = match response.e_tag() {
+                        Some(etag) => etag.to_string(),
+                        None => {
+                            // Missing ETag - abort upload
+                            let _ = self
+                                .inner
+                                .abort_multipart_upload()
+                                .bucket(&path.bucket)
+                                .key(&path.key)
+                                .upload_id(&upload_id)
+                                .send()
+                                .await;
+                            return Err(Error::Network(format!(
+                                "No ETag returned for part {part_number}"
+                            )));
+                        }
+                    };
 
                     completed_parts.push(
                         aws_sdk_s3::types::CompletedPart::builder()
@@ -370,19 +386,23 @@ impl S3Client {
             .send()
             .await
             .map_err(|e| {
-                // Try to abort on completion failure
+                // Best-effort abort on completion failure
                 let client = self.inner.clone();
                 let bucket = path.bucket.clone();
                 let key = path.key.clone();
                 let uid = upload_id.clone();
                 tokio::spawn(async move {
-                    let _ = client
+                    tracing::debug!(upload_id = %uid, "Attempting to abort multipart upload after completion failure");
+                    if let Err(abort_err) = client
                         .abort_multipart_upload()
                         .bucket(bucket)
                         .key(key)
                         .upload_id(uid)
                         .send()
-                        .await;
+                        .await
+                    {
+                        tracing::warn!("Failed to abort multipart upload: {abort_err}");
+                    }
                 });
                 Error::Network(Self::format_sdk_error(&e))
             })?;
