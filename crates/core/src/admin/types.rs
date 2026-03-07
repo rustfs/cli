@@ -516,7 +516,11 @@ mod tests {
         };
 
         let json = serde_json::to_string(&request).unwrap();
-        assert!(json.contains("\"expiration\":\"2025-12-31T23:59:59Z\""));
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed.get("expiration").and_then(|v| v.as_str()),
+            Some("2025-12-31T23:59:59Z")
+        );
     }
 
     #[test]
