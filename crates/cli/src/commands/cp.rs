@@ -110,11 +110,9 @@ fn parse_cp_path(path: &str, alias_manager: Option<&AliasManager>) -> rc_core::R
         return Ok(parsed);
     };
 
-    if let Some(manager) = alias_manager {
-        if matches!(manager.exists(&remote.alias), Ok(true)) {
-            return Ok(parsed);
-        }
-    } else {
+    if let Some(manager) = alias_manager
+        && matches!(manager.exists(&remote.alias), Ok(true))
+    {
         return Ok(parsed);
     }
 
@@ -674,19 +672,17 @@ mod tests {
 
     #[test]
     fn test_parse_cp_path_prefers_existing_local_path_when_alias_missing() {
-        let (alias_manager, _temp_dir) = temp_alias_manager();
-        let relative = format!("target/issue-2094-{}-local/file.txt", std::process::id());
-        let full = Path::new(&relative);
+        let (alias_manager, temp_dir) = temp_alias_manager();
+        let full = temp_dir.path().join("issue-2094-local").join("file.txt");
+        let full_str = full.to_string_lossy().to_string();
 
         if let Some(parent) = full.parent() {
             std::fs::create_dir_all(parent).expect("create parent dirs");
         }
-        std::fs::write(full, b"test").expect("write local file");
+        std::fs::write(&full, b"test").expect("write local file");
 
-        let parsed = parse_cp_path(&relative, Some(&alias_manager)).expect("parse path");
+        let parsed = parse_cp_path(&full_str, Some(&alias_manager)).expect("parse path");
         assert!(matches!(parsed, ParsedPath::Local(_)));
-
-        std::fs::remove_file(full).expect("remove temp file");
     }
 
     #[test]
