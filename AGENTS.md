@@ -18,9 +18,8 @@ This document defines the standards and constraints that AI assistants must foll
 
 ### 1. Before Starting
 
-1. Read `IMPLEMENTATION_PLAN.md` to confirm the current phase
-2. Check if the current phase status is "In Progress"
-3. Understand the goals and acceptance criteria for the current phase
+1. Understand the task goals and acceptance criteria
+2. Identify related modules and existing tests
 
 ### 2. Before Modifying
 
@@ -42,8 +41,7 @@ This document defines the standards and constraints that AI assistants must foll
 1. Run `cargo fmt --all` - Code formatting
 2. Run `cargo clippy --workspace -- -D warnings` - Static analysis, **must have zero warnings**
 3. Run `cargo test --workspace` - Unit tests, **must all pass**
-4. Update `IMPLEMENTATION_PLAN.md` status
-5. **Only create a git commit after all above checks pass**
+4. **Only create a git commit after all above checks pass**
    - Commit message format: `feat(phase-N): <description>`
    - Example: `feat(phase-1): implement alias commands and core infrastructure`
 
@@ -283,7 +281,6 @@ Before submitting a PR, confirm all of the following:
 - [ ] Golden tests pass (output schema not broken)
 - [ ] No sensitive information in logs
 - [ ] Complex logic has appropriate comments (explaining WHY)
-- [ ] Updated IMPLEMENTATION_PLAN.md status (if applicable)
 - [ ] Commit message and PR description are in English
 
 **Do not skip checks and commit directly! Code that fails CI should not be merged.**

@@ -18,6 +18,8 @@ A S3-compatible command-line client written in Rust.
 ### Binary Download
 
 Download the appropriate binary for your platform from the [Releases](https://github.com/rustfs/cli/releases) page.
+On Linux, use the default `linux-amd64` / `linux-arm64` artifacts for maximum compatibility (`musl` static build).
+If you specifically need glibc-linked builds, use `linux-amd64-gnu` / `linux-arm64-gnu`.
 
 ### Homebrew (macOS/Linux)
 

@@ -94,27 +94,28 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             os_name: linux
-            arch: amd64
+            arch: amd64-gnu
             artifact_name: rc
+            cross: true
 
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             os_name: linux
-            arch: arm64
+            arch: arm64-gnu
             artifact_name: rc
             cross: true
 
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             os_name: linux
-            arch: amd64-musl
+            arch: amd64
             artifact_name: rc
             cross: false
 
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
             os_name: linux
-            arch: arm64-musl
+            arch: arm64
             artifact_name: rc
             cross: true
 
