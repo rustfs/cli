@@ -77,6 +77,8 @@ jobs:
             "option_behavior_operations::test_cp_dry_run_does_not_create_target_object"
             "option_behavior_operations::test_head_bytes_returns_prefix_bytes"
             "option_behavior_operations::test_find_print_outputs_full_remote_path"
+            "option_behavior_operations::test_find_exec_rejects_json_output"
+            "option_behavior_operations::test_mirror_parallel_zero_returns_usage_error"
           )
 
           for test_name in "${TESTS[@]}"; do

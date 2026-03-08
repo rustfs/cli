@@ -9,6 +9,8 @@ use rc_s3::S3Client;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 use crate::commands::diff::{DiffEntry, DiffStatus};
 use crate::exit_code::ExitCode;
@@ -65,6 +67,11 @@ struct FileInfo {
 /// Execute the mirror command
 pub async fn execute(args: MirrorArgs, output_config: OutputConfig) -> ExitCode {
     let formatter = Formatter::new(output_config);
+
+    if args.parallel == 0 {
+        formatter.error("--parallel must be greater than 0");
+        return ExitCode::UsageError;
+    }
 
     // Parse both paths
     let source_parsed = parse_path(&args.source);
@@ -253,7 +260,11 @@ pub async fn execute(args: MirrorArgs, output_config: OutputConfig) -> ExitCode 
     let mut copied = 0;
     let mut errors = 0;
 
-    for (key, _) in &to_copy {
+    let parallel_limit = args.parallel.max(1);
+    let copy_semaphore = Arc::new(Semaphore::new(parallel_limit));
+    let mut copy_tasks: JoinSet<(String, Result<(), String>)> = JoinSet::new();
+
+    for (key, _) in to_copy {
         let source_sep = if source_path.key.is_empty() || source_path.key.ends_with('/') {
             ""
         } else {
@@ -276,26 +287,46 @@ pub async fn execute(args: MirrorArgs, output_config: OutputConfig) -> ExitCode 
             format!("{}{target_sep}{key}", target_path.key),
         );
 
-        // Get object content and upload to target
-        match source_client.get_object(&source_full).await {
-            Ok(data) => match target_client.put_object(&target_full, data, None).await {
-                Ok(_) => {
-                    copied += 1;
-                    if !args.quiet && !formatter.is_json() {
-                        formatter.println(&format!("+ {key}"));
-                    }
+        let key = key.to_string();
+        let source_client = Arc::clone(&source_client);
+        let target_client = Arc::clone(&target_client);
+        let permit = copy_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("semaphore should not be closed");
+        copy_tasks.spawn(async move {
+            let _permit = permit;
+            let result = match source_client.get_object(&source_full).await {
+                Ok(data) => target_client
+                    .put_object(&target_full, data, None)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| format!("Failed to upload {key}: {e}")),
+                Err(e) => Err(format!("Failed to download {key}: {e}")),
+            };
+            (key, result)
+        });
+    }
+
+    while let Some(task_result) = copy_tasks.join_next().await {
+        match task_result {
+            Ok((key, Ok(()))) => {
+                copied += 1;
+                if !args.quiet && !formatter.is_json() {
+                    formatter.println(&format!("+ {key}"));
                 }
-                Err(e) => {
-                    errors += 1;
-                    if !formatter.is_json() {
-                        formatter.error(&format!("Failed to upload {key}: {e}"));
-                    }
-                }
-            },
-            Err(e) => {
+            }
+            Ok((_, Err(message))) => {
                 errors += 1;
                 if !formatter.is_json() {
-                    formatter.error(&format!("Failed to download {key}: {e}"));
+                    formatter.error(&message);
+                }
+            }
+            Err(join_error) => {
+                errors += 1;
+                if !formatter.is_json() {
+                    formatter.error(&format!("Mirror copy worker failed: {join_error}"));
                 }
             }
         }
@@ -309,7 +340,10 @@ pub async fn execute(args: MirrorArgs, output_config: OutputConfig) -> ExitCode 
     let mut removed = 0;
 
     if args.remove {
-        for key in &to_remove {
+        let remove_semaphore = Arc::new(Semaphore::new(parallel_limit));
+        let mut remove_tasks: JoinSet<(String, Result<(), String>)> = JoinSet::new();
+
+        for key in to_remove {
             let sep = if target_path.key.is_empty() || target_path.key.ends_with('/') {
                 ""
             } else {
@@ -321,17 +355,42 @@ pub async fn execute(args: MirrorArgs, output_config: OutputConfig) -> ExitCode 
                 format!("{}{sep}{key}", target_path.key),
             );
 
-            match target_client.delete_object(&target_full).await {
-                Ok(_) => {
+            let key = key.to_string();
+            let target_client = Arc::clone(&target_client);
+            let permit = remove_semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("semaphore should not be closed");
+            remove_tasks.spawn(async move {
+                let _permit = permit;
+                let result = target_client
+                    .delete_object(&target_full)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| format!("Failed to remove {key}: {e}"));
+                (key, result)
+            });
+        }
+
+        while let Some(task_result) = remove_tasks.join_next().await {
+            match task_result {
+                Ok((key, Ok(()))) => {
                     removed += 1;
                     if !args.quiet && !formatter.is_json() {
                         formatter.println(&format!("- {key}"));
                     }
                 }
-                Err(e) => {
+                Ok((_, Err(message))) => {
                     errors += 1;
                     if !formatter.is_json() {
-                        formatter.error(&format!("Failed to remove {key}: {e}"));
+                        formatter.error(&message);
+                    }
+                }
+                Err(join_error) => {
+                    errors += 1;
+                    if !formatter.is_json() {
+                        formatter.error(&format!("Mirror remove worker failed: {join_error}"));
                     }
                 }
             }

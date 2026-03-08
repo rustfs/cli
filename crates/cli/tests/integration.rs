@@ -2835,6 +2835,31 @@ mod option_behavior_operations {
     }
 
     #[test]
+    fn test_share_rejects_expiration_over_seven_days() {
+        let config_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let output = run_rc(
+            &[
+                "share",
+                "test/demo-bucket/demo.txt",
+                "--expire",
+                "8d",
+                "--json",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            !output.status.success(),
+            "share with expiration > 7 days should fail"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("Expiration cannot exceed 7 days"),
+            "Unexpected error output: {}",
+            stderr
+        );
+    }
+
+    #[test]
     fn test_find_print_outputs_full_remote_path() {
         let (config_dir, bucket_name) = match setup_with_alias("findprint") {
             Some(v) => v,
@@ -2963,5 +2988,330 @@ mod option_behavior_operations {
         );
 
         cleanup_bucket(config_dir.path(), &bucket_name);
+    }
+
+    #[test]
+    fn test_find_maxdepth_excludes_deeper_matches() {
+        let (config_dir, bucket_name) = match setup_with_alias("finddepth") {
+            Some(v) => v,
+            None => {
+                eprintln!("Skipping: S3 test config not available");
+                return;
+            }
+        };
+
+        upload_text_object(config_dir.path(), &bucket_name, "top.txt", "top");
+        upload_text_object(config_dir.path(), &bucket_name, "one/file.txt", "one");
+        upload_text_object(config_dir.path(), &bucket_name, "one/two/deep.txt", "deep");
+
+        let output = run_rc(
+            &[
+                "find",
+                &format!("test/{}/", bucket_name),
+                "--name",
+                "*.txt",
+                "--maxdepth",
+                "1",
+                "--json",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            output.status.success(),
+            "find --maxdepth failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("top.txt"), "top.txt should be matched");
+        assert!(
+            stdout.contains("one/file.txt"),
+            "one/file.txt should be matched"
+        );
+        assert!(
+            !stdout.contains("one/two/deep.txt"),
+            "one/two/deep.txt should be excluded by maxdepth=1"
+        );
+
+        cleanup_bucket(config_dir.path(), &bucket_name);
+    }
+
+    #[test]
+    fn test_mirror_remove_with_parallel_synchronizes_destination() {
+        let (config_dir, bucket_name) = match setup_with_alias("mirroropt") {
+            Some(v) => v,
+            None => {
+                eprintln!("Skipping: S3 test config not available");
+                return;
+            }
+        };
+
+        let target_bucket = format!("{}-dest", bucket_name);
+        let output = run_rc(
+            &["mb", &format!("test/{}", target_bucket)],
+            config_dir.path(),
+        );
+        assert!(
+            output.status.success(),
+            "Failed to create destination bucket: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        upload_text_object(config_dir.path(), &bucket_name, "src/keep-1.txt", "keep-1");
+        upload_text_object(
+            config_dir.path(),
+            &bucket_name,
+            "src/nested/keep-2.txt",
+            "keep-2",
+        );
+        upload_text_object(
+            config_dir.path(),
+            &target_bucket,
+            "mirror-stale.txt",
+            "should be removed",
+        );
+
+        let output = run_rc(
+            &[
+                "mirror",
+                &format!("test/{}/src/", bucket_name),
+                &format!("test/{}/", target_bucket),
+                "--remove",
+                "--overwrite",
+                "--parallel",
+                "2",
+                "--json",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            output.status.success(),
+            "mirror --remove --parallel failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let json: serde_json::Value = serde_json::from_str(&stdout).expect("Invalid JSON output");
+        assert_eq!(json["errors"], 0);
+        assert!(json["copied"].as_u64().unwrap_or(0) >= 2);
+        assert!(json["removed"].as_u64().unwrap_or(0) >= 1);
+
+        let output = run_rc(
+            &[
+                "ls",
+                "--recursive",
+                &format!("test/{}/", target_bucket),
+                "--json",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            output.status.success(),
+            "Failed to list destination after mirror: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("keep-1.txt"),
+            "Expected keep-1.txt in destination"
+        );
+        assert!(
+            stdout.contains("nested/keep-2.txt") || stdout.contains("keep-2.txt"),
+            "Expected keep-2.txt in destination"
+        );
+        assert!(
+            !stdout.contains("mirror-stale.txt"),
+            "Stale destination file should be removed"
+        );
+
+        cleanup_bucket(config_dir.path(), &bucket_name);
+        cleanup_bucket(config_dir.path(), &target_bucket);
+    }
+
+    #[test]
+    fn test_mirror_parallel_zero_returns_usage_error() {
+        let (config_dir, bucket_name) = match setup_with_alias("mirrorparallelzero") {
+            Some(v) => v,
+            None => {
+                eprintln!("Skipping: S3 test config not available");
+                return;
+            }
+        };
+
+        let target_bucket = format!("{}-dest", bucket_name);
+        let output = run_rc(
+            &["mb", &format!("test/{}", target_bucket)],
+            config_dir.path(),
+        );
+        assert!(
+            output.status.success(),
+            "Failed to create destination bucket"
+        );
+
+        let output = run_rc(
+            &[
+                "mirror",
+                &format!("test/{}/", bucket_name),
+                &format!("test/{}/", target_bucket),
+                "--parallel",
+                "0",
+                "--json",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            !output.status.success(),
+            "mirror --parallel 0 should fail with usage error"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("--parallel must be greater than 0"),
+            "Unexpected error output: {}",
+            stderr
+        );
+
+        cleanup_bucket(config_dir.path(), &bucket_name);
+        cleanup_bucket(config_dir.path(), &target_bucket);
+    }
+
+    #[test]
+    fn test_tree_option_combination_filters_expected_nodes() {
+        let (config_dir, bucket_name) = match setup_with_alias("treeopts") {
+            Some(v) => v,
+            None => {
+                eprintln!("Skipping: S3 test config not available");
+                return;
+            }
+        };
+
+        upload_text_object(config_dir.path(), &bucket_name, "dir/a.txt", "A");
+        upload_text_object(config_dir.path(), &bucket_name, "dir/b.log", "B");
+        upload_text_object(config_dir.path(), &bucket_name, "dir/deep/c.txt", "C");
+
+        let output = run_rc(
+            &[
+                "tree",
+                &format!("test/{}/", bucket_name),
+                "--pattern",
+                "*.txt",
+                "--level",
+                "2",
+                "--full-path",
+                "--json",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            output.status.success(),
+            "tree option combination failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let json: serde_json::Value = serde_json::from_str(&stdout).expect("Invalid JSON output");
+        assert_eq!(json["name"], format!("test/{}/", bucket_name));
+        assert!(stdout.contains("a.txt"), "Expected a.txt to match pattern");
+        assert!(
+            !stdout.contains("b.log"),
+            "b.log should be filtered by pattern"
+        );
+        assert!(
+            !stdout.contains("deep/c.txt"),
+            "deep/c.txt should be excluded by level=2"
+        );
+
+        // dirs-only should remove all files from output tree
+        let output = run_rc(
+            &[
+                "tree",
+                &format!("test/{}/", bucket_name),
+                "--dirs-only",
+                "--json",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            output.status.success(),
+            "tree --dirs-only failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(!stdout.contains("a.txt"), "dirs-only should exclude files");
+        assert!(!stdout.contains("b.log"), "dirs-only should exclude files");
+
+        cleanup_bucket(config_dir.path(), &bucket_name);
+    }
+
+    #[test]
+    fn test_diff_diff_only_excludes_same_entries() {
+        let (config_dir, bucket_name) = match setup_with_alias("diffonly") {
+            Some(v) => v,
+            None => {
+                eprintln!("Skipping: S3 test config not available");
+                return;
+            }
+        };
+
+        let second_bucket = format!("{}-second", bucket_name);
+        let output = run_rc(
+            &["mb", &format!("test/{}", second_bucket)],
+            config_dir.path(),
+        );
+        assert!(output.status.success(), "Failed to create second bucket");
+
+        upload_text_object(config_dir.path(), &bucket_name, "same.txt", "same-content");
+        upload_text_object(
+            config_dir.path(),
+            &second_bucket,
+            "same.txt",
+            "same-content",
+        );
+        upload_text_object(config_dir.path(), &bucket_name, "only-first.txt", "first");
+
+        let base_args = [
+            "diff",
+            &format!("test/{}/", bucket_name),
+            &format!("test/{}/", second_bucket),
+        ];
+
+        let output = run_rc(
+            &[base_args[0], base_args[1], base_args[2], "--json"],
+            config_dir.path(),
+        );
+        assert!(
+            !output.status.success(),
+            "diff with differences should return non-zero"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("same.txt"),
+            "baseline diff should include same entries"
+        );
+
+        let output = run_rc(
+            &[
+                "diff",
+                &format!("test/{}/", bucket_name),
+                &format!("test/{}/", second_bucket),
+                "--diff-only",
+                "--json",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            !output.status.success(),
+            "diff --diff-only with differences should return non-zero"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !stdout.contains("\"status\":\"same\""),
+            "diff-only output must exclude same entries"
+        );
+        assert!(
+            stdout.contains("only-first.txt"),
+            "diff-only output should include real differences"
+        );
+
+        cleanup_bucket(config_dir.path(), &bucket_name);
+        cleanup_bucket(config_dir.path(), &second_bucket);
     }
 }
