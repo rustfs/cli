@@ -265,6 +265,86 @@ mod bucket_operations {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+
+    #[test]
+    fn test_mb_ignore_existing_first_and_second_run() {
+        let (endpoint, access_key, secret_key) = match get_test_config() {
+            Some(c) => c,
+            None => {
+                eprintln!("Skipping: S3 test config not available");
+                return;
+            }
+        };
+
+        let config_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let bucket_name = format!("test-ignore-existing-{}", uuid_suffix());
+
+        // Set up alias
+        let output = run_rc(
+            &[
+                "alias",
+                "set",
+                "test",
+                &endpoint,
+                &access_key,
+                &secret_key,
+                "--bucket-lookup",
+                "path",
+            ],
+            config_dir.path(),
+        );
+        assert!(output.status.success(), "Failed to set alias");
+
+        assert!(
+            wait_for_s3_ready(config_dir.path()),
+            "S3 service did not become ready in time"
+        );
+
+        // First run: create a brand-new bucket with --ignore-existing
+        let output = run_rc(
+            &[
+                "mb",
+                &format!("test/{}", bucket_name),
+                "--ignore-existing",
+                "--json",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            output.status.success(),
+            "First mb --ignore-existing failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("success"),
+            "Expected success in first run output"
+        );
+
+        // Second run: same command should also succeed (bucket already exists)
+        let output = run_rc(
+            &[
+                "mb",
+                &format!("test/{}", bucket_name),
+                "--ignore-existing",
+                "--json",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            output.status.success(),
+            "Second mb --ignore-existing failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("success"),
+            "Expected success in second run output"
+        );
+
+        // Cleanup
+        cleanup_bucket(config_dir.path(), &bucket_name);
+    }
 }
 
 mod object_operations {
