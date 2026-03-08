@@ -2517,3 +2517,320 @@ mod alias_operations {
         assert!(!stdout.contains("myalias"), "myalias should be removed");
     }
 }
+
+mod option_behavior_operations {
+    use super::*;
+
+    fn upload_text_object(config_dir: &std::path::Path, bucket: &str, key: &str, content: &str) {
+        let temp_file = tempfile::NamedTempFile::new().expect("Failed to create temp file");
+        std::fs::write(temp_file.path(), content).expect("Failed to write");
+
+        let output = run_rc(
+            &[
+                "cp",
+                temp_file.path().to_str().unwrap(),
+                &format!("test/{}/{}", bucket, key),
+            ],
+            config_dir,
+        );
+        assert!(
+            output.status.success(),
+            "Failed to upload {}: {}",
+            key,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn test_cp_dry_run_does_not_create_target_object() {
+        let (config_dir, bucket_name) = match setup_with_alias("cpdryrun") {
+            Some(v) => v,
+            None => {
+                eprintln!("Skipping: S3 test config not available");
+                return;
+            }
+        };
+
+        upload_text_object(
+            config_dir.path(),
+            &bucket_name,
+            "alpha-source.txt",
+            "cp dry run source",
+        );
+
+        let output = run_rc(
+            &[
+                "cp",
+                &format!("test/{}/alpha-source.txt", bucket_name),
+                &format!("test/{}/beta-target.txt", bucket_name),
+                "--dry-run",
+                "--json",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            output.status.success(),
+            "cp --dry-run failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let output = run_rc(
+            &[
+                "ls",
+                "--recursive",
+                &format!("test/{}/", bucket_name),
+                "--json",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            output.status.success(),
+            "Failed to list objects after cp --dry-run"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("alpha-source.txt"),
+            "Source object should still exist"
+        );
+        assert!(
+            !stdout.contains("beta-target.txt"),
+            "Target object should not be created by --dry-run"
+        );
+
+        cleanup_bucket(config_dir.path(), &bucket_name);
+    }
+
+    #[test]
+    fn test_mv_dry_run_keeps_source_and_skips_target() {
+        let (config_dir, bucket_name) = match setup_with_alias("mvdryrun") {
+            Some(v) => v,
+            None => {
+                eprintln!("Skipping: S3 test config not available");
+                return;
+            }
+        };
+
+        upload_text_object(
+            config_dir.path(),
+            &bucket_name,
+            "move-source.txt",
+            "mv dry run source",
+        );
+
+        let output = run_rc(
+            &[
+                "mv",
+                &format!("test/{}/move-source.txt", bucket_name),
+                &format!("test/{}/move-target.txt", bucket_name),
+                "--dry-run",
+                "--json",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            output.status.success(),
+            "mv --dry-run failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let output = run_rc(
+            &[
+                "ls",
+                "--recursive",
+                &format!("test/{}/", bucket_name),
+                "--json",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            output.status.success(),
+            "Failed to list objects after mv --dry-run"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("move-source.txt"),
+            "Source object should still exist"
+        );
+        assert!(
+            !stdout.contains("move-target.txt"),
+            "Target object should not be created by --dry-run"
+        );
+
+        cleanup_bucket(config_dir.path(), &bucket_name);
+    }
+
+    #[test]
+    fn test_rm_dry_run_does_not_delete_object() {
+        let (config_dir, bucket_name) = match setup_with_alias("rmdryrun") {
+            Some(v) => v,
+            None => {
+                eprintln!("Skipping: S3 test config not available");
+                return;
+            }
+        };
+
+        upload_text_object(
+            config_dir.path(),
+            &bucket_name,
+            "keep-me.txt",
+            "rm dry run source",
+        );
+
+        let output = run_rc(
+            &[
+                "rm",
+                &format!("test/{}/keep-me.txt", bucket_name),
+                "--dry-run",
+                "--json",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            output.status.success(),
+            "rm --dry-run failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let output = run_rc(
+            &[
+                "ls",
+                "--recursive",
+                &format!("test/{}/", bucket_name),
+                "--json",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            output.status.success(),
+            "Failed to list objects after rm --dry-run"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("keep-me.txt"),
+            "Object should still exist after rm --dry-run"
+        );
+
+        cleanup_bucket(config_dir.path(), &bucket_name);
+    }
+
+    #[test]
+    fn test_head_bytes_returns_prefix_bytes() {
+        let (config_dir, bucket_name) = match setup_with_alias("headbytes") {
+            Some(v) => v,
+            None => {
+                eprintln!("Skipping: S3 test config not available");
+                return;
+            }
+        };
+
+        upload_text_object(
+            config_dir.path(),
+            &bucket_name,
+            "bytes.txt",
+            "ABCDEFGHIJ12345",
+        );
+
+        let output = run_rc(
+            &[
+                "head",
+                "--bytes",
+                "5",
+                &format!("test/{}/bytes.txt", bucket_name),
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            output.status.success(),
+            "head --bytes failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            output.stdout, b"ABCDE",
+            "head --bytes should output exact prefix"
+        );
+
+        cleanup_bucket(config_dir.path(), &bucket_name);
+    }
+
+    #[test]
+    fn test_find_count_json_reports_match_count() {
+        let (config_dir, bucket_name) = match setup_with_alias("findcount") {
+            Some(v) => v,
+            None => {
+                eprintln!("Skipping: S3 test config not available");
+                return;
+            }
+        };
+
+        upload_text_object(config_dir.path(), &bucket_name, "a.txt", "aaaaa");
+        upload_text_object(config_dir.path(), &bucket_name, "b.txt", "bbbbb");
+        upload_text_object(config_dir.path(), &bucket_name, "c.log", "ccccc");
+
+        let output = run_rc(
+            &[
+                "find",
+                &format!("test/{}/", bucket_name),
+                "--name",
+                "*.txt",
+                "--count",
+                "--json",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            output.status.success(),
+            "find --count failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let json: serde_json::Value = serde_json::from_str(&stdout).expect("Invalid JSON output");
+        assert_eq!(json["count"], 2, "Expected exactly 2 txt matches");
+        assert!(json["total_size_bytes"].as_i64().unwrap_or(0) > 0);
+
+        cleanup_bucket(config_dir.path(), &bucket_name);
+    }
+
+    #[test]
+    fn test_share_upload_generates_upload_url_with_expiration() {
+        let (config_dir, bucket_name) = match setup_with_alias("shareupload") {
+            Some(v) => v,
+            None => {
+                eprintln!("Skipping: S3 test config not available");
+                return;
+            }
+        };
+
+        let object_path = format!("test/{}/upload-target.bin", bucket_name);
+        let output = run_rc(
+            &[
+                "share",
+                &object_path,
+                "--upload",
+                "--content-type",
+                "application/octet-stream",
+                "--expire",
+                "1h",
+                "--json",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            output.status.success(),
+            "share --upload failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let json: serde_json::Value = serde_json::from_str(&stdout).expect("Invalid JSON output");
+        assert_eq!(json["type"], "upload");
+        assert_eq!(json["path"], object_path);
+        assert_eq!(json["expires_secs"], 3600);
+        assert!(
+            json["url"].as_str().unwrap_or_default().starts_with("http"),
+            "Expected a valid presigned URL"
+        );
+
+        cleanup_bucket(config_dir.path(), &bucket_name);
+    }
+}

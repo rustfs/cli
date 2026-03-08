@@ -74,6 +74,8 @@ jobs:
             "object_operations::test_upload_and_download_small_file"
             "object_operations::test_move_recursive_prefix_s3_to_s3"
             "quota_operations::test_bucket_quota_set_info_clear"
+            "option_behavior_operations::test_cp_dry_run_does_not_create_target_object"
+            "option_behavior_operations::test_head_bytes_returns_prefix_bytes"
           )
 
           for test_name in "${TESTS[@]}"; do
