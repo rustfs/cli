@@ -202,16 +202,13 @@ async fn upload_file(
         return ExitCode::Success;
     }
 
-    // Read file content
-    let data = match std::fs::read(src) {
-        Ok(d) => d,
+    let size = match std::fs::metadata(src) {
+        Ok(metadata) => metadata.len() as i64,
         Err(e) => {
-            formatter.error(&format!("Failed to read {src_display}: {e}"));
+            formatter.error(&format!("Failed to read metadata for {src_display}: {e}"));
             return ExitCode::GeneralError;
         }
     };
-
-    let size = data.len() as i64;
 
     // Determine content type
     let guessed_type: Option<String> = mime_guess::from_path(src)
@@ -220,7 +217,10 @@ async fn upload_file(
     let content_type = args.content_type.as_deref().or(guessed_type.as_deref());
 
     // Upload
-    match client.put_object(&target, data, content_type).await {
+    match client
+        .put_object_from_path(&target, src, content_type)
+        .await
+    {
         Ok(info) => {
             if formatter.is_json() {
                 let output = CpOutput {
