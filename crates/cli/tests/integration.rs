@@ -11,7 +11,7 @@
 //!     -e RUSTFS_ROOT_PASSWORD=secretkey \
 //!     -e RUSTFS_ACCESS_KEY=accesskey \
 //!     -e RUSTFS_SECRET_KEY=secretkey \
-//!     rustfs/rustfs:1.0.0-alpha.81
+//!     rustfs/rustfs:latest
 //!
 //! # Run tests
 //! cargo test --features integration
@@ -653,6 +653,88 @@ mod object_operations {
         assert!(stdout.contains("dest.txt"), "Dest file should exist");
 
         // Cleanup
+        cleanup_bucket(config_dir.path(), &bucket_name);
+    }
+
+    #[test]
+    fn test_move_recursive_prefix_s3_to_s3() {
+        let (config_dir, bucket_name) = match setup_with_alias("mvrec") {
+            Some(v) => v,
+            None => {
+                eprintln!("Skipping: S3 test config not available");
+                return;
+            }
+        };
+
+        let source_files = ["src/dir/a.txt", "src/dir/sub/b.txt"];
+        for key in &source_files {
+            let tmp = tempfile::NamedTempFile::new().expect("Failed to create temp file");
+            std::fs::write(tmp.path(), format!("content for {}", key)).expect("Failed to write");
+            let output = run_rc(
+                &[
+                    "cp",
+                    tmp.path().to_str().unwrap(),
+                    &format!("test/{}/{}", bucket_name, key),
+                ],
+                config_dir.path(),
+            );
+            assert!(output.status.success(), "Failed to upload {}", key);
+        }
+
+        let output = run_rc(
+            &[
+                "mv",
+                "--recursive",
+                "--continue-on-error",
+                &format!("test/{}/src/", bucket_name),
+                &format!("test/{}/dst/", bucket_name),
+                "--json",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            output.status.success(),
+            "Failed to recursive move: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let json: serde_json::Value = serde_json::from_str(&stdout).expect("Invalid JSON output");
+        assert_eq!(json["status"], "success");
+        assert_eq!(json["errors"], 0);
+        assert_eq!(json["moved"], 2);
+
+        let output = run_rc(
+            &[
+                "ls",
+                "--recursive",
+                &format!("test/{}/", bucket_name),
+                "--json",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            output.status.success(),
+            "Failed to list bucket after recursive move"
+        );
+        let listing = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            listing.contains("dst/dir/a.txt"),
+            "Moved object dst/dir/a.txt not found"
+        );
+        assert!(
+            listing.contains("dst/dir/sub/b.txt"),
+            "Moved object dst/dir/sub/b.txt not found"
+        );
+        assert!(
+            !listing.contains("src/dir/a.txt"),
+            "Source object src/dir/a.txt should be removed"
+        );
+        assert!(
+            !listing.contains("src/dir/sub/b.txt"),
+            "Source object src/dir/sub/b.txt should be removed"
+        );
+
         cleanup_bucket(config_dir.path(), &bucket_name);
     }
 
@@ -2311,6 +2393,65 @@ mod tag_operations {
         );
 
         // Cleanup
+        cleanup_bucket(config_dir.path(), &bucket_name);
+    }
+}
+
+mod quota_operations {
+    use super::*;
+
+    #[test]
+    fn test_bucket_quota_set_info_clear() {
+        let (config_dir, bucket_name) = match setup_with_alias("quota") {
+            Some(v) => v,
+            None => {
+                eprintln!("Skipping: S3 test config not available");
+                return;
+            }
+        };
+
+        let bucket_path = format!("test/{}", bucket_name);
+
+        let output = run_rc(
+            &["quota", "set", &bucket_path, "64MiB", "--json"],
+            config_dir.path(),
+        );
+        assert!(
+            output.status.success(),
+            "Failed to set quota: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let output = run_rc(
+            &["quota", "info", &bucket_path, "--json"],
+            config_dir.path(),
+        );
+        assert!(
+            output.status.success(),
+            "Failed to get quota info: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let json: serde_json::Value = serde_json::from_str(&stdout).expect("Invalid JSON output");
+        assert_eq!(json["bucket"], bucket_name);
+        assert_eq!(json["quota"], 64 * 1024 * 1024);
+        assert_eq!(json["quotaType"], "HARD");
+
+        let output = run_rc(
+            &["quota", "clear", &bucket_path, "--json"],
+            config_dir.path(),
+        );
+        assert!(
+            output.status.success(),
+            "Failed to clear quota: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let json: serde_json::Value = serde_json::from_str(&stdout).expect("Invalid JSON output");
+        assert_eq!(json["bucket"], bucket_name);
+        assert!(json["quota"].is_null());
+        assert_eq!(json["quotaType"], "HARD");
+
         cleanup_bucket(config_dir.path(), &bucket_name);
     }
 }

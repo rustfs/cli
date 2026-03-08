@@ -7,7 +7,7 @@
 services:
   # RustFS - S3-compatible object storage (Tier 1)
   rustfs:
-    image: rustfs/rustfs:1.0.0-alpha.81
+    image: rustfs/rustfs:latest
     container_name: rc-test-rustfs
     ports:
       - "9000:9000"   # S3 API
