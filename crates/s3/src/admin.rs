@@ -34,8 +34,21 @@ pub struct AdminClient {
 impl AdminClient {
     /// Create a new AdminClient from an Alias
     pub fn new(alias: &Alias) -> Result<Self> {
-        let http_client = Client::builder()
+        let mut builder = Client::builder()
             .danger_accept_invalid_certs(alias.insecure)
+            .tls_built_in_native_certs(true)
+            .tls_built_in_webpki_certs(true);
+
+        if let Some(bundle_path) = alias.ca_bundle.as_deref() {
+            let pem = std::fs::read(bundle_path).map_err(|e| {
+                Error::Network(format!("Failed to read CA bundle '{bundle_path}': {e}"))
+            })?;
+            let cert = reqwest::Certificate::from_pem(&pem)
+                .map_err(|e| Error::Network(format!("Invalid CA bundle '{bundle_path}': {e}")))?;
+            builder = builder.add_root_certificate(cert);
+        }
+
+        let http_client = builder
             .build()
             .map_err(|e| Error::Network(format!("Failed to create HTTP client: {e}")))?;
 
@@ -700,6 +713,7 @@ impl AdminApi for AdminClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn test_admin_url_construction() {
@@ -747,5 +761,50 @@ mod tests {
             hash,
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
+    }
+
+    #[test]
+    fn test_admin_client_invalid_ca_bundle_path_surfaces_error() {
+        let mut alias = Alias::new("test", "https://localhost:9000", "access", "secret");
+        alias.ca_bundle = Some("/definitely-not-here/ca.pem".to_string());
+
+        let result = AdminClient::new(&alias);
+        match result {
+            Err(Error::Network(msg)) => {
+                assert!(
+                    msg.contains("Failed to read CA bundle"),
+                    "Unexpected error message: {msg}"
+                );
+            }
+            Ok(_) => panic!("Expected Error::Network for invalid path, got Ok(_)"),
+            Err(e) => panic!("Expected Error::Network for invalid path, got Err({e})"),
+        }
+    }
+
+    #[test]
+    fn test_admin_client_invalid_ca_bundle_pem_surfaces_error() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let bad_pem_path = temp_dir.path().join("bad-ca.pem");
+        std::fs::write(
+            &bad_pem_path,
+            b"-----BEGIN CERTIFICATE-----\ninvalid-base64\n-----END CERTIFICATE-----\n",
+        )
+        .expect("write invalid PEM");
+
+        let mut alias = Alias::new("test", "https://localhost:9000", "access", "secret");
+        alias.ca_bundle = Some(bad_pem_path.display().to_string());
+
+        let result = AdminClient::new(&alias);
+        match result {
+            Err(Error::Network(msg)) => {
+                assert!(
+                    msg.contains("Invalid CA bundle")
+                        || msg.contains("Failed to create HTTP client"),
+                    "Unexpected error message: {msg}"
+                );
+            }
+            Ok(_) => panic!("Expected Error::Network for invalid PEM, got Ok(_)"),
+            Err(e) => panic!("Expected Error::Network for invalid PEM, got Err({e})"),
+        }
     }
 }
