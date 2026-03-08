@@ -19,7 +19,9 @@ use rc_core::{
 };
 use tokio::io::AsyncReadExt;
 
-const SINGLE_PUT_OBJECT_MAX_SIZE: u64 = 5 * 1024 * 1024 * 1024;
+/// Keep single-part uploads small to avoid backend incompatibilities with
+/// streaming aws-chunked payloads.
+const SINGLE_PUT_OBJECT_MAX_SIZE: u64 = 64 * 1024 * 1024;
 
 /// Custom HTTP connector using reqwest, supporting insecure TLS (skip cert verification)
 /// and custom CA bundles. Used when `alias.insecure = true` or `alias.ca_bundle.is_some()`.
@@ -196,6 +198,14 @@ impl S3Client {
         // Build S3 client with path-style addressing for compatibility
         let s3_config = aws_sdk_s3::config::Builder::from(&config)
             .force_path_style(alias.bucket_lookup == "path" || alias.bucket_lookup == "auto")
+            // Improve compatibility with S3-compatible backends by only sending request
+            // checksums when the operation explicitly requires them.
+            .request_checksum_calculation(
+                aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
+            )
+            .response_checksum_validation(
+                aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired,
+            )
             .build();
 
         let client = aws_sdk_s3::Client::from_conf(s3_config);
@@ -270,11 +280,10 @@ impl S3Client {
         content_type: Option<&str>,
         file_size: u64,
     ) -> Result<ObjectInfo> {
-        let body = aws_sdk_s3::primitives::ByteStream::read_from()
-            .path(file_path)
-            .build()
+        let data = tokio::fs::read(file_path)
             .await
-            .map_err(|e| Error::General(format!("build request body: {e}")))?;
+            .map_err(|e| Error::General(format!("read file '{}': {e}", file_path.display())))?;
+        let body = aws_sdk_s3::primitives::ByteStream::from(data);
 
         let mut request = self
             .inner
@@ -1188,7 +1197,7 @@ mod tests {
         assert!(!S3Client::should_use_multipart(0));
         assert!(!S3Client::should_use_multipart(1024 * 1024));
         assert!(!S3Client::should_use_multipart(
-            crate::multipart::DEFAULT_PART_SIZE + 1
+            crate::multipart::DEFAULT_PART_SIZE
         ));
         assert!(!S3Client::should_use_multipart(SINGLE_PUT_OBJECT_MAX_SIZE));
     }
