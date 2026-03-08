@@ -545,4 +545,15 @@ mod tests {
         assert_eq!(decoded.bucket, "my-bucket");
         assert_eq!(decoded.quota, Some(1024));
     }
+
+    #[test]
+    fn test_bucket_quota_defaults_quota_type_when_missing() {
+        let json = r#"{"bucket":"my-bucket","quota":1024,"size":512}"#;
+        let decoded: BucketQuota = serde_json::from_str(json).unwrap();
+
+        assert_eq!(decoded.bucket, "my-bucket");
+        assert_eq!(decoded.quota, Some(1024));
+        assert_eq!(decoded.size, 512);
+        assert_eq!(decoded.quota_type, "HARD");
+    }
 }
