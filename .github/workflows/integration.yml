@@ -1,28 +1,32 @@
 name: Integration Tests
 
 on:
-  push:
-    branches: [ main ]
   pull_request:
-    branches: [ main ]
-  workflow_dispatch:  # Allow manual triggering
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: "0 2 * * *"
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  TEST_S3_ENDPOINT: http://localhost:9000
+  TEST_S3_ACCESS_KEY: accesskey
+  TEST_S3_SECRET_KEY: secretkey
 
 jobs:
-  integration:
-    name: Integration Tests
+  smoke-latest:
+    name: Smoke (RustFS latest)
     runs-on: ubuntu-latest
-    # Don't block PR merges - integration tests are supplementary
-    continue-on-error: true
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Start RustFS
+      - name: Start RustFS latest
         run: |
           docker run -d --name rustfs \
             -p 9000:9000 \
@@ -36,41 +40,96 @@ jobs:
             -e RUSTFS_ADDRESS=":9000" \
             -e RUSTFS_CONSOLE_ENABLE="true" \
             -e RUSTFS_CONSOLE_ADDRESS=":9001" \
-            rustfs/rustfs:1.0.0-alpha.81
+            rustfs/rustfs:latest
 
       - name: Wait for RustFS
         run: |
-          echo "Waiting for RustFS to start..."
-          sleep 3
-          for i in {1..30}; do
-            # Try health endpoint
+          for i in {1..60}; do
             if curl -sf http://localhost:9000/health > /dev/null 2>&1; then
-              echo "RustFS is ready!"
+              echo "RustFS is ready"
               exit 0
             fi
-            echo "Waiting for RustFS... ($i/30)"
-            sleep 2
+            sleep 1
           done
           echo "RustFS failed to start"
           docker logs rustfs
           exit 1
 
-      - name: Run integration tests
-        run: cargo test --package rustfs-cli --test integration --features integration -- --test-threads=1
-        env:
-          TEST_S3_ENDPOINT: http://localhost:9000
-          TEST_S3_ACCESS_KEY: accesskey
-          TEST_S3_SECRET_KEY: secretkey
+      - name: Run smoke compatibility tests
+        run: |
+          set -euo pipefail
+          TESTS=(
+            "object_operations::test_upload_and_download_small_file"
+            "object_operations::test_move_recursive_prefix_s3_to_s3"
+            "quota_operations::test_bucket_quota_set_info_clear"
+          )
+
+          for test_name in "${TESTS[@]}"; do
+            echo "==> Running $test_name"
+            cargo test \
+              --package rustfs-cli \
+              --test integration \
+              --features integration \
+              "$test_name" \
+              -- \
+              --exact \
+              --test-threads=1
+          done
 
       - name: Show RustFS logs on failure
         if: failure()
-        run: docker logs rustfs 2>&1 | tail -100
+        run: docker logs rustfs 2>&1 | tail -200
+
+  full-latest:
+    name: Full Integration (RustFS latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Start RustFS latest
+        run: |
+          docker run -d --name rustfs \
+            -p 9000:9000 \
+            -p 9001:9001 \
+            -v rustfs-data:/data \
+            -e RUSTFS_ROOT_USER=accesskey \
+            -e RUSTFS_ROOT_PASSWORD=secretkey \
+            -e RUSTFS_ACCESS_KEY=accesskey \
+            -e RUSTFS_SECRET_KEY=secretkey \
+            -e RUSTFS_VOLUMES=/data \
+            -e RUSTFS_ADDRESS=":9000" \
+            -e RUSTFS_CONSOLE_ENABLE="true" \
+            -e RUSTFS_CONSOLE_ADDRESS=":9001" \
+            rustfs/rustfs:latest
+
+      - name: Wait for RustFS
+        run: |
+          for i in {1..60}; do
+            if curl -sf http://localhost:9000/health > /dev/null 2>&1; then
+              echo "RustFS is ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "RustFS failed to start"
+          docker logs rustfs
+          exit 1
+
+      - name: Run full integration suite
+        run: cargo test --package rustfs-cli --test integration --features integration -- --test-threads=1
+
+      - name: Show RustFS logs on failure
+        if: failure()
+        run: docker logs rustfs 2>&1 | tail -200
 
   golden:
     name: Golden Tests
     runs-on: ubuntu-latest
-    # Don't block PR merges
-    continue-on-error: true
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -79,5 +138,4 @@ jobs:
       - name: Run golden tests
         run: cargo test --package rustfs-cli --test golden --features golden
         env:
-          # Golden tests use isolated config dir, no real S3 needed for alias tests
           RC_CONFIG_DIR: ${{ runner.temp }}/rc-test-config
