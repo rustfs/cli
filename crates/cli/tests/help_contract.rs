@@ -69,8 +69,9 @@ fn assert_help_case(case: &HelpCase) {
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let normalized_stdout = stdout.replace("Usage: rc.exe ", "Usage: rc ");
     assert!(
-        stdout.contains(case.usage),
+        normalized_stdout.contains(case.usage),
         "usage marker `{}` missing for {command_label}\nstdout:\n{}",
         case.usage,
         stdout
