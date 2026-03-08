@@ -404,15 +404,15 @@ impl ObjectStore for S3Client {
         match self.inner.head_bucket().bucket(bucket).send().await {
             Ok(_) => Ok(true),
             Err(e) => {
-                let err_str = e.to_string();
-                if err_str.contains("NotFound") || err_str.contains("NoSuchBucket") {
-                    return Ok(false);
-                }
-                // Check HTTP status code for 404 (Not Found)
+                // Check HTTP status code for 404 first to avoid unnecessary string formatting
                 // Some S3-compatible services may return 404 without standard error codes
                 if let aws_sdk_s3::error::SdkError::ServiceError(ref service_err) = e
                     && service_err.raw().status().as_u16() == 404
                 {
+                    return Ok(false);
+                }
+                let err_str = e.to_string();
+                if err_str.contains("NotFound") || err_str.contains("NoSuchBucket") {
                     return Ok(false);
                 }
                 Err(Error::Network(err_str))
