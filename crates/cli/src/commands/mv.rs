@@ -318,8 +318,8 @@ async fn move_s3_to_s3(
 
                 let src_obj = RemotePath::new(&src.alias, &src.bucket, &item.key);
                 let dst_obj = RemotePath::new(&dst.alias, &dst.bucket, &target_key);
-                let src_obj_display = format!("{}/{}/{}", src.alias, src.bucket, src_obj.key);
-                let dst_obj_display = format!("{}/{}/{}", dst.alias, dst.bucket, dst_obj.key);
+                let src_obj_display = src_obj.to_string();
+                let dst_obj_display = dst_obj.to_string();
 
                 match client.copy_object(&src_obj, &dst_obj).await {
                     Ok(_) => match client.delete_object(&src_obj).await {
@@ -355,7 +355,15 @@ async fn move_s3_to_s3(
             if !list_result.truncated {
                 break;
             }
-            continuation_token = list_result.continuation_token.clone();
+            continuation_token = match list_result.continuation_token.clone() {
+                Some(token) => Some(token),
+                None => {
+                    formatter.error(
+                        "Backend indicated truncated results but did not provide a continuation token; stopping to avoid an infinite loop.",
+                    );
+                    return ExitCode::GeneralError;
+                }
+            };
         }
 
         if formatter.is_json() {

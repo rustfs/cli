@@ -21,7 +21,7 @@ use tokio::io::AsyncReadExt;
 
 /// Keep single-part uploads small to avoid backend incompatibilities with
 /// streaming aws-chunked payloads.
-const SINGLE_PUT_OBJECT_MAX_SIZE: u64 = 64 * 1024 * 1024;
+const SINGLE_PUT_OBJECT_MAX_SIZE: u64 = crate::multipart::DEFAULT_PART_SIZE;
 
 /// Custom HTTP connector using reqwest, supporting insecure TLS (skip cert verification)
 /// and custom CA bundles. Used when `alias.insecure = true` or `alias.ca_bundle.is_some()`.
