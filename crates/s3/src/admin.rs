@@ -43,9 +43,16 @@ impl AdminClient {
             let pem = std::fs::read(bundle_path).map_err(|e| {
                 Error::Network(format!("Failed to read CA bundle '{bundle_path}': {e}"))
             })?;
-            let cert = reqwest::Certificate::from_pem(&pem)
+            let certs = reqwest::Certificate::from_pem_bundle(&pem)
                 .map_err(|e| Error::Network(format!("Invalid CA bundle '{bundle_path}': {e}")))?;
-            builder = builder.add_root_certificate(cert);
+            if certs.is_empty() {
+                return Err(Error::Network(format!(
+                    "Invalid CA bundle '{bundle_path}': no certificates found"
+                )));
+            }
+            for cert in certs {
+                builder = builder.add_root_certificate(cert);
+            }
         }
 
         let http_client = builder
@@ -798,9 +805,8 @@ mod tests {
         match result {
             Err(Error::Network(msg)) => {
                 assert!(
-                    msg.contains("Invalid CA bundle")
-                        || msg.contains("Failed to create HTTP client"),
-                    "Unexpected error message: {msg}"
+                    msg.contains("Invalid CA bundle") && msg.contains("bad-ca.pem"),
+                    "Unexpected error message for invalid PEM CA bundle: {msg}"
                 );
             }
             Ok(_) => panic!("Expected Error::Network for invalid PEM, got Ok(_)"),
