@@ -244,16 +244,32 @@ impl S3Client {
         file_size > SINGLE_PUT_OBJECT_MAX_SIZE
     }
 
+    async fn read_next_part(
+        file: &mut tokio::fs::File,
+        file_path: &std::path::Path,
+        buffer: &mut [u8],
+    ) -> Result<usize> {
+        let mut total_read = 0usize;
+        while total_read < buffer.len() {
+            let bytes_read = file
+                .read(&mut buffer[total_read..])
+                .await
+                .map_err(|e| Error::General(format!("read file '{}': {e}", file_path.display())))?;
+            if bytes_read == 0 {
+                break;
+            }
+            total_read += bytes_read;
+        }
+        Ok(total_read)
+    }
+
     async fn put_object_single_part_from_path(
         &self,
         path: &RemotePath,
         file_path: &std::path::Path,
         content_type: Option<&str>,
+        file_size: u64,
     ) -> Result<ObjectInfo> {
-        let metadata = tokio::fs::metadata(file_path).await.map_err(|e| {
-            Error::General(format!("read metadata for '{}': {e}", file_path.display()))
-        })?;
-        let size = metadata.len() as i64;
         let body = aws_sdk_s3::primitives::ByteStream::read_from()
             .path(file_path)
             .build()
@@ -276,7 +292,7 @@ impl S3Client {
             .await
             .map_err(|e| Error::Network(e.to_string()))?;
 
-        let mut info = ObjectInfo::file(&path.key, size);
+        let mut info = ObjectInfo::file(&path.key, file_size as i64);
         if let Some(etag) = response.e_tag() {
             info.etag = Some(etag.trim_matches('"').to_string());
         }
@@ -335,19 +351,15 @@ impl S3Client {
             .map_err(|e| Error::General(format!("open file '{}': {e}", file_path.display())))?;
         let mut completed_parts = Vec::new();
         let mut part_number: i32 = 1;
+        let mut chunk = vec![0u8; part_buffer_size];
 
         loop {
-            let mut chunk = vec![0u8; part_buffer_size];
-            let bytes_read = file
-                .read(&mut chunk)
-                .await
-                .map_err(|e| Error::General(format!("read file '{}': {e}", file_path.display())))?;
+            let bytes_read = Self::read_next_part(&mut file, file_path, &mut chunk).await?;
             if bytes_read == 0 {
                 break;
             }
-            chunk.truncate(bytes_read);
 
-            let body = aws_sdk_s3::primitives::ByteStream::from(chunk);
+            let body = aws_sdk_s3::primitives::ByteStream::from(chunk[..bytes_read].to_vec());
             let upload_part_result = self
                 .inner
                 .upload_part()
@@ -445,7 +457,7 @@ impl S3Client {
             self.put_object_multipart_from_path(path, file_path, content_type, file_size)
                 .await
         } else {
-            self.put_object_single_part_from_path(path, file_path, content_type)
+            self.put_object_single_part_from_path(path, file_path, content_type, file_size)
                 .await
         }
     }
@@ -1138,5 +1150,44 @@ mod tests {
             crate::multipart::DEFAULT_PART_SIZE + 1
         ));
         assert!(!S3Client::should_use_multipart(SINGLE_PUT_OBJECT_MAX_SIZE));
+    }
+
+    #[tokio::test]
+    async fn read_next_part_fills_buffer_until_eof() {
+        use tokio::io::AsyncWriteExt;
+
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let file_path = temp_dir.path().join("payload.bin");
+        let mut writer = tokio::fs::File::create(&file_path)
+            .await
+            .expect("create temp file");
+        writer
+            .write_all(b"abcdefghij")
+            .await
+            .expect("write temp file");
+        writer.flush().await.expect("flush temp file");
+        drop(writer);
+
+        let mut reader = tokio::fs::File::open(&file_path)
+            .await
+            .expect("open temp file");
+        let mut buffer = vec![0u8; 8];
+
+        let first = S3Client::read_next_part(&mut reader, &file_path, &mut buffer)
+            .await
+            .expect("first read");
+        assert_eq!(first, 8);
+        assert_eq!(&buffer[..first], b"abcdefgh");
+
+        let second = S3Client::read_next_part(&mut reader, &file_path, &mut buffer)
+            .await
+            .expect("second read");
+        assert_eq!(second, 2);
+        assert_eq!(&buffer[..second], b"ij");
+
+        let third = S3Client::read_next_part(&mut reader, &file_path, &mut buffer)
+            .await
+            .expect("third read");
+        assert_eq!(third, 0);
     }
 }

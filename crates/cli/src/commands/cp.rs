@@ -202,14 +202,6 @@ async fn upload_file(
         return ExitCode::Success;
     }
 
-    let size = match std::fs::metadata(src) {
-        Ok(metadata) => metadata.len() as i64,
-        Err(e) => {
-            formatter.error(&format!("Failed to read metadata for {src_display}: {e}"));
-            return ExitCode::GeneralError;
-        }
-    };
-
     // Determine content type
     let guessed_type: Option<String> = mime_guess::from_path(src)
         .first()
@@ -227,8 +219,8 @@ async fn upload_file(
                     status: "success",
                     source: src_display,
                     target: dst_display,
-                    size_bytes: Some(size),
-                    size_human: Some(humansize::format_size(size as u64, humansize::BINARY)),
+                    size_bytes: info.size_bytes,
+                    size_human: info.size_human.clone(),
                 };
                 formatter.json(&output);
             } else {
