@@ -258,9 +258,16 @@ async fn upload_file(
         let progress = ProgressBar::new(formatter.output_config(), file_size);
 
         match client
-            .multipart_upload_file(&target, src, content_type, &config, |bytes_sent| {
-                progress.set_position(bytes_sent);
-            })
+            .multipart_upload_file(
+                &target,
+                src,
+                content_type,
+                &config,
+                file_size,
+                |bytes_sent| {
+                    progress.set_position(bytes_sent);
+                },
+            )
             .await
         {
             Ok(info) => {

@@ -371,7 +371,7 @@ impl S3Client {
             .set_parts(Some(completed_parts))
             .build();
 
-        let complete_response = self
+        let complete_response = match self
             .inner
             .complete_multipart_upload()
             .bucket(&path.bucket)
@@ -380,27 +380,25 @@ impl S3Client {
             .multipart_upload(completed_upload)
             .send()
             .await
-            .map_err(|e| {
-                // Best-effort abort on completion failure
-                let client = self.inner.clone();
-                let bucket = path.bucket.clone();
-                let key = path.key.clone();
-                let uid = upload_id.clone();
-                tokio::spawn(async move {
-                    tracing::debug!(upload_id = %uid, "Attempting to abort multipart upload after completion failure");
-                    if let Err(abort_err) = client
-                        .abort_multipart_upload()
-                        .bucket(bucket)
-                        .key(key)
-                        .upload_id(uid)
-                        .send()
-                        .await
-                    {
-                        tracing::warn!("Failed to abort multipart upload: {abort_err}");
-                    }
-                });
-                Error::Network(Self::format_sdk_error(&e))
-            })?;
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                // Abort the multipart upload and await it to ensure the request is sent
+                tracing::debug!(upload_id = %upload_id, "Attempting to abort multipart upload after completion failure");
+                if let Err(abort_err) = self
+                    .inner
+                    .abort_multipart_upload()
+                    .bucket(&path.bucket)
+                    .key(&path.key)
+                    .upload_id(&upload_id)
+                    .send()
+                    .await
+                {
+                    tracing::warn!("Failed to abort multipart upload: {abort_err}");
+                }
+                return Err(Error::Network(Self::format_sdk_error(&e)));
+            }
+        };
 
         tracing::debug!("Multipart upload completed");
 
