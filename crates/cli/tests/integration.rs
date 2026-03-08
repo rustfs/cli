@@ -2833,4 +2833,135 @@ mod option_behavior_operations {
 
         cleanup_bucket(config_dir.path(), &bucket_name);
     }
+
+    #[test]
+    fn test_find_print_outputs_full_remote_path() {
+        let (config_dir, bucket_name) = match setup_with_alias("findprint") {
+            Some(v) => v,
+            None => {
+                eprintln!("Skipping: S3 test config not available");
+                return;
+            }
+        };
+
+        upload_text_object(
+            config_dir.path(),
+            &bucket_name,
+            "dir/sample.txt",
+            "print me",
+        );
+
+        let full_path = format!("test/{}/dir/sample.txt", bucket_name);
+        let output = run_rc(
+            &[
+                "find",
+                &format!("test/{}/", bucket_name),
+                "--name",
+                "*.txt",
+                "--print",
+                "--no-color",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            output.status.success(),
+            "find --print failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(&full_path),
+            "Expected full remote path in output when using --print, got: {}",
+            stdout
+        );
+
+        cleanup_bucket(config_dir.path(), &bucket_name);
+    }
+
+    #[test]
+    fn test_find_exec_runs_command_with_full_remote_path() {
+        let (config_dir, bucket_name) = match setup_with_alias("findexec") {
+            Some(v) => v,
+            None => {
+                eprintln!("Skipping: S3 test config not available");
+                return;
+            }
+        };
+
+        upload_text_object(config_dir.path(), &bucket_name, "exec-a.txt", "a");
+        upload_text_object(config_dir.path(), &bucket_name, "exec-b.txt", "b");
+
+        let path_a = format!("test/{}/exec-a.txt", bucket_name);
+        let path_b = format!("test/{}/exec-b.txt", bucket_name);
+        let output = run_rc(
+            &[
+                "find",
+                &format!("test/{}/", bucket_name),
+                "--name",
+                "*.txt",
+                "--exec",
+                "echo EXEC:{}",
+                "--no-color",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            output.status.success(),
+            "find --exec failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(&format!("EXEC:{}", path_a)),
+            "Expected command output for first match, got: {}",
+            stdout
+        );
+        assert!(
+            stdout.contains(&format!("EXEC:{}", path_b)),
+            "Expected command output for second match, got: {}",
+            stdout
+        );
+
+        cleanup_bucket(config_dir.path(), &bucket_name);
+    }
+
+    #[test]
+    fn test_find_exec_rejects_json_output() {
+        let (config_dir, bucket_name) = match setup_with_alias("findexecjson") {
+            Some(v) => v,
+            None => {
+                eprintln!("Skipping: S3 test config not available");
+                return;
+            }
+        };
+
+        upload_text_object(config_dir.path(), &bucket_name, "x.txt", "x");
+
+        let output = run_rc(
+            &[
+                "find",
+                &format!("test/{}/", bucket_name),
+                "--name",
+                "*.txt",
+                "--exec",
+                "echo EXEC:{}",
+                "--json",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            !output.status.success(),
+            "find --exec --json should fail with usage error"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("--exec cannot be used with --json output"),
+            "Unexpected error output: {}",
+            stderr
+        );
+
+        cleanup_bucket(config_dir.path(), &bucket_name);
+    }
 }

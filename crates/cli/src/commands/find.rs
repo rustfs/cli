@@ -6,6 +6,8 @@ use clap::Args;
 use rc_core::{AliasManager, ListOptions, ObjectStore as _, RemotePath};
 use rc_s3::S3Client;
 use serde::Serialize;
+use std::io::Write as _;
+use std::process::Command;
 
 use crate::exit_code::ExitCode;
 use crate::output::{Formatter, OutputConfig};
@@ -130,6 +132,58 @@ pub async fn execute(args: FindArgs, output_config: OutputConfig) -> ExitCode {
         }
     };
 
+    // Execute command for each match if requested.
+    // This mode is human-output only because command output cannot be embedded in JSON.
+    if let Some(exec_template) = args.exec.as_deref() {
+        if formatter.is_json() {
+            formatter.error("--exec cannot be used with --json output");
+            return ExitCode::UsageError;
+        }
+
+        for m in &matches {
+            let object_path = full_object_path(&alias_name, &bucket, &m.key);
+            let command_text = exec_template.replace("{}", &object_path);
+            let output = match run_shell_command(&command_text) {
+                Ok(output) => output,
+                Err(e) => {
+                    formatter.error(&format!("Failed to run command for {}: {}", object_path, e));
+                    return ExitCode::GeneralError;
+                }
+            };
+
+            if std::io::stdout().write_all(&output.stdout).is_err() {
+                formatter.error("Failed to write command stdout");
+                return ExitCode::GeneralError;
+            }
+            if std::io::stderr().write_all(&output.stderr).is_err() {
+                formatter.error("Failed to write command stderr");
+                return ExitCode::GeneralError;
+            }
+
+            if !output.status.success() {
+                formatter.error(&format!(
+                    "Command failed for {}: {}",
+                    object_path, command_text
+                ));
+                return ExitCode::GeneralError;
+            }
+        }
+    }
+
+    let display_matches: Vec<MatchInfo> = matches
+        .iter()
+        .map(|m| MatchInfo {
+            key: if args.print {
+                full_object_path(&alias_name, &bucket, &m.key)
+            } else {
+                m.key.clone()
+            },
+            size_bytes: m.size_bytes,
+            size_human: m.size_human.clone(),
+            last_modified: m.last_modified.clone(),
+        })
+        .collect();
+
     // Calculate totals
     let total_count = matches.len();
     let total_size: i64 = matches.iter().filter_map(|m| m.size_bytes).sum();
@@ -153,16 +207,16 @@ pub async fn execute(args: FindArgs, output_config: OutputConfig) -> ExitCode {
         }
     } else if formatter.is_json() {
         let output = FindOutput {
-            matches,
+            matches: display_matches,
             total_count,
             total_size_bytes: total_size,
             total_size_human: humansize::format_size(total_size as u64, humansize::BINARY),
         };
         formatter.json(&output);
-    } else if matches.is_empty() {
+    } else if display_matches.is_empty() {
         formatter.println("No matches found.");
     } else {
-        for m in &matches {
+        for m in &display_matches {
             let size = m.size_human.as_deref().unwrap_or("0B");
             let styled_size = formatter.style_size(&format!("{:>10}", size));
             let styled_key = formatter.style_file(&m.key);
@@ -177,6 +231,21 @@ pub async fn execute(args: FindArgs, output_config: OutputConfig) -> ExitCode {
     }
 
     ExitCode::Success
+}
+
+fn full_object_path(alias: &str, bucket: &str, key: &str) -> String {
+    format!("{alias}/{bucket}/{key}")
+}
+
+fn run_shell_command(command: &str) -> std::io::Result<std::process::Output> {
+    #[cfg(target_family = "windows")]
+    {
+        Command::new("cmd").args(["/C", command]).output()
+    }
+    #[cfg(not(target_family = "windows"))]
+    {
+        Command::new("sh").args(["-c", command]).output()
+    }
 }
 
 /// Filters for find command
@@ -430,5 +499,13 @@ mod tests {
     fn test_parse_find_path_errors() {
         assert!(parse_find_path("").is_err());
         assert!(parse_find_path("myalias").is_err());
+    }
+
+    #[test]
+    fn test_full_object_path() {
+        assert_eq!(
+            full_object_path("test", "bucket", "a/b.txt"),
+            "test/bucket/a/b.txt"
+        );
     }
 }

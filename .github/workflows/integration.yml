@@ -76,6 +76,7 @@ jobs:
             "quota_operations::test_bucket_quota_set_info_clear"
             "option_behavior_operations::test_cp_dry_run_does_not_create_target_object"
             "option_behavior_operations::test_head_bytes_returns_prefix_bytes"
+            "option_behavior_operations::test_find_print_outputs_full_remote_path"
           )
 
           for test_name in "${TESTS[@]}"; do
