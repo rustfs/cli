@@ -350,7 +350,12 @@ pub struct BucketQuota {
     pub size: u64,
 
     /// Quota type (currently only HARD)
+    #[serde(default = "default_quota_type")]
     pub quota_type: String,
+}
+
+fn default_quota_type() -> String {
+    "HARD".to_string()
 }
 
 #[cfg(test)]

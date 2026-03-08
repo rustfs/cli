@@ -3,7 +3,7 @@
 //! Moves objects between locations (copy + delete).
 
 use clap::Args;
-use rc_core::{AliasManager, ObjectStore as _, ParsedPath, RemotePath, parse_path};
+use rc_core::{AliasManager, ListOptions, ObjectStore as _, ParsedPath, RemotePath, parse_path};
 use rc_s3::S3Client;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -273,39 +273,160 @@ async fn move_s3_to_s3(
         return ExitCode::Success;
     }
 
-    // Copy
-    match client.copy_object(src, dst).await {
-        Ok(info) => {
-            // Delete source
-            if let Err(e) = client.delete_object(src).await {
-                formatter.error(&format!("Copied but failed to delete source: {e}"));
-                return ExitCode::GeneralError;
+    // Recursive move for prefix/directory semantics.
+    if args.recursive {
+        let mut continuation_token: Option<String> = None;
+        let mut moved_count = 0usize;
+        let mut error_count = 0usize;
+        let src_prefix = src.key.clone();
+
+        loop {
+            let list_opts = ListOptions {
+                recursive: true,
+                continuation_token: continuation_token.clone(),
+                ..Default::default()
+            };
+
+            let list_result = match client.list_objects(src, list_opts).await {
+                Ok(result) => result,
+                Err(e) => {
+                    formatter.error(&format!("Failed to list source objects: {e}"));
+                    return ExitCode::NetworkError;
+                }
+            };
+
+            for item in &list_result.items {
+                if item.is_dir {
+                    continue;
+                }
+
+                let relative = if src_prefix.is_empty() {
+                    item.key.clone()
+                } else if let Some(rest) = item.key.strip_prefix(&src_prefix) {
+                    rest.trim_start_matches('/').to_string()
+                } else {
+                    item.key.clone()
+                };
+
+                let target_key = if dst.key.is_empty() {
+                    relative.clone()
+                } else if dst.key.ends_with('/') {
+                    format!("{}{}", dst.key, relative)
+                } else {
+                    format!("{}/{}", dst.key, relative)
+                };
+
+                let src_obj = RemotePath::new(&src.alias, &src.bucket, &item.key);
+                let dst_obj = RemotePath::new(&dst.alias, &dst.bucket, &target_key);
+                let src_obj_display = format!("{}/{}/{}", src.alias, src.bucket, src_obj.key);
+                let dst_obj_display = format!("{}/{}/{}", dst.alias, dst.bucket, dst_obj.key);
+
+                match client.copy_object(&src_obj, &dst_obj).await {
+                    Ok(_) => match client.delete_object(&src_obj).await {
+                        Ok(()) => {
+                            moved_count += 1;
+                            if !formatter.is_json() {
+                                formatter
+                                    .println(&format!("{src_obj_display} -> {dst_obj_display}"));
+                            }
+                        }
+                        Err(e) => {
+                            error_count += 1;
+                            formatter.error(&format!(
+                                "Copied but failed to delete source '{src_obj_display}': {e}"
+                            ));
+                            if !args.continue_on_error {
+                                return ExitCode::GeneralError;
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        error_count += 1;
+                        formatter.error(&format!(
+                            "Failed to move '{src_obj_display}' -> '{dst_obj_display}': {e}"
+                        ));
+                        if !args.continue_on_error {
+                            return ExitCode::NetworkError;
+                        }
+                    }
+                }
             }
 
-            if formatter.is_json() {
-                let output = MvOutput {
-                    status: "success",
-                    source: src_display,
-                    target: dst_display,
-                    size_bytes: info.size_bytes,
-                };
-                formatter.json(&output);
-            } else {
-                formatter.println(&format!(
-                    "{src_display} -> {dst_display} ({})",
-                    info.size_human.unwrap_or_default()
-                ));
+            if !list_result.truncated {
+                break;
             }
-            ExitCode::Success
+            continuation_token = list_result.continuation_token.clone();
         }
-        Err(e) => {
-            let err_str = e.to_string();
-            if err_str.contains("NotFound") || err_str.contains("NoSuchKey") {
-                formatter.error(&format!("Source not found: {src_display}"));
-                ExitCode::NotFound
-            } else {
-                formatter.error(&format!("Failed to move: {e}"));
-                ExitCode::NetworkError
+
+        if formatter.is_json() {
+            #[derive(Serialize)]
+            struct MvRecursiveOutput {
+                status: &'static str,
+                source: String,
+                target: String,
+                moved: usize,
+                errors: usize,
+            }
+
+            formatter.json(&MvRecursiveOutput {
+                status: if error_count == 0 {
+                    "success"
+                } else {
+                    "partial"
+                },
+                source: src_display,
+                target: dst_display,
+                moved: moved_count,
+                errors: error_count,
+            });
+        } else if error_count == 0 {
+            formatter.println(&format!("Moved {moved_count} object(s)."));
+        } else {
+            formatter.println(&format!(
+                "Moved {moved_count} object(s), {error_count} failed."
+            ));
+        }
+
+        if error_count == 0 {
+            ExitCode::Success
+        } else {
+            ExitCode::GeneralError
+        }
+    } else {
+        // Copy
+        match client.copy_object(src, dst).await {
+            Ok(info) => {
+                // Delete source
+                if let Err(e) = client.delete_object(src).await {
+                    formatter.error(&format!("Copied but failed to delete source: {e}"));
+                    return ExitCode::GeneralError;
+                }
+
+                if formatter.is_json() {
+                    let output = MvOutput {
+                        status: "success",
+                        source: src_display,
+                        target: dst_display,
+                        size_bytes: info.size_bytes,
+                    };
+                    formatter.json(&output);
+                } else {
+                    formatter.println(&format!(
+                        "{src_display} -> {dst_display} ({})",
+                        info.size_human.unwrap_or_default()
+                    ));
+                }
+                ExitCode::Success
+            }
+            Err(e) => {
+                let err_str = e.to_string();
+                if err_str.contains("NotFound") || err_str.contains("NoSuchKey") {
+                    formatter.error(&format!("Source not found: {src_display}"));
+                    ExitCode::NotFound
+                } else {
+                    formatter.error(&format!("Failed to move: {e}"));
+                    ExitCode::NetworkError
+                }
             }
         }
     }
