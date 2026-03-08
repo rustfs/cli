@@ -17,6 +17,18 @@ env:
   TEST_S3_SECRET_KEY: secretkey
 
 jobs:
+  cli-contract:
+    name: CLI Contract (Commands and Options)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run CLI help contract tests
+        run: cargo test --package rustfs-cli --test help_contract
+
   smoke-latest:
     name: Smoke (RustFS latest)
     runs-on: ubuntu-latest
