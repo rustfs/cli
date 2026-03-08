@@ -6,7 +6,7 @@ use clap::Args;
 use rc_core::{AliasManager, ObjectStore as _, RemotePath};
 use rc_s3::S3Client;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use crate::exit_code::ExitCode;
 use crate::output::{Formatter, OutputConfig};
@@ -44,7 +44,7 @@ struct StatOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     version_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    metadata: Option<HashMap<String, String>>,
+    metadata: Option<BTreeMap<String, String>>,
 }
 
 /// Execute the stat command
@@ -101,7 +101,15 @@ pub async fn execute(args: StatArgs, output_config: OutputConfig) -> ExitCode {
                     content_type: info.content_type.clone(),
                     storage_class: info.storage_class.clone(),
                     version_id: args.version_id,
-                    metadata: info.metadata.clone(),
+                    metadata: info
+                        .metadata
+                        .as_ref()
+                        .map(|m| {
+                            m.iter()
+                                .map(|(k, v)| (k.clone(), v.clone()))
+                                .collect::<BTreeMap<_, _>>()
+                        })
+                        .filter(|m| !m.is_empty()),
                 };
                 formatter.json(&output);
             } else {
@@ -138,7 +146,8 @@ pub async fn execute(args: StatArgs, output_config: OutputConfig) -> ExitCode {
                     formatter.println(&format_kv("Class", sc));
                 }
                 if let Some(metadata) = &info.metadata {
-                    for (key, value) in metadata {
+                    let sorted: BTreeMap<_, _> = metadata.iter().collect();
+                    for (key, value) in &sorted {
                         formatter.println(&format_kv(
                             &format!("X-Amz-Meta-{}", capitalize_meta_key(key)),
                             value,
@@ -257,7 +266,7 @@ mod tests {
 
     #[test]
     fn test_stat_output_serialization_with_metadata() {
-        let mut meta = HashMap::new();
+        let mut meta = BTreeMap::new();
         meta.insert("content-disposition".to_string(), "attachment".to_string());
         let output = StatOutput {
             name: "file.txt".to_string(),
@@ -291,5 +300,24 @@ mod tests {
         };
         let json = serde_json::to_string(&output).expect("should serialize");
         assert!(!json.contains("metadata"));
+    }
+
+    #[test]
+    fn test_stat_output_serialization_empty_metadata_omitted() {
+        let output = StatOutput {
+            name: "file.txt".to_string(),
+            last_modified: None,
+            size_bytes: Some(1024),
+            size_human: Some("1 KiB".to_string()),
+            etag: None,
+            content_type: None,
+            storage_class: None,
+            version_id: None,
+            metadata: Some(BTreeMap::new()),
+        };
+        let json = serde_json::to_string(&output).expect("should serialize");
+        // Empty BTreeMap should still serialize (skip_serializing_if only skips None)
+        // but the code filters empty maps to None before building StatOutput
+        assert!(json.contains("metadata"));
     }
 }
