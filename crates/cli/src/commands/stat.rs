@@ -6,6 +6,7 @@ use clap::Args;
 use rc_core::{AliasManager, ObjectStore as _, RemotePath};
 use rc_s3::S3Client;
 use serde::Serialize;
+use std::collections::BTreeMap;
 
 use crate::exit_code::ExitCode;
 use crate::output::{Formatter, OutputConfig};
@@ -42,6 +43,16 @@ struct StatOutput {
     storage_class: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     version_id: Option<String>,
+    #[serde(skip_serializing_if = "metadata_is_none_or_empty")]
+    metadata: Option<BTreeMap<String, String>>,
+}
+
+/// Returns true if metadata is None or contains an empty map.
+fn metadata_is_none_or_empty(metadata: &Option<BTreeMap<String, String>>) -> bool {
+    match metadata {
+        None => true,
+        Some(m) => m.is_empty(),
+    }
 }
 
 /// Execute the stat command
@@ -98,6 +109,15 @@ pub async fn execute(args: StatArgs, output_config: OutputConfig) -> ExitCode {
                     content_type: info.content_type.clone(),
                     storage_class: info.storage_class.clone(),
                     version_id: args.version_id,
+                    metadata: info
+                        .metadata
+                        .as_ref()
+                        .map(|m| {
+                            m.iter()
+                                .map(|(k, v)| (k.clone(), v.clone()))
+                                .collect::<BTreeMap<_, _>>()
+                        })
+                        .filter(|m| !m.is_empty()),
                 };
                 formatter.json(&output);
             } else {
@@ -132,6 +152,15 @@ pub async fn execute(args: StatArgs, output_config: OutputConfig) -> ExitCode {
                 }
                 if let Some(sc) = &info.storage_class {
                     formatter.println(&format_kv("Class", sc));
+                }
+                if let Some(metadata) = &info.metadata {
+                    let sorted: BTreeMap<_, _> = metadata.iter().collect();
+                    for (key, value) in &sorted {
+                        formatter.println(&format_kv(
+                            &format!("X-Amz-Meta-{}", capitalize_meta_key(key)),
+                            value,
+                        ));
+                    }
                 }
             }
             ExitCode::Success
@@ -181,6 +210,20 @@ fn parse_stat_path(path: &str) -> Result<(String, String, String), String> {
     Ok((alias, bucket, key))
 }
 
+/// Capitalize the first letter of each hyphen-separated segment
+fn capitalize_meta_key(s: &str) -> String {
+    s.split('-')
+        .map(|segment| {
+            let mut chars = segment.chars();
+            match chars.next() {
+                None => String::new(),
+                Some(c) => c.to_uppercase().to_string() + chars.as_str(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,5 +257,74 @@ mod tests {
     #[test]
     fn test_parse_stat_path_empty() {
         assert!(parse_stat_path("").is_err());
+    }
+
+    #[test]
+    fn test_capitalize_meta_key() {
+        assert_eq!(capitalize_meta_key("content-type"), "Content-Type");
+        assert_eq!(
+            capitalize_meta_key("content-disposition"),
+            "Content-Disposition"
+        );
+        assert_eq!(capitalize_meta_key("a"), "A");
+        assert_eq!(capitalize_meta_key(""), "");
+        assert_eq!(capitalize_meta_key("already"), "Already");
+        assert_eq!(capitalize_meta_key("x-custom-key"), "X-Custom-Key");
+    }
+
+    #[test]
+    fn test_stat_output_serialization_with_metadata() {
+        let mut meta = BTreeMap::new();
+        meta.insert("content-disposition".to_string(), "attachment".to_string());
+        let output = StatOutput {
+            name: "file.txt".to_string(),
+            last_modified: None,
+            size_bytes: Some(1024),
+            size_human: Some("1 KiB".to_string()),
+            etag: None,
+            content_type: None,
+            storage_class: None,
+            version_id: None,
+            metadata: Some(meta),
+        };
+        let json = serde_json::to_string(&output).expect("should serialize");
+        assert!(json.contains("\"metadata\""));
+        assert!(json.contains("content-disposition"));
+        assert!(json.contains("attachment"));
+    }
+
+    #[test]
+    fn test_stat_output_serialization_without_metadata() {
+        let output = StatOutput {
+            name: "file.txt".to_string(),
+            last_modified: None,
+            size_bytes: Some(1024),
+            size_human: Some("1 KiB".to_string()),
+            etag: None,
+            content_type: None,
+            storage_class: None,
+            version_id: None,
+            metadata: None,
+        };
+        let json = serde_json::to_string(&output).expect("should serialize");
+        assert!(!json.contains("metadata"));
+    }
+
+    #[test]
+    fn test_stat_output_serialization_empty_metadata_omitted() {
+        let output = StatOutput {
+            name: "file.txt".to_string(),
+            last_modified: None,
+            size_bytes: Some(1024),
+            size_human: Some("1 KiB".to_string()),
+            etag: None,
+            content_type: None,
+            storage_class: None,
+            version_id: None,
+            metadata: Some(BTreeMap::new()),
+        };
+        let json = serde_json::to_string(&output).expect("should serialize");
+        // Empty BTreeMap is treated as None via skip_serializing_if helper
+        assert!(!json.contains("metadata"));
     }
 }

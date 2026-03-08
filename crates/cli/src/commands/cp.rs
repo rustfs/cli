@@ -4,7 +4,7 @@
 
 use clap::Args;
 use rc_core::{AliasManager, ObjectStore as _, ParsedPath, RemotePath, parse_path};
-use rc_s3::{MultipartConfig, S3Client};
+use rc_s3::S3Client;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
@@ -183,15 +183,14 @@ fn print_upload_success(
     info: &rc_core::ObjectInfo,
     src_display: &str,
     dst_display: &str,
-    size: i64,
 ) {
     if formatter.is_json() {
         let output = CpOutput {
             status: "success",
             source: src_display.to_string(),
             target: dst_display.to_string(),
-            size_bytes: Some(size),
-            size_human: Some(humansize::format_size(size as u64, humansize::BINARY)),
+            size_bytes: info.size_bytes,
+            size_human: info.size_human.clone(),
         };
         formatter.json(&output);
     } else {
@@ -229,7 +228,13 @@ async fn upload_file(
         return ExitCode::Success;
     }
 
-    // Get file size
+    // Determine content type
+    let guessed_type: Option<String> = mime_guess::from_path(src)
+        .first()
+        .map(|m| m.essence_str().to_string());
+    let content_type = args.content_type.as_deref().or(guessed_type.as_deref());
+
+    // Get file size for progress bar decision
     let file_size = match std::fs::metadata(src) {
         Ok(m) => m.len(),
         Err(e) => {
@@ -238,70 +243,41 @@ async fn upload_file(
         }
     };
 
-    // Determine content type
-    let guessed_type: Option<String> = mime_guess::from_path(src)
-        .first()
-        .map(|m| m.essence_str().to_string());
-    let content_type = args.content_type.as_deref().or(guessed_type.as_deref());
-
-    let size = file_size as i64;
-
-    if file_size >= MULTIPART_THRESHOLD {
-        // Use multipart upload for large files
+    // Show progress bar for large files
+    let progress = if file_size >= MULTIPART_THRESHOLD {
         tracing::debug!(
             file_size,
             threshold = MULTIPART_THRESHOLD,
             "Using multipart upload for large file"
         );
-
-        let config = MultipartConfig::default();
-        let progress = ProgressBar::new(formatter.output_config(), file_size);
-
-        match client
-            .multipart_upload_file(
-                &target,
-                src,
-                content_type,
-                &config,
-                file_size,
-                |bytes_sent| {
-                    progress.set_position(bytes_sent);
-                },
-            )
-            .await
-        {
-            Ok(info) => {
-                progress.finish_and_clear();
-                print_upload_success(formatter, &info, &src_display, &dst_display, size);
-                ExitCode::Success
-            }
-            Err(e) => {
-                progress.finish_and_clear();
-                formatter.error(&format!("Failed to upload {src_display}: {e}"));
-                ExitCode::NetworkError
-            }
-        }
+        Some(ProgressBar::new(formatter.output_config(), file_size))
     } else {
-        // Use single put_object for small files
         tracing::debug!(file_size, "Using single put_object for small file");
+        None
+    };
 
-        let data = match std::fs::read(src) {
-            Ok(d) => d,
-            Err(e) => {
-                formatter.error(&format!("Failed to read {src_display}: {e}"));
-                return ExitCode::GeneralError;
+    // Upload
+    match client
+        .put_object_from_path(&target, src, content_type, |bytes_sent| {
+            if let Some(ref pb) = progress {
+                pb.set_position(bytes_sent);
             }
-        };
-
-        match client.put_object(&target, data, content_type).await {
-            Ok(info) => {
-                print_upload_success(formatter, &info, &src_display, &dst_display, size);
-                ExitCode::Success
+        })
+        .await
+    {
+        Ok(info) => {
+            if let Some(ref pb) = progress {
+                pb.finish_and_clear();
             }
-            Err(e) => {
-                formatter.error(&format!("Failed to upload {src_display}: {e}"));
-                ExitCode::NetworkError
+            print_upload_success(formatter, &info, &src_display, &dst_display);
+            ExitCode::Success
+        }
+        Err(e) => {
+            if let Some(ref pb) = progress {
+                pb.finish_and_clear();
             }
+            formatter.error(&format!("Failed to upload {src_display}: {e}"));
+            ExitCode::NetworkError
         }
     }
 }

@@ -3,6 +3,8 @@
 //! This trait defines the interface for S3-compatible storage operations.
 //! It allows the CLI to be decoupled from the specific S3 SDK implementation.
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
@@ -68,6 +70,10 @@ pub struct ObjectInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_type: Option<String>,
 
+    /// User-defined metadata
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<HashMap<String, String>>,
+
     /// Whether this is a directory/prefix
     pub is_dir: bool,
 }
@@ -83,6 +89,7 @@ impl ObjectInfo {
             etag: None,
             storage_class: None,
             content_type: None,
+            metadata: None,
             is_dir: false,
         }
     }
@@ -97,6 +104,7 @@ impl ObjectInfo {
             etag: None,
             storage_class: None,
             content_type: None,
+            metadata: None,
             is_dir: true,
         }
     }
@@ -111,6 +119,7 @@ impl ObjectInfo {
             etag: None,
             storage_class: None,
             content_type: None,
+            metadata: None,
             is_dir: true,
         }
     }
@@ -302,5 +311,25 @@ mod tests {
         let info = ObjectInfo::bucket("my-bucket");
         assert_eq!(info.key, "my-bucket");
         assert!(info.is_dir);
+    }
+
+    #[test]
+    fn test_object_info_metadata_default_none() {
+        let info = ObjectInfo::file("test.txt", 1024);
+        assert!(info.metadata.is_none());
+    }
+
+    #[test]
+    fn test_object_info_metadata_set() {
+        let mut info = ObjectInfo::file("test.txt", 1024);
+        let mut meta = HashMap::new();
+        meta.insert("content-disposition".to_string(), "attachment".to_string());
+        meta.insert("custom-key".to_string(), "custom-value".to_string());
+        info.metadata = Some(meta);
+
+        let metadata = info.metadata.as_ref().expect("metadata should be Some");
+        assert_eq!(metadata.len(), 2);
+        assert_eq!(metadata.get("content-disposition").unwrap(), "attachment");
+        assert_eq!(metadata.get("custom-key").unwrap(), "custom-value");
     }
 }
