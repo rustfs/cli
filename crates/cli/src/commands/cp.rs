@@ -175,7 +175,7 @@ async fn copy_local_to_s3(
     }
 }
 
-/// Multipart upload threshold: files larger than this use multipart upload (64 MiB)
+/// Multipart upload threshold: files at least this size use multipart upload (64 MiB)
 const MULTIPART_THRESHOLD: u64 = 64 * 1024 * 1024;
 
 async fn upload_file(
