@@ -248,15 +248,10 @@ impl S3Client {
         file_path: &std::path::Path,
         content_type: Option<&str>,
         config: &crate::multipart::MultipartConfig,
+        file_size: u64,
         on_progress: impl Fn(u64) + Send,
     ) -> Result<ObjectInfo> {
         use tokio::io::AsyncReadExt;
-
-        let file_size = tokio::fs::metadata(file_path)
-            .await
-            .map_err(Error::Io)?
-            .len();
-
         let part_size = config.calculate_part_size(file_size);
         let total_parts = crate::multipart::calculate_parts(file_size, part_size);
 
