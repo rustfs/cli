@@ -43,8 +43,16 @@ struct StatOutput {
     storage_class: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     version_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "metadata_is_none_or_empty")]
     metadata: Option<BTreeMap<String, String>>,
+}
+
+/// Returns true if metadata is None or contains an empty map.
+fn metadata_is_none_or_empty(metadata: &Option<BTreeMap<String, String>>) -> bool {
+    match metadata {
+        None => true,
+        Some(m) => m.is_empty(),
+    }
 }
 
 /// Execute the stat command
@@ -316,8 +324,7 @@ mod tests {
             metadata: Some(BTreeMap::new()),
         };
         let json = serde_json::to_string(&output).expect("should serialize");
-        // Empty BTreeMap should still serialize (skip_serializing_if only skips None)
-        // but the code filters empty maps to None before building StatOutput
-        assert!(json.contains("metadata"));
+        // Empty BTreeMap is treated as None via skip_serializing_if helper
+        assert!(!json.contains("metadata"));
     }
 }
