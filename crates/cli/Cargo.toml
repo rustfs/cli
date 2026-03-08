@@ -49,6 +49,7 @@ jiff.workspace = true
 humansize.workspace = true
 mime_guess.workspace = true
 glob.workspace = true
+shlex.workspace = true
 
 [features]
 default = []
@@ -60,4 +61,3 @@ golden = []
 [dev-dependencies]
 tempfile.workspace = true
 insta.workspace = true
-

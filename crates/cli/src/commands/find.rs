@@ -7,7 +7,7 @@ use rc_core::{AliasManager, ListOptions, ObjectStore as _, RemotePath};
 use rc_s3::S3Client;
 use serde::Serialize;
 use std::io::Write as _;
-use std::process::Command;
+use std::process::{Command, Output};
 
 use crate::exit_code::ExitCode;
 use crate::output::{Formatter, OutputConfig};
@@ -140,13 +140,25 @@ pub async fn execute(args: FindArgs, output_config: OutputConfig) -> ExitCode {
             return ExitCode::UsageError;
         }
 
+        let exec_argv_template = match parse_exec_template(exec_template) {
+            Ok(template) => template,
+            Err(e) => {
+                formatter.error(&e);
+                return ExitCode::UsageError;
+            }
+        };
+
         for m in &matches {
             let object_path = full_object_path(&alias_name, &bucket, &m.key);
-            let command_text = exec_template.replace("{}", &object_path);
-            let output = match run_shell_command(&command_text) {
+            let (program, exec_args, command_text) =
+                render_exec_command(&exec_argv_template, &object_path);
+            let output = match run_exec_command(&program, &exec_args) {
                 Ok(output) => output,
                 Err(e) => {
-                    formatter.error(&format!("Failed to run command for {}: {}", object_path, e));
+                    formatter.error(&format!(
+                        "Failed to run command for {}: {} ({})",
+                        object_path, command_text, e
+                    ));
                     return ExitCode::GeneralError;
                 }
             };
@@ -162,31 +174,24 @@ pub async fn execute(args: FindArgs, output_config: OutputConfig) -> ExitCode {
 
             if !output.status.success() {
                 formatter.error(&format!(
-                    "Command failed for {}: {}",
-                    object_path, command_text
+                    "Command failed for {} (status {}): {}",
+                    object_path, output.status, command_text
                 ));
                 return ExitCode::GeneralError;
             }
         }
     }
 
-    let display_matches: Vec<MatchInfo> = matches
-        .iter()
-        .map(|m| MatchInfo {
-            key: if args.print {
-                full_object_path(&alias_name, &bucket, &m.key)
-            } else {
-                m.key.clone()
-            },
-            size_bytes: m.size_bytes,
-            size_human: m.size_human.clone(),
-            last_modified: m.last_modified.clone(),
-        })
-        .collect();
+    let mut display_matches = matches;
+    if args.print {
+        for m in &mut display_matches {
+            m.key = full_object_path(&alias_name, &bucket, &m.key);
+        }
+    }
 
     // Calculate totals
-    let total_count = matches.len();
-    let total_size: i64 = matches.iter().filter_map(|m| m.size_bytes).sum();
+    let total_count = display_matches.len();
+    let total_size: i64 = display_matches.iter().filter_map(|m| m.size_bytes).sum();
 
     if args.count {
         // Only print count
@@ -234,18 +239,35 @@ pub async fn execute(args: FindArgs, output_config: OutputConfig) -> ExitCode {
 }
 
 fn full_object_path(alias: &str, bucket: &str, key: &str) -> String {
-    format!("{alias}/{bucket}/{key}")
+    RemotePath::new(alias, bucket, key).to_full_path()
 }
 
-fn run_shell_command(command: &str) -> std::io::Result<std::process::Output> {
-    #[cfg(target_family = "windows")]
-    {
-        Command::new("cmd").args(["/C", command]).output()
+fn parse_exec_template(exec_template: &str) -> Result<Vec<String>, String> {
+    let args = shlex::split(exec_template)
+        .ok_or_else(|| "Invalid --exec template: unbalanced quotes".to_string())?;
+    if args.is_empty() {
+        return Err("Invalid --exec template: command cannot be empty".to_string());
     }
-    #[cfg(not(target_family = "windows"))]
-    {
-        Command::new("sh").args(["-c", command]).output()
-    }
+
+    Ok(args)
+}
+
+fn render_exec_command(
+    argv_template: &[String],
+    object_path: &str,
+) -> (String, Vec<String>, String) {
+    let rendered: Vec<String> = argv_template
+        .iter()
+        .map(|arg| arg.replace("{}", object_path))
+        .collect();
+    let program = rendered[0].clone();
+    let args = rendered[1..].to_vec();
+    let command_text = rendered.join(" ");
+    (program, args, command_text)
+}
+
+fn run_exec_command(program: &str, args: &[String]) -> std::io::Result<Output> {
+    Command::new(program).args(args).output()
 }
 
 /// Filters for find command
@@ -506,6 +528,47 @@ mod tests {
         assert_eq!(
             full_object_path("test", "bucket", "a/b.txt"),
             "test/bucket/a/b.txt"
+        );
+        assert_eq!(full_object_path("test", "bucket", ""), "test/bucket");
+    }
+
+    #[test]
+    fn test_parse_exec_template() {
+        assert_eq!(
+            parse_exec_template("echo EXEC:{}").unwrap(),
+            vec!["echo".to_string(), "EXEC:{}".to_string()]
+        );
+        assert_eq!(
+            parse_exec_template(r#"printf '%s\n' "{}""#).unwrap(),
+            vec!["printf".to_string(), "%s\\n".to_string(), "{}".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_parse_exec_template_errors() {
+        assert!(parse_exec_template("").is_err());
+        assert!(parse_exec_template("'unterminated").is_err());
+    }
+
+    #[test]
+    fn test_render_exec_command() {
+        let template = vec![
+            "echo".to_string(),
+            "prefix:{}".to_string(),
+            "{}".to_string(),
+        ];
+        let (program, args, text) = render_exec_command(&template, "test/bucket/a.txt");
+        assert_eq!(program, "echo");
+        assert_eq!(
+            args,
+            vec![
+                "prefix:test/bucket/a.txt".to_string(),
+                "test/bucket/a.txt".to_string()
+            ]
+        );
+        assert_eq!(
+            text,
+            "echo prefix:test/bucket/a.txt test/bucket/a.txt".to_string()
         );
     }
 }

@@ -2327,6 +2327,7 @@ dependencies = [
  "rc-s3",
  "serde",
  "serde_json",
+ "shlex",
  "tempfile",
  "thiserror",
  "tokio",
