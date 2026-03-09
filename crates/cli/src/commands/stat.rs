@@ -3,7 +3,7 @@
 //! Displays detailed metadata information about an object.
 
 use clap::Args;
-use rc_core::{AliasManager, ObjectStore as _, RemotePath};
+use rc_core::{AliasManager, ObjectInfo, ObjectStore as _, RemotePath};
 use rc_s3::S3Client;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -53,6 +53,28 @@ fn metadata_is_none_or_empty(metadata: &Option<BTreeMap<String, String>>) -> boo
         None => true,
         Some(m) => m.is_empty(),
     }
+}
+
+/// Build display metadata fields for human-readable output.
+///
+/// Includes Content-Type and all user-defined metadata.
+fn build_display_metadata(info: &ObjectInfo) -> BTreeMap<String, String> {
+    let mut display_metadata = BTreeMap::new();
+
+    if let Some(content_type) = &info.content_type {
+        display_metadata.insert("Content-Type".to_string(), content_type.clone());
+    }
+
+    if let Some(metadata) = &info.metadata {
+        for (key, value) in metadata {
+            display_metadata.insert(
+                format!("X-Amz-Meta-{}", capitalize_meta_key(key)),
+                value.clone(),
+            );
+        }
+    }
+
+    display_metadata
 }
 
 /// Execute the stat command
@@ -147,19 +169,15 @@ pub async fn execute(args: StatArgs, output_config: OutputConfig) -> ExitCode {
                 if let Some(etag) = &info.etag {
                     formatter.println(&format_kv("ETag", etag));
                 }
-                if let Some(ct) = &info.content_type {
-                    formatter.println(&format_kv("Type", ct));
-                }
+                formatter.println(&format_kv("Type", "file"));
                 if let Some(sc) = &info.storage_class {
                     formatter.println(&format_kv("Class", sc));
                 }
-                if let Some(metadata) = &info.metadata {
-                    let sorted: BTreeMap<_, _> = metadata.iter().collect();
-                    for (key, value) in &sorted {
-                        formatter.println(&format_kv(
-                            &format!("X-Amz-Meta-{}", capitalize_meta_key(key)),
-                            value,
-                        ));
+                let display_metadata = build_display_metadata(&info);
+                if !display_metadata.is_empty() {
+                    formatter.println(&format_kv("Metadata", ""));
+                    for (key, value) in &display_metadata {
+                        formatter.println(&format_kv(key, value));
                     }
                 }
             }
@@ -326,5 +344,33 @@ mod tests {
         let json = serde_json::to_string(&output).expect("should serialize");
         // Empty BTreeMap is treated as None via skip_serializing_if helper
         assert!(!json.contains("metadata"));
+    }
+
+    #[test]
+    fn test_build_display_metadata_includes_content_type() {
+        let mut user_meta = std::collections::HashMap::new();
+        user_meta.insert("custom-key".to_string(), "custom-value".to_string());
+
+        let info = ObjectInfo {
+            key: "file.txt".to_string(),
+            size_bytes: Some(1),
+            size_human: Some("1 B".to_string()),
+            last_modified: None,
+            etag: None,
+            storage_class: None,
+            content_type: Some("text/plain".to_string()),
+            metadata: Some(user_meta),
+            is_dir: false,
+        };
+
+        let display_metadata = build_display_metadata(&info);
+        assert_eq!(
+            display_metadata.get("Content-Type"),
+            Some(&"text/plain".to_string())
+        );
+        assert_eq!(
+            display_metadata.get("X-Amz-Meta-Custom-Key"),
+            Some(&"custom-value".to_string())
+        );
     }
 }
