@@ -725,6 +725,7 @@ impl ObjectStore for S3Client {
             versioning: true,
             object_lock: false,
             tagging: true,
+            anonymous: true,
             select: false,
             notifications: false,
         })
@@ -1146,6 +1147,93 @@ impl ObjectStore for S3Client {
             .map_err(|e| Error::General(format!("delete_bucket_tags: {e}")))?;
 
         Ok(())
+    }
+
+    async fn get_bucket_policy(&self, bucket: &str) -> Result<Option<String>> {
+        let response = match self.inner.get_bucket_policy().bucket(bucket).send().await {
+            Ok(policy) => policy,
+            Err(error) => {
+                if let aws_sdk_s3::error::SdkError::ServiceError(service_err) = &error {
+                    if let Some(code) = service_err
+                        .raw()
+                        .headers()
+                        .get("x-amz-error-code")
+                        .and_then(|value| std::str::from_utf8(value.as_bytes()).ok())
+                        .map(|value| value.to_ascii_lowercase())
+                    {
+                        if code == "nosuchbucketpolicy" || code == "nosuchpolicy" {
+                            return Ok(None);
+                        }
+                        if code == "nosuchbucket" {
+                            return Err(Error::NotFound(format!("Bucket not found: {bucket}")));
+                        }
+                    }
+
+                    if service_err.raw().status().as_u16() == 404 {
+                        return Ok(None);
+                    }
+                }
+                return Err(Error::Network(format!("get_bucket_policy: {error}")));
+            }
+        };
+
+        Ok(response.policy().map(|policy| policy.to_string()))
+    }
+
+    async fn set_bucket_policy(&self, bucket: &str, policy: &str) -> Result<()> {
+        self.inner
+            .put_bucket_policy()
+            .bucket(bucket)
+            .policy(policy)
+            .send()
+            .await
+            .map_err(|e| Error::General(format!("set_bucket_policy: {e}")))?;
+
+        Ok(())
+    }
+
+    async fn delete_bucket_policy(&self, bucket: &str) -> Result<()> {
+        match self
+            .inner
+            .delete_bucket_policy()
+            .bucket(bucket)
+            .send()
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                if let aws_sdk_s3::error::SdkError::ServiceError(service_err) = &e {
+                    if let Some(code) = service_err
+                        .raw()
+                        .headers()
+                        .get("x-amz-error-code")
+                        .and_then(|value| std::str::from_utf8(value.as_bytes()).ok())
+                        .map(|value| value.to_ascii_lowercase())
+                    {
+                        if code == "nosuchbucketpolicy" || code == "nosuchpolicy" {
+                            return Ok(());
+                        }
+
+                        if code == "nosuchbucket" {
+                            return Err(Error::NotFound(format!("Bucket not found: {bucket}")));
+                        }
+                    }
+
+                    if service_err.raw().status().as_u16() == 404 {
+                        return Ok(());
+                    }
+                }
+
+                let err_str = e.to_string();
+                if err_str.contains("NoSuchBucket") {
+                    Err(Error::NotFound(format!("Bucket not found: {bucket}")))
+                } else if err_str.contains("NoSuchBucketPolicy") || err_str.contains("NoSuchPolicy") {
+                    Ok(())
+                } else {
+                    Err(Error::General(format!("delete_bucket_policy: {e}")))
+                }
+            }
+        }
     }
 }
 

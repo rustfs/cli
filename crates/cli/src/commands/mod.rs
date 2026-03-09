@@ -13,6 +13,7 @@ mod admin;
 mod alias;
 mod cat;
 mod completions;
+mod anonymous;
 pub mod cp;
 pub mod diff;
 mod find;
@@ -131,6 +132,10 @@ pub enum Commands {
     #[command(subcommand)]
     Tag(tag::TagCommands),
 
+    /// Manage anonymous access to buckets and objects
+    #[command(subcommand)]
+    Anonymous(anonymous::AnonymousCommands),
+
     /// Manage bucket quota
     #[command(subcommand)]
     Quota(quota::QuotaCommands),
@@ -177,6 +182,13 @@ pub async fn execute(cli: Cli) -> ExitCode {
             version::execute(version::VersionArgs { command: cmd }, output_config).await
         }
         Commands::Tag(cmd) => tag::execute(tag::TagArgs { command: cmd }, output_config).await,
+        Commands::Anonymous(cmd) => {
+            anonymous::execute(
+                anonymous::AnonymousArgs { command: cmd },
+                output_config,
+            )
+            .await
+        }
         Commands::Quota(cmd) => {
             quota::execute(quota::QuotaArgs { command: cmd }, output_config).await
         }

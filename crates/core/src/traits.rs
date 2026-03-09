@@ -170,6 +170,9 @@ pub struct Capabilities {
     /// Supports object tagging
     pub tagging: bool,
 
+    /// Supports anonymous bucket access policies
+    pub anonymous: bool,
+
     /// Supports S3 Select
     pub select: bool,
 
@@ -280,6 +283,15 @@ pub trait ObjectStore: Send + Sync {
 
     /// Delete bucket tags
     async fn delete_bucket_tags(&self, bucket: &str) -> Result<()>;
+
+    /// Get bucket policy as raw JSON string. Returns `None` when no policy exists.
+    async fn get_bucket_policy(&self, bucket: &str) -> Result<Option<String>>;
+
+    /// Replace bucket policy using raw JSON string.
+    async fn set_bucket_policy(&self, bucket: &str, policy: &str) -> Result<()>;
+
+    /// Remove bucket policy (set anonymous access to private).
+    async fn delete_bucket_policy(&self, bucket: &str) -> Result<()>;
     // async fn get_versioning(&self, bucket: &str) -> Result<bool>;
     // async fn set_versioning(&self, bucket: &str, enabled: bool) -> Result<()>;
     // async fn get_tags(&self, path: &RemotePath) -> Result<HashMap<String, String>>;

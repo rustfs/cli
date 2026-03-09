@@ -121,6 +121,7 @@ fn top_level_command_help_contract() {
                 "version",
                 "tag",
                 "quota",
+                "anonymous",
                 "completions",
             ],
         },
@@ -259,6 +260,11 @@ fn top_level_command_help_contract() {
             args: &["quota"],
             usage: "Usage: rc quota [OPTIONS] <COMMAND>",
             expected_tokens: &["set", "info", "clear"],
+        },
+        HelpCase {
+            args: &["anonymous"],
+            usage: "Usage: rc anonymous [OPTIONS] <COMMAND>",
+            expected_tokens: &["set", "set-json", "get", "get-json", "list", "links"],
         },
         HelpCase {
             args: &["completions"],
@@ -491,6 +497,36 @@ fn nested_subcommand_help_contract() {
             args: &["quota", "clear"],
             usage: "Usage: rc quota clear [OPTIONS] <PATH>",
             expected_tokens: &[],
+        },
+        HelpCase {
+            args: &["anonymous", "set"],
+            usage: "Usage: rc anonymous set [OPTIONS] <PERMISSION> <PATH>",
+            expected_tokens: &[],
+        },
+        HelpCase {
+            args: &["anonymous", "set-json"],
+            usage: "Usage: rc anonymous set-json [OPTIONS] <FILE> <PATH>",
+            expected_tokens: &[],
+        },
+        HelpCase {
+            args: &["anonymous", "get"],
+            usage: "Usage: rc anonymous get [OPTIONS] <PATH>",
+            expected_tokens: &[],
+        },
+        HelpCase {
+            args: &["anonymous", "get-json"],
+            usage: "Usage: rc anonymous get-json [OPTIONS] <PATH>",
+            expected_tokens: &[],
+        },
+        HelpCase {
+            args: &["anonymous", "list"],
+            usage: "Usage: rc anonymous list [OPTIONS] <PATH>",
+            expected_tokens: &[],
+        },
+        HelpCase {
+            args: &["anonymous", "links"],
+            usage: "Usage: rc anonymous links [OPTIONS] <PATH>",
+            expected_tokens: &["--recursive"],
         },
     ];
 
