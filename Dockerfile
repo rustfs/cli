@@ -13,8 +13,10 @@ RUN cargo build --release
 
 FROM alpine:3.23
 
-# Install CA certificates for HTTPS
-RUN apk add --no-cache ca-certificates
+# Install runtime dependencies:
+# - ca-certificates: HTTPS support
+# - jq/yq: lightweight JSON/YAML processing for container workflows
+RUN apk add --no-cache ca-certificates jq yq
 
 COPY --from=builder /app/target/release/rc /usr/bin/rc
 COPY --from=builder /app/LICENSE-* /licenses/
