@@ -217,6 +217,21 @@ async fn execute_set(args: SetArgs, output_config: OutputConfig) -> ExitCode {
         }
     };
 
+    if permission == AccessLevel::Private && !target.prefix.is_empty() {
+        formatter.error(
+            "Cannot set a prefix target to private because that would delete the entire bucket policy",
+        );
+        return ExitCode::UsageError;
+    }
+
+    if !formatter.is_json() && !target.prefix.is_empty() {
+        formatter.println(&format!(
+            "Warning: setting '{}' will replace the entire bucket policy for '{}', which may remove unrelated statements",
+            target.path_with_bucket_prefix(),
+            target.bucket
+        ));
+    }
+
     let (_alias, client) = match setup_anonymous_client(&target.alias, &formatter).await {
         Ok(client) => client,
         Err(code) => return code,
@@ -269,7 +284,10 @@ async fn execute_set_json(args: SetJsonArgs, output_config: OutputConfig) -> Exi
     let policy = match tokio::fs::read_to_string(&args.file).await {
         Ok(content) => content,
         Err(error) => {
-            formatter.error(&format!("Failed to read policy file '{}': {error}", args.file));
+            formatter.error(&format!(
+                "Failed to read policy file '{}': {error}",
+                args.file
+            ));
             return ExitCode::GeneralError;
         }
     };
@@ -283,6 +301,14 @@ async fn execute_set_json(args: SetJsonArgs, output_config: OutputConfig) -> Exi
         Ok(client) => client,
         Err(code) => return code,
     };
+
+    // This subcommand applies the provided JSON as-is and overwrites the whole bucket policy.
+    if !formatter.is_json() {
+        formatter.println(&format!(
+            "Warning: applying '{}' will replace the entire bucket policy for '{}'",
+            args.file, target.bucket
+        ));
+    }
 
     match client.set_bucket_policy(&target.bucket, &policy).await {
         Ok(()) => {
@@ -326,10 +352,12 @@ async fn execute_get(args: AnonymousPathArg, output_config: OutputConfig) -> Exi
     };
 
     let permission = match client.get_bucket_policy(&target.bucket).await {
-        Ok(Some(policy)) => match parse_permission_from_policy(&policy, &target.bucket, &target.prefix) {
-            Ok(permission) => permission,
-            Err(_) => AccessLevel::Custom,
-        },
+        Ok(Some(policy)) => {
+            match parse_permission_from_policy(&policy, &target.bucket, &target.prefix) {
+                Ok(permission) => permission,
+                Err(_) => AccessLevel::Custom,
+            }
+        }
         Ok(None) => AccessLevel::Private,
         Err(error) => {
             formatter.error(&format!(
@@ -448,15 +476,6 @@ async fn execute_list(args: AnonymousPathArg, output_config: OutputConfig) -> Ex
 
     // For compatibility with `mc anonymous list`, always show all known anonymous rules for
     // the bucket. This avoids false negatives for bucket-level and inherited policies.
-    if rules.is_empty() {
-        if formatter.is_json() {
-            formatter.json(&Vec::<RuleOutput>::new());
-        } else {
-            formatter.println("No anonymous policies found for target.");
-        }
-        return ExitCode::Success;
-    }
-
     let mut merged: HashMap<String, PermissionFlags> = HashMap::new();
     for rule in rules {
         merged
@@ -485,11 +504,8 @@ async fn execute_list(args: AnonymousPathArg, output_config: OutputConfig) -> Ex
     } else {
         formatter.println("Anonymous policies:");
         for rule in rules {
-            formatter.println(&format!(
-                "  {} => {}",
-                rule.resource,
-                rule.flags.level()
-            ));
+            let display_resource = display_rule_resource(&rule.resource);
+            formatter.println(&format!("  {display_resource} => {}", rule.flags.level()));
         }
     }
 
@@ -548,23 +564,27 @@ async fn execute_links(args: LinksArgs, output_config: OutputConfig) -> ExitCode
             continue;
         }
 
-        let list_prefix = if target_prefix.is_empty() {
-            rule.resource.clone()
-        } else if rule.resource.is_empty() {
-            target_prefix.clone()
-        } else {
-            rule.resource.clone()
-        };
-
-        for key in list_keys_for_prefix(
+        let list_prefix = select_list_prefix(&rule.resource, &target_prefix);
+        let keys = match list_keys_for_prefix(
             &client,
+            &target.alias,
             &target.bucket,
             &list_prefix,
             args.recursive,
         )
         .await
-        .unwrap_or_default()
         {
+            Ok(keys) => keys,
+            Err(error) => {
+                formatter.error(&format!(
+                    "Failed to list objects for prefix '{}': {error}",
+                    list_prefix
+                ));
+                return exit_code_from_error(&error);
+            }
+        };
+
+        for key in keys {
             if !target_prefix.is_empty() && !key_under_prefix(&key, &target_prefix) {
                 continue;
             }
@@ -622,6 +642,9 @@ fn parse_anonymous_path(path: &str) -> Result<AccessTarget, String> {
     let prefix = parts.next().map(|v| v.trim_end_matches('/')).unwrap_or("");
     if alias.is_empty() || bucket.is_empty() {
         return Err("Path must be in format alias/bucket[/prefix]".to_string());
+    }
+    if prefix.contains('*') || prefix.contains('?') {
+        return Err("Prefix cannot contain wildcard characters '*' or '?'".to_string());
     }
 
     Ok(AccessTarget {
@@ -696,17 +719,15 @@ fn build_policy(level: &AccessLevel, bucket: &str, prefix: &str) -> String {
 
 fn build_object_resource(bucket: &str, prefix: &str) -> String {
     if prefix.is_empty() {
-        format!("arn:aws:s3:::{}/*", bucket)
+        format!("arn:aws:s3:::{bucket}/*")
     } else {
-        format!(
-            "arn:aws:s3:::{}/*",
-            format!("{}/{}", bucket, prefix.trim_end_matches('/'))
-        )
+        format!("arn:aws:s3:::{}/{}/*", bucket, prefix.trim_end_matches('/'))
     }
 }
 
 async fn list_keys_for_prefix(
     client: &S3Client,
+    alias_name: &str,
     bucket: &str,
     prefix: &str,
     recursive: bool,
@@ -727,7 +748,7 @@ async fn list_keys_for_prefix(
 
     loop {
         options.continuation_token = continuation.clone();
-        let path = RemotePath::new("anonymous", bucket, prefix);
+        let path = RemotePath::new(alias_name, bucket, prefix);
         let result = client.list_objects(&path, options.clone()).await?;
         for item in result.items {
             if !item.is_dir {
@@ -837,9 +858,7 @@ fn target_covers_prefix(rule_prefix: &str, target_prefix: &str) -> bool {
 }
 
 fn normalize_bucket_resource(bucket: &str, resource: &str) -> Option<String> {
-    let resource = resource
-        .strip_prefix("arn:aws:s3:::")
-        .unwrap_or(resource);
+    let resource = resource.strip_prefix("arn:aws:s3:::").unwrap_or(resource);
 
     if resource == bucket {
         return Some(String::new());
@@ -910,10 +929,12 @@ fn is_public_principal(principal: Option<&serde_json::Value>) -> bool {
 
     match principal {
         serde_json::Value::String(value) => value == "*",
-        serde_json::Value::Array(values) => values.iter().any(|value| is_public_principal(Some(value))),
-        serde_json::Value::Object(values) => {
-            values.values().any(|value| is_public_principal(Some(value)))
+        serde_json::Value::Array(values) => {
+            values.iter().any(|value| is_public_principal(Some(value)))
         }
+        serde_json::Value::Object(values) => values
+            .values()
+            .any(|value| is_public_principal(Some(value))),
         _ => false,
     }
 }
@@ -929,7 +950,30 @@ fn prefixes_overlap(rule_prefix: &str, target_prefix: &str) -> bool {
         return true;
     }
 
-    rule_prefix.starts_with(&format!("{target_prefix}/")) || target_prefix.starts_with(&format!("{rule_prefix}/"))
+    rule_prefix.starts_with(&format!("{target_prefix}/"))
+        || target_prefix.starts_with(&format!("{rule_prefix}/"))
+}
+
+fn select_list_prefix(rule_prefix: &str, target_prefix: &str) -> String {
+    if rule_prefix.is_empty() {
+        return target_prefix.to_string();
+    }
+    if target_prefix.is_empty() {
+        return rule_prefix.to_string();
+    }
+
+    if target_prefix == rule_prefix || target_prefix.starts_with(&format!("{rule_prefix}/")) {
+        return target_prefix.to_string();
+    }
+    if rule_prefix.starts_with(&format!("{target_prefix}/")) {
+        return rule_prefix.to_string();
+    }
+
+    target_prefix.to_string()
+}
+
+fn display_rule_resource(resource: &str) -> &str {
+    if resource.is_empty() { "/" } else { resource }
 }
 
 fn key_under_prefix(key: &str, prefix: &str) -> bool {
@@ -964,10 +1008,16 @@ fn parse_statement_list(value: &serde_json::Value) -> Result<Vec<&serde_json::Va
 
 fn build_public_url(endpoint: &str, bucket: &str, key: &str) -> String {
     let endpoint = endpoint.trim_end_matches('/');
+    let bucket = urlencoding::encode(bucket).into_owned();
     if key.is_empty() {
         format!("{endpoint}/{bucket}")
     } else {
-        format!("{endpoint}/{bucket}/{key}")
+        let encoded_key = key
+            .split('/')
+            .map(|segment| urlencoding::encode(segment).into_owned())
+            .collect::<Vec<_>>()
+            .join("/");
+        format!("{endpoint}/{bucket}/{encoded_key}")
     }
 }
 
@@ -1057,13 +1107,21 @@ mod tests {
         assert!(parse_anonymous_path("local").is_err());
         assert!(parse_anonymous_path("/mybucket").is_err());
         assert!(parse_anonymous_path("local/").is_err());
+        assert!(parse_anonymous_path("local/bucket/path/*").is_err());
+        assert!(parse_anonymous_path("local/bucket/path/?").is_err());
     }
 
     #[test]
     fn test_parse_permission() {
-        assert_eq!(AccessLevel::parse("private").ok(), Some(AccessLevel::Private));
+        assert_eq!(
+            AccessLevel::parse("private").ok(),
+            Some(AccessLevel::Private)
+        );
         assert_eq!(AccessLevel::parse("public").ok(), Some(AccessLevel::Public));
-        assert_eq!(AccessLevel::parse("download").ok(), Some(AccessLevel::Download));
+        assert_eq!(
+            AccessLevel::parse("download").ok(),
+            Some(AccessLevel::Download)
+        );
         assert_eq!(AccessLevel::parse("upload").ok(), Some(AccessLevel::Upload));
         assert!(AccessLevel::parse("invalid").is_err());
     }
@@ -1080,5 +1138,26 @@ mod tests {
     fn test_build_public_url() {
         let url = build_public_url("http://localhost:9000/", "bucket", "path/to/object.txt");
         assert_eq!(url, "http://localhost:9000/bucket/path/to/object.txt");
+    }
+
+    #[test]
+    fn test_build_public_url_encodes_segments() {
+        let url = build_public_url(
+            "https://example.com/",
+            "my bucket",
+            "photos/with space/file#1?.jpg",
+        );
+        assert_eq!(
+            url,
+            "https://example.com/my%20bucket/photos/with%20space/file%231%3F.jpg"
+        );
+    }
+
+    #[test]
+    fn test_select_list_prefix_uses_more_specific_prefix() {
+        assert_eq!(select_list_prefix("a", "a/b"), "a/b");
+        assert_eq!(select_list_prefix("a/b", "a"), "a/b");
+        assert_eq!(select_list_prefix("", "a"), "a");
+        assert_eq!(select_list_prefix("a", ""), "a");
     }
 }

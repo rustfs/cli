@@ -50,6 +50,7 @@ humansize.workspace = true
 mime_guess.workspace = true
 glob.workspace = true
 shlex.workspace = true
+urlencoding.workspace = true
 
 [features]
 default = []
