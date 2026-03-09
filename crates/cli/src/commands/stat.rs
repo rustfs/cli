@@ -6,7 +6,7 @@ use clap::Args;
 use rc_core::{AliasManager, ObjectStore as _, RemotePath};
 use rc_s3::S3Client;
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::exit_code::ExitCode;
 use crate::output::{Formatter, OutputConfig};
@@ -53,6 +53,31 @@ fn metadata_is_none_or_empty(metadata: &Option<BTreeMap<String, String>>) -> boo
         None => true,
         Some(m) => m.is_empty(),
     }
+}
+
+fn normalize_metadata(
+    content_type: Option<&str>,
+    metadata: Option<&HashMap<String, String>>,
+) -> Option<BTreeMap<String, String>> {
+    let mut out = BTreeMap::new();
+
+    if let Some(ct) = content_type
+        && !ct.is_empty()
+    {
+        out.insert("Content-Type".to_string(), ct.to_string());
+    }
+
+    if let Some(meta) = metadata {
+        let mut sorted: BTreeMap<_, _> = meta.iter().collect();
+        for (key, value) in &mut sorted {
+            out.insert(
+                format!("X-Amz-Meta-{}", capitalize_meta_key(key)),
+                (*value).clone(),
+            );
+        }
+    }
+
+    if out.is_empty() { None } else { Some(out) }
 }
 
 /// Execute the stat command
@@ -109,15 +134,10 @@ pub async fn execute(args: StatArgs, output_config: OutputConfig) -> ExitCode {
                     content_type: info.content_type.clone(),
                     storage_class: info.storage_class.clone(),
                     version_id: args.version_id,
-                    metadata: info
-                        .metadata
-                        .as_ref()
-                        .map(|m| {
-                            m.iter()
-                                .map(|(k, v)| (k.clone(), v.clone()))
-                                .collect::<BTreeMap<_, _>>()
-                        })
-                        .filter(|m| !m.is_empty()),
+                    metadata: normalize_metadata(
+                        info.content_type.as_deref(),
+                        info.metadata.as_ref(),
+                    ),
                 };
                 formatter.json(&output);
             } else {
@@ -153,13 +173,12 @@ pub async fn execute(args: StatArgs, output_config: OutputConfig) -> ExitCode {
                 if let Some(sc) = &info.storage_class {
                     formatter.println(&format_kv("Class", sc));
                 }
-                if let Some(metadata) = &info.metadata {
-                    let sorted: BTreeMap<_, _> = metadata.iter().collect();
-                    for (key, value) in &sorted {
-                        formatter.println(&format_kv(
-                            &format!("X-Amz-Meta-{}", capitalize_meta_key(key)),
-                            value,
-                        ));
+                if let Some(metadata) =
+                    normalize_metadata(info.content_type.as_deref(), info.metadata.as_ref())
+                {
+                    formatter.println(&format_kv("Metadata", ""));
+                    for (key, value) in &metadata {
+                        formatter.println(&format_kv(key, value));
                     }
                 }
             }
@@ -326,5 +345,39 @@ mod tests {
         let json = serde_json::to_string(&output).expect("should serialize");
         // Empty BTreeMap is treated as None via skip_serializing_if helper
         assert!(!json.contains("metadata"));
+    }
+
+    #[test]
+    fn test_normalize_metadata_includes_content_type() {
+        let metadata = normalize_metadata(Some("text/plain"), None).expect("metadata present");
+        assert_eq!(
+            metadata.get("Content-Type").map(String::as_str),
+            Some("text/plain")
+        );
+    }
+
+    #[test]
+    fn test_normalize_metadata_includes_custom_metadata() {
+        let mut custom = HashMap::new();
+        custom.insert("content-disposition".to_string(), "attachment".to_string());
+        custom.insert("x-custom-key".to_string(), "value".to_string());
+
+        let metadata =
+            normalize_metadata(Some("text/plain"), Some(&custom)).expect("metadata present");
+
+        assert_eq!(
+            metadata.get("Content-Type").map(String::as_str),
+            Some("text/plain")
+        );
+        assert_eq!(
+            metadata
+                .get("X-Amz-Meta-Content-Disposition")
+                .map(String::as_str),
+            Some("attachment")
+        );
+        assert_eq!(
+            metadata.get("X-Amz-Meta-X-Custom-Key").map(String::as_str),
+            Some("value")
+        );
     }
 }
