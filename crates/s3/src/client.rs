@@ -268,6 +268,19 @@ impl S3Client {
         file_size > SINGLE_PUT_OBJECT_MAX_SIZE
     }
 
+    fn classify_network_error<E: std::fmt::Display>(
+        context: &str,
+        error: aws_sdk_s3::error::SdkError<E>,
+    ) -> Error {
+        let message = format!("{context}: {}", Self::format_sdk_error(&error));
+        match error {
+            aws_sdk_s3::error::SdkError::DispatchFailure(_)
+            | aws_sdk_s3::error::SdkError::TimeoutError(_)
+            | aws_sdk_s3::error::SdkError::ResponseError(_) => Error::Network(message),
+            _ => Error::General(message),
+        }
+    }
+
     fn bucket_policy_error_kind(
         error_code: Option<&str>,
         status_code: Option<u16>,
@@ -893,8 +906,8 @@ impl ObjectStore for S3Client {
     }
 
     async fn capabilities(&self) -> Result<Capabilities> {
-        // For now, return conservative defaults
-        // In Phase 5, we'll implement actual capability detection
+        // Return optimistic defaults for commonly supported optional features.
+        // Users can still bypass capability checks with --force in commands that gate on them.
         Ok(Capabilities {
             versioning: true,
             object_lock: false,
@@ -1413,10 +1426,10 @@ impl ObjectStore for S3Client {
                     BucketNotificationErrorKind::MissingBucket => {
                         Err(Error::NotFound(format!("Bucket not found: {bucket}")))
                     }
-                    BucketNotificationErrorKind::Other => Err(Error::General(format!(
-                        "get_bucket_notifications: {}",
-                        Self::format_sdk_error(&error)
-                    ))),
+                    BucketNotificationErrorKind::Other => Err(Self::classify_network_error(
+                        "get_bucket_notifications",
+                        error,
+                    )),
                 };
             }
         };
@@ -1567,12 +1580,7 @@ impl ObjectStore for S3Client {
             .notification_configuration(config)
             .send()
             .await
-            .map_err(|e| {
-                Error::General(format!(
-                    "set_bucket_notifications: {}",
-                    Self::format_sdk_error(&e)
-                ))
-            })?;
+            .map_err(|e| Self::classify_network_error("set_bucket_notifications", e))?;
 
         Ok(())
     }
@@ -1640,6 +1648,30 @@ mod tests {
         assert!(
             delete_missing_policy.is_ok(),
             "Missing policy should be treated as successful delete"
+        );
+    }
+
+    #[test]
+    fn bucket_notification_error_kind_uses_error_code() {
+        assert_eq!(
+            S3Client::bucket_notification_error_kind(Some("NoSuchNotification"), Some(404), ""),
+            BucketNotificationErrorKind::MissingConfiguration
+        );
+        assert_eq!(
+            S3Client::bucket_notification_error_kind(Some("NoSuchBucket"), Some(404), ""),
+            BucketNotificationErrorKind::MissingBucket
+        );
+    }
+
+    #[test]
+    fn bucket_notification_error_kind_prefers_bucket_not_found_over_404_fallback() {
+        assert_eq!(
+            S3Client::bucket_notification_error_kind(None, Some(404), "NoSuchBucket"),
+            BucketNotificationErrorKind::MissingBucket
+        );
+        assert_eq!(
+            S3Client::bucket_notification_error_kind(None, Some(404), "unknown"),
+            BucketNotificationErrorKind::MissingConfiguration
         );
     }
 

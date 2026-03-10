@@ -325,21 +325,21 @@ async fn setup_client(
 }
 
 fn parse_bucket_path(path: &str) -> Result<(String, String), String> {
-    if path.is_empty() {
-        return Err("Path cannot be empty".to_string());
+    if path.trim().is_empty() {
+        return Err("Bucket path must be in format alias/bucket".to_string());
     }
 
     let parts: Vec<&str> = path.splitn(2, '/').collect();
-    if parts.len() < 2 || parts[0].is_empty() || parts[1].is_empty() {
+    if parts.len() < 2 || parts[0].trim().is_empty() || parts[1].trim().is_empty() {
         return Err("Bucket path must be in format alias/bucket".to_string());
     }
 
     let bucket = parts[1].trim_end_matches('/');
-    if bucket.is_empty() {
+    if bucket.is_empty() || bucket.contains('/') {
         return Err("Bucket path must be in format alias/bucket".to_string());
     }
 
-    Ok((parts[0].to_string(), bucket.to_string()))
+    Ok((parts[0].trim().to_string(), bucket.to_string()))
 }
 
 fn normalize_events(events: Vec<String>) -> Vec<String> {
@@ -426,9 +426,11 @@ mod tests {
     #[test]
     fn test_parse_bucket_path_errors() {
         assert!(parse_bucket_path("").is_err());
+        assert!(parse_bucket_path("   ").is_err());
         assert!(parse_bucket_path("local").is_err());
         assert!(parse_bucket_path("/bucket").is_err());
         assert!(parse_bucket_path("local/").is_err());
+        assert!(parse_bucket_path("local/bucket/extra").is_err());
     }
 
     #[test]
