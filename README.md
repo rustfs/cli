@@ -134,6 +134,14 @@ rc admin policy attach local/ readonly --user newuser
 
 # Create a service account (access_key + secret_key)
 rc admin service-account create local/ AKIAIOSFODNN7EXAMPLE wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+
+# Create a service account with inline policy file
+rc admin service-account create local/ SAKEY123 SASECRET123 --policy ./service-account-policy.json
+
+# Manage bucket event notifications
+rc event add local/my-bucket arn:aws:sns:us-east-1:123456789012:topic --event 's3:ObjectCreated:*'
+rc event list local/my-bucket
+rc event remove local/my-bucket arn:aws:sns:us-east-1:123456789012:topic
 ```
 
 ### Admin Operations (Cluster)
@@ -176,6 +184,7 @@ rc admin heal status local --json
 | `mirror` | Mirror sync between S3 locations |
 | `tree` | Tree view display |
 | `share` | Generate presigned URLs |
+| `event` | Manage bucket event notifications |
 | `pipe` | Upload from stdin |
 | `version` | Manage bucket versioning |
 | `tag` | Manage bucket and object tags |

@@ -16,6 +16,7 @@ mod cat;
 mod completions;
 pub mod cp;
 pub mod diff;
+mod event;
 mod find;
 mod head;
 mod ls;
@@ -111,6 +112,10 @@ pub enum Commands {
     /// Find objects matching criteria
     Find(find::FindArgs),
 
+    /// Manage bucket event notifications
+    #[command(subcommand)]
+    Event(event::EventCommands),
+
     /// Show differences between locations
     Diff(diff::DiffArgs),
 
@@ -174,6 +179,9 @@ pub async fn execute(cli: Cli) -> ExitCode {
         Commands::Rm(args) => rm::execute(args, output_config).await,
         Commands::Pipe(args) => pipe::execute(args, output_config).await,
         Commands::Find(args) => find::execute(args, output_config).await,
+        Commands::Event(cmd) => {
+            event::execute(event::EventArgs { command: cmd }, output_config).await
+        }
         Commands::Diff(args) => diff::execute(args, output_config).await,
         Commands::Mirror(args) => mirror::execute(args, output_config).await,
         Commands::Tree(args) => tree::execute(args, output_config).await,
