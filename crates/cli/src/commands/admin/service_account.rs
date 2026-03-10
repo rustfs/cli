@@ -208,8 +208,17 @@ async fn execute_create(args: CreateArgs, formatter: &Formatter) -> ExitCode {
     };
 
     let request = build_create_service_account_request(&args, policy);
+    let create_result = match client.create_service_account(request.clone()).await {
+        Ok(sa) => Ok(sa),
+        Err(e) if should_retry_with_default_expiry(&args, &e) => {
+            let mut retry_request = request;
+            retry_request.expiry = Some(DEFAULT_SERVICE_ACCOUNT_EXPIRY.to_string());
+            client.create_service_account(retry_request).await
+        }
+        Err(e) => Err(e),
+    };
 
-    match client.create_service_account(request).await {
+    match create_result {
         Ok(sa) => {
             if formatter.is_json() {
                 let output = ServiceAccountCreateOutput {
@@ -245,16 +254,22 @@ fn build_create_service_account_request(
 ) -> CreateServiceAccountRequest {
     CreateServiceAccountRequest {
         policy,
-        expiry: args
-            .expiry
-            .clone()
-            .or_else(|| Some(DEFAULT_SERVICE_ACCOUNT_EXPIRY.to_string())),
+        expiry: args.expiry.clone(),
         // Keep existing CLI UX where positional ACCESS_KEY is enough.
         name: args.name.clone().or_else(|| Some(args.access_key.clone())),
         description: args.description.clone(),
         access_key: args.access_key.clone(),
         secret_key: args.secret_key.clone(),
     }
+}
+
+fn should_retry_with_default_expiry(args: &CreateArgs, error: &rc_core::Error) -> bool {
+    if args.expiry.is_some() {
+        return false;
+    }
+
+    let text = error.to_string();
+    text.contains("missing field `expiration`") || text.contains("InvalidExpiration")
 }
 
 async fn execute_info(args: InfoArgs, formatter: &Formatter) -> ExitCode {
@@ -374,10 +389,7 @@ mod tests {
 
         let request = build_create_service_account_request(&args, None);
         assert_eq!(request.name.as_deref(), Some("AKIAIOSFODNN7EXAMPLE"));
-        assert_eq!(
-            request.expiry.as_deref(),
-            Some(DEFAULT_SERVICE_ACCOUNT_EXPIRY)
-        );
+        assert!(request.expiry.is_none());
     }
 
     #[test]
@@ -397,5 +409,35 @@ mod tests {
         assert_eq!(request.description.as_deref(), Some("demo"));
         assert_eq!(request.expiry.as_deref(), Some("2030-01-01T00:00:00Z"));
         assert_eq!(request.policy.as_deref(), Some("{\"x\":1}"));
+    }
+
+    #[test]
+    fn test_should_retry_with_default_expiry_for_missing_field_error() {
+        let args = CreateArgs {
+            alias: "local".to_string(),
+            access_key: "AKIAIOSFODNN7EXAMPLE".to_string(),
+            secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+            name: None,
+            description: None,
+            policy: None,
+            expiry: None,
+        };
+        let error = rc_core::Error::InvalidPath("missing field `expiration`".to_string());
+        assert!(should_retry_with_default_expiry(&args, &error));
+    }
+
+    #[test]
+    fn test_should_not_retry_with_default_expiry_when_expiry_is_explicit() {
+        let args = CreateArgs {
+            alias: "local".to_string(),
+            access_key: "AKIAIOSFODNN7EXAMPLE".to_string(),
+            secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+            name: None,
+            description: None,
+            policy: None,
+            expiry: Some("2030-01-01T00:00:00Z".to_string()),
+        };
+        let error = rc_core::Error::InvalidPath("missing field `expiration`".to_string());
+        assert!(!should_retry_with_default_expiry(&args, &error));
     }
 }
