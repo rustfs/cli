@@ -205,14 +205,7 @@ async fn execute_create(args: CreateArgs, formatter: &Formatter) -> ExitCode {
         None
     };
 
-    let request = CreateServiceAccountRequest {
-        policy,
-        expiry: args.expiry,
-        name: args.name,
-        description: args.description,
-        access_key: args.access_key.clone(),
-        secret_key: args.secret_key.clone(),
-    };
+    let request = build_create_request(&args, policy);
 
     match client.create_service_account(request).await {
         Ok(sa) => {
@@ -241,6 +234,21 @@ async fn execute_create(args: CreateArgs, formatter: &Formatter) -> ExitCode {
             formatter.error(&format!("Failed to create service account: {e}"));
             ExitCode::GeneralError
         }
+    }
+}
+
+fn build_create_request(args: &CreateArgs, policy: Option<String>) -> CreateServiceAccountRequest {
+    // Some RustFS versions require `name` to be non-empty when creating service accounts.
+    // Default to access_key for backward compatibility when --name is omitted.
+    let name = args.name.clone().or_else(|| Some(args.access_key.clone()));
+
+    CreateServiceAccountRequest {
+        policy,
+        expiry: args.expiry.clone(),
+        name,
+        description: args.description.clone(),
+        access_key: args.access_key.clone(),
+        secret_key: args.secret_key.clone(),
     }
 }
 
@@ -345,5 +353,38 @@ mod tests {
         assert_eq!(info.access_key, "AKIAIOSFODNN7EXAMPLE");
         assert!(info.secret_key.is_some());
         assert_eq!(info.parent_user, Some("admin".to_string()));
+    }
+
+    #[test]
+    fn test_build_create_request_uses_access_key_as_default_name() {
+        let args = CreateArgs {
+            alias: "local".to_string(),
+            access_key: "svc-access".to_string(),
+            secret_key: "svc-secret".to_string(),
+            name: None,
+            description: None,
+            policy: None,
+            expiry: None,
+        };
+
+        let request = build_create_request(&args, None);
+        assert_eq!(request.name, Some("svc-access".to_string()));
+    }
+
+    #[test]
+    fn test_build_create_request_keeps_explicit_name() {
+        let args = CreateArgs {
+            alias: "local".to_string(),
+            access_key: "svc-access".to_string(),
+            secret_key: "svc-secret".to_string(),
+            name: Some("custom-name".to_string()),
+            description: Some("desc".to_string()),
+            policy: None,
+            expiry: None,
+        };
+
+        let request = build_create_request(&args, None);
+        assert_eq!(request.name, Some("custom-name".to_string()));
+        assert_eq!(request.description, Some("desc".to_string()));
     }
 }
