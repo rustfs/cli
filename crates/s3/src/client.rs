@@ -896,8 +896,8 @@ impl ObjectStore for S3Client {
     }
 
     async fn capabilities(&self) -> Result<Capabilities> {
-        // For now, return conservative defaults
-        // In Phase 5, we'll implement actual capability detection
+        // Hardcoded optimistic defaults for common S3-compatible backends.
+        // In a future phase we can replace these with active detection.
         Ok(Capabilities {
             versioning: true,
             object_lock: false,
@@ -1606,6 +1606,66 @@ mod tests {
             delete_missing_policy.is_ok(),
             "Missing policy should be treated as successful delete"
         );
+    }
+
+    #[test]
+    fn notification_filter_round_trip_prefix_and_suffix() {
+        let filter = S3Client::build_notification_filter(Some("logs/"), Some(".json"))
+            .expect("filter should be built");
+        let (prefix, suffix) = S3Client::extract_notification_filter(Some(&filter));
+        assert_eq!(prefix.as_deref(), Some("logs/"));
+        assert_eq!(suffix.as_deref(), Some(".json"));
+    }
+
+    #[test]
+    fn notification_filter_none_when_empty() {
+        assert!(S3Client::build_notification_filter(None, None).is_none());
+    }
+
+    #[test]
+    fn notifications_equivalent_ignores_order_and_duplicate_events() {
+        let expected = vec![
+            BucketNotification {
+                id: Some("a".to_string()),
+                target: NotificationTarget::Queue,
+                arn: "arn:aws:sqs:us-east-1:123456789012:q".to_string(),
+                events: vec![
+                    "s3:ObjectCreated:*".to_string(),
+                    "s3:ObjectCreated:*".to_string(),
+                ],
+                prefix: Some("images/".to_string()),
+                suffix: Some(".jpg".to_string()),
+            },
+            BucketNotification {
+                id: Some("b".to_string()),
+                target: NotificationTarget::Topic,
+                arn: "arn:aws:sns:us-east-1:123456789012:t".to_string(),
+                events: vec!["s3:ObjectRemoved:*".to_string()],
+                prefix: None,
+                suffix: None,
+            },
+        ];
+
+        let actual = vec![
+            BucketNotification {
+                id: None,
+                target: NotificationTarget::Topic,
+                arn: "arn:aws:sns:us-east-1:123456789012:t".to_string(),
+                events: vec!["s3:ObjectRemoved:*".to_string()],
+                prefix: None,
+                suffix: None,
+            },
+            BucketNotification {
+                id: None,
+                target: NotificationTarget::Queue,
+                arn: "arn:aws:sqs:us-east-1:123456789012:q".to_string(),
+                events: vec!["s3:ObjectCreated:*".to_string()],
+                prefix: Some("images/".to_string()),
+                suffix: Some(".jpg".to_string()),
+            },
+        ];
+
+        assert!(S3Client::notifications_equivalent(&expected, &actual));
     }
 
     #[tokio::test]

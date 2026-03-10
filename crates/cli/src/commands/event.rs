@@ -158,10 +158,6 @@ async fn execute_add(args: AddArgs, output_config: OutputConfig) -> ExitCode {
     };
 
     let events = parse_event_list(&args.events);
-    if events.is_empty() {
-        formatter.error("At least one event is required");
-        return ExitCode::UsageError;
-    }
 
     let client = match setup_client(&alias_name, &bucket, args.force, &formatter).await {
         Ok(client) => client,
