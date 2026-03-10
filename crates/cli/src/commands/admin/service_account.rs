@@ -240,14 +240,15 @@ async fn execute_create(args: CreateArgs, formatter: &Formatter) -> ExitCode {
 fn build_create_request(args: &CreateArgs, policy: Option<String>) -> CreateServiceAccountRequest {
     // Some RustFS versions require `name` to be non-empty when creating service accounts.
     // Default to access_key for backward compatibility when --name is omitted.
-    let name = args.name.clone().or_else(|| Some(args.access_key.clone()));
+    let access_key = args.access_key.clone();
+    let name = args.name.clone().or_else(|| Some(access_key.clone()));
 
     CreateServiceAccountRequest {
         policy,
         expiry: args.expiry.clone(),
         name,
         description: args.description.clone(),
-        access_key: args.access_key.clone(),
+        access_key,
         secret_key: args.secret_key.clone(),
     }
 }
