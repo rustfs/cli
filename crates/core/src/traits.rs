@@ -180,6 +180,43 @@ pub struct Capabilities {
     pub notifications: bool,
 }
 
+/// Target type for bucket event notifications
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NotificationTargetType {
+    /// Publish to SNS topic
+    Topic,
+    /// Send to SQS queue
+    Queue,
+    /// Invoke Lambda function
+    Lambda,
+}
+
+/// Bucket event notification rule
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationRule {
+    /// Optional rule identifier
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+
+    /// Destination ARN
+    pub arn: String,
+
+    /// Destination target type
+    pub target: NotificationTargetType,
+
+    /// S3 event names
+    pub events: Vec<String>,
+
+    /// Optional object key prefix filter
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+
+    /// Optional object key suffix filter
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suffix: Option<String>,
+}
+
 /// Trait for S3-compatible storage operations
 ///
 /// This trait is implemented by the S3 adapter and can be mocked for testing.
@@ -292,6 +329,16 @@ pub trait ObjectStore: Send + Sync {
 
     /// Remove bucket policy (set anonymous access to private).
     async fn delete_bucket_policy(&self, bucket: &str) -> Result<()>;
+
+    /// Get bucket notification rules.
+    async fn get_bucket_notifications(&self, bucket: &str) -> Result<Vec<NotificationRule>>;
+
+    /// Replace bucket notification rules.
+    async fn set_bucket_notifications(
+        &self,
+        bucket: &str,
+        rules: Vec<NotificationRule>,
+    ) -> Result<()>;
     // async fn get_versioning(&self, bucket: &str) -> Result<bool>;
     // async fn set_versioning(&self, bucket: &str, enabled: bool) -> Result<()>;
     // async fn get_tags(&self, path: &RemotePath) -> Result<HashMap<String, String>>;

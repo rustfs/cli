@@ -16,6 +16,7 @@ mod cat;
 mod completions;
 pub mod cp;
 pub mod diff;
+mod event;
 mod find;
 mod head;
 mod ls;
@@ -140,6 +141,10 @@ pub enum Commands {
     #[command(subcommand)]
     Quota(quota::QuotaCommands),
 
+    /// Manage bucket event notifications
+    #[command(subcommand)]
+    Event(event::EventCommands),
+
     // Phase 6: Utilities
     /// Generate shell completion scripts
     Completions(completions::CompletionsArgs),
@@ -187,6 +192,9 @@ pub async fn execute(cli: Cli) -> ExitCode {
         }
         Commands::Quota(cmd) => {
             quota::execute(quota::QuotaArgs { command: cmd }, output_config).await
+        }
+        Commands::Event(cmd) => {
+            event::execute(event::EventArgs { command: cmd }, output_config).await
         }
         Commands::Completions(args) => completions::execute(args),
     }
