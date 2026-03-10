@@ -59,8 +59,19 @@ pub async fn execute(cmd: AdminCommands, output_config: OutputConfig) -> ExitCod
     }
 }
 
+fn normalize_admin_alias(alias_name: &str) -> &str {
+    let normalized_alias = alias_name.trim_end_matches('/');
+    if normalized_alias.is_empty() {
+        alias_name
+    } else {
+        normalized_alias
+    }
+}
+
 /// Helper to get AdminClient from an alias name
 pub fn get_admin_client(alias_name: &str, formatter: &Formatter) -> Result<AdminClient, ExitCode> {
+    let alias_lookup_name = normalize_admin_alias(alias_name);
+
     let alias_manager = match AliasManager::new() {
         Ok(am) => am,
         Err(e) => {
@@ -69,7 +80,7 @@ pub fn get_admin_client(alias_name: &str, formatter: &Formatter) -> Result<Admin
         }
     };
 
-    let alias = match alias_manager.get(alias_name) {
+    let alias = match alias_manager.get(alias_lookup_name) {
         Ok(a) => a,
         Err(rc_core::Error::AliasNotFound(_)) => {
             formatter.error(&format!("Alias '{}' not found", alias_name));
@@ -145,5 +156,20 @@ mod tests {
             }
             _ => panic!("Unexpected command parsing result"),
         }
+    }
+
+    #[test]
+    fn test_normalize_admin_alias_trailing_slash() {
+        assert_eq!(normalize_admin_alias("local/"), "local");
+    }
+
+    #[test]
+    fn test_normalize_admin_alias_without_trailing_slash() {
+        assert_eq!(normalize_admin_alias("local"), "local");
+    }
+
+    #[test]
+    fn test_normalize_admin_alias_only_slash() {
+        assert_eq!(normalize_admin_alias("/"), "/");
     }
 }

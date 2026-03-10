@@ -315,7 +315,10 @@ pub struct CreateServiceAccountRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy: Option<String>,
 
-    /// Expiration time (ISO 8601). The `expiration` field must be present in the request body; use null when no expiration is set.
+    /// Expiration time (ISO 8601)
+    ///
+    /// RustFS latest rejects `"expiration": null`, so omit this field when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "expiration")]
     pub expiry: Option<String>,
 
@@ -487,7 +490,7 @@ mod tests {
     }
 
     #[test]
-    fn test_create_service_account_request_includes_expiration() {
+    fn test_create_service_account_request_omits_expiration_when_none() {
         let request = CreateServiceAccountRequest {
             policy: None,
             expiry: None,
@@ -498,15 +501,10 @@ mod tests {
         };
 
         let json = serde_json::to_string(&request).unwrap();
-        // expiration field must always be present even when None
         assert!(
-            json.contains("\"expiration\""),
-            "JSON must contain expiration field, got: {json}"
+            !json.contains("\"expiration\""),
+            "JSON must not contain expiration field when unset, got: {json}"
         );
-
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert!(parsed.get("expiration").is_some());
-        assert!(parsed["expiration"].is_null());
     }
 
     #[test]

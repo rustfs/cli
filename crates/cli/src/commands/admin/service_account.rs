@@ -10,6 +10,8 @@ use crate::exit_code::ExitCode;
 use crate::output::Formatter;
 use rc_core::admin::{AdminApi, CreateServiceAccountRequest, ServiceAccount};
 
+const DEFAULT_SERVICE_ACCOUNT_EXPIRY: &str = "9999-12-31T23:59:59Z";
+
 /// Service account management subcommands
 #[derive(Subcommand, Debug)]
 pub enum ServiceAccountCommands {
@@ -205,14 +207,7 @@ async fn execute_create(args: CreateArgs, formatter: &Formatter) -> ExitCode {
         None
     };
 
-    let request = CreateServiceAccountRequest {
-        policy,
-        expiry: args.expiry,
-        name: args.name,
-        description: args.description,
-        access_key: args.access_key.clone(),
-        secret_key: args.secret_key.clone(),
-    };
+    let request = build_create_service_account_request(&args, policy);
 
     match client.create_service_account(request).await {
         Ok(sa) => {
@@ -241,6 +236,24 @@ async fn execute_create(args: CreateArgs, formatter: &Formatter) -> ExitCode {
             formatter.error(&format!("Failed to create service account: {e}"));
             ExitCode::GeneralError
         }
+    }
+}
+
+fn build_create_service_account_request(
+    args: &CreateArgs,
+    policy: Option<String>,
+) -> CreateServiceAccountRequest {
+    CreateServiceAccountRequest {
+        policy,
+        expiry: args
+            .expiry
+            .clone()
+            .or_else(|| Some(DEFAULT_SERVICE_ACCOUNT_EXPIRY.to_string())),
+        // Keep existing CLI UX where positional ACCESS_KEY is enough.
+        name: args.name.clone().or_else(|| Some(args.access_key.clone())),
+        description: args.description.clone(),
+        access_key: args.access_key.clone(),
+        secret_key: args.secret_key.clone(),
     }
 }
 
@@ -345,5 +358,44 @@ mod tests {
         assert_eq!(info.access_key, "AKIAIOSFODNN7EXAMPLE");
         assert!(info.secret_key.is_some());
         assert_eq!(info.parent_user, Some("admin".to_string()));
+    }
+
+    #[test]
+    fn test_build_create_request_uses_access_key_as_default_name() {
+        let args = CreateArgs {
+            alias: "local".to_string(),
+            access_key: "AKIAIOSFODNN7EXAMPLE".to_string(),
+            secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+            name: None,
+            description: None,
+            policy: None,
+            expiry: None,
+        };
+
+        let request = build_create_service_account_request(&args, None);
+        assert_eq!(request.name.as_deref(), Some("AKIAIOSFODNN7EXAMPLE"));
+        assert_eq!(
+            request.expiry.as_deref(),
+            Some(DEFAULT_SERVICE_ACCOUNT_EXPIRY)
+        );
+    }
+
+    #[test]
+    fn test_build_create_request_keeps_explicit_name() {
+        let args = CreateArgs {
+            alias: "local".to_string(),
+            access_key: "AKIAIOSFODNN7EXAMPLE".to_string(),
+            secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+            name: Some("manual-name".to_string()),
+            description: Some("demo".to_string()),
+            policy: None,
+            expiry: Some("2030-01-01T00:00:00Z".to_string()),
+        };
+
+        let request = build_create_service_account_request(&args, Some("{\"x\":1}".to_string()));
+        assert_eq!(request.name.as_deref(), Some("manual-name"));
+        assert_eq!(request.description.as_deref(), Some("demo"));
+        assert_eq!(request.expiry.as_deref(), Some("2030-01-01T00:00:00Z"));
+        assert_eq!(request.policy.as_deref(), Some("{\"x\":1}"));
     }
 }
