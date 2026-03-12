@@ -6,6 +6,7 @@ use clap::Args;
 use rc_core::{AliasManager, ListOptions, ObjectInfo, ObjectStore as _, RemotePath};
 use rc_s3::S3Client;
 use serde::Serialize;
+use std::collections::HashMap;
 
 use crate::exit_code::ExitCode;
 use crate::output::{Formatter, OutputConfig};
@@ -90,9 +91,14 @@ pub async fn execute(args: LsArgs, output_config: OutputConfig) -> ExitCode {
         }
     };
 
-    // If no bucket specified, list buckets
     if bucket.is_none() {
-        return list_buckets(&client, &formatter, args.summarize).await;
+        if args.recursive {
+            // If no bucket specified & recursive flag is provided, list all objects on the server
+            return list_all_objects(&client, alias_name, &formatter, args.summarize).await;
+        } else {
+            // Else no bucket specified, list buckets
+            return list_buckets(&client, &formatter, args.summarize).await;
+        }
     }
 
     let bucket = bucket.unwrap();
@@ -160,38 +166,14 @@ async fn list_objects(
         ..Default::default()
     };
 
-    let mut all_items = Vec::new();
-    let mut continuation_token: Option<String> = None;
-    let mut is_truncated;
-
-    // Paginate through all results
-    loop {
-        let opts = ListOptions {
-            continuation_token: continuation_token.clone(),
-            ..options.clone()
+    let (all_items, is_truncated, continuation_token) =
+        match list_objects_with_paging(client, path, &options).await {
+            Ok(r) => r,
+            Err((message, exit_code)) => {
+                formatter.error(&message);
+                return exit_code;
+            }
         };
-
-        match client.list_objects(path, opts).await {
-            Ok(result) => {
-                all_items.extend(result.items);
-                is_truncated = result.truncated;
-                continuation_token = result.continuation_token.clone();
-
-                if !result.truncated {
-                    break;
-                }
-            }
-            Err(e) => {
-                let err_str = e.to_string();
-                if err_str.contains("NotFound") || err_str.contains("NoSuchBucket") {
-                    formatter.error(&format!("Bucket not found: {}", path.bucket));
-                    return ExitCode::NotFound;
-                }
-                formatter.error(&format!("Failed to list objects: {e}"));
-                return ExitCode::NetworkError;
-            }
-        }
-    }
 
     // Calculate summary
     let total_objects = all_items.iter().filter(|i| !i.is_dir).count();
@@ -244,6 +226,154 @@ async fn list_objects(
     }
 
     ExitCode::Success
+}
+
+async fn list_all_objects(
+    client: &S3Client,
+    alias: String,
+    formatter: &Formatter,
+    summarize: bool,
+) -> ExitCode {
+    let buckets = match client.list_buckets().await {
+        Ok(buckets) => buckets,
+        Err(e) => {
+            formatter.error(&format!("Failed to list buckets: {e}"));
+            return ExitCode::NetworkError;
+        }
+    };
+
+    let options = ListOptions {
+        recursive: true,
+        max_keys: Some(1000),
+        ..Default::default()
+    };
+
+    let mut all_items: HashMap<&str, Vec<ObjectInfo>> = HashMap::new();
+    let mut is_truncated = false;
+    let mut continuation_token: Option<String> = None;
+
+    // List all objects in each bucket
+    for bucket in &buckets {
+        let path = &RemotePath::new(&alias, &bucket.key, "");
+        let new_items: Vec<ObjectInfo>;
+
+        (new_items, is_truncated, continuation_token) =
+            match list_objects_with_paging(client, path, &options).await {
+                Ok(r) => r,
+                Err((message, exit_code)) => {
+                    formatter.error(&message);
+                    return exit_code;
+                }
+            };
+
+        all_items.entry(&bucket.key).or_default().extend(new_items);
+    }
+
+    // Calculate summary
+    let total_objects = all_items.values().flatten().filter(|i| !i.is_dir).count();
+    let total_size = all_items
+        .values()
+        .flatten()
+        .filter_map(|i| i.size_bytes)
+        .sum();
+
+    if formatter.is_json() {
+        let output = LsOutput {
+            items: all_items.into_values().flatten().collect(),
+            truncated: is_truncated,
+            continuation_token,
+            summary: if summarize {
+                Some(Summary {
+                    total_objects,
+                    total_size_bytes: total_size,
+                    total_size_human: humansize::format_size(total_size as u64, humansize::BINARY),
+                })
+            } else {
+                None
+            },
+        };
+        formatter.json(&output);
+    } else {
+        for (bucket_name, objects) in all_items {
+            for item in objects {
+                let date = item
+                    .last_modified
+                    .map(|d| d.strftime("%Y-%m-%d %H:%M:%S").to_string())
+                    .unwrap_or_else(|| "                   ".to_string());
+                let styled_date = formatter.style_date(&format!("[{date}]"));
+
+                if item.is_dir {
+                    let styled_size = formatter.style_size(&format!("{:>10}", "0B"));
+                    let styled_name =
+                        formatter.style_dir(&format!("{}/{}", bucket_name, &item.key));
+                    formatter.println(&format!("{styled_date} {styled_size} {styled_name}"));
+                } else {
+                    let size = item.size_human.clone().unwrap_or_else(|| "0 B".to_string());
+                    let styled_size = formatter.style_size(&format!("{:>10}", size));
+                    let styled_name =
+                        formatter.style_file(&format!("{}/{}", bucket_name, &item.key));
+                    formatter.println(&format!("{styled_date} {styled_size} {styled_name}"));
+                }
+            }
+        }
+
+        if summarize {
+            let total_size_human = humansize::format_size(total_size as u64, humansize::BINARY);
+            formatter.println(&format!(
+                "\nTotal: {} objects, {}",
+                formatter.style_size(&total_objects.to_string()),
+                formatter.style_size(&total_size_human)
+            ));
+        }
+    }
+
+    ExitCode::Success
+}
+
+// List objects using pagination, returns (Vec<ObjectInfo>, is_truncated, Option<continuation_token>)
+async fn list_objects_with_paging(
+    client: &S3Client,
+    path: &RemotePath,
+    options: &ListOptions,
+) -> Result<(Vec<ObjectInfo>, bool, Option<String>), (String, ExitCode)> {
+    let mut all_items = Vec::new();
+    let mut is_truncated;
+    let mut continuation_token = None;
+
+    // Paginate through all results
+    loop {
+        let opts = ListOptions {
+            continuation_token: continuation_token.clone(),
+            ..options.clone()
+        };
+
+        match client.list_objects(path, opts).await {
+            Ok(result) => {
+                all_items.extend(result.items);
+                is_truncated = result.truncated;
+                continuation_token = result.continuation_token.clone();
+
+                if !result.truncated {
+                    break;
+                }
+            }
+            Err(e) => {
+                let err_str = e.to_string();
+                if err_str.contains("NotFound") || err_str.contains("NoSuchBucket") {
+                    return Err((
+                        format!("Bucket not found: {}", path.bucket),
+                        ExitCode::NotFound,
+                    ));
+                }
+                return Err((
+                    format!("Failed to list objects: {e}"),
+                    ExitCode::NetworkError,
+                ));
+            }
+        }
+    }
+
+    Ok((all_items, is_truncated, continuation_token))
 }
 
 /// Parse ls path into (alias, bucket, prefix)
