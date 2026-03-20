@@ -126,6 +126,15 @@ struct TierOperationOutput {
     action: String,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TierInfoOutput {
+    tier_name: String,
+    config: TierConfig,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stats: Option<serde_json::Value>,
+}
+
 /// Execute a tier subcommand
 pub async fn execute(cmd: TierCommands, output_config: OutputConfig) -> ExitCode {
     match cmd {
@@ -277,35 +286,61 @@ async fn execute_info(args: TierNameArg, output_config: OutputConfig) -> ExitCod
         Err(code) => return code,
     };
 
-    let stats = match client.tier_stats().await {
-        Ok(stats) => stats,
+    let tiers = match client.list_tiers().await {
+        Ok(tiers) => tiers,
         Err(error) => {
-            formatter.error(&format!("Failed to get tier stats: {error}"));
+            formatter.error(&format!("Failed to list tiers: {error}"));
             return ExitCode::GeneralError;
         }
     };
 
-    // The tier_stats endpoint returns a JSON object keyed by tier name
-    let tier_name_upper = args.tier_name.to_uppercase();
-    if let Some(tier_info) = stats.get(&tier_name_upper) {
-        if formatter.is_json() {
-            formatter.json(&serde_json::json!({
-                "tierName": tier_name_upper,
-                "stats": tier_info,
-            }));
-        } else {
-            formatter.println(&format!("Tier: {tier_name_upper}"));
-            if let Some(obj) = tier_info.as_object() {
-                for (key, value) in obj {
-                    formatter.println(&format!("  {key}: {value}"));
+    let Some(config) = find_tier_config(&tiers, &args.tier_name).cloned() else {
+        formatter.error(&format!("Tier '{}' not found", args.tier_name));
+        return ExitCode::NotFound;
+    };
+
+    let tier_name = config.tier_name().to_string();
+    let stats = match client.tier_stats().await {
+        Ok(stats) => stats.get(&tier_name).cloned(),
+        Err(_) => None,
+    };
+
+    if formatter.is_json() {
+        formatter.json(&TierInfoOutput {
+            tier_name,
+            config,
+            stats,
+        });
+    } else {
+        formatter.println(&format!("Tier: {}", config.tier_name()));
+        formatter.println(&format!("Type: {}", config.tier_type));
+        formatter.println(&format!("Endpoint: {}", config.endpoint()));
+        formatter.println(&format!("Bucket: {}", config.bucket()));
+        formatter.println(&format!("Prefix: {}", display_or_dash(config.prefix())));
+        formatter.println(&format!("Region: {}", display_or_dash(config.region())));
+        if let Some(stats) = stats {
+            formatter.println("Stats:");
+            match serde_json::to_string_pretty(&stats) {
+                Ok(pretty) => formatter.println(&pretty),
+                Err(error) => {
+                    formatter.error(&format!("Failed to format tier stats: {error}"));
+                    return ExitCode::GeneralError;
                 }
             }
         }
-        ExitCode::Success
-    } else {
-        formatter.error(&format!("Tier '{}' not found in stats", args.tier_name));
-        ExitCode::NotFound
     }
+
+    ExitCode::Success
+}
+
+fn find_tier_config<'a>(tiers: &'a [TierConfig], tier_name: &str) -> Option<&'a TierConfig> {
+    tiers
+        .iter()
+        .find(|tier| tier.tier_name().eq_ignore_ascii_case(tier_name))
+}
+
+fn display_or_dash(value: &str) -> &str {
+    if value.is_empty() { "-" } else { value }
 }
 
 async fn execute_remove(args: RemoveTierArgs, output_config: OutputConfig) -> ExitCode {
@@ -540,6 +575,53 @@ mod tests {
         assert_eq!(config.tier_type, TierType::MinIO);
         assert!(config.minio.is_some());
         assert!(config.s3.is_none());
+    }
+
+    #[test]
+    fn test_find_tier_config_matches_case_insensitively() {
+        let warm = build_tier_config(&TierConfigParams {
+            tier_type: TierType::RustFS,
+            name: "WARM",
+            endpoint: "http://remote:9000",
+            access_key: "admin",
+            secret_key: "password",
+            bucket: "archive-bucket",
+            prefix: "",
+            region: "",
+            storage_class: "",
+        });
+        let cold = build_tier_config(&TierConfigParams {
+            tier_type: TierType::MinIO,
+            name: "COLD",
+            endpoint: "http://minio:9000",
+            access_key: "key",
+            secret_key: "secret",
+            bucket: "cold-bucket",
+            prefix: "data/",
+            region: "us-west-2",
+            storage_class: "",
+        });
+
+        let tiers = vec![warm, cold];
+        let matched = find_tier_config(&tiers, "warm").expect("tier should exist");
+        assert_eq!(matched.tier_name(), "WARM");
+    }
+
+    #[test]
+    fn test_find_tier_config_returns_none_when_missing() {
+        let tiers = vec![build_tier_config(&TierConfigParams {
+            tier_type: TierType::RustFS,
+            name: "WARM",
+            endpoint: "http://remote:9000",
+            access_key: "admin",
+            secret_key: "password",
+            bucket: "archive-bucket",
+            prefix: "",
+            region: "",
+            storage_class: "",
+        })];
+
+        assert!(find_tier_config(&tiers, "COLD").is_none());
     }
 
     #[tokio::test]

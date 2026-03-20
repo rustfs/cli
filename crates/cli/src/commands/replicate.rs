@@ -498,6 +498,7 @@ async fn execute_list(args: BucketArg, output_config: OutputConfig) -> ExitCode 
                     Cell::new("Priority"),
                     Cell::new("Status"),
                     Cell::new("Prefix"),
+                    Cell::new("Flags"),
                     Cell::new("Destination"),
                     Cell::new("Storage Class"),
                 ]);
@@ -508,6 +509,7 @@ async fn execute_list(args: BucketArg, output_config: OutputConfig) -> ExitCode 
                         Cell::new(rule.priority),
                         Cell::new(rule.status),
                         Cell::new(rule.prefix.as_deref().unwrap_or("-")),
+                        Cell::new(format_replication_flags(rule)),
                         Cell::new(&rule.destination.bucket_arn),
                         Cell::new(rule.destination.storage_class.as_deref().unwrap_or("-")),
                     ]);
@@ -891,6 +893,26 @@ fn default_replication_role(bucket_arn: &str) -> String {
     bucket_arn.to_string()
 }
 
+fn format_replication_flags(rule: &ReplicationRule) -> String {
+    let mut flags = Vec::new();
+
+    if rule.delete_replication == Some(true) {
+        flags.push("delete");
+    }
+    if rule.delete_marker_replication == Some(true) {
+        flags.push("delete-marker");
+    }
+    if rule.existing_object_replication == Some(true) {
+        flags.push("existing-objects");
+    }
+
+    if flags.is_empty() {
+        "-".to_string()
+    } else {
+        flags.join(",")
+    }
+}
+
 fn remote_target_endpoint(endpoint: &str, insecure: bool) -> (String, bool) {
     let trimmed = endpoint.trim().trim_end_matches('/');
 
@@ -966,6 +988,29 @@ mod tests {
     fn test_default_replication_role_uses_destination_arn() {
         let arn = "arn:rustfs:replication:us-east-1:123:test";
         assert_eq!(default_replication_role(arn), arn);
+    }
+
+    #[test]
+    fn test_format_replication_flags_includes_delete_replication() {
+        let rule = ReplicationRule {
+            id: "rule-1".to_string(),
+            priority: 1,
+            status: ReplicationRuleStatus::Enabled,
+            prefix: None,
+            tags: None,
+            destination: ReplicationDestination {
+                bucket_arn: "arn:rustfs:replication:us-east-1:123:test".to_string(),
+                storage_class: Some("STANDARD".to_string()),
+            },
+            delete_marker_replication: Some(true),
+            existing_object_replication: Some(true),
+            delete_replication: Some(true),
+        };
+
+        assert_eq!(
+            format_replication_flags(&rule),
+            "delete,delete-marker,existing-objects"
+        );
     }
 
     #[test]

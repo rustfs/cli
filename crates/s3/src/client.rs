@@ -3,6 +3,11 @@
 //! Wraps aws-sdk-s3 and implements the ObjectStore trait from rc-core.
 
 use async_trait::async_trait;
+use aws_credential_types::Credentials;
+use aws_sigv4::http_request::{
+    SignableBody, SignableRequest, SignatureLocation, SigningSettings, sign,
+};
+use aws_sigv4::sign::v4;
 use aws_smithy_runtime_api::client::http::{
     HttpClient, HttpConnector, HttpConnectorFuture, HttpConnectorSettings, SharedHttpConnector,
 };
@@ -13,16 +18,23 @@ use aws_smithy_runtime_api::http::{Response, StatusCode};
 use aws_smithy_types::body::SdkBody;
 use bytes::Bytes;
 use jiff::Timestamp;
+use quick_xml::de::from_str as from_xml_str;
 use rc_core::{
     Alias, BucketNotification, Capabilities, Error, LifecycleRule, ListOptions, ListResult,
     NotificationTarget, ObjectInfo, ObjectStore, ObjectVersion, RemotePath,
     ReplicationConfiguration, Result,
 };
+use reqwest::Method;
+use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
 
 /// Keep single-part uploads small to avoid backend incompatibilities with
 /// streaming aws-chunked payloads.
 const SINGLE_PUT_OBJECT_MAX_SIZE: u64 = crate::multipart::DEFAULT_PART_SIZE;
+const S3_SERVICE_NAME: &str = "s3";
+const S3_REPLICATION_XML_NAMESPACE: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BucketPolicyErrorKind {
@@ -40,26 +52,220 @@ struct ReqwestConnector {
 
 impl ReqwestConnector {
     async fn new(insecure: bool, ca_bundle: Option<&str>) -> Result<Self> {
-        // NOTE: When `insecure = true`, `danger_accept_invalid_certs` disables all TLS
-        // certificate verification. Any CA bundle provided will still be added to the
-        // trust store but is rendered ineffective for this connection.
-        let mut builder = reqwest::Client::builder().danger_accept_invalid_certs(insecure);
-
-        if let Some(bundle_path) = ca_bundle {
-            // Use tokio::fs::read to avoid blocking the async runtime thread.
-            let pem = tokio::fs::read(bundle_path).await.map_err(|e| {
-                Error::Network(format!("Failed to read CA bundle '{bundle_path}': {e}"))
-            })?;
-            let cert = reqwest::Certificate::from_pem(&pem)
-                .map_err(|e| Error::Network(format!("Invalid CA bundle '{bundle_path}': {e}")))?;
-            builder = builder.add_root_certificate(cert);
-        }
-
-        let client = builder
-            .build()
-            .map_err(|e| Error::Network(format!("Failed to build HTTP client: {e}")))?;
+        let client = build_reqwest_client(insecure, ca_bundle).await?;
         Ok(Self { client })
     }
+}
+
+async fn build_reqwest_client(insecure: bool, ca_bundle: Option<&str>) -> Result<reqwest::Client> {
+    // NOTE: When `insecure = true`, `danger_accept_invalid_certs` disables all TLS
+    // certificate verification. Any CA bundle provided will still be added to the
+    // trust store but is rendered ineffective for this connection.
+    let mut builder = reqwest::Client::builder().danger_accept_invalid_certs(insecure);
+
+    if let Some(bundle_path) = ca_bundle {
+        // Use tokio::fs::read to avoid blocking the async runtime thread.
+        let pem = tokio::fs::read(bundle_path).await.map_err(|e| {
+            Error::Network(format!("Failed to read CA bundle '{bundle_path}': {e}"))
+        })?;
+        let cert = reqwest::Certificate::from_pem(&pem)
+            .map_err(|e| Error::Network(format!("Invalid CA bundle '{bundle_path}': {e}")))?;
+        builder = builder.add_root_certificate(cert);
+    }
+
+    let client = builder
+        .build()
+        .map_err(|e| Error::Network(format!("Failed to build HTTP client: {e}")))?;
+    Ok(client)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ReplicationConfigurationXml {
+    role: Option<String>,
+    #[serde(rename = "Rule", default)]
+    rules: Vec<ReplicationRuleXml>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ReplicationRuleXml {
+    #[serde(rename = "ID")]
+    id: Option<String>,
+    priority: Option<i32>,
+    status: Option<String>,
+    #[serde(rename = "Prefix")]
+    legacy_prefix: Option<String>,
+    filter: Option<ReplicationFilterXml>,
+    destination: Option<ReplicationDestinationXml>,
+    delete_marker_replication: Option<ReplicationStatusXml>,
+    existing_object_replication: Option<ReplicationStatusXml>,
+    delete_replication: Option<ReplicationStatusXml>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ReplicationFilterXml {
+    prefix: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ReplicationDestinationXml {
+    bucket: Option<String>,
+    storage_class: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ReplicationStatusXml {
+    status: Option<String>,
+}
+
+fn parse_replication_status(status: Option<&ReplicationStatusXml>) -> Option<bool> {
+    status
+        .and_then(|value| value.status.as_deref())
+        .map(|value| value.eq_ignore_ascii_case("enabled"))
+}
+
+fn parse_replication_rule_status(status: Option<&str>) -> rc_core::ReplicationRuleStatus {
+    match status {
+        Some(value) if value.eq_ignore_ascii_case("enabled") => {
+            rc_core::ReplicationRuleStatus::Enabled
+        }
+        _ => rc_core::ReplicationRuleStatus::Disabled,
+    }
+}
+
+fn parse_replication_configuration_xml(body: &str) -> Result<ReplicationConfiguration> {
+    let config: ReplicationConfigurationXml = from_xml_str(body)
+        .map_err(|e| Error::General(format!("parse replication config xml: {e}")))?;
+
+    let rules = config
+        .rules
+        .into_iter()
+        .map(|rule| rc_core::ReplicationRule {
+            id: rule.id.unwrap_or_default(),
+            priority: rule.priority.unwrap_or_default(),
+            status: parse_replication_rule_status(rule.status.as_deref()),
+            prefix: rule
+                .filter
+                .and_then(|filter| filter.prefix)
+                .or(rule.legacy_prefix),
+            tags: None,
+            destination: rc_core::ReplicationDestination {
+                bucket_arn: rule
+                    .destination
+                    .as_ref()
+                    .and_then(|destination| destination.bucket.clone())
+                    .unwrap_or_default(),
+                storage_class: rule
+                    .destination
+                    .and_then(|destination| destination.storage_class),
+            },
+            delete_marker_replication: parse_replication_status(
+                rule.delete_marker_replication.as_ref(),
+            ),
+            existing_object_replication: parse_replication_status(
+                rule.existing_object_replication.as_ref(),
+            ),
+            delete_replication: parse_replication_status(rule.delete_replication.as_ref()),
+        })
+        .collect();
+
+    Ok(ReplicationConfiguration {
+        role: config.role.unwrap_or_default(),
+        rules,
+    })
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn append_replication_status_tag(xml: &mut String, tag: &str, enabled: Option<bool>) {
+    if let Some(enabled) = enabled {
+        let status = if enabled { "Enabled" } else { "Disabled" };
+        xml.push('<');
+        xml.push_str(tag);
+        xml.push_str("><Status>");
+        xml.push_str(status);
+        xml.push_str("</Status></");
+        xml.push_str(tag);
+        xml.push('>');
+    }
+}
+
+fn build_replication_configuration_xml(config: &ReplicationConfiguration) -> String {
+    let mut xml = String::from(r#"<?xml version="1.0" encoding="UTF-8"?>"#);
+    xml.push_str(r#"<ReplicationConfiguration xmlns=""#);
+    xml.push_str(S3_REPLICATION_XML_NAMESPACE);
+    xml.push_str(r#"">"#);
+
+    if !config.role.is_empty() {
+        xml.push_str("<Role>");
+        xml.push_str(&xml_escape(&config.role));
+        xml.push_str("</Role>");
+    }
+
+    for rule in &config.rules {
+        xml.push_str("<Rule>");
+
+        xml.push_str("<Status>");
+        xml.push_str(match rule.status {
+            rc_core::ReplicationRuleStatus::Enabled => "Enabled",
+            rc_core::ReplicationRuleStatus::Disabled => "Disabled",
+        });
+        xml.push_str("</Status>");
+
+        xml.push_str("<Destination><Bucket>");
+        xml.push_str(&xml_escape(&rule.destination.bucket_arn));
+        xml.push_str("</Bucket>");
+        if let Some(storage_class) = &rule.destination.storage_class {
+            xml.push_str("<StorageClass>");
+            xml.push_str(&xml_escape(storage_class));
+            xml.push_str("</StorageClass>");
+        }
+        xml.push_str("</Destination>");
+
+        if !rule.id.is_empty() {
+            xml.push_str("<ID>");
+            xml.push_str(&xml_escape(&rule.id));
+            xml.push_str("</ID>");
+        }
+
+        xml.push_str("<Priority>");
+        xml.push_str(&rule.priority.to_string());
+        xml.push_str("</Priority>");
+
+        if let Some(prefix) = &rule.prefix {
+            xml.push_str("<Filter><Prefix>");
+            xml.push_str(&xml_escape(prefix));
+            xml.push_str("</Prefix></Filter>");
+        }
+
+        append_replication_status_tag(
+            &mut xml,
+            "ExistingObjectReplication",
+            rule.existing_object_replication,
+        );
+        append_replication_status_tag(
+            &mut xml,
+            "DeleteMarkerReplication",
+            rule.delete_marker_replication,
+        );
+        append_replication_status_tag(&mut xml, "DeleteReplication", rule.delete_replication);
+
+        xml.push_str("</Rule>");
+    }
+
+    xml.push_str("</ReplicationConfiguration>");
+    xml
 }
 
 impl HttpConnector for ReqwestConnector {
@@ -166,6 +372,7 @@ impl HttpClient for ReqwestConnector {
 /// S3 client wrapper
 pub struct S3Client {
     inner: aws_sdk_s3::Client,
+    xml_http_client: reqwest::Client,
     #[allow(dead_code)]
     alias: Alias,
 }
@@ -201,6 +408,8 @@ impl S3Client {
             config_loader = config_loader.http_client(connector);
         }
 
+        let xml_http_client =
+            build_reqwest_client(alias.insecure, alias.ca_bundle.as_deref()).await?;
         let config = config_loader.load().await;
 
         // Build S3 client with path-style addressing for compatibility
@@ -220,6 +429,7 @@ impl S3Client {
 
         Ok(Self {
             inner: client,
+            xml_http_client,
             alias,
         })
     }
@@ -260,6 +470,162 @@ impl S3Client {
 
     fn should_use_multipart(file_size: u64) -> bool {
         file_size > SINGLE_PUT_OBJECT_MAX_SIZE
+    }
+
+    fn sha256_hash(body: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(body);
+        hex::encode(hasher.finalize())
+    }
+
+    fn request_host(&self, url: &reqwest::Url) -> Result<String> {
+        let host = url
+            .host_str()
+            .ok_or_else(|| Error::Network("Missing host in request URL".to_string()))?;
+        Ok(match url.port() {
+            Some(port) => format!("{host}:{port}"),
+            None => host.to_string(),
+        })
+    }
+
+    fn replication_url(&self, bucket: &str) -> Result<reqwest::Url> {
+        let mut url =
+            reqwest::Url::parse(self.alias.endpoint.trim_end_matches('/')).map_err(|e| {
+                Error::Network(format!("Invalid endpoint '{}': {e}", self.alias.endpoint))
+            })?;
+
+        {
+            let mut segments = url.path_segments_mut().map_err(|_| {
+                Error::Network(format!(
+                    "Endpoint '{}' does not support path-style bucket operations",
+                    self.alias.endpoint
+                ))
+            })?;
+            segments.pop_if_empty();
+            segments.push(bucket);
+        }
+
+        url.set_query(Some("replication="));
+        Ok(url)
+    }
+
+    async fn sign_xml_request(
+        &self,
+        method: &Method,
+        url: &str,
+        headers: &HeaderMap,
+        body: &[u8],
+    ) -> Result<HeaderMap> {
+        let credentials = Credentials::new(
+            &self.alias.access_key,
+            &self.alias.secret_key,
+            None,
+            None,
+            "s3-xml-client",
+        );
+
+        let identity = credentials.into();
+        let mut signing_settings = SigningSettings::default();
+        signing_settings.signature_location = SignatureLocation::Headers;
+
+        let signing_params = v4::SigningParams::builder()
+            .identity(&identity)
+            .region(&self.alias.region)
+            .name(S3_SERVICE_NAME)
+            .time(std::time::SystemTime::now())
+            .settings(signing_settings)
+            .build()
+            .map_err(|e| Error::Auth(format!("Failed to build signing params: {e}")))?;
+
+        let header_pairs: Vec<(&str, &str)> = headers
+            .iter()
+            .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.as_str(), v)))
+            .collect();
+
+        let signable_request = SignableRequest::new(
+            method.as_str(),
+            url,
+            header_pairs.into_iter(),
+            SignableBody::Bytes(body),
+        )
+        .map_err(|e| Error::Auth(format!("Failed to create signable request: {e}")))?;
+
+        let (signing_instructions, _) = sign(signable_request, &signing_params.into())
+            .map_err(|e| Error::Auth(format!("Failed to sign request: {e}")))?
+            .into_parts();
+
+        let mut signed_headers = headers.clone();
+        for (name, value) in signing_instructions.headers() {
+            let header_name = HeaderName::try_from(name.to_string())
+                .map_err(|e| Error::Auth(format!("Invalid header name: {e}")))?;
+            let header_value = HeaderValue::try_from(value.to_string())
+                .map_err(|e| Error::Auth(format!("Invalid header value: {e}")))?;
+            signed_headers.insert(header_name, header_value);
+        }
+
+        Ok(signed_headers)
+    }
+
+    async fn xml_request(
+        &self,
+        method: Method,
+        url: reqwest::Url,
+        content_type: Option<&str>,
+        body: Option<Vec<u8>>,
+    ) -> Result<String> {
+        let body = body.unwrap_or_default();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-amz-content-sha256",
+            HeaderValue::from_str(&Self::sha256_hash(&body))
+                .map_err(|e| Error::Auth(format!("Invalid content hash header: {e}")))?,
+        );
+        headers.insert(
+            "host",
+            HeaderValue::from_str(&self.request_host(&url)?)
+                .map_err(|e| Error::Auth(format!("Invalid host header: {e}")))?,
+        );
+
+        if let Some(content_type) = content_type {
+            headers.insert(
+                CONTENT_TYPE,
+                HeaderValue::from_str(content_type)
+                    .map_err(|e| Error::Auth(format!("Invalid content type header: {e}")))?,
+            );
+        }
+
+        let signed_headers = self
+            .sign_xml_request(&method, url.as_str(), &headers, &body)
+            .await?;
+
+        let mut request_builder = self.xml_http_client.request(method, url);
+        for (name, value) in &signed_headers {
+            request_builder = request_builder.header(name, value);
+        }
+        if !body.is_empty() {
+            request_builder = request_builder.body(body);
+        }
+
+        let response = request_builder
+            .send()
+            .await
+            .map_err(|e| Error::Network(format!("Request failed: {e}")))?;
+
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .map_err(|e| Error::Network(format!("Failed to read response: {e}")))?;
+
+        if !status.is_success() {
+            return Err(Error::Network(format!(
+                "HTTP {}: {}",
+                status.as_u16(),
+                text
+            )));
+        }
+
+        Ok(text)
     }
 
     fn bucket_policy_error_kind(
@@ -1811,81 +2177,22 @@ impl ObjectStore for S3Client {
         &self,
         bucket: &str,
     ) -> Result<Option<ReplicationConfiguration>> {
-        let response = match self
-            .inner
-            .get_bucket_replication()
-            .bucket(bucket)
-            .send()
-            .await
-        {
-            Ok(resp) => resp,
-            Err(error) => {
-                let error_text = Self::format_sdk_error(&error);
+        let url = self.replication_url(bucket)?;
+        let body = match self.xml_request(Method::GET, url, None, None).await {
+            Ok(body) => body,
+            Err(Error::Network(error_text))
                 if error_text.contains("ReplicationConfigurationNotFound")
                     || error_text.contains("replication configuration is not found")
-                    || error_text.contains("replication not found")
-                {
-                    return Ok(None);
-                }
-                return Err(Error::General(format!(
-                    "get_bucket_replication: {error_text}"
-                )));
+                    || error_text.contains("replication not found") =>
+            {
+                return Ok(None);
+            }
+            Err(error) => {
+                return Err(Error::General(format!("get_bucket_replication: {error}")));
             }
         };
 
-        let Some(config) = response.replication_configuration() else {
-            return Ok(None);
-        };
-
-        let role = config.role().to_string();
-        let mut rules = Vec::new();
-
-        for sdk_rule in config.rules() {
-            let id = sdk_rule.id().unwrap_or("").to_string();
-            let priority = sdk_rule.priority().unwrap_or(0);
-            let status = match sdk_rule.status().as_str() {
-                "Enabled" => rc_core::ReplicationRuleStatus::Enabled,
-                _ => rc_core::ReplicationRuleStatus::Disabled,
-            };
-
-            let prefix = sdk_rule
-                .filter()
-                .and_then(|f| f.prefix().map(|p| p.to_string()));
-
-            let destination = rc_core::ReplicationDestination {
-                bucket_arn: sdk_rule
-                    .destination()
-                    .map(|d| d.bucket().to_string())
-                    .unwrap_or_default(),
-                storage_class: sdk_rule
-                    .destination()
-                    .and_then(|d| d.storage_class())
-                    .map(|sc| sc.as_str().to_string()),
-            };
-
-            let delete_marker_replication = sdk_rule
-                .delete_marker_replication()
-                .and_then(|d| d.status())
-                .map(|s| s.as_str() == "Enabled");
-
-            let existing_object_replication = sdk_rule
-                .existing_object_replication()
-                .map(|e| e.status().as_str() == "Enabled");
-
-            rules.push(rc_core::ReplicationRule {
-                id,
-                priority,
-                status,
-                prefix,
-                tags: None,
-                destination,
-                delete_marker_replication,
-                existing_object_replication,
-                delete_replication: None,
-            });
-        }
-
-        Ok(Some(ReplicationConfiguration { role, rules }))
+        parse_replication_configuration_xml(&body).map(Some)
     }
 
     async fn set_bucket_replication(
@@ -1893,93 +2200,11 @@ impl ObjectStore for S3Client {
         bucket: &str,
         config: ReplicationConfiguration,
     ) -> Result<()> {
-        use aws_sdk_s3::types::{
-            DeleteMarkerReplication, DeleteMarkerReplicationStatus, Destination,
-            ExistingObjectReplication, ExistingObjectReplicationStatus,
-            ReplicationConfiguration as SdkConfig, ReplicationRule as SdkRule,
-            ReplicationRuleFilter, ReplicationRuleStatus as SdkStatus, StorageClass,
-        };
-
-        let mut sdk_rules = Vec::new();
-        for rule in config.rules {
-            let status = match rule.status {
-                rc_core::ReplicationRuleStatus::Enabled => SdkStatus::Enabled,
-                rc_core::ReplicationRuleStatus::Disabled => SdkStatus::Disabled,
-            };
-
-            let mut dest_builder = Destination::builder().bucket(&rule.destination.bucket_arn);
-            if let Some(sc) = &rule.destination.storage_class {
-                dest_builder = dest_builder.storage_class(StorageClass::from(sc.as_str()));
-            }
-            let destination = dest_builder
-                .build()
-                .map_err(|e| Error::General(format!("build destination: {e}")))?;
-
-            let filter = rule
-                .prefix
-                .as_ref()
-                .map(|p| ReplicationRuleFilter::builder().prefix(p).build());
-
-            let dmr = rule.delete_marker_replication.map(|enabled| {
-                DeleteMarkerReplication::builder()
-                    .status(if enabled {
-                        DeleteMarkerReplicationStatus::Enabled
-                    } else {
-                        DeleteMarkerReplicationStatus::Disabled
-                    })
-                    .build()
-            });
-
-            let eor = rule.existing_object_replication.map(|enabled| {
-                ExistingObjectReplication::builder()
-                    .status(if enabled {
-                        ExistingObjectReplicationStatus::Enabled
-                    } else {
-                        ExistingObjectReplicationStatus::Disabled
-                    })
-                    .build()
-                    .expect("build existing object replication")
-            });
-
-            let mut builder = SdkRule::builder()
-                .id(&rule.id)
-                .priority(rule.priority)
-                .status(status)
-                .destination(destination);
-            if let Some(filter) = filter {
-                builder = builder.filter(filter);
-            }
-            if let Some(dmr) = dmr {
-                builder = builder.delete_marker_replication(dmr);
-            }
-            if let Some(eor) = eor {
-                builder = builder.existing_object_replication(eor);
-            }
-
-            let sdk_rule = builder
-                .build()
-                .map_err(|e| Error::General(format!("build replication rule: {e}")))?;
-            sdk_rules.push(sdk_rule);
-        }
-
-        let sdk_config = SdkConfig::builder()
-            .role(&config.role)
-            .set_rules(Some(sdk_rules))
-            .build()
-            .map_err(|e| Error::General(format!("build replication config: {e}")))?;
-
-        self.inner
-            .put_bucket_replication()
-            .bucket(bucket)
-            .replication_configuration(sdk_config)
-            .send()
+        let url = self.replication_url(bucket)?;
+        let body = build_replication_configuration_xml(&config).into_bytes();
+        self.xml_request(Method::PUT, url, Some("application/xml"), Some(body))
             .await
-            .map_err(|e| {
-                Error::General(format!(
-                    "set_bucket_replication: {}",
-                    Self::format_sdk_error(&e)
-                ))
-            })?;
+            .map_err(|e| Error::General(format!("set_bucket_replication: {e}")))?;
 
         Ok(())
     }
@@ -2009,6 +2234,75 @@ mod tests {
         let info = ObjectInfo::file("test.txt", 1024);
         assert_eq!(info.key, "test.txt");
         assert_eq!(info.size_bytes, Some(1024));
+    }
+
+    #[test]
+    fn parse_replication_configuration_xml_reads_delete_replication() {
+        let body = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ReplicationConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Role>arn:rustfs:replication:us-east-1:123:test</Role>
+  <Rule>
+    <Status>Enabled</Status>
+    <Destination>
+      <Bucket>arn:rustfs:replication:us-east-1:123:dest</Bucket>
+      <StorageClass>STANDARD</StorageClass>
+    </Destination>
+    <ID>rule-1</ID>
+    <Priority>1</Priority>
+    <Filter>
+      <Prefix>logs/</Prefix>
+    </Filter>
+    <ExistingObjectReplication>
+      <Status>Enabled</Status>
+    </ExistingObjectReplication>
+    <DeleteMarkerReplication>
+      <Status>Disabled</Status>
+    </DeleteMarkerReplication>
+    <DeleteReplication>
+      <Status>Enabled</Status>
+    </DeleteReplication>
+  </Rule>
+</ReplicationConfiguration>"#;
+
+        let config = parse_replication_configuration_xml(body).expect("parse replication xml");
+        assert_eq!(config.role, "arn:rustfs:replication:us-east-1:123:test");
+        assert_eq!(config.rules.len(), 1);
+        assert_eq!(config.rules[0].id, "rule-1");
+        assert_eq!(config.rules[0].prefix.as_deref(), Some("logs/"));
+        assert_eq!(config.rules[0].delete_replication, Some(true));
+        assert_eq!(config.rules[0].delete_marker_replication, Some(false));
+        assert_eq!(config.rules[0].existing_object_replication, Some(true));
+    }
+
+    #[test]
+    fn build_replication_configuration_xml_writes_delete_replication() {
+        let config = ReplicationConfiguration {
+            role: "arn:rustfs:replication:us-east-1:123:test".to_string(),
+            rules: vec![rc_core::ReplicationRule {
+                id: "rule-1".to_string(),
+                priority: 1,
+                status: rc_core::ReplicationRuleStatus::Enabled,
+                prefix: Some("logs/".to_string()),
+                tags: None,
+                destination: rc_core::ReplicationDestination {
+                    bucket_arn: "arn:rustfs:replication:us-east-1:123:dest".to_string(),
+                    storage_class: Some("STANDARD".to_string()),
+                },
+                delete_marker_replication: Some(true),
+                existing_object_replication: Some(true),
+                delete_replication: Some(true),
+            }],
+        };
+
+        let xml = build_replication_configuration_xml(&config);
+        assert!(xml.contains("<DeleteReplication><Status>Enabled</Status></DeleteReplication>"));
+        assert!(xml.contains(
+            "<ExistingObjectReplication><Status>Enabled</Status></ExistingObjectReplication>"
+        ));
+        assert!(xml.contains(
+            "<DeleteMarkerReplication><Status>Enabled</Status></DeleteMarkerReplication>"
+        ));
+        assert!(xml.contains("<Filter><Prefix>logs/</Prefix></Filter>"));
     }
 
     #[test]
