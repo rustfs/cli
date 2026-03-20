@@ -294,25 +294,31 @@ async fn list_all_objects(
         };
         formatter.json(&output);
     } else {
-        for (bucket_name, objects) in all_items {
-            for item in objects {
-                let date = item
-                    .last_modified
-                    .map(|d| d.strftime("%Y-%m-%d %H:%M:%S").to_string())
-                    .unwrap_or_else(|| "                   ".to_string());
-                let styled_date = formatter.style_date(&format!("[{date}]"));
+        // Ensure deterministic bucket order in text output
+        let mut bucket_names: Vec<&str> = all_items.keys().copied().collect();
+        bucket_names.sort_unstable();
 
-                if item.is_dir {
-                    let styled_size = formatter.style_size(&format!("{:>10}", "0B"));
-                    let styled_name =
-                        formatter.style_dir(&format!("{}/{}", bucket_name, &item.key));
-                    formatter.println(&format!("{styled_date} {styled_size} {styled_name}"));
-                } else {
-                    let size = item.size_human.clone().unwrap_or_else(|| "0 B".to_string());
-                    let styled_size = formatter.style_size(&format!("{:>10}", size));
-                    let styled_name =
-                        formatter.style_file(&format!("{}/{}", bucket_name, &item.key));
-                    formatter.println(&format!("{styled_date} {styled_size} {styled_name}"));
+        for bucket_name in bucket_names {
+            if let Some(objects) = all_items.get(bucket_name) {
+                for item in objects {
+                    let date = item
+                        .last_modified
+                        .map(|d| d.strftime("%Y-%m-%d %H:%M:%S").to_string())
+                        .unwrap_or_else(|| "                   ".to_string());
+                    let styled_date = formatter.style_date(&format!("[{date}]"));
+
+                    if item.is_dir {
+                        let styled_size = formatter.style_size(&format!("{:>10}", "0B"));
+                        let styled_name =
+                            formatter.style_dir(&format!("{}/{}", bucket_name, &item.key));
+                        formatter.println(&format!("{styled_date} {styled_size} {styled_name}"));
+                    } else {
+                        let size = item.size_human.clone().unwrap_or_else(|| "0 B".to_string());
+                        let styled_size = formatter.style_size(&format!("{:>10}", size));
+                        let styled_name =
+                            formatter.style_file(&format!("{}/{}", bucket_name, &item.key));
+                        formatter.println(&format!("{styled_date} {styled_size} {styled_name}"));
+                    }
                 }
             }
         }
