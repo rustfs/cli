@@ -17,6 +17,10 @@ use serde::Serialize;
 use crate::exit_code::ExitCode;
 use crate::output::{Formatter, OutputConfig};
 
+const DEFAULT_REMOTE_TARGET_PATH: &str = "auto";
+const DEFAULT_REMOTE_TARGET_API: &str = "s3v4";
+const DEFAULT_REPLICATION_STORAGE_CLASS: &str = "STANDARD";
+
 /// Manage bucket replication
 #[derive(Args, Debug)]
 pub struct ReplicateArgs {
@@ -261,23 +265,31 @@ async fn execute_add(args: AddArgs, output_config: OutputConfig) -> ExitCode {
         Err(code) => return code,
     };
 
-    let secure = target_alias_info.endpoint.starts_with("https");
+    let (target_endpoint, secure) =
+        remote_target_endpoint(&target_alias_info.endpoint, target_alias_info.insecure);
+
+    let storage_class = args
+        .storage_class
+        .clone()
+        .unwrap_or_else(|| DEFAULT_REPLICATION_STORAGE_CLASS.to_string());
 
     // Build BucketTarget
     let target = BucketTarget {
         source_bucket: source_bucket.clone(),
-        endpoint: target_alias_info.endpoint.clone(),
+        endpoint: target_endpoint,
         credentials: Some(BucketTargetCredentials {
             access_key: target_alias_info.access_key.clone(),
             secret_key: target_alias_info.secret_key.clone(),
         }),
         target_bucket: target_bucket.clone(),
         secure,
+        path: DEFAULT_REMOTE_TARGET_PATH.to_string(),
+        api: DEFAULT_REMOTE_TARGET_API.to_string(),
         target_type: "replication".to_string(),
         region: target_alias_info.region.clone(),
         bandwidth_limit: args.bandwidth,
         replication_sync: args.sync,
-        storage_class: args.storage_class.clone().unwrap_or_default(),
+        storage_class: storage_class.clone(),
         health_check_duration: args.healthcheck_seconds,
         disable_proxy: args.disable_proxy,
         ..Default::default()
@@ -303,6 +315,8 @@ async fn execute_add(args: AddArgs, output_config: OutputConfig) -> ExitCode {
         .id
         .unwrap_or_else(|| format!("rule-{}", &arn[arn.len().saturating_sub(8)..]));
 
+    let destination_storage_class = Some(storage_class);
+
     let new_rule = ReplicationRule {
         id: rule_id.clone(),
         priority: args.priority,
@@ -311,7 +325,7 @@ async fn execute_add(args: AddArgs, output_config: OutputConfig) -> ExitCode {
         tags: None,
         destination: ReplicationDestination {
             bucket_arn: arn,
-            storage_class: args.storage_class,
+            storage_class: destination_storage_class,
         },
         delete_marker_replication: Some(delete_marker_replication),
         existing_object_replication: Some(existing_object_replication),
@@ -322,7 +336,7 @@ async fn execute_add(args: AddArgs, output_config: OutputConfig) -> ExitCode {
     let mut config = match s3_client.get_bucket_replication(&source_bucket).await {
         Ok(Some(config)) => config,
         Ok(None) => ReplicationConfiguration {
-            role: String::new(),
+            role: default_replication_role(&new_rule.destination.bucket_arn),
             rules: Vec::new(),
         },
         Err(error) => {
@@ -330,6 +344,10 @@ async fn execute_add(args: AddArgs, output_config: OutputConfig) -> ExitCode {
             return ExitCode::GeneralError;
         }
     };
+
+    if config.role.is_empty() {
+        config.role = default_replication_role(&new_rule.destination.bucket_arn);
+    }
 
     config.rules.push(new_rule);
 
@@ -869,6 +887,28 @@ fn parse_replicate_flags(flags: Option<&str>) -> (bool, bool, bool) {
     (delete, delete_marker, existing_objects)
 }
 
+fn default_replication_role(bucket_arn: &str) -> String {
+    bucket_arn.to_string()
+}
+
+fn remote_target_endpoint(endpoint: &str, insecure: bool) -> (String, bool) {
+    let trimmed = endpoint.trim().trim_end_matches('/');
+
+    if let Some(rest) = trimmed.strip_prefix("https://") {
+        return (strip_endpoint_path(rest), true);
+    }
+
+    if let Some(rest) = trimmed.strip_prefix("http://") {
+        return (strip_endpoint_path(rest), false);
+    }
+
+    (strip_endpoint_path(trimmed), !insecure)
+}
+
+fn strip_endpoint_path(endpoint: &str) -> String {
+    endpoint.split('/').next().unwrap_or(endpoint).to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -920,6 +960,46 @@ mod tests {
     fn test_parse_replicate_flags_case_insensitive() {
         let (d, _, _) = parse_replicate_flags(Some("DELETE"));
         assert!(d);
+    }
+
+    #[test]
+    fn test_default_replication_role_uses_destination_arn() {
+        let arn = "arn:rustfs:replication:us-east-1:123:test";
+        assert_eq!(default_replication_role(arn), arn);
+    }
+
+    #[test]
+    fn test_remote_target_endpoint_strips_scheme_and_path() {
+        let (endpoint, secure) = remote_target_endpoint("https://localhost:9005/path/", false);
+        assert_eq!(endpoint, "localhost:9005");
+        assert!(secure);
+    }
+
+    #[test]
+    fn test_remote_target_endpoint_supports_plain_host_port() {
+        let (endpoint, secure) = remote_target_endpoint("localhost:9005", true);
+        assert_eq!(endpoint, "localhost:9005");
+        assert!(!secure);
+    }
+
+    #[test]
+    fn test_add_defaults_destination_storage_class_to_standard() {
+        let rule = ReplicationRule {
+            id: "rule-1".to_string(),
+            priority: 1,
+            status: ReplicationRuleStatus::Enabled,
+            prefix: None,
+            tags: None,
+            destination: ReplicationDestination {
+                bucket_arn: "arn:rustfs:replication:us-east-1:123:test".to_string(),
+                storage_class: Some("STANDARD".to_string()),
+            },
+            delete_marker_replication: Some(false),
+            existing_object_replication: Some(false),
+            delete_replication: Some(false),
+        };
+
+        assert_eq!(rule.destination.storage_class.as_deref(), Some("STANDARD"));
     }
 
     #[tokio::test]

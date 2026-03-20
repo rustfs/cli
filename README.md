@@ -180,8 +180,20 @@ rc ilm restore local/my-bucket/archived-file.dat --days 7
 ### Bucket Replication
 
 ```bash
-# Add replication rule (requires remote target setup)
-rc replicate add local/my-bucket --remote-bucket remote/target-bucket --priority 1
+# Replication requires versioning on both source and destination buckets
+rc version enable local/my-bucket
+rc version enable remote/target-bucket
+
+# Configure a remote alias with the destination RustFS endpoint URL.
+# rc normalizes the remote target endpoint to the host:port form expected by
+# the RustFS admin API when creating replication targets.
+rc alias set remote http://remote:9000 ACCESS_KEY SECRET_KEY
+
+# Add a replication rule
+rc replicate add local/my-bucket \
+  --remote-bucket remote/target-bucket \
+  --priority 1 \
+  --replicate delete,delete-marker,existing-objects
 
 # List replication rules
 rc replicate list local/my-bucket
