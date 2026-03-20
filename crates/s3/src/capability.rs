@@ -64,6 +64,8 @@ pub fn require_capability(caps: &Capabilities, feature: &str) -> Result<()> {
         "tagging" => caps.tagging,
         "select" | "sql" => caps.select,
         "notifications" | "watch" => caps.notifications,
+        "lifecycle" => caps.lifecycle,
+        "replication" => caps.replication,
         _ => false,
     };
 

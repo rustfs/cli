@@ -4,12 +4,17 @@
 //! IAM users, policies, groups, service accounts, and cluster operations.
 
 mod cluster;
+pub mod tier;
 mod types;
 
 pub use cluster::{
     BackendInfo, BackendType, BucketsInfo, ClusterInfo, DiskInfo, HealDriveInfo, HealDriveInfos,
     HealResultItem, HealScanMode, HealStartRequest, HealStatus, HealingDiskInfo, MemStats,
     ObjectsInfo, ServerInfo, UsageInfo,
+};
+pub use tier::{
+    TierAliyun, TierAzure, TierConfig, TierCreds, TierGCS, TierHuaweicloud, TierMinIO, TierR2,
+    TierRustFS, TierS3, TierTencent, TierType,
 };
 pub use types::{
     BucketQuota, CreateServiceAccountRequest, Group, GroupStatus, Policy, PolicyEntity, PolicyInfo,
@@ -139,6 +144,45 @@ pub trait AdminApi: Send + Sync {
 
     /// Clear bucket quota
     async fn clear_bucket_quota(&self, bucket: &str) -> Result<BucketQuota>;
+
+    // ==================== Tier Operations ====================
+
+    /// List all configured storage tiers
+    async fn list_tiers(&self) -> Result<Vec<TierConfig>>;
+
+    /// Get tier statistics
+    async fn tier_stats(&self) -> Result<serde_json::Value>;
+
+    /// Add a new storage tier
+    async fn add_tier(&self, config: TierConfig) -> Result<()>;
+
+    /// Edit tier credentials
+    async fn edit_tier(&self, name: &str, creds: TierCreds) -> Result<()>;
+
+    /// Remove a storage tier
+    async fn remove_tier(&self, name: &str, force: bool) -> Result<()>;
+
+    // ==================== Replication Target Operations ====================
+
+    /// Set a remote replication target for a bucket, returns the ARN
+    async fn set_remote_target(
+        &self,
+        bucket: &str,
+        target: crate::replication::BucketTarget,
+        update: bool,
+    ) -> Result<String>;
+
+    /// List remote replication targets for a bucket
+    async fn list_remote_targets(
+        &self,
+        bucket: &str,
+    ) -> Result<Vec<crate::replication::BucketTarget>>;
+
+    /// Remove a remote replication target
+    async fn remove_remote_target(&self, bucket: &str, arn: &str) -> Result<()>;
+
+    /// Get replication metrics for a bucket
+    async fn replication_metrics(&self, bucket: &str) -> Result<serde_json::Value>;
 }
 
 #[cfg(test)]

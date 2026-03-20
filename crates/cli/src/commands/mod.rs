@@ -19,6 +19,7 @@ pub mod diff;
 mod event;
 mod find;
 mod head;
+mod ilm;
 mod ls;
 mod mb;
 mod mirror;
@@ -26,6 +27,7 @@ mod mv;
 mod pipe;
 mod quota;
 mod rb;
+mod replicate;
 mod rm;
 mod share;
 mod stat;
@@ -145,6 +147,13 @@ pub enum Commands {
     #[command(subcommand)]
     Quota(quota::QuotaCommands),
 
+    /// Manage bucket lifecycle (ILM) rules, tiers, and restores
+    Ilm(ilm::IlmArgs),
+
+    /// Manage bucket replication
+    #[command(subcommand)]
+    Replicate(replicate::ReplicateCommands),
+
     // Phase 6: Utilities
     /// Generate shell completion scripts
     Completions(completions::CompletionsArgs),
@@ -195,6 +204,10 @@ pub async fn execute(cli: Cli) -> ExitCode {
         }
         Commands::Quota(cmd) => {
             quota::execute(quota::QuotaArgs { command: cmd }, output_config).await
+        }
+        Commands::Ilm(args) => ilm::execute(args, output_config).await,
+        Commands::Replicate(cmd) => {
+            replicate::execute(replicate::ReplicateArgs { command: cmd }, output_config).await
         }
         Commands::Completions(args) => completions::execute(args),
     }

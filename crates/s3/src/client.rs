@@ -14,8 +14,9 @@ use aws_smithy_types::body::SdkBody;
 use bytes::Bytes;
 use jiff::Timestamp;
 use rc_core::{
-    Alias, BucketNotification, Capabilities, Error, ListOptions, ListResult, NotificationTarget,
-    ObjectInfo, ObjectStore, ObjectVersion, RemotePath, Result,
+    Alias, BucketNotification, Capabilities, Error, LifecycleRule, ListOptions, ListResult,
+    NotificationTarget, ObjectInfo, ObjectStore, ObjectVersion, RemotePath,
+    ReplicationConfiguration, Result,
 };
 use tokio::io::AsyncReadExt;
 
@@ -905,6 +906,8 @@ impl ObjectStore for S3Client {
             anonymous: true,
             select: false,
             notifications: true,
+            lifecycle: true,
+            replication: true,
         })
     }
 
@@ -1539,6 +1542,460 @@ impl ObjectStore for S3Client {
             }
         }
 
+        Ok(())
+    }
+
+    async fn get_bucket_lifecycle(&self, bucket: &str) -> Result<Vec<LifecycleRule>> {
+        let response = match self
+            .inner
+            .get_bucket_lifecycle_configuration()
+            .bucket(bucket)
+            .send()
+            .await
+        {
+            Ok(resp) => resp,
+            Err(error) => {
+                let error_text = Self::format_sdk_error(&error);
+                if error_text.contains("NoSuchLifecycleConfiguration")
+                    || error_text.contains("lifecycle configuration is not found")
+                {
+                    return Ok(Vec::new());
+                }
+                return Err(Error::General(format!(
+                    "get_bucket_lifecycle: {error_text}"
+                )));
+            }
+        };
+
+        let mut rules = Vec::new();
+        for sdk_rule in response.rules() {
+            let id = sdk_rule.id().unwrap_or("").to_string();
+            let status = match sdk_rule.status().as_str() {
+                "Enabled" => rc_core::LifecycleRuleStatus::Enabled,
+                _ => rc_core::LifecycleRuleStatus::Disabled,
+            };
+
+            let prefix = sdk_rule
+                .filter()
+                .and_then(|f| f.prefix().map(|p| p.to_string()))
+                .or_else(|| {
+                    sdk_rule
+                        .filter()
+                        .and_then(|f| f.and())
+                        .and_then(|a| a.prefix().map(|p: &str| p.to_string()))
+                });
+
+            let expiration = sdk_rule
+                .expiration()
+                .map(|exp| rc_core::LifecycleExpiration {
+                    days: exp.days(),
+                    date: exp.date().map(|d| d.to_string()),
+                });
+
+            let transition = sdk_rule
+                .transitions()
+                .first()
+                .map(|t| rc_core::LifecycleTransition {
+                    days: t.days(),
+                    date: t.date().map(|d| d.to_string()),
+                    storage_class: t
+                        .storage_class()
+                        .map(|sc| sc.as_str().to_string())
+                        .unwrap_or_default(),
+                });
+
+            let noncurrent_version_expiration =
+                sdk_rule.noncurrent_version_expiration().map(|nve| {
+                    rc_core::NoncurrentVersionExpiration {
+                        noncurrent_days: nve.noncurrent_days().unwrap_or(0),
+                        newer_noncurrent_versions: nve.newer_noncurrent_versions(),
+                    }
+                });
+
+            let noncurrent_version_transition = sdk_rule
+                .noncurrent_version_transitions()
+                .first()
+                .map(|nvt| rc_core::NoncurrentVersionTransition {
+                    noncurrent_days: nvt.noncurrent_days().unwrap_or(0),
+                    storage_class: nvt
+                        .storage_class()
+                        .map(|sc| sc.as_str().to_string())
+                        .unwrap_or_default(),
+                });
+
+            let abort_incomplete_multipart_upload_days = sdk_rule
+                .abort_incomplete_multipart_upload()
+                .and_then(|a| a.days_after_initiation());
+
+            let expired_object_delete_marker = sdk_rule
+                .expiration()
+                .and_then(|e| e.expired_object_delete_marker())
+                .filter(|v| *v);
+
+            rules.push(LifecycleRule {
+                id,
+                status,
+                prefix,
+                tags: None,
+                expiration,
+                transition,
+                noncurrent_version_expiration,
+                noncurrent_version_transition,
+                abort_incomplete_multipart_upload_days,
+                expired_object_delete_marker,
+            });
+        }
+
+        Ok(rules)
+    }
+
+    async fn set_bucket_lifecycle(&self, bucket: &str, rules: Vec<LifecycleRule>) -> Result<()> {
+        use aws_sdk_s3::types::{
+            AbortIncompleteMultipartUpload, BucketLifecycleConfiguration, ExpirationStatus,
+            LifecycleExpiration as SdkExpiration, LifecycleRule as SdkRule, LifecycleRuleFilter,
+            NoncurrentVersionExpiration as SdkNve, NoncurrentVersionTransition as SdkNvt,
+            Transition, TransitionStorageClass,
+        };
+
+        let mut sdk_rules = Vec::new();
+        for rule in rules {
+            let status = match rule.status {
+                rc_core::LifecycleRuleStatus::Enabled => ExpirationStatus::Enabled,
+                rc_core::LifecycleRuleStatus::Disabled => ExpirationStatus::Disabled,
+            };
+
+            let filter = rule
+                .prefix
+                .as_ref()
+                .map(|p| LifecycleRuleFilter::builder().prefix(p).build());
+
+            let expiration = rule.expiration.map(|exp| {
+                let mut builder = SdkExpiration::builder();
+                if let Some(days) = exp.days {
+                    builder = builder.days(days);
+                }
+                if let Some(ref date_str) = exp.date
+                    && let Ok(dt) = aws_smithy_types::DateTime::from_str(
+                        date_str,
+                        aws_smithy_types::date_time::Format::DateTime,
+                    )
+                {
+                    builder = builder.date(dt);
+                }
+                if let Some(true) = rule.expired_object_delete_marker {
+                    builder = builder.expired_object_delete_marker(true);
+                }
+                builder.build()
+            });
+
+            let transitions = rule.transition.map(|t| {
+                #[allow(deprecated)]
+                let sc = TransitionStorageClass::from(t.storage_class.as_str());
+                let mut builder = Transition::builder().storage_class(sc);
+                if let Some(days) = t.days {
+                    builder = builder.days(days);
+                }
+                if let Some(ref date_str) = t.date
+                    && let Ok(dt) = aws_smithy_types::DateTime::from_str(
+                        date_str,
+                        aws_smithy_types::date_time::Format::DateTime,
+                    )
+                {
+                    builder = builder.date(dt);
+                }
+                vec![builder.build()]
+            });
+
+            let nve = rule.noncurrent_version_expiration.map(|nve| {
+                let mut builder = SdkNve::builder().noncurrent_days(nve.noncurrent_days);
+                if let Some(newer) = nve.newer_noncurrent_versions {
+                    builder = builder.newer_noncurrent_versions(newer);
+                }
+                builder.build()
+            });
+
+            let nvt = rule.noncurrent_version_transition.map(|nvt| {
+                let sc = TransitionStorageClass::from(nvt.storage_class.as_str());
+                let builder = SdkNvt::builder()
+                    .noncurrent_days(nvt.noncurrent_days)
+                    .storage_class(sc);
+                vec![builder.build()]
+            });
+
+            let abort = rule.abort_incomplete_multipart_upload_days.map(|days| {
+                AbortIncompleteMultipartUpload::builder()
+                    .days_after_initiation(days)
+                    .build()
+            });
+
+            let mut builder = SdkRule::builder().id(&rule.id).status(status);
+            if let Some(filter) = filter {
+                builder = builder.filter(filter);
+            }
+            if let Some(expiration) = expiration {
+                builder = builder.expiration(expiration);
+            }
+            if let Some(transitions) = transitions {
+                builder = builder.set_transitions(Some(transitions));
+            }
+            if let Some(nve) = nve {
+                builder = builder.noncurrent_version_expiration(nve);
+            }
+            if let Some(nvt) = nvt {
+                builder = builder.set_noncurrent_version_transitions(Some(nvt));
+            }
+            if let Some(abort) = abort {
+                builder = builder.abort_incomplete_multipart_upload(abort);
+            }
+
+            let sdk_rule = builder
+                .build()
+                .map_err(|e| Error::General(format!("build lifecycle rule: {e}")))?;
+            sdk_rules.push(sdk_rule);
+        }
+
+        let config = BucketLifecycleConfiguration::builder()
+            .set_rules(Some(sdk_rules))
+            .build()
+            .map_err(|e| Error::General(format!("build lifecycle config: {e}")))?;
+
+        self.inner
+            .put_bucket_lifecycle_configuration()
+            .bucket(bucket)
+            .lifecycle_configuration(config)
+            .send()
+            .await
+            .map_err(|e| {
+                Error::General(format!(
+                    "set_bucket_lifecycle: {}",
+                    Self::format_sdk_error(&e)
+                ))
+            })?;
+
+        Ok(())
+    }
+
+    async fn delete_bucket_lifecycle(&self, bucket: &str) -> Result<()> {
+        self.inner
+            .delete_bucket_lifecycle()
+            .bucket(bucket)
+            .send()
+            .await
+            .map_err(|e| {
+                Error::General(format!(
+                    "delete_bucket_lifecycle: {}",
+                    Self::format_sdk_error(&e)
+                ))
+            })?;
+        Ok(())
+    }
+
+    async fn restore_object(&self, path: &RemotePath, days: i32) -> Result<()> {
+        use aws_sdk_s3::types::RestoreRequest;
+
+        let request = RestoreRequest::builder().days(days).build();
+        self.inner
+            .restore_object()
+            .bucket(&path.bucket)
+            .key(&path.key)
+            .restore_request(request)
+            .send()
+            .await
+            .map_err(|e| {
+                Error::General(format!("restore_object: {}", Self::format_sdk_error(&e)))
+            })?;
+        Ok(())
+    }
+
+    async fn get_bucket_replication(
+        &self,
+        bucket: &str,
+    ) -> Result<Option<ReplicationConfiguration>> {
+        let response = match self
+            .inner
+            .get_bucket_replication()
+            .bucket(bucket)
+            .send()
+            .await
+        {
+            Ok(resp) => resp,
+            Err(error) => {
+                let error_text = Self::format_sdk_error(&error);
+                if error_text.contains("ReplicationConfigurationNotFound")
+                    || error_text.contains("replication configuration is not found")
+                    || error_text.contains("replication not found")
+                {
+                    return Ok(None);
+                }
+                return Err(Error::General(format!(
+                    "get_bucket_replication: {error_text}"
+                )));
+            }
+        };
+
+        let Some(config) = response.replication_configuration() else {
+            return Ok(None);
+        };
+
+        let role = config.role().to_string();
+        let mut rules = Vec::new();
+
+        for sdk_rule in config.rules() {
+            let id = sdk_rule.id().unwrap_or("").to_string();
+            let priority = sdk_rule.priority().unwrap_or(0);
+            let status = match sdk_rule.status().as_str() {
+                "Enabled" => rc_core::ReplicationRuleStatus::Enabled,
+                _ => rc_core::ReplicationRuleStatus::Disabled,
+            };
+
+            let prefix = sdk_rule
+                .filter()
+                .and_then(|f| f.prefix().map(|p| p.to_string()));
+
+            let destination = rc_core::ReplicationDestination {
+                bucket_arn: sdk_rule
+                    .destination()
+                    .map(|d| d.bucket().to_string())
+                    .unwrap_or_default(),
+                storage_class: sdk_rule
+                    .destination()
+                    .and_then(|d| d.storage_class())
+                    .map(|sc| sc.as_str().to_string()),
+            };
+
+            let delete_marker_replication = sdk_rule
+                .delete_marker_replication()
+                .and_then(|d| d.status())
+                .map(|s| s.as_str() == "Enabled");
+
+            let existing_object_replication = sdk_rule
+                .existing_object_replication()
+                .map(|e| e.status().as_str() == "Enabled");
+
+            rules.push(rc_core::ReplicationRule {
+                id,
+                priority,
+                status,
+                prefix,
+                tags: None,
+                destination,
+                delete_marker_replication,
+                existing_object_replication,
+                delete_replication: None,
+            });
+        }
+
+        Ok(Some(ReplicationConfiguration { role, rules }))
+    }
+
+    async fn set_bucket_replication(
+        &self,
+        bucket: &str,
+        config: ReplicationConfiguration,
+    ) -> Result<()> {
+        use aws_sdk_s3::types::{
+            DeleteMarkerReplication, DeleteMarkerReplicationStatus, Destination,
+            ExistingObjectReplication, ExistingObjectReplicationStatus,
+            ReplicationConfiguration as SdkConfig, ReplicationRule as SdkRule,
+            ReplicationRuleFilter, ReplicationRuleStatus as SdkStatus, StorageClass,
+        };
+
+        let mut sdk_rules = Vec::new();
+        for rule in config.rules {
+            let status = match rule.status {
+                rc_core::ReplicationRuleStatus::Enabled => SdkStatus::Enabled,
+                rc_core::ReplicationRuleStatus::Disabled => SdkStatus::Disabled,
+            };
+
+            let mut dest_builder = Destination::builder().bucket(&rule.destination.bucket_arn);
+            if let Some(sc) = &rule.destination.storage_class {
+                dest_builder = dest_builder.storage_class(StorageClass::from(sc.as_str()));
+            }
+            let destination = dest_builder
+                .build()
+                .map_err(|e| Error::General(format!("build destination: {e}")))?;
+
+            let filter = rule
+                .prefix
+                .as_ref()
+                .map(|p| ReplicationRuleFilter::builder().prefix(p).build());
+
+            let dmr = rule.delete_marker_replication.map(|enabled| {
+                DeleteMarkerReplication::builder()
+                    .status(if enabled {
+                        DeleteMarkerReplicationStatus::Enabled
+                    } else {
+                        DeleteMarkerReplicationStatus::Disabled
+                    })
+                    .build()
+            });
+
+            let eor = rule.existing_object_replication.map(|enabled| {
+                ExistingObjectReplication::builder()
+                    .status(if enabled {
+                        ExistingObjectReplicationStatus::Enabled
+                    } else {
+                        ExistingObjectReplicationStatus::Disabled
+                    })
+                    .build()
+                    .expect("build existing object replication")
+            });
+
+            let mut builder = SdkRule::builder()
+                .id(&rule.id)
+                .priority(rule.priority)
+                .status(status)
+                .destination(destination);
+            if let Some(filter) = filter {
+                builder = builder.filter(filter);
+            }
+            if let Some(dmr) = dmr {
+                builder = builder.delete_marker_replication(dmr);
+            }
+            if let Some(eor) = eor {
+                builder = builder.existing_object_replication(eor);
+            }
+
+            let sdk_rule = builder
+                .build()
+                .map_err(|e| Error::General(format!("build replication rule: {e}")))?;
+            sdk_rules.push(sdk_rule);
+        }
+
+        let sdk_config = SdkConfig::builder()
+            .role(&config.role)
+            .set_rules(Some(sdk_rules))
+            .build()
+            .map_err(|e| Error::General(format!("build replication config: {e}")))?;
+
+        self.inner
+            .put_bucket_replication()
+            .bucket(bucket)
+            .replication_configuration(sdk_config)
+            .send()
+            .await
+            .map_err(|e| {
+                Error::General(format!(
+                    "set_bucket_replication: {}",
+                    Self::format_sdk_error(&e)
+                ))
+            })?;
+
+        Ok(())
+    }
+
+    async fn delete_bucket_replication(&self, bucket: &str) -> Result<()> {
+        self.inner
+            .delete_bucket_replication()
+            .bucket(bucket)
+            .send()
+            .await
+            .map_err(|e| {
+                Error::General(format!(
+                    "delete_bucket_replication: {}",
+                    Self::format_sdk_error(&e)
+                ))
+            })?;
         Ok(())
     }
 }

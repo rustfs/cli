@@ -122,6 +122,8 @@ fn top_level_command_help_contract() {
                 "tag",
                 "quota",
                 "anonymous",
+                "ilm",
+                "replicate",
                 "completions",
             ],
         },
@@ -527,6 +529,90 @@ fn nested_subcommand_help_contract() {
             args: &["anonymous", "links"],
             usage: "Usage: rc anonymous links [OPTIONS] <PATH>",
             expected_tokens: &["--recursive"],
+        },
+        // ILM commands
+        HelpCase {
+            args: &["ilm"],
+            usage: "Usage: rc ilm [OPTIONS] <COMMAND>",
+            expected_tokens: &["rule", "tier", "restore"],
+        },
+        HelpCase {
+            args: &["ilm", "rule"],
+            usage: "Usage: rc ilm rule [OPTIONS] <COMMAND>",
+            expected_tokens: &["add", "edit", "list", "remove", "export", "import"],
+        },
+        HelpCase {
+            args: &["ilm", "rule", "add"],
+            usage: "Usage: rc ilm rule add [OPTIONS] <PATH>",
+            expected_tokens: &[
+                "--expiry-days",
+                "--transition-days",
+                "--storage-class",
+                "--prefix",
+            ],
+        },
+        HelpCase {
+            args: &["ilm", "rule", "list"],
+            usage: "Usage: rc ilm rule list [OPTIONS] <PATH>",
+            expected_tokens: &[],
+        },
+        HelpCase {
+            args: &["ilm", "rule", "remove"],
+            usage: "Usage: rc ilm rule remove [OPTIONS] <PATH>",
+            expected_tokens: &["--id", "--all"],
+        },
+        HelpCase {
+            args: &["ilm", "tier"],
+            usage: "Usage: rc ilm tier [OPTIONS] <COMMAND>",
+            expected_tokens: &["add", "edit", "list", "info", "remove"],
+        },
+        HelpCase {
+            args: &["ilm", "tier", "add"],
+            usage: "Usage: rc ilm tier add [OPTIONS]",
+            expected_tokens: &["--endpoint", "--access-key", "--secret-key", "--bucket"],
+        },
+        HelpCase {
+            args: &["ilm", "tier", "list"],
+            usage: "Usage: rc ilm tier list [OPTIONS] <ALIAS>",
+            expected_tokens: &[],
+        },
+        HelpCase {
+            args: &["ilm", "tier", "remove"],
+            usage: "Usage: rc ilm tier remove [OPTIONS]",
+            expected_tokens: &["--force"],
+        },
+        HelpCase {
+            args: &["ilm", "restore"],
+            usage: "Usage: rc ilm restore [OPTIONS] <PATH>",
+            expected_tokens: &["--days"],
+        },
+        // Replicate commands
+        HelpCase {
+            args: &["replicate"],
+            usage: "Usage: rc replicate [OPTIONS] <COMMAND>",
+            expected_tokens: &[
+                "add", "update", "list", "status", "remove", "export", "import",
+            ],
+        },
+        HelpCase {
+            args: &["replicate", "add"],
+            usage: "Usage: rc replicate add [OPTIONS]",
+            expected_tokens: &["--remote-bucket", "--priority"],
+        },
+        HelpCase {
+            args: &["replicate", "list"],
+            usage: "Usage: rc replicate list [OPTIONS] <PATH>",
+            expected_tokens: &[],
+        },
+        HelpCase {
+            args: &["replicate", "status"],
+            usage: "Usage: rc replicate status [OPTIONS] <PATH>",
+            expected_tokens: &[],
+        },
+        HelpCase {
+            args: &["replicate", "remove"],
+            usage: "Usage: rc replicate remove [OPTIONS] <PATH>",
+            expected_tokens: &["--id", "--all"],
         },
     ];
 

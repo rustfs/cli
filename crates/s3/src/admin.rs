@@ -715,6 +715,82 @@ impl AdminApi for AdminClient {
         let path = format!("/quota/{}", urlencoding::encode(bucket));
         self.request(Method::DELETE, &path, None, None).await
     }
+
+    // ==================== Tier Operations ====================
+
+    async fn list_tiers(&self) -> Result<Vec<rc_core::admin::TierConfig>> {
+        self.request(Method::GET, "/tier", None, None).await
+    }
+
+    async fn tier_stats(&self) -> Result<serde_json::Value> {
+        self.request(Method::GET, "/tier-stats", None, None).await
+    }
+
+    async fn add_tier(&self, config: rc_core::admin::TierConfig) -> Result<()> {
+        let body = serde_json::to_vec(&config).map_err(Error::Json)?;
+        self.request_no_response(Method::PUT, "/tier", None, Some(&body))
+            .await
+    }
+
+    async fn edit_tier(&self, name: &str, creds: rc_core::admin::TierCreds) -> Result<()> {
+        let path = format!("/tier/{}", urlencoding::encode(name));
+        let body = serde_json::to_vec(&creds).map_err(Error::Json)?;
+        self.request_no_response(Method::POST, &path, None, Some(&body))
+            .await
+    }
+
+    async fn remove_tier(&self, name: &str, force: bool) -> Result<()> {
+        let path = format!("/tier/{}", urlencoding::encode(name));
+        if force {
+            let query: &[(&str, &str)] = &[("force", "true")];
+            self.request_no_response(Method::DELETE, &path, Some(query), None)
+                .await
+        } else {
+            self.request_no_response(Method::DELETE, &path, None, None)
+                .await
+        }
+    }
+
+    // ==================== Replication Target Operations ====================
+
+    async fn set_remote_target(
+        &self,
+        bucket: &str,
+        target: rc_core::replication::BucketTarget,
+        update: bool,
+    ) -> Result<String> {
+        let body = serde_json::to_vec(&target).map_err(Error::Json)?;
+        if update {
+            let query: &[(&str, &str)] = &[("bucket", bucket), ("update", "true")];
+            self.request(Method::PUT, "/set-remote-target", Some(query), Some(&body))
+                .await
+        } else {
+            let query: &[(&str, &str)] = &[("bucket", bucket)];
+            self.request(Method::PUT, "/set-remote-target", Some(query), Some(&body))
+                .await
+        }
+    }
+
+    async fn list_remote_targets(
+        &self,
+        bucket: &str,
+    ) -> Result<Vec<rc_core::replication::BucketTarget>> {
+        let query: &[(&str, &str)] = &[("bucket", bucket)];
+        self.request(Method::GET, "/list-remote-targets", Some(query), None)
+            .await
+    }
+
+    async fn remove_remote_target(&self, bucket: &str, arn: &str) -> Result<()> {
+        let query: &[(&str, &str)] = &[("bucket", bucket), ("arn", arn)];
+        self.request_no_response(Method::DELETE, "/remove-remote-target", Some(query), None)
+            .await
+    }
+
+    async fn replication_metrics(&self, bucket: &str) -> Result<serde_json::Value> {
+        let query: &[(&str, &str)] = &[("bucket", bucket)];
+        self.request(Method::GET, "/replicationmetrics", Some(query), None)
+            .await
+    }
 }
 
 #[cfg(test)]

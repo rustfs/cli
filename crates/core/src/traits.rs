@@ -10,7 +10,9 @@ use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
+use crate::lifecycle::LifecycleRule;
 use crate::path::RemotePath;
+use crate::replication::ReplicationConfiguration;
 
 /// Metadata for an object version
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -178,6 +180,12 @@ pub struct Capabilities {
 
     /// Supports event notifications
     pub notifications: bool,
+
+    /// Supports lifecycle configuration
+    pub lifecycle: bool,
+
+    /// Supports bucket replication
+    pub replication: bool,
 }
 
 /// Bucket notification target type
@@ -334,6 +342,38 @@ pub trait ObjectStore: Send + Sync {
         bucket: &str,
         notifications: Vec<BucketNotification>,
     ) -> Result<()>;
+
+    // Lifecycle operations (capability-dependent)
+
+    /// Get bucket lifecycle rules. Returns empty vec if no lifecycle config exists.
+    async fn get_bucket_lifecycle(&self, bucket: &str) -> Result<Vec<LifecycleRule>>;
+
+    /// Set bucket lifecycle configuration (replaces all rules).
+    async fn set_bucket_lifecycle(&self, bucket: &str, rules: Vec<LifecycleRule>) -> Result<()>;
+
+    /// Delete bucket lifecycle configuration.
+    async fn delete_bucket_lifecycle(&self, bucket: &str) -> Result<()>;
+
+    /// Restore a transitioned (archived) object.
+    async fn restore_object(&self, path: &RemotePath, days: i32) -> Result<()>;
+
+    // Replication operations (capability-dependent)
+
+    /// Get bucket replication configuration. Returns None if not configured.
+    async fn get_bucket_replication(
+        &self,
+        bucket: &str,
+    ) -> Result<Option<ReplicationConfiguration>>;
+
+    /// Set bucket replication configuration.
+    async fn set_bucket_replication(
+        &self,
+        bucket: &str,
+        config: ReplicationConfiguration,
+    ) -> Result<()>;
+
+    /// Delete bucket replication configuration.
+    async fn delete_bucket_replication(&self, bucket: &str) -> Result<()>;
     // async fn get_versioning(&self, bucket: &str) -> Result<bool>;
     // async fn set_versioning(&self, bucket: &str, enabled: bool) -> Result<()>;
     // async fn get_tags(&self, path: &RemotePath) -> Result<HashMap<String, String>>;

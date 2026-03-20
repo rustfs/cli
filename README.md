@@ -144,6 +144,63 @@ rc event list local/my-bucket
 rc event remove local/my-bucket arn:aws:sns:us-east-1:123456789012:topic
 ```
 
+### Lifecycle (ILM) Operations
+
+```bash
+# Add lifecycle rule: expire objects after 30 days with prefix filter
+rc ilm rule add local/my-bucket --expiry-days 30 --prefix "logs/"
+
+# Add lifecycle rule: transition to remote tier after 90 days
+rc ilm rule add local/my-bucket --transition-days 90 --storage-class WARM
+
+# List lifecycle rules
+rc ilm rule list local/my-bucket
+
+# Edit an existing rule
+rc ilm rule edit local/my-bucket --id rule-abc123 --expiry-days 60
+
+# Remove a specific rule or all rules
+rc ilm rule remove local/my-bucket --id rule-abc123
+rc ilm rule remove local/my-bucket --all
+
+# Export/import lifecycle configuration (JSON)
+rc ilm rule export local/my-bucket > lifecycle.json
+rc ilm rule import local/my-bucket lifecycle.json
+
+# Manage remote storage tiers
+rc ilm tier add rustfs WARM local --endpoint http://remote:9000 --access-key ak --secret-key sk --bucket warm-bucket
+rc ilm tier list local
+rc ilm tier info WARM local
+rc ilm tier remove WARM local --force
+
+# Restore a transitioned (archived) object
+rc ilm restore local/my-bucket/archived-file.dat --days 7
+```
+
+### Bucket Replication
+
+```bash
+# Add replication rule (requires remote target setup)
+rc replicate add local/my-bucket --remote-bucket remote/target-bucket --priority 1
+
+# List replication rules
+rc replicate list local/my-bucket
+
+# View replication status/metrics
+rc replicate status local/my-bucket
+
+# Update a replication rule
+rc replicate update local/my-bucket --id rule-1 --priority 2
+
+# Remove replication rules
+rc replicate remove local/my-bucket --id rule-1
+rc replicate remove local/my-bucket --all
+
+# Export/import replication configuration (JSON)
+rc replicate export local/my-bucket > replication.json
+rc replicate import local/my-bucket replication.json
+```
+
 ### Admin Operations (Cluster)
 
 ```bash
@@ -189,6 +246,8 @@ rc admin heal status local --json
 | `version` | Manage bucket versioning |
 | `tag` | Manage bucket and object tags |
 | `quota` | Manage bucket quota |
+| `ilm` | Manage lifecycle rules, storage tiers, and object restore |
+| `replicate` | Manage bucket replication |
 | `completions` | Generate shell completion scripts |
 
 ### Admin Subcommands
@@ -201,6 +260,35 @@ rc admin heal status local --json
 | `admin service-account` | Manage service accounts (create, remove, list, info) |
 | `admin info` | Display cluster information (cluster, server, disk) |
 | `admin heal` | Manage cluster healing operations (status, start, stop) |
+
+### ILM Subcommands
+
+| Command | Description |
+|---------|-------------|
+| `ilm rule add` | Add a lifecycle rule to a bucket |
+| `ilm rule edit` | Edit an existing lifecycle rule |
+| `ilm rule list` | List lifecycle rules on a bucket |
+| `ilm rule remove` | Remove lifecycle rules from a bucket |
+| `ilm rule export` | Export lifecycle configuration as JSON |
+| `ilm rule import` | Import lifecycle configuration from JSON |
+| `ilm tier add` | Add a remote storage tier |
+| `ilm tier edit` | Edit tier credentials |
+| `ilm tier list` | List all configured storage tiers |
+| `ilm tier info` | Show details for a specific tier |
+| `ilm tier remove` | Remove a storage tier |
+| `ilm restore` | Restore a transitioned (archived) object |
+
+### Replicate Subcommands
+
+| Command | Description |
+|---------|-------------|
+| `replicate add` | Add a new replication rule |
+| `replicate update` | Update an existing replication rule |
+| `replicate list` | List replication rules for a bucket |
+| `replicate status` | Show replication status and metrics |
+| `replicate remove` | Remove replication rules |
+| `replicate export` | Export replication configuration as JSON |
+| `replicate import` | Import replication configuration from JSON |
 
 ## Output Format
 
