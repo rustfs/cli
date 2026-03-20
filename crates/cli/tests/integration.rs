@@ -2155,6 +2155,83 @@ mod mirror_operations {
         cleanup_bucket(config_dir.path(), &bucket_name);
         cleanup_bucket(config_dir.path(), &bucket_name2);
     }
+
+    #[test]
+    fn test_mirror_preserves_content_type() {
+        let (config_dir, bucket_name) = match setup_with_alias("mirrorcontenttype") {
+            Some(v) => v,
+            None => {
+                eprintln!("Skipping: S3 test config not available");
+                return;
+            }
+        };
+
+        let target_bucket = format!("{}-dest", bucket_name);
+        let output = run_rc(
+            &["mb", &format!("test/{}", target_bucket)],
+            config_dir.path(),
+        );
+        assert!(
+            output.status.success(),
+            "Failed to create destination bucket: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let temp_file = tempfile::NamedTempFile::new().expect("Failed to create temp file");
+        std::fs::write(temp_file.path(), b"not-a-real-jpeg").expect("Failed to write test file");
+
+        let output = run_rc(
+            &[
+                "cp",
+                temp_file.path().to_str().unwrap(),
+                &format!("test/{}/source/photo.bin", bucket_name),
+                "--content-type",
+                "image/jpeg",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            output.status.success(),
+            "Failed to upload source object: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let output = run_rc(
+            &[
+                "mirror",
+                &format!("test/{}/source/", bucket_name),
+                &format!("test/{}/", target_bucket),
+                "--json",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            output.status.success(),
+            "Failed to mirror objects: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let output = run_rc(
+            &[
+                "stat",
+                &format!("test/{}/photo.bin", target_bucket),
+                "--json",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            output.status.success(),
+            "Failed to stat mirrored object: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let json: serde_json::Value = serde_json::from_str(&stdout).expect("Invalid JSON output");
+        assert_eq!(json["content_type"], "image/jpeg");
+
+        cleanup_bucket(config_dir.path(), &bucket_name);
+        cleanup_bucket(config_dir.path(), &target_bucket);
+    }
 }
 
 mod tree_operations {

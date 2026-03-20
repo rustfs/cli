@@ -64,6 +64,48 @@ struct FileInfo {
     etag: Option<String>,
 }
 
+trait MirrorCopySource {
+    async fn head_object_for_mirror(
+        &self,
+        path: &RemotePath,
+    ) -> rc_core::Result<rc_core::ObjectInfo>;
+
+    async fn get_object_for_mirror(&self, path: &RemotePath) -> rc_core::Result<Vec<u8>>;
+}
+
+trait MirrorCopyTarget {
+    async fn put_object_for_mirror(
+        &self,
+        path: &RemotePath,
+        data: Vec<u8>,
+        content_type: Option<&str>,
+    ) -> rc_core::Result<rc_core::ObjectInfo>;
+}
+
+impl MirrorCopySource for S3Client {
+    async fn head_object_for_mirror(
+        &self,
+        path: &RemotePath,
+    ) -> rc_core::Result<rc_core::ObjectInfo> {
+        rc_core::ObjectStore::head_object(self, path).await
+    }
+
+    async fn get_object_for_mirror(&self, path: &RemotePath) -> rc_core::Result<Vec<u8>> {
+        rc_core::ObjectStore::get_object(self, path).await
+    }
+}
+
+impl MirrorCopyTarget for S3Client {
+    async fn put_object_for_mirror(
+        &self,
+        path: &RemotePath,
+        data: Vec<u8>,
+        content_type: Option<&str>,
+    ) -> rc_core::Result<rc_core::ObjectInfo> {
+        rc_core::ObjectStore::put_object(self, path, data, content_type).await
+    }
+}
+
 /// Execute the mirror command
 pub async fn execute(args: MirrorArgs, output_config: OutputConfig) -> ExitCode {
     let formatter = Formatter::new(output_config);
@@ -297,14 +339,14 @@ pub async fn execute(args: MirrorArgs, output_config: OutputConfig) -> ExitCode 
             .expect("semaphore should not be closed");
         copy_tasks.spawn(async move {
             let _permit = permit;
-            let result = match source_client.get_object(&source_full).await {
-                Ok(data) => target_client
-                    .put_object(&target_full, data, None)
-                    .await
-                    .map(|_| ())
-                    .map_err(|e| format!("Failed to upload {key}: {e}")),
-                Err(e) => Err(format!("Failed to download {key}: {e}")),
-            };
+            let result = copy_object_with_metadata(
+                source_client.as_ref(),
+                target_client.as_ref(),
+                &source_full,
+                &target_full,
+            )
+            .await
+            .map_err(|e| format!("Failed to copy {key}: {e}"));
             (key, result)
         });
     }
@@ -431,6 +473,40 @@ pub async fn execute(args: MirrorArgs, output_config: OutputConfig) -> ExitCode 
     }
 }
 
+// Mirror should preserve source content type when metadata is available, but
+// still fall back to a plain byte copy if metadata lookup is not supported.
+async fn copy_object_with_metadata<S, T>(
+    source_client: &S,
+    target_client: &T,
+    source_path: &RemotePath,
+    target_path: &RemotePath,
+) -> rc_core::Result<()>
+where
+    S: MirrorCopySource,
+    T: MirrorCopyTarget,
+{
+    let content_type = match source_client.head_object_for_mirror(source_path).await {
+        Ok(source_info) => source_info.content_type,
+        Err(error) => {
+            tracing::warn!(
+                source = %format!(
+                    "{}/{}/{}",
+                    source_path.alias, source_path.bucket, source_path.key
+                ),
+                error = %error,
+                "Falling back to mirror upload without source content type"
+            );
+            None
+        }
+    };
+
+    let data = source_client.get_object_for_mirror(source_path).await?;
+    target_client
+        .put_object_for_mirror(target_path, data, content_type.as_deref())
+        .await?;
+    Ok(())
+}
+
 async fn list_objects_map(
     client: &S3Client,
     path: &RemotePath,
@@ -543,6 +619,153 @@ fn compare_objects_internal(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rc_core::ObjectInfo;
+    use std::sync::Mutex;
+
+    #[derive(Debug)]
+    struct TestMirrorSource {
+        content_type: Option<String>,
+        data: Vec<u8>,
+        head_calls: Mutex<Vec<String>>,
+        get_calls: Mutex<Vec<String>>,
+    }
+
+    impl TestMirrorSource {
+        fn new(content_type: Option<&str>, data: &[u8]) -> Self {
+            Self {
+                content_type: content_type.map(ToOwned::to_owned),
+                data: data.to_vec(),
+                head_calls: Mutex::new(Vec::new()),
+                get_calls: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl MirrorCopySource for TestMirrorSource {
+        async fn head_object_for_mirror(&self, path: &RemotePath) -> rc_core::Result<ObjectInfo> {
+            self.head_calls
+                .lock()
+                .expect("head call mutex should not be poisoned")
+                .push(path.key.clone());
+            Ok(ObjectInfo {
+                key: path.key.clone(),
+                size_bytes: Some(self.data.len() as i64),
+                size_human: None,
+                last_modified: None,
+                etag: None,
+                storage_class: None,
+                content_type: self.content_type.clone(),
+                metadata: None,
+                is_dir: false,
+            })
+        }
+
+        async fn get_object_for_mirror(&self, path: &RemotePath) -> rc_core::Result<Vec<u8>> {
+            self.get_calls
+                .lock()
+                .expect("get call mutex should not be poisoned")
+                .push(path.key.clone());
+            Ok(self.data.clone())
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct PutCall {
+        key: String,
+        content_type: Option<String>,
+        data: Vec<u8>,
+    }
+
+    #[derive(Debug, Default)]
+    struct TestMirrorTarget {
+        put_calls: Mutex<Vec<PutCall>>,
+    }
+
+    impl MirrorCopyTarget for TestMirrorTarget {
+        async fn put_object_for_mirror(
+            &self,
+            path: &RemotePath,
+            data: Vec<u8>,
+            content_type: Option<&str>,
+        ) -> rc_core::Result<ObjectInfo> {
+            self.put_calls
+                .lock()
+                .expect("put call mutex should not be poisoned")
+                .push(PutCall {
+                    key: path.key.clone(),
+                    content_type: content_type.map(ToOwned::to_owned),
+                    data: data.clone(),
+                });
+
+            Ok(ObjectInfo::file(path.key.clone(), data.len() as i64))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_copy_object_with_metadata_preserves_content_type() {
+        let source = TestMirrorSource::new(Some("image/jpeg"), b"jpeg-bytes");
+        let target = TestMirrorTarget::default();
+        let source_path = RemotePath::new("stage", "images", "photo.jpg");
+        let target_path = RemotePath::new("prod", "images", "photo.jpg");
+
+        copy_object_with_metadata(&source, &target, &source_path, &target_path)
+            .await
+            .expect("copy should succeed");
+
+        assert_eq!(
+            source
+                .head_calls
+                .lock()
+                .expect("head call mutex should not be poisoned")
+                .as_slice(),
+            ["photo.jpg"]
+        );
+        assert_eq!(
+            source
+                .get_calls
+                .lock()
+                .expect("get call mutex should not be poisoned")
+                .as_slice(),
+            ["photo.jpg"]
+        );
+        assert_eq!(
+            target
+                .put_calls
+                .lock()
+                .expect("put call mutex should not be poisoned")
+                .as_slice(),
+            [PutCall {
+                key: "photo.jpg".to_string(),
+                content_type: Some("image/jpeg".to_string()),
+                data: b"jpeg-bytes".to_vec(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_copy_object_with_metadata_passes_none_when_source_has_no_content_type() {
+        let source = TestMirrorSource::new(None, b"plain-bytes");
+        let target = TestMirrorTarget::default();
+        let source_path = RemotePath::new("stage", "docs", "readme.txt");
+        let target_path = RemotePath::new("prod", "docs", "readme.txt");
+
+        copy_object_with_metadata(&source, &target, &source_path, &target_path)
+            .await
+            .expect("copy should succeed");
+
+        assert_eq!(
+            target
+                .put_calls
+                .lock()
+                .expect("put call mutex should not be poisoned")
+                .as_slice(),
+            [PutCall {
+                key: "readme.txt".to_string(),
+                content_type: None,
+                data: b"plain-bytes".to_vec(),
+            }]
+        );
+    }
 
     #[test]
     fn test_compare_objects_internal() {
