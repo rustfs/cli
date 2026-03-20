@@ -28,6 +28,7 @@ use reqwest::Method;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use tokio::io::AsyncReadExt;
 
 /// Keep single-part uploads small to avoid backend incompatibilities with
@@ -107,6 +108,23 @@ struct ReplicationRuleXml {
 #[serde(rename_all = "PascalCase")]
 struct ReplicationFilterXml {
     prefix: Option<String>,
+    tag: Option<TagXml>,
+    and: Option<ReplicationAndXml>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ReplicationAndXml {
+    prefix: Option<String>,
+    #[serde(rename = "Tag", default)]
+    tags: Vec<TagXml>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct TagXml {
+    key: Option<String>,
+    value: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -137,6 +155,95 @@ fn parse_replication_rule_status(status: Option<&str>) -> rc_core::ReplicationRu
     }
 }
 
+fn collect_tag_map<'a, I>(tags: I) -> Option<HashMap<String, String>>
+where
+    I: IntoIterator<Item = (&'a str, &'a str)>,
+{
+    let collected: HashMap<String, String> = tags
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+    if collected.is_empty() {
+        None
+    } else {
+        Some(collected)
+    }
+}
+
+fn parse_tag_xml(tag: Option<&TagXml>) -> Option<HashMap<String, String>> {
+    collect_tag_map(tag.and_then(|tag| Some((tag.key.as_deref()?, tag.value.as_deref()?))))
+}
+
+fn parse_tag_xmls(tags: &[TagXml]) -> Option<HashMap<String, String>> {
+    collect_tag_map(
+        tags.iter()
+            .filter_map(|tag| Some((tag.key.as_deref()?, tag.value.as_deref()?))),
+    )
+}
+
+fn parse_replication_filter_prefix(filter: Option<&ReplicationFilterXml>) -> Option<String> {
+    filter
+        .and_then(|filter| filter.prefix.clone())
+        .or_else(|| filter.and_then(|filter| filter.and.as_ref()?.prefix.clone()))
+}
+
+fn parse_replication_filter_tags(
+    filter: Option<&ReplicationFilterXml>,
+) -> Option<HashMap<String, String>> {
+    filter
+        .and_then(|filter| parse_tag_xml(filter.tag.as_ref()))
+        .or_else(|| filter.and_then(|filter| parse_tag_xmls(&filter.and.as_ref()?.tags)))
+}
+
+fn sorted_tags(tags: &HashMap<String, String>) -> Vec<(&str, &str)> {
+    let mut pairs: Vec<(&str, &str)> = tags
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    pairs.sort_unstable();
+    pairs
+}
+
+fn append_tag_xml(xml: &mut String, key: &str, value: &str) {
+    xml.push_str("<Tag><Key>");
+    xml.push_str(&xml_escape(key));
+    xml.push_str("</Key><Value>");
+    xml.push_str(&xml_escape(value));
+    xml.push_str("</Value></Tag>");
+}
+
+fn append_replication_filter_xml(
+    xml: &mut String,
+    prefix: Option<&str>,
+    tags: Option<&HashMap<String, String>>,
+) {
+    let Some(tags) = tags.filter(|tags| !tags.is_empty()) else {
+        if let Some(prefix) = prefix {
+            xml.push_str("<Filter><Prefix>");
+            xml.push_str(&xml_escape(prefix));
+            xml.push_str("</Prefix></Filter>");
+        }
+        return;
+    };
+
+    xml.push_str("<Filter>");
+    if prefix.is_some() || tags.len() > 1 {
+        xml.push_str("<And>");
+        if let Some(prefix) = prefix {
+            xml.push_str("<Prefix>");
+            xml.push_str(&xml_escape(prefix));
+            xml.push_str("</Prefix>");
+        }
+        for (key, value) in sorted_tags(tags) {
+            append_tag_xml(xml, key, value);
+        }
+        xml.push_str("</And>");
+    } else if let Some((key, value)) = sorted_tags(tags).into_iter().next() {
+        append_tag_xml(xml, key, value);
+    }
+    xml.push_str("</Filter>");
+}
+
 fn parse_replication_configuration_xml(body: &str) -> Result<ReplicationConfiguration> {
     let config: ReplicationConfigurationXml = from_xml_str(body)
         .map_err(|e| Error::General(format!("parse replication config xml: {e}")))?;
@@ -148,11 +255,8 @@ fn parse_replication_configuration_xml(body: &str) -> Result<ReplicationConfigur
             id: rule.id.unwrap_or_default(),
             priority: rule.priority.unwrap_or_default(),
             status: parse_replication_rule_status(rule.status.as_deref()),
-            prefix: rule
-                .filter
-                .and_then(|filter| filter.prefix)
-                .or(rule.legacy_prefix),
-            tags: None,
+            prefix: parse_replication_filter_prefix(rule.filter.as_ref()).or(rule.legacy_prefix),
+            tags: parse_replication_filter_tags(rule.filter.as_ref()),
             destination: rc_core::ReplicationDestination {
                 bucket_arn: rule
                     .destination
@@ -243,11 +347,7 @@ fn build_replication_configuration_xml(config: &ReplicationConfiguration) -> Str
         xml.push_str(&rule.priority.to_string());
         xml.push_str("</Priority>");
 
-        if let Some(prefix) = &rule.prefix {
-            xml.push_str("<Filter><Prefix>");
-            xml.push_str(&xml_escape(prefix));
-            xml.push_str("</Prefix></Filter>");
-        }
+        append_replication_filter_xml(&mut xml, rule.prefix.as_deref(), rule.tags.as_ref());
 
         append_replication_status_tag(
             &mut xml,
@@ -266,6 +366,82 @@ fn build_replication_configuration_xml(config: &ReplicationConfiguration) -> Str
 
     xml.push_str("</ReplicationConfiguration>");
     xml
+}
+
+fn parse_lifecycle_filter_prefix(
+    filter: Option<&aws_sdk_s3::types::LifecycleRuleFilter>,
+) -> Option<String> {
+    filter
+        .and_then(|filter| filter.prefix().map(str::to_string))
+        .or_else(|| filter.and_then(|filter| filter.and()?.prefix().map(str::to_string)))
+}
+
+fn parse_lifecycle_filter_tags(
+    filter: Option<&aws_sdk_s3::types::LifecycleRuleFilter>,
+) -> Option<HashMap<String, String>> {
+    filter
+        .and_then(|filter| collect_tag_map(filter.tag().map(|tag| (tag.key(), tag.value()))))
+        .or_else(|| {
+            filter.and_then(|filter| {
+                collect_tag_map(
+                    filter
+                        .and()?
+                        .tags()
+                        .iter()
+                        .map(|tag| (tag.key(), tag.value())),
+                )
+            })
+        })
+}
+
+fn build_s3_tag(key: &str, value: &str) -> Result<aws_sdk_s3::types::Tag> {
+    aws_sdk_s3::types::Tag::builder()
+        .key(key)
+        .value(value)
+        .build()
+        .map_err(|error| Error::General(format!("build filter tag: {error}")))
+}
+
+fn build_lifecycle_rule_filter(
+    prefix: Option<&str>,
+    tags: Option<&HashMap<String, String>>,
+) -> Result<Option<aws_sdk_s3::types::LifecycleRuleFilter>> {
+    let Some(tags) = tags.filter(|tags| !tags.is_empty()) else {
+        return Ok(prefix.map(|prefix| {
+            aws_sdk_s3::types::LifecycleRuleFilter::builder()
+                .prefix(prefix)
+                .build()
+        }));
+    };
+
+    let tag_values = sorted_tags(tags)
+        .into_iter()
+        .map(|(key, value)| build_s3_tag(key, value))
+        .collect::<Result<Vec<_>>>()?;
+
+    let filter = if prefix.is_some() || tag_values.len() > 1 {
+        let mut and_builder = aws_sdk_s3::types::LifecycleRuleAndOperator::builder();
+        if let Some(prefix) = prefix {
+            and_builder = and_builder.prefix(prefix);
+        }
+        for tag in tag_values {
+            and_builder = and_builder.tags(tag);
+        }
+        aws_sdk_s3::types::LifecycleRuleFilter::builder()
+            .and(and_builder.build())
+            .build()
+    } else {
+        aws_sdk_s3::types::LifecycleRuleFilter::builder()
+            .tag(
+                tag_values
+                    .into_iter()
+                    .next()
+                    .expect("non-empty tags required to build lifecycle filter"),
+            )
+            .build()
+    };
+
+    Ok(Some(filter))
 }
 
 impl HttpConnector for ReqwestConnector {
@@ -1941,15 +2117,8 @@ impl ObjectStore for S3Client {
                 _ => rc_core::LifecycleRuleStatus::Disabled,
             };
 
-            let prefix = sdk_rule
-                .filter()
-                .and_then(|f| f.prefix().map(|p| p.to_string()))
-                .or_else(|| {
-                    sdk_rule
-                        .filter()
-                        .and_then(|f| f.and())
-                        .and_then(|a| a.prefix().map(|p: &str| p.to_string()))
-                });
+            let prefix = parse_lifecycle_filter_prefix(sdk_rule.filter());
+            let tags = parse_lifecycle_filter_tags(sdk_rule.filter());
 
             let expiration = sdk_rule
                 .expiration()
@@ -2002,7 +2171,7 @@ impl ObjectStore for S3Client {
                 id,
                 status,
                 prefix,
-                tags: None,
+                tags,
                 expiration,
                 transition,
                 noncurrent_version_expiration,
@@ -2018,7 +2187,7 @@ impl ObjectStore for S3Client {
     async fn set_bucket_lifecycle(&self, bucket: &str, rules: Vec<LifecycleRule>) -> Result<()> {
         use aws_sdk_s3::types::{
             AbortIncompleteMultipartUpload, BucketLifecycleConfiguration, ExpirationStatus,
-            LifecycleExpiration as SdkExpiration, LifecycleRule as SdkRule, LifecycleRuleFilter,
+            LifecycleExpiration as SdkExpiration, LifecycleRule as SdkRule,
             NoncurrentVersionExpiration as SdkNve, NoncurrentVersionTransition as SdkNvt,
             Transition, TransitionStorageClass,
         };
@@ -2030,10 +2199,7 @@ impl ObjectStore for S3Client {
                 rc_core::LifecycleRuleStatus::Disabled => ExpirationStatus::Disabled,
             };
 
-            let filter = rule
-                .prefix
-                .as_ref()
-                .map(|p| LifecycleRuleFilter::builder().prefix(p).build());
+            let filter = build_lifecycle_rule_filter(rule.prefix.as_deref(), rule.tags.as_ref())?;
 
             let expiration = rule.expiration.map(|exp| {
                 let mut builder = SdkExpiration::builder();
@@ -2228,6 +2394,7 @@ impl ObjectStore for S3Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn test_object_info_creation() {
@@ -2275,6 +2442,41 @@ mod tests {
     }
 
     #[test]
+    fn parse_replication_configuration_xml_preserves_tag_filters() {
+        let body = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ReplicationConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Rule>
+    <Status>Enabled</Status>
+    <Destination>
+      <Bucket>arn:rustfs:replication:us-east-1:123:dest</Bucket>
+    </Destination>
+    <ID>tagged-rule</ID>
+    <Priority>2</Priority>
+    <Filter>
+      <And>
+        <Prefix>logs/</Prefix>
+        <Tag>
+          <Key>env</Key>
+          <Value>prod</Value>
+        </Tag>
+        <Tag>
+          <Key>team</Key>
+          <Value>core</Value>
+        </Tag>
+      </And>
+    </Filter>
+  </Rule>
+</ReplicationConfiguration>"#;
+
+        let config = parse_replication_configuration_xml(body).expect("parse replication xml");
+        let rule = &config.rules[0];
+        assert_eq!(rule.prefix.as_deref(), Some("logs/"));
+        let tags = rule.tags.as_ref().expect("tag filters");
+        assert_eq!(tags.get("env").map(String::as_str), Some("prod"));
+        assert_eq!(tags.get("team").map(String::as_str), Some("core"));
+    }
+
+    #[test]
     fn build_replication_configuration_xml_writes_delete_replication() {
         let config = ReplicationConfiguration {
             role: "arn:rustfs:replication:us-east-1:123:test".to_string(),
@@ -2303,6 +2505,55 @@ mod tests {
             "<DeleteMarkerReplication><Status>Enabled</Status></DeleteMarkerReplication>"
         ));
         assert!(xml.contains("<Filter><Prefix>logs/</Prefix></Filter>"));
+    }
+
+    #[test]
+    fn build_replication_configuration_xml_writes_and_tag_filters() {
+        let mut tags = HashMap::new();
+        tags.insert("env".to_string(), "prod".to_string());
+        tags.insert("team".to_string(), "core".to_string());
+
+        let config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![rc_core::ReplicationRule {
+                id: "rule-1".to_string(),
+                priority: 1,
+                status: rc_core::ReplicationRuleStatus::Enabled,
+                prefix: Some("logs/".to_string()),
+                tags: Some(tags),
+                destination: rc_core::ReplicationDestination {
+                    bucket_arn: "arn:rustfs:replication:us-east-1:123:dest".to_string(),
+                    storage_class: None,
+                },
+                delete_marker_replication: None,
+                existing_object_replication: None,
+                delete_replication: None,
+            }],
+        };
+
+        let xml = build_replication_configuration_xml(&config);
+        assert!(xml.contains("<Filter><And><Prefix>logs/</Prefix>"));
+        assert!(xml.contains("<Tag><Key>env</Key><Value>prod</Value></Tag>"));
+        assert!(xml.contains("<Tag><Key>team</Key><Value>core</Value></Tag>"));
+    }
+
+    #[test]
+    fn build_lifecycle_rule_filter_preserves_prefix_and_tags() {
+        let mut tags = HashMap::new();
+        tags.insert("env".to_string(), "prod".to_string());
+        tags.insert("team".to_string(), "core".to_string());
+
+        let filter = build_lifecycle_rule_filter(Some("logs/"), Some(&tags))
+            .expect("build lifecycle filter")
+            .expect("lifecycle filter");
+
+        assert_eq!(
+            parse_lifecycle_filter_prefix(Some(&filter)).as_deref(),
+            Some("logs/")
+        );
+        let parsed_tags = parse_lifecycle_filter_tags(Some(&filter)).expect("parsed tags");
+        assert_eq!(parsed_tags.get("env").map(String::as_str), Some("prod"));
+        assert_eq!(parsed_tags.get("team").map(String::as_str), Some("core"));
     }
 
     #[test]

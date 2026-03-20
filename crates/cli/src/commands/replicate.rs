@@ -12,7 +12,8 @@ use rc_core::replication::{
 };
 use rc_core::{AliasManager, ObjectStore as _};
 use rc_s3::{AdminClient, S3Client};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeSet, HashMap};
 
 use crate::exit_code::ExitCode;
 use crate::output::{Formatter, OutputConfig};
@@ -208,6 +209,15 @@ struct ReplicateOperationOutput {
     bucket: String,
     rule_id: String,
     action: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReplicationExport {
+    #[serde(flatten)]
+    config: ReplicationConfiguration,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    remote_targets: Vec<BucketTarget>,
 }
 
 // ==================== execute ====================
@@ -408,13 +418,63 @@ async fn execute_update(args: UpdateArgs, output_config: OutputConfig) -> ExitCo
         }
     };
 
-    let rule = match config.rules.iter_mut().find(|r| r.id == args.id) {
-        Some(rule) => rule,
+    let rule_index = match config.rules.iter().position(|rule| rule.id == args.id) {
+        Some(index) => index,
         None => {
             formatter.error(&format!("Rule '{}' not found", args.id));
             return ExitCode::NotFound;
         }
     };
+
+    let current_target_arn = config.rules[rule_index].destination.bucket_arn.clone();
+
+    if target_level_updates_requested(&args) {
+        let admin_client = match setup_admin_client(&source_alias, &formatter) {
+            Ok(client) => client,
+            Err(code) => return code,
+        };
+
+        let mut target = match admin_client.list_remote_targets(&source_bucket).await {
+            Ok(targets) => match targets
+                .into_iter()
+                .find(|target| target.arn == current_target_arn)
+            {
+                Some(target) => target,
+                None => {
+                    formatter.error(&format!(
+                        "Remote target '{}' not found for rule '{}'",
+                        current_target_arn, args.id
+                    ));
+                    return ExitCode::NotFound;
+                }
+            },
+            Err(error) => {
+                formatter.error(&format!("Failed to list remote targets: {error}"));
+                return ExitCode::GeneralError;
+            }
+        };
+
+        apply_target_updates(&mut target, &args);
+
+        let updated_arn = match admin_client
+            .set_remote_target(&source_bucket, target, true)
+            .await
+        {
+            Ok(arn) => arn,
+            Err(error) => {
+                formatter.error(&format!("Failed to update remote target: {error}"));
+                return ExitCode::GeneralError;
+            }
+        };
+
+        if updated_arn != current_target_arn {
+            let mut arn_map = HashMap::new();
+            arn_map.insert(current_target_arn.clone(), updated_arn);
+            remap_replication_arns(&mut config, &arn_map);
+        }
+    }
+
+    let rule = &mut config.rules[rule_index];
 
     // Apply updates
     if let Some(priority) = args.priority {
@@ -601,25 +661,66 @@ async fn execute_remove(args: RemoveArgs, output_config: OutputConfig) -> ExitCo
         Err(code) => return code,
     };
 
+    let admin_client = match setup_admin_client(&alias_name, &formatter) {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
+
     if args.all {
-        match client.delete_bucket_replication(&bucket).await {
-            Ok(()) => {
-                if formatter.is_json() {
-                    formatter.json(&ReplicateOperationOutput {
-                        bucket,
-                        rule_id: "*".to_string(),
-                        action: "removed".to_string(),
-                    });
-                } else {
-                    formatter.success("All replication rules removed.");
-                }
-                return ExitCode::Success;
-            }
+        let targets = match admin_client.list_remote_targets(&bucket).await {
+            Ok(targets) => targets,
             Err(error) => {
-                formatter.error(&format!("Failed to remove replication config: {error}"));
+                formatter.error(&format!("Failed to list remote targets: {error}"));
+                return ExitCode::GeneralError;
+            }
+        };
+
+        let config = match client.get_bucket_replication(&bucket).await {
+            Ok(config) => config,
+            Err(error) => {
+                formatter.error(&format!("Failed to get replication config: {error}"));
+                return ExitCode::GeneralError;
+            }
+        };
+
+        if config.is_none() && targets.is_empty() {
+            formatter.error("No replication configuration found on this bucket");
+            return ExitCode::NotFound;
+        }
+
+        if config.is_some()
+            && let Err(error) = client.delete_bucket_replication(&bucket).await
+        {
+            formatter.error(&format!("Failed to remove replication config: {error}"));
+            return ExitCode::GeneralError;
+        }
+
+        for target in targets {
+            if target.arn.is_empty() {
+                continue;
+            }
+            if let Err(error) = admin_client
+                .remove_remote_target(&bucket, &target.arn)
+                .await
+            {
+                formatter.error(&format!(
+                    "Failed to remove remote target '{}': {error}",
+                    target.arn
+                ));
                 return ExitCode::GeneralError;
             }
         }
+
+        if formatter.is_json() {
+            formatter.json(&ReplicateOperationOutput {
+                bucket,
+                rule_id: "*".to_string(),
+                action: "removed".to_string(),
+            });
+        } else {
+            formatter.success("All replication rules removed.");
+        }
+        return ExitCode::Success;
     }
 
     // Remove specific rule by ID
@@ -637,13 +738,24 @@ async fn execute_remove(args: RemoveArgs, output_config: OutputConfig) -> ExitCo
         }
     };
 
-    let before = config.rules.len();
-    config.rules.retain(|r| r.id != rule_id);
+    let removed_rule = match config
+        .rules
+        .iter()
+        .position(|rule| rule.id == rule_id)
+        .map(|index| config.rules.remove(index))
+    {
+        Some(rule) => rule,
+        None => {
+            formatter.error(&format!("Rule '{}' not found", rule_id));
+            return ExitCode::NotFound;
+        }
+    };
 
-    if config.rules.len() == before {
-        formatter.error(&format!("Rule '{}' not found", rule_id));
-        return ExitCode::NotFound;
-    }
+    let should_remove_target = !removed_rule.destination.bucket_arn.is_empty()
+        && !config
+            .rules
+            .iter()
+            .any(|rule| rule.destination.bucket_arn == removed_rule.destination.bucket_arn);
 
     if config.rules.is_empty() {
         match client.delete_bucket_replication(&bucket).await {
@@ -661,6 +773,18 @@ async fn execute_remove(args: RemoveArgs, output_config: OutputConfig) -> ExitCo
                 return ExitCode::GeneralError;
             }
         }
+    }
+
+    if should_remove_target
+        && let Err(error) = admin_client
+            .remove_remote_target(&bucket, &removed_rule.destination.bucket_arn)
+            .await
+    {
+        formatter.error(&format!(
+            "Failed to remove remote target '{}': {error}",
+            removed_rule.destination.bucket_arn
+        ));
+        return ExitCode::GeneralError;
     }
 
     if formatter.is_json() {
@@ -693,9 +817,24 @@ async fn execute_export(args: BucketArg, output_config: OutputConfig) -> ExitCod
         Err(code) => return code,
     };
 
+    let admin_client = match setup_admin_client(&alias_name, &formatter) {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
+
     match client.get_bucket_replication(&bucket).await {
         Ok(Some(config)) => {
-            formatter.json(&config);
+            let remote_targets = match admin_client.list_remote_targets(&bucket).await {
+                Ok(targets) => relevant_remote_targets(targets, &config),
+                Err(error) => {
+                    formatter.error(&format!("Failed to list remote targets: {error}"));
+                    return ExitCode::GeneralError;
+                }
+            };
+            formatter.json(&ReplicationExport {
+                config,
+                remote_targets,
+            });
             ExitCode::Success
         }
         Ok(None) => {
@@ -730,8 +869,8 @@ async fn execute_import(args: ImportArgs, output_config: OutputConfig) -> ExitCo
         }
     };
 
-    let config: ReplicationConfiguration = match serde_json::from_str(&data) {
-        Ok(config) => config,
+    let import: ReplicationExport = match serde_json::from_str(&data) {
+        Ok(import) => import,
         Err(error) => {
             formatter.error(&format!("Invalid JSON in '{}': {error}", args.file));
             return ExitCode::UsageError;
@@ -742,6 +881,57 @@ async fn execute_import(args: ImportArgs, output_config: OutputConfig) -> ExitCo
         Ok(client) => client,
         Err(code) => return code,
     };
+
+    let mut config = import.config;
+
+    if !import.remote_targets.is_empty() {
+        let admin_client = match setup_admin_client(&alias_name, &formatter) {
+            Ok(client) => client,
+            Err(code) => return code,
+        };
+
+        let existing_targets = match admin_client.list_remote_targets(&bucket).await {
+            Ok(targets) => targets,
+            Err(error) => {
+                formatter.error(&format!("Failed to list remote targets: {error}"));
+                return ExitCode::GeneralError;
+            }
+        };
+
+        let mut arn_map = HashMap::new();
+        for imported_target in import.remote_targets {
+            let mut target = normalize_imported_target(imported_target, &bucket);
+            let old_arn = target.arn.clone();
+
+            let resolved_arn = if let Some(existing_target) =
+                find_matching_remote_target(&existing_targets, &target)
+            {
+                target.arn = existing_target.arn.clone();
+                match admin_client.set_remote_target(&bucket, target, true).await {
+                    Ok(arn) => arn,
+                    Err(error) => {
+                        formatter.error(&format!("Failed to update remote target: {error}"));
+                        return ExitCode::GeneralError;
+                    }
+                }
+            } else {
+                target.arn.clear();
+                match admin_client.set_remote_target(&bucket, target, false).await {
+                    Ok(arn) => arn,
+                    Err(error) => {
+                        formatter.error(&format!("Failed to create remote target: {error}"));
+                        return ExitCode::GeneralError;
+                    }
+                }
+            };
+
+            if !old_arn.is_empty() {
+                arn_map.insert(old_arn, resolved_arn);
+            }
+        }
+
+        remap_replication_arns(&mut config, &arn_map);
+    }
 
     match client.set_bucket_replication(&bucket, config).await {
         Ok(()) => {
@@ -893,6 +1083,97 @@ fn default_replication_role(bucket_arn: &str) -> String {
     bucket_arn.to_string()
 }
 
+fn collect_target_arns(config: &ReplicationConfiguration) -> BTreeSet<String> {
+    config
+        .rules
+        .iter()
+        .filter_map(|rule| {
+            let arn = rule.destination.bucket_arn.trim();
+            if arn.is_empty() {
+                None
+            } else {
+                Some(arn.to_string())
+            }
+        })
+        .collect()
+}
+
+fn relevant_remote_targets(
+    targets: Vec<BucketTarget>,
+    config: &ReplicationConfiguration,
+) -> Vec<BucketTarget> {
+    let referenced = collect_target_arns(config);
+    targets
+        .into_iter()
+        .filter(|target| referenced.contains(target.arn.as_str()))
+        .collect()
+}
+
+fn target_level_updates_requested(args: &UpdateArgs) -> bool {
+    args.storage_class.is_some()
+        || args.bandwidth.is_some()
+        || args.sync.is_some()
+        || args.healthcheck_seconds.is_some()
+        || args.disable_proxy.is_some()
+}
+
+fn apply_target_updates(target: &mut BucketTarget, args: &UpdateArgs) {
+    if let Some(storage_class) = &args.storage_class {
+        target.storage_class = storage_class.clone();
+    }
+    if let Some(bandwidth) = args.bandwidth {
+        target.bandwidth_limit = bandwidth;
+    }
+    if let Some(sync) = args.sync {
+        target.replication_sync = sync;
+    }
+    if let Some(healthcheck_seconds) = args.healthcheck_seconds {
+        target.health_check_duration = healthcheck_seconds;
+    }
+    if let Some(disable_proxy) = args.disable_proxy {
+        target.disable_proxy = disable_proxy;
+    }
+}
+
+fn remap_replication_arns(
+    config: &mut ReplicationConfiguration,
+    arn_map: &HashMap<String, String>,
+) {
+    if let Some(updated_role) = arn_map.get(&config.role) {
+        config.role = updated_role.clone();
+    }
+
+    for rule in &mut config.rules {
+        if let Some(updated_arn) = arn_map.get(&rule.destination.bucket_arn) {
+            rule.destination.bucket_arn = updated_arn.clone();
+        }
+    }
+}
+
+fn find_matching_remote_target<'a>(
+    targets: &'a [BucketTarget],
+    expected: &BucketTarget,
+) -> Option<&'a BucketTarget> {
+    targets.iter().find(|target| {
+        target.endpoint == expected.endpoint
+            && target.target_bucket == expected.target_bucket
+            && target.secure == expected.secure
+            && target.region == expected.region
+            && target.target_type == expected.target_type
+    })
+}
+
+fn normalize_imported_target(mut target: BucketTarget, bucket: &str) -> BucketTarget {
+    target.source_bucket = bucket.to_string();
+    if target.path.is_empty() {
+        target.path = DEFAULT_REMOTE_TARGET_PATH.to_string();
+    }
+    if target.api.is_empty() {
+        target.api = DEFAULT_REMOTE_TARGET_API.to_string();
+    }
+    target
+}
+
 fn format_replication_flags(rule: &ReplicationRule) -> String {
     let mut flags = Vec::new();
 
@@ -934,6 +1215,7 @@ fn strip_endpoint_path(endpoint: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn test_parse_bucket_path_success() {
@@ -988,6 +1270,114 @@ mod tests {
     fn test_default_replication_role_uses_destination_arn() {
         let arn = "arn:rustfs:replication:us-east-1:123:test";
         assert_eq!(default_replication_role(arn), arn);
+    }
+
+    #[test]
+    fn test_collect_target_arns_deduplicates_destinations() {
+        let config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![
+                ReplicationRule {
+                    id: "rule-1".to_string(),
+                    priority: 1,
+                    status: ReplicationRuleStatus::Enabled,
+                    prefix: None,
+                    tags: None,
+                    destination: ReplicationDestination {
+                        bucket_arn: "arn:one".to_string(),
+                        storage_class: None,
+                    },
+                    delete_marker_replication: None,
+                    existing_object_replication: None,
+                    delete_replication: None,
+                },
+                ReplicationRule {
+                    id: "rule-2".to_string(),
+                    priority: 2,
+                    status: ReplicationRuleStatus::Enabled,
+                    prefix: None,
+                    tags: None,
+                    destination: ReplicationDestination {
+                        bucket_arn: "arn:one".to_string(),
+                        storage_class: None,
+                    },
+                    delete_marker_replication: None,
+                    existing_object_replication: None,
+                    delete_replication: None,
+                },
+            ],
+        };
+
+        let arns = collect_target_arns(&config);
+        assert_eq!(arns.len(), 1);
+        assert!(arns.contains("arn:one"));
+    }
+
+    #[test]
+    fn test_remap_replication_arns_updates_role_and_rules() {
+        let mut config = ReplicationConfiguration {
+            role: "arn:old".to_string(),
+            rules: vec![ReplicationRule {
+                id: "rule-1".to_string(),
+                priority: 1,
+                status: ReplicationRuleStatus::Enabled,
+                prefix: None,
+                tags: None,
+                destination: ReplicationDestination {
+                    bucket_arn: "arn:old".to_string(),
+                    storage_class: None,
+                },
+                delete_marker_replication: None,
+                existing_object_replication: None,
+                delete_replication: None,
+            }],
+        };
+
+        let mut arn_map = HashMap::new();
+        arn_map.insert("arn:old".to_string(), "arn:new".to_string());
+        remap_replication_arns(&mut config, &arn_map);
+
+        assert_eq!(config.role, "arn:new");
+        assert_eq!(config.rules[0].destination.bucket_arn, "arn:new");
+    }
+
+    #[test]
+    fn test_replication_export_parses_legacy_config_shape() {
+        let payload = r#"{
+            "role": "arn:role",
+            "rules": []
+        }"#;
+
+        let export: ReplicationExport = serde_json::from_str(payload).expect("parse export");
+        assert_eq!(export.config.role, "arn:role");
+        assert!(export.remote_targets.is_empty());
+    }
+
+    #[test]
+    fn test_find_matching_remote_target_matches_endpoint_bucket_and_region() {
+        let targets = vec![BucketTarget {
+            source_bucket: "source".to_string(),
+            endpoint: "remote:9000".to_string(),
+            target_bucket: "dest".to_string(),
+            secure: true,
+            target_type: "replication".to_string(),
+            region: "us-east-1".to_string(),
+            arn: "arn:one".to_string(),
+            ..Default::default()
+        }];
+
+        let expected = BucketTarget {
+            source_bucket: "other".to_string(),
+            endpoint: "remote:9000".to_string(),
+            target_bucket: "dest".to_string(),
+            secure: true,
+            target_type: "replication".to_string(),
+            region: "us-east-1".to_string(),
+            ..Default::default()
+        };
+
+        let matched = find_matching_remote_target(&targets, &expected).expect("matching target");
+        assert_eq!(matched.arn, "arn:one");
     }
 
     #[test]

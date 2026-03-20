@@ -239,10 +239,13 @@ async fn execute_add(args: AddRuleArgs, output_config: OutputConfig) -> ExitCode
     };
 
     // Get existing rules
-    let mut rules = client
-        .get_bucket_lifecycle(&bucket)
-        .await
-        .unwrap_or_default();
+    let mut rules = match client.get_bucket_lifecycle(&bucket).await {
+        Ok(rules) => rules,
+        Err(error) => {
+            formatter.error(&format!("Failed to get lifecycle rules: {error}"));
+            return ExitCode::GeneralError;
+        }
+    };
 
     // Generate rule ID
     let rule_id = generate_rule_id();
