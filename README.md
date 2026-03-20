@@ -27,6 +27,13 @@ If you specifically need glibc-linked builds, use `linux-amd64-gnu` / `linux-arm
 brew install rustfs/tap/rc
 ```
 
+### Scoop (Windows)
+
+```powershell
+scoop bucket add rustfs https://github.com/rustfs/scoop-bucket
+scoop install rustfs/rc
+```
+
 ### Cargo
 
 ```bash
