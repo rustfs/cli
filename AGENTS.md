@@ -291,6 +291,8 @@ Before submitting a PR, confirm all of the following:
 - [ ] Golden tests pass (output schema not broken)
 - [ ] No sensitive information in logs
 - [ ] Complex logic has appropriate comments (explaining WHY)
+- [ ] PR title follows semantic/conventional commit format
+- [ ] PR description clearly covers related issue(s), background, solution, and test status
 - [ ] Commit message and PR description are in English
 
 **Do not skip checks and commit directly! Code that fails CI should not be merged.**
@@ -374,3 +376,19 @@ Each completed phase should have a commit:
 - Format: `feat(phase-N): <brief description>`
 - Example: `feat(phase-0): initialize project structure and CI`
 - Example: `feat(phase-1): implement core infrastructure and alias commands`
+
+### Pull Request Guidelines
+
+Each PR must follow these rules:
+
+- PR title must follow semantic/conventional commit format
+- Recommended formats: `feat(scope): <description>`, `fix(scope): <description>`, `docs(scope): <description>`, `refactor(scope): <description>`
+- If the change is breaking, include the breaking change marker as required above
+
+PR descriptions must be clear and easy to review. At minimum, they should include:
+
+- Related issue(s) being resolved
+- Problem background and user impact
+- Root cause summary
+- Solution overview
+- Test status and validation commands run
