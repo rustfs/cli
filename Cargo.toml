@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/cli", "crates/core", "crates/s3"]
 
 [workspace.package]
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 rust-version = "1.91"
 license = "MIT OR Apache-2.0"
@@ -15,9 +15,9 @@ categories = ["command-line-utilities", "filesystem"]
 
 [workspace.dependencies]
 # RustFS Internal Crates
-rc-core = { path = "./crates/core", version = "0.1.7" }
-rc-s3 = { path = "./crates/s3", version = "0.1.7" }
-rustfs-cli = { path = "./crates/cli", version = "0.1.7" }
+rc-core = { path = "./crates/core", version = "0.1.8" }
+rc-s3 = { path = "./crates/s3", version = "0.1.8" }
+rustfs-cli = { path = "./crates/cli", version = "0.1.8" }
 
 # Async runtime
 tokio = { version = "1.49", features = ["full"] }

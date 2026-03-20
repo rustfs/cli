@@ -2134,7 +2134,7 @@ dependencies = [
 
 [[package]]
 name = "rc-core"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2155,7 +2155,7 @@ dependencies = [
 
 [[package]]
 name = "rc-s3"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2321,7 +2321,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-cli"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "anyhow",
  "clap",
