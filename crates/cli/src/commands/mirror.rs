@@ -474,7 +474,7 @@ pub async fn execute(args: MirrorArgs, output_config: OutputConfig) -> ExitCode 
 }
 
 // Mirror should preserve source content type when metadata is available, but
-// still fall back to a plain byte copy if metadata lookup is not supported.
+// still fall back to a plain byte copy if metadata lookup fails for any reason.
 async fn copy_object_with_metadata<S, T>(
     source_client: &S,
     target_client: &T,
@@ -489,10 +489,9 @@ where
         Ok(source_info) => source_info.content_type,
         Err(error) => {
             tracing::warn!(
-                source = %format!(
-                    "{}/{}/{}",
-                    source_path.alias, source_path.bucket, source_path.key
-                ),
+                source_alias = %source_path.alias,
+                source_bucket = %source_path.bucket,
+                source_key = %source_path.key,
                 error = %error,
                 "Falling back to mirror upload without source content type"
             );
@@ -626,6 +625,7 @@ mod tests {
     struct TestMirrorSource {
         content_type: Option<String>,
         data: Vec<u8>,
+        head_error: Option<rc_core::Error>,
         head_calls: Mutex<Vec<String>>,
         get_calls: Mutex<Vec<String>>,
     }
@@ -635,6 +635,17 @@ mod tests {
             Self {
                 content_type: content_type.map(ToOwned::to_owned),
                 data: data.to_vec(),
+                head_error: None,
+                head_calls: Mutex::new(Vec::new()),
+                get_calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn with_head_error(error: rc_core::Error, data: &[u8]) -> Self {
+            Self {
+                content_type: None,
+                data: data.to_vec(),
+                head_error: Some(error),
                 head_calls: Mutex::new(Vec::new()),
                 get_calls: Mutex::new(Vec::new()),
             }
@@ -647,6 +658,9 @@ mod tests {
                 .lock()
                 .expect("head call mutex should not be poisoned")
                 .push(path.key.clone());
+            if let Some(error) = &self.head_error {
+                return Err(rc_core::Error::General(error.to_string()));
+            }
             Ok(ObjectInfo {
                 key: path.key.clone(),
                 size_bytes: Some(self.data.len() as i64),
@@ -753,6 +767,50 @@ mod tests {
             .await
             .expect("copy should succeed");
 
+        assert_eq!(
+            target
+                .put_calls
+                .lock()
+                .expect("put call mutex should not be poisoned")
+                .as_slice(),
+            [PutCall {
+                key: "readme.txt".to_string(),
+                content_type: None,
+                data: b"plain-bytes".to_vec(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_copy_object_with_metadata_falls_back_when_head_lookup_fails() {
+        let source = TestMirrorSource::with_head_error(
+            rc_core::Error::Network("head failed".to_string()),
+            b"plain-bytes",
+        );
+        let target = TestMirrorTarget::default();
+        let source_path = RemotePath::new("stage", "docs", "readme.txt");
+        let target_path = RemotePath::new("prod", "docs", "readme.txt");
+
+        copy_object_with_metadata(&source, &target, &source_path, &target_path)
+            .await
+            .expect("copy should succeed");
+
+        assert_eq!(
+            source
+                .head_calls
+                .lock()
+                .expect("head call mutex should not be poisoned")
+                .as_slice(),
+            ["readme.txt"]
+        );
+        assert_eq!(
+            source
+                .get_calls
+                .lock()
+                .expect("get call mutex should not be poisoned")
+                .as_slice(),
+            ["readme.txt"]
+        );
         assert_eq!(
             target
                 .put_calls
