@@ -279,7 +279,15 @@ async fn list_all_objects(
 
     if formatter.is_json() {
         let output = LsOutput {
-            items: all_items.into_values().flatten().collect(),
+            items: all_items
+                .into_iter()
+                .flat_map(|(bucket, objects)| {
+                    objects.into_iter().map(move |mut obj| {
+                        obj.key = format!("{}/{}", bucket, obj.key);
+                        obj
+                    })
+                })
+                .collect(),
             truncated: is_truncated,
             continuation_token,
             summary: if summarize {
