@@ -214,6 +214,24 @@ pub fn parse_path(path: &str) -> Result<ParsedPath> {
     }
 }
 
+/// Parse a remote path that must refer to a single object (`alias/bucket/key` with non-empty key).
+pub fn parse_object_path(path: &str) -> Result<RemotePath> {
+    match parse_path(path)? {
+        ParsedPath::Remote(r) => {
+            if r.key.is_empty() || r.is_dir {
+                Err(Error::InvalidPath(
+                    "Object path required: alias/bucket/key (key must not be empty)".into(),
+                ))
+            } else {
+                Ok(r)
+            }
+        }
+        ParsedPath::Local(_) => Err(Error::InvalidPath(
+            "Expected remote path in the form alias/bucket/key".into(),
+        )),
+    }
+}
+
 /// Check if a string is a valid alias name
 fn is_valid_alias_name(name: &str) -> bool {
     !name.is_empty()
@@ -254,6 +272,14 @@ mod tests {
         assert_eq!(remote.bucket, "bucket");
         assert_eq!(remote.key, "");
         assert!(remote.is_dir);
+    }
+
+    #[test]
+    fn test_parse_object_path_requires_non_empty_key() {
+        assert!(parse_object_path("myalias/bucket").is_err());
+        assert!(parse_object_path("myalias/bucket/dir/").is_err());
+        let r = parse_object_path("myalias/bucket/key.txt").unwrap();
+        assert_eq!(r.key, "key.txt");
     }
 
     #[test]

@@ -23,7 +23,7 @@ use quick_xml::de::from_str as from_xml_str;
 use rc_core::{
     Alias, BucketNotification, Capabilities, CorsRule, Error, LifecycleRule, ListOptions,
     ListResult, NotificationTarget, ObjectInfo, ObjectStore, ObjectVersion, RemotePath,
-    ReplicationConfiguration, Result,
+    ReplicationConfiguration, Result, SelectOptions,
 };
 use reqwest::Method;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
@@ -31,6 +31,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWrite;
 
 /// Keep single-part uploads small to avoid backend incompatibilities with
 /// streaming aws-chunked payloads.
@@ -648,7 +649,6 @@ impl HttpClient for ReqwestConnector {
 pub struct S3Client {
     inner: aws_sdk_s3::Client,
     xml_http_client: reqwest::Client,
-    #[allow(dead_code)]
     alias: Alias,
 }
 
@@ -1725,8 +1725,8 @@ impl ObjectStore for S3Client {
     }
 
     async fn capabilities(&self) -> Result<Capabilities> {
-        // Hardcoded optimistic defaults for common S3-compatible backends.
-        // In a future phase we can replace these with active detection.
+        // Best-effort hints for common S3-compatible backends. `select` is not inferred here;
+        // use [`ObjectStore::probe_select_support`] (e.g. from `rc sql`).
         Ok(Capabilities {
             versioning: true,
             object_lock: false,
@@ -2700,6 +2700,19 @@ impl ObjectStore for S3Client {
                 ))
             })?;
         Ok(())
+    }
+
+    async fn probe_select_support(&self, bucket: &str) -> Result<bool> {
+        crate::select::probe_select_support(&self.inner, bucket).await
+    }
+
+    async fn select_object_content(
+        &self,
+        path: &RemotePath,
+        options: &SelectOptions,
+        writer: &mut (dyn AsyncWrite + Send + Unpin),
+    ) -> Result<()> {
+        crate::select::select_object_content(&self.inner, path, options, writer).await
     }
 }
 

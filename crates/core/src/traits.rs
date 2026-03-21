@@ -8,12 +8,14 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncWrite;
 
 use crate::cors::CorsRule;
 use crate::error::Result;
 use crate::lifecycle::LifecycleRule;
 use crate::path::RemotePath;
 use crate::replication::ReplicationConfiguration;
+use crate::select::SelectOptions;
 
 /// Metadata for an object version
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,7 +178,8 @@ pub struct Capabilities {
     /// Supports anonymous bucket access policies
     pub anonymous: bool,
 
-    /// Supports S3 Select
+    /// S3 Select (`SelectObjectContent`). **Not set by [`ObjectStore::capabilities`]** (it stays
+    /// `false` there); use [`ObjectStore::probe_select_support`] to detect support per bucket.
     pub select: bool,
 
     /// Supports event notifications
@@ -387,6 +390,19 @@ pub trait ObjectStore: Send + Sync {
 
     /// Delete bucket CORS configuration.
     async fn delete_bucket_cors(&self, bucket: &str) -> Result<()>;
+
+    /// Whether this store supports S3 Select for `bucket` (`SelectObjectContent`).
+    ///
+    /// Implementations that do not support Select should return `Ok(false)`.
+    async fn probe_select_support(&self, bucket: &str) -> Result<bool>;
+
+    /// Run S3 Select on an object and stream result payloads to `writer`.
+    async fn select_object_content(
+        &self,
+        path: &RemotePath,
+        options: &SelectOptions,
+        writer: &mut (dyn AsyncWrite + Send + Unpin),
+    ) -> Result<()>;
     // async fn get_versioning(&self, bucket: &str) -> Result<bool>;
     // async fn set_versioning(&self, bucket: &str, enabled: bool) -> Result<()>;
     // async fn get_tags(&self, path: &RemotePath) -> Result<HashMap<String, String>>;

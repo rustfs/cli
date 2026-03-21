@@ -18,6 +18,7 @@ pub mod lifecycle;
 pub mod path;
 pub mod replication;
 pub mod retry;
+pub mod select;
 pub mod traits;
 
 pub use alias::{Alias, AliasManager};
@@ -28,12 +29,13 @@ pub use lifecycle::{
     LifecycleConfiguration, LifecycleExpiration, LifecycleRule, LifecycleRuleStatus,
     LifecycleTransition, NoncurrentVersionExpiration, NoncurrentVersionTransition,
 };
-pub use path::{ParsedPath, RemotePath, parse_path};
+pub use path::{ParsedPath, RemotePath, parse_object_path, parse_path};
 pub use replication::{
     BucketTarget, BucketTargetCredentials, ReplicationConfiguration, ReplicationDestination,
     ReplicationRule, ReplicationRuleStatus,
 };
 pub use retry::{RetryBuilder, is_retryable_error, retry_with_backoff};
+pub use select::{SelectCompression, SelectInputFormat, SelectOptions, SelectOutputFormat};
 pub use traits::{
     BucketNotification, Capabilities, ListOptions, ListResult, NotificationTarget, ObjectInfo,
     ObjectStore, ObjectVersion,

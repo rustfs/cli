@@ -5,9 +5,9 @@
 //! depends on the AWS SDK.
 
 pub mod admin;
-pub mod capability;
 pub mod client;
 pub mod multipart;
+mod select;
 
 pub use admin::AdminClient;
 pub use client::{DeleteRequestOptions, S3Client};

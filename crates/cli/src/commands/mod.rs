@@ -35,6 +35,7 @@ mod rb;
 mod replicate;
 mod rm;
 mod share;
+mod sql;
 mod stat;
 mod tag;
 mod tree;
@@ -209,6 +210,9 @@ pub enum Commands {
     /// Deprecated: use `rc object share`
     Share(share::ShareArgs),
 
+    /// Run S3 Select SQL on an object
+    Sql(sql::SqlArgs),
+
     // Phase 5: Optional commands (capability-dependent)
     /// Deprecated: use `rc bucket version`
     #[command(subcommand)]
@@ -239,8 +243,6 @@ pub enum Commands {
     // Retention(retention::RetentionArgs),
     // /// Watch for object events
     // Watch(watch::WatchArgs),
-    // /// Run S3 Select queries
-    // Sql(sql::SqlArgs),
 }
 
 /// Execute the CLI command and return an exit code
@@ -324,6 +326,9 @@ pub async fn execute(cli: Cli) -> ExitCode {
         }
         Commands::Share(args) => {
             share::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
+        Commands::Sql(args) => {
+            sql::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
         }
         Commands::Version(cmd) => {
             version::execute(
