@@ -346,7 +346,7 @@ fn parse_event_list(values: &[String]) -> Vec<String> {
         .flat_map(|value| value.split(','))
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
+        .map(normalize_event_name)
         .collect();
 
     if events.is_empty() {
@@ -356,6 +356,17 @@ fn parse_event_list(values: &[String]) -> Vec<String> {
     events.sort();
     events.dedup();
     events
+}
+
+fn normalize_event_name(value: &str) -> String {
+    match value.to_ascii_lowercase().as_str() {
+        "put" => "s3:ObjectCreated:*".to_string(),
+        "get" => "s3:ObjectAccessed:*".to_string(),
+        "delete" => "s3:ObjectRemoved:*".to_string(),
+        "replica" => "s3:Replication:*".to_string(),
+        "ilm" => "s3:ObjectTransition:*".to_string(),
+        _ => value.to_string(),
+    }
 }
 
 fn infer_target_from_arn(arn: &str) -> Result<NotificationTarget, String> {
@@ -437,6 +448,28 @@ mod tests {
             vec![
                 "s3:ObjectCreated:Put".to_string(),
                 "s3:ObjectRemoved:*".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_event_list_normalizes_shorthand_names() {
+        let events = parse_event_list(&[
+            "put,get,delete".to_string(),
+            "replica".to_string(),
+            "ilm,s3:ObjectCreated:Post".to_string(),
+            "PUT".to_string(),
+        ]);
+
+        assert_eq!(
+            events,
+            vec![
+                "s3:ObjectAccessed:*".to_string(),
+                "s3:ObjectCreated:*".to_string(),
+                "s3:ObjectCreated:Post".to_string(),
+                "s3:ObjectRemoved:*".to_string(),
+                "s3:ObjectTransition:*".to_string(),
+                "s3:Replication:*".to_string(),
             ]
         );
     }
