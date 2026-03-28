@@ -475,6 +475,17 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_event_list_deduplicates_shorthand_against_canonical_name() {
+        let events = parse_event_list(&[
+            "put".to_string(),
+            "s3:ObjectCreated:*".to_string(),
+            "PUT".to_string(),
+        ]);
+
+        assert_eq!(events, vec!["s3:ObjectCreated:*".to_string()]);
+    }
+
+    #[test]
     fn test_infer_target_from_arn() {
         assert_eq!(
             infer_target_from_arn("arn:aws:sqs:us-east-1:123456789012:queue").expect("queue"),
