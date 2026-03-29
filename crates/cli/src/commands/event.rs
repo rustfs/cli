@@ -475,6 +475,24 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_event_list_deduplicates_shorthand_and_canonical_values() {
+        let events = parse_event_list(&[
+            "put,s3:ObjectCreated:*".to_string(),
+            "GET,s3:ObjectAccessed:*".to_string(),
+            "delete,s3:ObjectRemoved:*".to_string(),
+        ]);
+
+        assert_eq!(
+            events,
+            vec![
+                "s3:ObjectAccessed:*".to_string(),
+                "s3:ObjectCreated:*".to_string(),
+                "s3:ObjectRemoved:*".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn test_infer_target_from_arn() {
         assert_eq!(
             infer_target_from_arn("arn:aws:sqs:us-east-1:123456789012:queue").expect("queue"),
