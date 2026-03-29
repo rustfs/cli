@@ -475,6 +475,13 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_event_list_defaults_when_inputs_are_blank() {
+        let events = parse_event_list(&[" , ,  ".to_string(), "".to_string()]);
+
+        assert_eq!(events, vec!["s3:ObjectCreated:*".to_string()]);
+    }
+
+    #[test]
     fn test_infer_target_from_arn() {
         assert_eq!(
             infer_target_from_arn("arn:aws:sqs:us-east-1:123456789012:queue").expect("queue"),
