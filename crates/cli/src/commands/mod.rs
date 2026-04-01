@@ -4,7 +4,9 @@
 //! Commands are organized by functionality and follow the pattern established
 //! in the command implementation template.
 
-use clap::{Parser, Subcommand};
+use std::io::{IsTerminal, stderr, stdout};
+
+use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::exit_code::ExitCode;
 use crate::output::OutputConfig;
@@ -46,6 +48,10 @@ mod version;
 #[command(author, version, about, long_about = None)]
 #[command(propagate_version = true)]
 pub struct Cli {
+    /// Output format: auto-detect, human-readable, or JSON
+    #[arg(long, global = true, value_enum)]
+    pub format: Option<OutputFormat>,
+
     /// Output format: human-readable or JSON
     #[arg(long, global = true, default_value = "false")]
     pub json: bool,
@@ -68,6 +74,67 @@ pub struct Cli {
 
     #[command(subcommand)]
     pub command: Commands,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum OutputFormat {
+    Auto,
+    Human,
+    Json,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum OutputBehavior {
+    HumanDefault,
+    StructuredDefault,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct GlobalOutputOptions {
+    format: Option<OutputFormat>,
+    json: bool,
+    no_color: bool,
+    no_progress: bool,
+    quiet: bool,
+}
+
+impl GlobalOutputOptions {
+    fn from_cli(cli: &Cli) -> Self {
+        Self {
+            format: cli.format,
+            json: cli.json,
+            no_color: cli.no_color,
+            no_progress: cli.no_progress,
+            quiet: cli.quiet,
+        }
+    }
+
+    fn resolve(self, behavior: OutputBehavior) -> OutputConfig {
+        let stdout_is_tty = stdout().is_terminal();
+        let stderr_is_tty = stderr().is_terminal();
+
+        let selected_format = if self.json {
+            OutputFormat::Json
+        } else {
+            self.format.unwrap_or(match behavior {
+                OutputBehavior::HumanDefault => OutputFormat::Human,
+                OutputBehavior::StructuredDefault => OutputFormat::Auto,
+            })
+        };
+
+        let json = match selected_format {
+            OutputFormat::Json => true,
+            OutputFormat::Human => false,
+            OutputFormat::Auto => !stdout_is_tty,
+        };
+
+        OutputConfig {
+            json,
+            no_color: self.no_color || !stdout_is_tty || json,
+            no_progress: self.no_progress || !stderr_is_tty || json,
+            quiet: self.quiet,
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -175,50 +242,168 @@ pub enum Commands {
 
 /// Execute the CLI command and return an exit code
 pub async fn execute(cli: Cli) -> ExitCode {
-    let output_config = OutputConfig {
-        json: cli.json,
-        no_color: cli.no_color,
-        no_progress: cli.no_progress,
-        quiet: cli.quiet,
-    };
+    let output_options = GlobalOutputOptions::from_cli(&cli);
 
     match cli.command {
-        Commands::Alias(cmd) => alias::execute(cmd, output_config).await,
-        Commands::Admin(cmd) => admin::execute(cmd, output_config).await,
-        Commands::Bucket(args) => bucket::execute(args, output_config).await,
-        Commands::Object(args) => object::execute(args, output_config).await,
-        Commands::Ls(args) => ls::execute(args, output_config).await,
-        Commands::Mb(args) => mb::execute(args, output_config).await,
-        Commands::Rb(args) => rb::execute(args, output_config).await,
-        Commands::Cat(args) => cat::execute(args, output_config).await,
-        Commands::Head(args) => head::execute(args, output_config).await,
-        Commands::Stat(args) => stat::execute(args, output_config).await,
-        Commands::Cp(args) => cp::execute(args, output_config).await,
-        Commands::Mv(args) => mv::execute(args, output_config).await,
-        Commands::Rm(args) => rm::execute(args, output_config).await,
-        Commands::Pipe(args) => pipe::execute(args, output_config).await,
-        Commands::Find(args) => find::execute(args, output_config).await,
+        Commands::Alias(cmd) => {
+            alias::execute(cmd, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
+        Commands::Admin(cmd) => {
+            admin::execute(cmd, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
+        Commands::Bucket(args) => {
+            bucket::execute(
+                args,
+                output_options.resolve(OutputBehavior::StructuredDefault),
+            )
+            .await
+        }
+        Commands::Object(args) => {
+            let behavior = match &args.command {
+                object::ObjectCommands::Show(_) | object::ObjectCommands::Head(_) => {
+                    OutputBehavior::HumanDefault
+                }
+                _ => OutputBehavior::StructuredDefault,
+            };
+            object::execute(args, output_options.resolve(behavior)).await
+        }
+        Commands::Ls(args) => {
+            ls::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
+        Commands::Mb(args) => {
+            mb::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
+        Commands::Rb(args) => {
+            rb::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
+        Commands::Cat(args) => {
+            cat::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
+        Commands::Head(args) => {
+            head::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
+        Commands::Stat(args) => {
+            stat::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
+        Commands::Cp(args) => {
+            cp::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
+        Commands::Mv(args) => {
+            mv::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
+        Commands::Rm(args) => {
+            rm::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
+        Commands::Pipe(args) => {
+            pipe::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
+        Commands::Find(args) => {
+            find::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
         Commands::Event(cmd) => {
-            event::execute(event::EventArgs { command: cmd }, output_config).await
+            event::execute(
+                event::EventArgs { command: cmd },
+                output_options.resolve(OutputBehavior::HumanDefault),
+            )
+            .await
         }
-        Commands::Diff(args) => diff::execute(args, output_config).await,
-        Commands::Mirror(args) => mirror::execute(args, output_config).await,
-        Commands::Tree(args) => tree::execute(args, output_config).await,
-        Commands::Share(args) => share::execute(args, output_config).await,
+        Commands::Diff(args) => {
+            diff::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
+        Commands::Mirror(args) => {
+            mirror::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
+        Commands::Tree(args) => {
+            tree::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
+        Commands::Share(args) => {
+            share::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
         Commands::Version(cmd) => {
-            version::execute(version::VersionArgs { command: cmd }, output_config).await
+            version::execute(
+                version::VersionArgs { command: cmd },
+                output_options.resolve(OutputBehavior::HumanDefault),
+            )
+            .await
         }
-        Commands::Tag(cmd) => tag::execute(tag::TagArgs { command: cmd }, output_config).await,
+        Commands::Tag(cmd) => {
+            tag::execute(
+                tag::TagArgs { command: cmd },
+                output_options.resolve(OutputBehavior::HumanDefault),
+            )
+            .await
+        }
         Commands::Anonymous(cmd) => {
-            anonymous::execute(anonymous::AnonymousArgs { command: cmd }, output_config).await
+            anonymous::execute(
+                anonymous::AnonymousArgs { command: cmd },
+                output_options.resolve(OutputBehavior::HumanDefault),
+            )
+            .await
         }
         Commands::Quota(cmd) => {
-            quota::execute(quota::QuotaArgs { command: cmd }, output_config).await
+            quota::execute(
+                quota::QuotaArgs { command: cmd },
+                output_options.resolve(OutputBehavior::HumanDefault),
+            )
+            .await
         }
-        Commands::Ilm(args) => ilm::execute(args, output_config).await,
+        Commands::Ilm(args) => {
+            ilm::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
         Commands::Replicate(cmd) => {
-            replicate::execute(replicate::ReplicateArgs { command: cmd }, output_config).await
+            replicate::execute(
+                replicate::ReplicateArgs { command: cmd },
+                output_options.resolve(OutputBehavior::HumanDefault),
+            )
+            .await
         }
         Commands::Completions(args) => completions::execute(args),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn structured_default_uses_auto_format_when_not_explicit() {
+        let options = GlobalOutputOptions {
+            format: None,
+            json: false,
+            no_color: false,
+            no_progress: false,
+            quiet: false,
+        };
+
+        let resolved = options.resolve(OutputBehavior::StructuredDefault);
+        assert_eq!(resolved.json, !std::io::stdout().is_terminal());
+    }
+
+    #[test]
+    fn human_default_keeps_human_format_when_not_explicit() {
+        let options = GlobalOutputOptions {
+            format: None,
+            json: false,
+            no_color: false,
+            no_progress: false,
+            quiet: false,
+        };
+
+        let resolved = options.resolve(OutputBehavior::HumanDefault);
+        assert!(!resolved.json);
+    }
+
+    #[test]
+    fn explicit_json_overrides_behavior_defaults() {
+        let options = GlobalOutputOptions {
+            format: Some(OutputFormat::Human),
+            json: true,
+            no_color: false,
+            no_progress: false,
+            quiet: false,
+        };
+
+        let resolved = options.resolve(OutputBehavior::HumanDefault);
+        assert!(resolved.json);
     }
 }

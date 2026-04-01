@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::process::{Command, Output};
 
 const GLOBAL_OPTIONS: &[&str] = &[
+    "--format",
     "--json",
     "--no-color",
     "--no-progress",
