@@ -12,6 +12,7 @@ use crate::output::OutputConfig;
 mod admin;
 mod alias;
 mod anonymous;
+mod bucket;
 mod cat;
 mod completions;
 pub mod cp;
@@ -24,6 +25,7 @@ mod ls;
 mod mb;
 mod mirror;
 mod mv;
+mod object;
 mod pipe;
 mod quota;
 mod rb;
@@ -78,43 +80,49 @@ pub enum Commands {
     #[command(subcommand)]
     Admin(admin::AdminCommands),
 
+    /// Manage bucket-oriented workflows
+    Bucket(bucket::BucketArgs),
+
+    /// Manage object-oriented workflows
+    Object(object::ObjectArgs),
+
     // Phase 2: Basic commands
-    /// List buckets and objects
+    /// Deprecated: use `rc bucket list` or `rc object list`
     Ls(ls::LsArgs),
 
-    /// Create a bucket
+    /// Deprecated: use `rc bucket create`
     Mb(mb::MbArgs),
 
-    /// Remove a bucket
+    /// Deprecated: use `rc bucket remove`
     Rb(rb::RbArgs),
 
-    /// Display object contents
+    /// Deprecated: use `rc object show`
     Cat(cat::CatArgs),
 
-    /// Display first N lines of an object
+    /// Deprecated: use `rc object head`
     Head(head::HeadArgs),
 
-    /// Show object metadata
+    /// Deprecated: use `rc object stat`
     Stat(stat::StatArgs),
 
     // Phase 3: Transfer commands
-    /// Copy objects (local<->S3, S3<->S3)
+    /// Deprecated: use `rc object copy`
     Cp(cp::CpArgs),
 
-    /// Move objects (copy + delete source)
+    /// Deprecated: use `rc object move`
     Mv(mv::MvArgs),
 
-    /// Remove objects
+    /// Deprecated: use `rc object remove`
     Rm(rm::RmArgs),
 
     /// Stream stdin to an object
     Pipe(pipe::PipeArgs),
 
     // Phase 4: Advanced commands
-    /// Find objects matching criteria
+    /// Deprecated: use `rc object find`
     Find(find::FindArgs),
 
-    /// Manage bucket event notifications
+    /// Deprecated: use `rc bucket event`
     #[command(subcommand)]
     Event(event::EventCommands),
 
@@ -124,14 +132,14 @@ pub enum Commands {
     /// Mirror objects between locations
     Mirror(mirror::MirrorArgs),
 
-    /// Display objects in tree format
+    /// Deprecated: use `rc object tree`
     Tree(tree::TreeArgs),
 
-    /// Generate presigned URLs
+    /// Deprecated: use `rc object share`
     Share(share::ShareArgs),
 
     // Phase 5: Optional commands (capability-dependent)
-    /// Manage bucket versioning
+    /// Deprecated: use `rc bucket version`
     #[command(subcommand)]
     Version(version::VersionCommands),
 
@@ -139,18 +147,18 @@ pub enum Commands {
     #[command(subcommand)]
     Tag(tag::TagCommands),
 
-    /// Manage anonymous access to buckets and objects
+    /// Deprecated: use `rc bucket anonymous`
     #[command(subcommand)]
     Anonymous(anonymous::AnonymousCommands),
 
-    /// Manage bucket quota
+    /// Deprecated: use `rc bucket quota`
     #[command(subcommand)]
     Quota(quota::QuotaCommands),
 
-    /// Manage bucket lifecycle (ILM) rules, tiers, and restores
+    /// Deprecated: use `rc bucket lifecycle`
     Ilm(ilm::IlmArgs),
 
-    /// Manage bucket replication
+    /// Deprecated: use `rc bucket replication`
     #[command(subcommand)]
     Replicate(replicate::ReplicateCommands),
 
@@ -177,6 +185,8 @@ pub async fn execute(cli: Cli) -> ExitCode {
     match cli.command {
         Commands::Alias(cmd) => alias::execute(cmd, output_config).await,
         Commands::Admin(cmd) => admin::execute(cmd, output_config).await,
+        Commands::Bucket(args) => bucket::execute(args, output_config).await,
+        Commands::Object(args) => object::execute(args, output_config).await,
         Commands::Ls(args) => ls::execute(args, output_config).await,
         Commands::Mb(args) => mb::execute(args, output_config).await,
         Commands::Rb(args) => rb::execute(args, output_config).await,
