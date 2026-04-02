@@ -34,13 +34,13 @@ Examples:
 
 /// Manage bucket replication
 #[derive(Args, Debug)]
+#[command(after_help = REPLICATE_AFTER_HELP)]
 pub struct ReplicateArgs {
     #[command(subcommand)]
     pub command: ReplicateCommands,
 }
 
 #[derive(Subcommand, Debug)]
-#[command(after_help = REPLICATE_AFTER_HELP)]
 pub enum ReplicateCommands {
     /// Add a new replication rule
     Add(AddArgs),

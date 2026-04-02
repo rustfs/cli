@@ -3,11 +3,11 @@ source: crates/cli/tests/golden.rs
 expression: json
 ---
 {
-  "error": "Alias 'nonexistent' not found",
   "details": {
-    "type": "not_found",
     "message": "Alias 'nonexistent' not found",
+    "retryable": false,
     "suggestion": "Check the alias, bucket, or object path and retry the command.",
-    "retryable": false
-  }
+    "type": "not_found"
+  },
+  "error": "Alias 'nonexistent' not found"
 }

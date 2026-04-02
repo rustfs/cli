@@ -121,14 +121,6 @@ fn infer_error_metadata(message: &str) -> (&'static str, bool, Option<String>) {
         return ("not_found", false, Some(NOT_FOUND_SUGGESTION.to_string()));
     }
 
-    if normalized.contains("access denied")
-        || normalized.contains("permission")
-        || normalized.contains("unauthorized")
-        || normalized.contains("forbidden")
-    {
-        return ("auth_error", false, Some(AUTH_SUGGESTION.to_string()));
-    }
-
     if normalized.contains("invalid")
         || normalized.contains("cannot be empty")
         || normalized.contains("must be")
@@ -137,6 +129,15 @@ fn infer_error_metadata(message: &str) -> (&'static str, bool, Option<String>) {
         || normalized.contains("use -r/--recursive")
     {
         return ("usage_error", false, Some(USAGE_SUGGESTION.to_string()));
+    }
+
+    if normalized.contains("access denied")
+        || normalized.contains("unauthorized")
+        || normalized.contains("forbidden")
+        || normalized.contains("authentication")
+        || normalized.contains("credentials")
+    {
+        return ("auth_error", false, Some(AUTH_SUGGESTION.to_string()));
     }
 
     if normalized.contains("already exists")
@@ -495,6 +496,17 @@ mod tests {
         assert_eq!(details.error_type, "not_found");
         assert!(!details.retryable);
         assert_eq!(details.suggestion.as_deref(), Some(NOT_FOUND_SUGGESTION));
+    }
+
+    #[test]
+    fn test_error_descriptor_from_message_prefers_usage_for_invalid_permission() {
+        let descriptor = ErrorDescriptor::from_message("Invalid permission 'download'");
+        let json = descriptor.to_json_output();
+
+        let details = json.details.expect("details should be present");
+        assert_eq!(details.error_type, "usage_error");
+        assert!(!details.retryable);
+        assert_eq!(details.suggestion.as_deref(), Some(USAGE_SUGGESTION));
     }
 
     #[test]

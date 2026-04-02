@@ -24,13 +24,13 @@ Examples:
 
 /// Manage bucket event notifications
 #[derive(Args, Debug)]
+#[command(after_help = EVENT_AFTER_HELP)]
 pub struct EventArgs {
     #[command(subcommand)]
     pub command: EventCommands,
 }
 
 #[derive(Subcommand, Debug)]
-#[command(after_help = EVENT_AFTER_HELP)]
 pub enum EventCommands {
     /// Add or replace a bucket notification rule for an ARN
     Add(AddArgs),

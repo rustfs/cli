@@ -190,8 +190,7 @@ pub enum Commands {
     Find(find::FindArgs),
 
     /// Deprecated: use `rc bucket event`
-    #[command(subcommand)]
-    Event(event::EventCommands),
+    Event(event::EventArgs),
 
     /// Show differences between locations
     Diff(diff::DiffArgs),
@@ -226,8 +225,7 @@ pub enum Commands {
     Ilm(ilm::IlmArgs),
 
     /// Deprecated: use `rc bucket replication`
-    #[command(subcommand)]
-    Replicate(replicate::ReplicateCommands),
+    Replicate(replicate::ReplicateArgs),
 
     // Phase 6: Utilities
     /// Generate shell completion scripts
@@ -300,12 +298,8 @@ pub async fn execute(cli: Cli) -> ExitCode {
         Commands::Find(args) => {
             find::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
         }
-        Commands::Event(cmd) => {
-            event::execute(
-                event::EventArgs { command: cmd },
-                output_options.resolve(OutputBehavior::HumanDefault),
-            )
-            .await
+        Commands::Event(args) => {
+            event::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
         }
         Commands::Diff(args) => {
             diff::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
@@ -350,12 +344,8 @@ pub async fn execute(cli: Cli) -> ExitCode {
         Commands::Ilm(args) => {
             ilm::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
         }
-        Commands::Replicate(cmd) => {
-            replicate::execute(
-                replicate::ReplicateArgs { command: cmd },
-                output_options.resolve(OutputBehavior::HumanDefault),
-            )
-            .await
+        Commands::Replicate(args) => {
+            replicate::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
         }
         Commands::Completions(args) => completions::execute(args),
     }
