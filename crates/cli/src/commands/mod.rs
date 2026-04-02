@@ -4,7 +4,9 @@
 //! Commands are organized by functionality and follow the pattern established
 //! in the command implementation template.
 
-use clap::{Parser, Subcommand};
+use std::io::{IsTerminal, stderr, stdout};
+
+use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::exit_code::ExitCode;
 use crate::output::OutputConfig;
@@ -12,6 +14,7 @@ use crate::output::OutputConfig;
 mod admin;
 mod alias;
 mod anonymous;
+mod bucket;
 mod cat;
 mod completions;
 pub mod cp;
@@ -24,6 +27,7 @@ mod ls;
 mod mb;
 mod mirror;
 mod mv;
+mod object;
 mod pipe;
 mod quota;
 mod rb;
@@ -44,6 +48,10 @@ mod version;
 #[command(author, version, about, long_about = None)]
 #[command(propagate_version = true)]
 pub struct Cli {
+    /// Output format: auto-detect, human-readable, or JSON
+    #[arg(long, global = true, value_enum)]
+    pub format: Option<OutputFormat>,
+
     /// Output format: human-readable or JSON
     #[arg(long, global = true, default_value = "false")]
     pub json: bool,
@@ -68,6 +76,67 @@ pub struct Cli {
     pub command: Commands,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum OutputFormat {
+    Auto,
+    Human,
+    Json,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum OutputBehavior {
+    HumanDefault,
+    StructuredDefault,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct GlobalOutputOptions {
+    format: Option<OutputFormat>,
+    json: bool,
+    no_color: bool,
+    no_progress: bool,
+    quiet: bool,
+}
+
+impl GlobalOutputOptions {
+    fn from_cli(cli: &Cli) -> Self {
+        Self {
+            format: cli.format,
+            json: cli.json,
+            no_color: cli.no_color,
+            no_progress: cli.no_progress,
+            quiet: cli.quiet,
+        }
+    }
+
+    fn resolve(self, behavior: OutputBehavior) -> OutputConfig {
+        let stdout_is_tty = stdout().is_terminal();
+        let stderr_is_tty = stderr().is_terminal();
+
+        let selected_format = if self.json {
+            OutputFormat::Json
+        } else {
+            self.format.unwrap_or(match behavior {
+                OutputBehavior::HumanDefault => OutputFormat::Human,
+                OutputBehavior::StructuredDefault => OutputFormat::Auto,
+            })
+        };
+
+        let json = match selected_format {
+            OutputFormat::Json => true,
+            OutputFormat::Human => false,
+            OutputFormat::Auto => !stdout_is_tty,
+        };
+
+        OutputConfig {
+            json,
+            no_color: self.no_color || !stdout_is_tty || json,
+            no_progress: self.no_progress || !stderr_is_tty || json,
+            quiet: self.quiet,
+        }
+    }
+}
+
 #[derive(Subcommand, Debug)]
 pub enum Commands {
     /// Manage storage service aliases
@@ -78,45 +147,50 @@ pub enum Commands {
     #[command(subcommand)]
     Admin(admin::AdminCommands),
 
+    /// Manage bucket-oriented workflows
+    Bucket(bucket::BucketArgs),
+
+    /// Manage object-oriented workflows
+    Object(object::ObjectArgs),
+
     // Phase 2: Basic commands
-    /// List buckets and objects
+    /// Deprecated: use `rc bucket list` or `rc object list`
     Ls(ls::LsArgs),
 
-    /// Create a bucket
+    /// Deprecated: use `rc bucket create`
     Mb(mb::MbArgs),
 
-    /// Remove a bucket
+    /// Deprecated: use `rc bucket remove`
     Rb(rb::RbArgs),
 
-    /// Display object contents
+    /// Deprecated: use `rc object show`
     Cat(cat::CatArgs),
 
-    /// Display first N lines of an object
+    /// Deprecated: use `rc object head`
     Head(head::HeadArgs),
 
-    /// Show object metadata
+    /// Deprecated: use `rc object stat`
     Stat(stat::StatArgs),
 
     // Phase 3: Transfer commands
-    /// Copy objects (local<->S3, S3<->S3)
+    /// Deprecated: use `rc object copy`
     Cp(cp::CpArgs),
 
-    /// Move objects (copy + delete source)
+    /// Deprecated: use `rc object move`
     Mv(mv::MvArgs),
 
-    /// Remove objects
+    /// Deprecated: use `rc object remove`
     Rm(rm::RmArgs),
 
     /// Stream stdin to an object
     Pipe(pipe::PipeArgs),
 
     // Phase 4: Advanced commands
-    /// Find objects matching criteria
+    /// Deprecated: use `rc object find`
     Find(find::FindArgs),
 
-    /// Manage bucket event notifications
-    #[command(subcommand)]
-    Event(event::EventCommands),
+    /// Deprecated: use `rc bucket event`
+    Event(event::EventArgs),
 
     /// Show differences between locations
     Diff(diff::DiffArgs),
@@ -124,14 +198,14 @@ pub enum Commands {
     /// Mirror objects between locations
     Mirror(mirror::MirrorArgs),
 
-    /// Display objects in tree format
+    /// Deprecated: use `rc object tree`
     Tree(tree::TreeArgs),
 
-    /// Generate presigned URLs
+    /// Deprecated: use `rc object share`
     Share(share::ShareArgs),
 
     // Phase 5: Optional commands (capability-dependent)
-    /// Manage bucket versioning
+    /// Deprecated: use `rc bucket version`
     #[command(subcommand)]
     Version(version::VersionCommands),
 
@@ -139,20 +213,19 @@ pub enum Commands {
     #[command(subcommand)]
     Tag(tag::TagCommands),
 
-    /// Manage anonymous access to buckets and objects
+    /// Deprecated: use `rc bucket anonymous`
     #[command(subcommand)]
     Anonymous(anonymous::AnonymousCommands),
 
-    /// Manage bucket quota
+    /// Deprecated: use `rc bucket quota`
     #[command(subcommand)]
     Quota(quota::QuotaCommands),
 
-    /// Manage bucket lifecycle (ILM) rules, tiers, and restores
+    /// Deprecated: use `rc bucket lifecycle`
     Ilm(ilm::IlmArgs),
 
-    /// Manage bucket replication
-    #[command(subcommand)]
-    Replicate(replicate::ReplicateCommands),
+    /// Deprecated: use `rc bucket replication`
+    Replicate(replicate::ReplicateArgs),
 
     // Phase 6: Utilities
     /// Generate shell completion scripts
@@ -167,48 +240,160 @@ pub enum Commands {
 
 /// Execute the CLI command and return an exit code
 pub async fn execute(cli: Cli) -> ExitCode {
-    let output_config = OutputConfig {
-        json: cli.json,
-        no_color: cli.no_color,
-        no_progress: cli.no_progress,
-        quiet: cli.quiet,
-    };
+    let output_options = GlobalOutputOptions::from_cli(&cli);
 
     match cli.command {
-        Commands::Alias(cmd) => alias::execute(cmd, output_config).await,
-        Commands::Admin(cmd) => admin::execute(cmd, output_config).await,
-        Commands::Ls(args) => ls::execute(args, output_config).await,
-        Commands::Mb(args) => mb::execute(args, output_config).await,
-        Commands::Rb(args) => rb::execute(args, output_config).await,
-        Commands::Cat(args) => cat::execute(args, output_config).await,
-        Commands::Head(args) => head::execute(args, output_config).await,
-        Commands::Stat(args) => stat::execute(args, output_config).await,
-        Commands::Cp(args) => cp::execute(args, output_config).await,
-        Commands::Mv(args) => mv::execute(args, output_config).await,
-        Commands::Rm(args) => rm::execute(args, output_config).await,
-        Commands::Pipe(args) => pipe::execute(args, output_config).await,
-        Commands::Find(args) => find::execute(args, output_config).await,
-        Commands::Event(cmd) => {
-            event::execute(event::EventArgs { command: cmd }, output_config).await
+        Commands::Alias(cmd) => {
+            alias::execute(cmd, output_options.resolve(OutputBehavior::HumanDefault)).await
         }
-        Commands::Diff(args) => diff::execute(args, output_config).await,
-        Commands::Mirror(args) => mirror::execute(args, output_config).await,
-        Commands::Tree(args) => tree::execute(args, output_config).await,
-        Commands::Share(args) => share::execute(args, output_config).await,
+        Commands::Admin(cmd) => {
+            admin::execute(cmd, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
+        Commands::Bucket(args) => {
+            bucket::execute(
+                args,
+                output_options.resolve(OutputBehavior::StructuredDefault),
+            )
+            .await
+        }
+        Commands::Object(args) => {
+            let behavior = match &args.command {
+                object::ObjectCommands::Show(_) | object::ObjectCommands::Head(_) => {
+                    OutputBehavior::HumanDefault
+                }
+                _ => OutputBehavior::StructuredDefault,
+            };
+            object::execute(args, output_options.resolve(behavior)).await
+        }
+        Commands::Ls(args) => {
+            ls::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
+        Commands::Mb(args) => {
+            mb::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
+        Commands::Rb(args) => {
+            rb::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
+        Commands::Cat(args) => {
+            cat::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
+        Commands::Head(args) => {
+            head::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
+        Commands::Stat(args) => {
+            stat::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
+        Commands::Cp(args) => {
+            cp::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
+        Commands::Mv(args) => {
+            mv::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
+        Commands::Rm(args) => {
+            rm::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
+        Commands::Pipe(args) => {
+            pipe::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
+        Commands::Find(args) => {
+            find::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
+        Commands::Event(args) => {
+            event::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
+        Commands::Diff(args) => {
+            diff::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
+        Commands::Mirror(args) => {
+            mirror::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
+        Commands::Tree(args) => {
+            tree::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
+        Commands::Share(args) => {
+            share::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
         Commands::Version(cmd) => {
-            version::execute(version::VersionArgs { command: cmd }, output_config).await
+            version::execute(
+                version::VersionArgs { command: cmd },
+                output_options.resolve(OutputBehavior::HumanDefault),
+            )
+            .await
         }
-        Commands::Tag(cmd) => tag::execute(tag::TagArgs { command: cmd }, output_config).await,
+        Commands::Tag(cmd) => {
+            tag::execute(
+                tag::TagArgs { command: cmd },
+                output_options.resolve(OutputBehavior::HumanDefault),
+            )
+            .await
+        }
         Commands::Anonymous(cmd) => {
-            anonymous::execute(anonymous::AnonymousArgs { command: cmd }, output_config).await
+            anonymous::execute(
+                anonymous::AnonymousArgs { command: cmd },
+                output_options.resolve(OutputBehavior::HumanDefault),
+            )
+            .await
         }
         Commands::Quota(cmd) => {
-            quota::execute(quota::QuotaArgs { command: cmd }, output_config).await
+            quota::execute(
+                quota::QuotaArgs { command: cmd },
+                output_options.resolve(OutputBehavior::HumanDefault),
+            )
+            .await
         }
-        Commands::Ilm(args) => ilm::execute(args, output_config).await,
-        Commands::Replicate(cmd) => {
-            replicate::execute(replicate::ReplicateArgs { command: cmd }, output_config).await
+        Commands::Ilm(args) => {
+            ilm::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
+        Commands::Replicate(args) => {
+            replicate::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
         }
         Commands::Completions(args) => completions::execute(args),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn structured_default_uses_auto_format_when_not_explicit() {
+        let options = GlobalOutputOptions {
+            format: None,
+            json: false,
+            no_color: false,
+            no_progress: false,
+            quiet: false,
+        };
+
+        let resolved = options.resolve(OutputBehavior::StructuredDefault);
+        assert_eq!(resolved.json, !std::io::stdout().is_terminal());
+    }
+
+    #[test]
+    fn human_default_keeps_human_format_when_not_explicit() {
+        let options = GlobalOutputOptions {
+            format: None,
+            json: false,
+            no_color: false,
+            no_progress: false,
+            quiet: false,
+        };
+
+        let resolved = options.resolve(OutputBehavior::HumanDefault);
+        assert!(!resolved.json);
+    }
+
+    #[test]
+    fn explicit_json_overrides_behavior_defaults() {
+        let options = GlobalOutputOptions {
+            format: Some(OutputFormat::Human),
+            json: true,
+            no_color: false,
+            no_progress: false,
+            quiet: false,
+        };
+
+        let resolved = options.resolve(OutputBehavior::HumanDefault);
+        assert!(resolved.json);
     }
 }

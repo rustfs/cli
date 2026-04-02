@@ -10,8 +10,21 @@ use serde::Serialize;
 use crate::exit_code::ExitCode;
 use crate::output::{Formatter, OutputConfig};
 
+const EVENT_AFTER_HELP: &str = "\
+Examples:
+  rc bucket event list local/my-bucket
+  rc bucket event add local/my-bucket arn:aws:sqs:us-east-1:123456789012:jobs --event put
+  rc event remove local/my-bucket arn:aws:sns:us-east-1:123456789012:alerts";
+
+const EVENT_ADD_AFTER_HELP: &str = "\
+Examples:
+  rc bucket event add local/my-bucket arn:aws:sqs:us-east-1:123456789012:jobs --event put
+  rc event add local/my-bucket arn:aws:sns:us-east-1:123456789012:alerts --event delete
+  rc bucket event add local/my-bucket arn:aws:lambda:us-east-1:123456789012:function:thumbnail --event put,delete";
+
 /// Manage bucket event notifications
 #[derive(Args, Debug)]
+#[command(after_help = EVENT_AFTER_HELP)]
 pub struct EventArgs {
     #[command(subcommand)]
     pub command: EventCommands,
@@ -40,6 +53,7 @@ pub struct BucketArg {
 }
 
 #[derive(Args, Debug)]
+#[command(after_help = EVENT_ADD_AFTER_HELP)]
 pub struct AddArgs {
     /// Path to the bucket (alias/bucket)
     pub path: String,
@@ -98,8 +112,11 @@ async fn execute_list(args: BucketArg, output_config: OutputConfig) -> ExitCode 
     let (alias_name, bucket) = match parse_bucket_path(&args.path) {
         Ok(parts) => parts,
         Err(error) => {
-            formatter.error(&error);
-            return ExitCode::UsageError;
+            return formatter.fail_with_suggestion(
+                ExitCode::UsageError,
+                &error,
+                "Use a bucket path in the form alias/bucket before retrying the event command.",
+            );
         }
     };
 
@@ -131,10 +148,10 @@ async fn execute_list(args: BucketArg, output_config: OutputConfig) -> ExitCode 
             }
             ExitCode::Success
         }
-        Err(error) => {
-            formatter.error(&format!("Failed to list notifications: {error}"));
-            ExitCode::GeneralError
-        }
+        Err(error) => formatter.fail(
+            ExitCode::GeneralError,
+            &format!("Failed to list notifications: {error}"),
+        ),
     }
 }
 
@@ -144,16 +161,22 @@ async fn execute_add(args: AddArgs, output_config: OutputConfig) -> ExitCode {
     let (alias_name, bucket) = match parse_bucket_path(&args.path) {
         Ok(parts) => parts,
         Err(error) => {
-            formatter.error(&error);
-            return ExitCode::UsageError;
+            return formatter.fail_with_suggestion(
+                ExitCode::UsageError,
+                &error,
+                "Use a bucket path in the form alias/bucket before retrying the event command.",
+            );
         }
     };
 
     let target = match infer_target_from_arn(&args.arn) {
         Ok(target) => target,
         Err(error) => {
-            formatter.error(&error);
-            return ExitCode::UsageError;
+            return formatter.fail_with_suggestion(
+                ExitCode::UsageError,
+                &error,
+                "Use an SQS, SNS, or Lambda ARN when adding a bucket notification target.",
+            );
         }
     };
 
@@ -167,8 +190,10 @@ async fn execute_add(args: AddArgs, output_config: OutputConfig) -> ExitCode {
     let mut notifications = match client.get_bucket_notifications(&bucket).await {
         Ok(items) => items,
         Err(error) => {
-            formatter.error(&format!("Failed to read current notifications: {error}"));
-            return ExitCode::GeneralError;
+            return formatter.fail(
+                ExitCode::GeneralError,
+                &format!("Failed to read current notifications: {error}"),
+            );
         }
     };
 
@@ -201,10 +226,10 @@ async fn execute_add(args: AddArgs, output_config: OutputConfig) -> ExitCode {
             }
             ExitCode::Success
         }
-        Err(error) => {
-            formatter.error(&format!("Failed to set notification: {error}"));
-            ExitCode::GeneralError
-        }
+        Err(error) => formatter.fail(
+            ExitCode::GeneralError,
+            &format!("Failed to set notification: {error}"),
+        ),
     }
 }
 
@@ -214,8 +239,11 @@ async fn execute_remove(args: RemoveArgs, output_config: OutputConfig) -> ExitCo
     let (alias_name, bucket) = match parse_bucket_path(&args.path) {
         Ok(parts) => parts,
         Err(error) => {
-            formatter.error(&error);
-            return ExitCode::UsageError;
+            return formatter.fail_with_suggestion(
+                ExitCode::UsageError,
+                &error,
+                "Use a bucket path in the form alias/bucket before retrying the event command.",
+            );
         }
     };
 
@@ -227,15 +255,20 @@ async fn execute_remove(args: RemoveArgs, output_config: OutputConfig) -> ExitCo
     let mut notifications = match client.get_bucket_notifications(&bucket).await {
         Ok(items) => items,
         Err(error) => {
-            formatter.error(&format!("Failed to read current notifications: {error}"));
-            return ExitCode::GeneralError;
+            return formatter.fail(
+                ExitCode::GeneralError,
+                &format!("Failed to read current notifications: {error}"),
+            );
         }
     };
 
     let removed = remove_notifications_by_arn(&mut notifications, &args.arn);
     if removed == 0 {
-        formatter.error(&format!("Notification target '{}' not found", args.arn));
-        return ExitCode::NotFound;
+        return formatter.fail_with_suggestion(
+            ExitCode::NotFound,
+            &format!("Notification target '{}' not found", args.arn),
+            "Run `rc bucket event list <alias/bucket>` to inspect the configured notification targets.",
+        );
     }
 
     match client
@@ -255,10 +288,10 @@ async fn execute_remove(args: RemoveArgs, output_config: OutputConfig) -> ExitCo
             }
             ExitCode::Success
         }
-        Err(error) => {
-            formatter.error(&format!("Failed to update notifications: {error}"));
-            ExitCode::GeneralError
-        }
+        Err(error) => formatter.fail(
+            ExitCode::GeneralError,
+            &format!("Failed to update notifications: {error}"),
+        ),
     }
 }
 
@@ -279,16 +312,21 @@ async fn setup_client(
     let alias = match alias_manager.get(alias_name) {
         Ok(alias) => alias,
         Err(_) => {
-            formatter.error(&format!("Alias '{alias_name}' not found"));
-            return Err(ExitCode::NotFound);
+            return Err(formatter.fail_with_suggestion(
+                ExitCode::NotFound,
+                &format!("Alias '{alias_name}' not found"),
+                "Run `rc alias list` to inspect configured aliases or add one with `rc alias set ...`.",
+            ));
         }
     };
 
     let client = match S3Client::new(alias).await {
         Ok(client) => client,
         Err(error) => {
-            formatter.error(&format!("Failed to create S3 client: {error}"));
-            return Err(ExitCode::NetworkError);
+            return Err(formatter.fail(
+                ExitCode::NetworkError,
+                &format!("Failed to create S3 client: {error}"),
+            ));
         }
     };
 
@@ -298,26 +336,36 @@ async fn setup_client(
             if force {
                 rc_core::Capabilities::default()
             } else {
-                formatter.error(&format!("Failed to detect capabilities: {error}"));
-                return Err(ExitCode::NetworkError);
+                return Err(formatter.fail(
+                    ExitCode::NetworkError,
+                    &format!("Failed to detect capabilities: {error}"),
+                ));
             }
         }
     };
 
     if !force && !caps.notifications {
-        formatter.error("Backend does not support notifications. Use --force to attempt anyway.");
-        return Err(ExitCode::UnsupportedFeature);
+        return Err(formatter.fail_with_suggestion(
+            ExitCode::UnsupportedFeature,
+            "Backend does not support notifications. Use --force to attempt anyway.",
+            "Retry with --force only if you know the backend supports bucket notifications.",
+        ));
     }
 
     match client.bucket_exists(bucket).await {
         Ok(true) => {}
         Ok(false) => {
-            formatter.error(&format!("Bucket '{bucket}' does not exist"));
-            return Err(ExitCode::NotFound);
+            return Err(formatter.fail_with_suggestion(
+                ExitCode::NotFound,
+                &format!("Bucket '{bucket}' does not exist"),
+                "Check the bucket path and retry the event command.",
+            ));
         }
         Err(error) => {
-            formatter.error(&format!("Failed to check bucket: {error}"));
-            return Err(ExitCode::NetworkError);
+            return Err(formatter.fail(
+                ExitCode::NetworkError,
+                &format!("Failed to check bucket: {error}"),
+            ));
         }
     }
 
@@ -490,6 +538,15 @@ mod tests {
                 "s3:ObjectRemoved:*".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn test_normalize_event_name_preserves_non_shorthand_values() {
+        assert_eq!(
+            normalize_event_name("s3:ObjectCreated:Post"),
+            "s3:ObjectCreated:Post"
+        );
+        assert_eq!(normalize_event_name("custom:event"), "custom:event");
     }
 
     #[test]

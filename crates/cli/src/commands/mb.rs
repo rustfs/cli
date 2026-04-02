@@ -10,8 +10,15 @@ use serde::Serialize;
 use crate::exit_code::ExitCode;
 use crate::output::{Formatter, OutputConfig};
 
+const MB_AFTER_HELP: &str = "\
+Examples:
+  rc bucket create local/my-bucket
+  rc mb local/my-bucket --ignore-existing
+  rc bucket create local/archive --with-versioning --with-lock";
+
 /// Create a bucket
 #[derive(Args, Debug)]
+#[command(after_help = MB_AFTER_HELP)]
 pub struct MbArgs {
     /// Target path (alias/bucket)
     pub target: String,
@@ -49,8 +56,11 @@ pub async fn execute(args: MbArgs, output_config: OutputConfig) -> ExitCode {
     let (alias_name, bucket) = match parse_mb_path(&args.target) {
         Ok(parsed) => parsed,
         Err(e) => {
-            formatter.error(&e);
-            return ExitCode::UsageError;
+            return formatter.fail_with_suggestion(
+                ExitCode::UsageError,
+                &e,
+                "Use a bucket path in the form alias/bucket before retrying the create command.",
+            );
         }
     };
 
@@ -66,8 +76,11 @@ pub async fn execute(args: MbArgs, output_config: OutputConfig) -> ExitCode {
     let alias = match alias_manager.get(&alias_name) {
         Ok(a) => a,
         Err(_) => {
-            formatter.error(&format!("Alias '{alias_name}' not found"));
-            return ExitCode::NotFound;
+            return formatter.fail_with_suggestion(
+                ExitCode::NotFound,
+                &format!("Alias '{alias_name}' not found"),
+                "Run `rc alias list` to inspect configured aliases or add one with `rc alias set ...`.",
+            );
         }
     };
 
@@ -75,8 +88,10 @@ pub async fn execute(args: MbArgs, output_config: OutputConfig) -> ExitCode {
     let client = match S3Client::new(alias).await {
         Ok(c) => c,
         Err(e) => {
-            formatter.error(&format!("Failed to create S3 client: {e}"));
-            return ExitCode::NetworkError;
+            return formatter.fail(
+                ExitCode::NetworkError,
+                &format!("Failed to create S3 client: {e}"),
+            );
         }
     };
 
@@ -140,16 +155,21 @@ pub async fn execute(args: MbArgs, output_config: OutputConfig) -> ExitCode {
                     }
                     return ExitCode::Success;
                 }
-                formatter.error(&format!("Bucket '{alias_name}/{bucket}' already exists"));
-                ExitCode::Conflict
+                formatter.fail_with_suggestion(
+                    ExitCode::Conflict,
+                    &format!("Bucket '{alias_name}/{bucket}' already exists"),
+                    "Retry with --ignore-existing if an existing bucket is acceptable.",
+                )
             } else if err_str.contains("AccessDenied") {
-                formatter.error(&format!(
-                    "Access denied: cannot create bucket '{alias_name}/{bucket}'"
-                ));
-                ExitCode::AuthError
+                formatter.fail(
+                    ExitCode::AuthError,
+                    &format!("Access denied: cannot create bucket '{alias_name}/{bucket}'"),
+                )
             } else {
-                formatter.error(&format!("Failed to create bucket: {e}"));
-                ExitCode::NetworkError
+                formatter.fail(
+                    ExitCode::NetworkError,
+                    &format!("Failed to create bucket: {e}"),
+                )
             }
         }
     }

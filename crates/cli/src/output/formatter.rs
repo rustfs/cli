@@ -7,6 +7,166 @@ use console::Style;
 use serde::Serialize;
 
 use super::OutputConfig;
+use crate::exit_code::ExitCode;
+
+const USAGE_SUGGESTION: &str =
+    "Run the command with --help to review the expected arguments and flags.";
+const NETWORK_SUGGESTION: &str =
+    "Retry the command. If the problem persists, verify the endpoint and network connectivity.";
+const AUTH_SUGGESTION: &str =
+    "Verify the alias credentials and permissions, then retry the command.";
+const NOT_FOUND_SUGGESTION: &str = "Check the alias, bucket, or object path and retry the command.";
+const CONFLICT_SUGGESTION: &str =
+    "Review the target resource state and retry with the appropriate overwrite or ignore flag.";
+const UNSUPPORTED_SUGGESTION: &str =
+    "Retry with --force only if you want to bypass capability detection.";
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct JsonErrorOutput {
+    error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<JsonErrorDetails>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct JsonErrorDetails {
+    #[serde(rename = "type")]
+    error_type: &'static str,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suggestion: Option<String>,
+    retryable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ErrorDescriptor {
+    code: Option<ExitCode>,
+    error_type: &'static str,
+    message: String,
+    suggestion: Option<String>,
+    retryable: bool,
+}
+
+impl ErrorDescriptor {
+    fn from_message(message: &str) -> Self {
+        let message = message.to_string();
+        let (error_type, retryable, suggestion) = infer_error_metadata(&message);
+
+        Self {
+            code: None,
+            error_type,
+            message,
+            suggestion,
+            retryable,
+        }
+    }
+
+    fn from_code(code: ExitCode, message: &str) -> Self {
+        let (error_type, retryable, suggestion) = defaults_for_exit_code(code);
+
+        Self {
+            code: Some(code),
+            error_type,
+            message: message.to_string(),
+            suggestion: suggestion.map(str::to_string),
+            retryable,
+        }
+    }
+
+    fn with_suggestion(mut self, suggestion: impl Into<String>) -> Self {
+        self.suggestion = Some(suggestion.into());
+        self
+    }
+
+    fn to_json_output(&self) -> JsonErrorOutput {
+        JsonErrorOutput {
+            error: self.message.clone(),
+            code: self.code.map(ExitCode::as_i32),
+            details: Some(JsonErrorDetails {
+                error_type: self.error_type,
+                message: self.message.clone(),
+                suggestion: self.suggestion.clone(),
+                retryable: self.retryable,
+            }),
+        }
+    }
+}
+
+fn defaults_for_exit_code(code: ExitCode) -> (&'static str, bool, Option<&'static str>) {
+    match code {
+        ExitCode::Success => ("success", false, None),
+        ExitCode::GeneralError => ("general_error", false, None),
+        ExitCode::UsageError => ("usage_error", false, Some(USAGE_SUGGESTION)),
+        ExitCode::NetworkError => ("network_error", true, Some(NETWORK_SUGGESTION)),
+        ExitCode::AuthError => ("auth_error", false, Some(AUTH_SUGGESTION)),
+        ExitCode::NotFound => ("not_found", false, Some(NOT_FOUND_SUGGESTION)),
+        ExitCode::Conflict => ("conflict", false, Some(CONFLICT_SUGGESTION)),
+        ExitCode::UnsupportedFeature => {
+            ("unsupported_feature", false, Some(UNSUPPORTED_SUGGESTION))
+        }
+        ExitCode::Interrupted => (
+            "interrupted",
+            true,
+            Some("Retry the command if you still need the operation to complete."),
+        ),
+    }
+}
+
+fn infer_error_metadata(message: &str) -> (&'static str, bool, Option<String>) {
+    let normalized = message.to_ascii_lowercase();
+
+    if normalized.contains("not found") || normalized.contains("does not exist") {
+        return ("not_found", false, Some(NOT_FOUND_SUGGESTION.to_string()));
+    }
+
+    if normalized.contains("invalid")
+        || normalized.contains("cannot be empty")
+        || normalized.contains("must be")
+        || normalized.contains("must specify")
+        || normalized.contains("expected:")
+        || normalized.contains("use -r/--recursive")
+    {
+        return ("usage_error", false, Some(USAGE_SUGGESTION.to_string()));
+    }
+
+    if normalized.contains("access denied")
+        || normalized.contains("unauthorized")
+        || normalized.contains("forbidden")
+        || normalized.contains("authentication")
+        || normalized.contains("credentials")
+    {
+        return ("auth_error", false, Some(AUTH_SUGGESTION.to_string()));
+    }
+
+    if normalized.contains("already exists")
+        || normalized.contains("conflict")
+        || normalized.contains("precondition")
+        || normalized.contains("destination exists")
+    {
+        return ("conflict", false, Some(CONFLICT_SUGGESTION.to_string()));
+    }
+
+    if normalized.contains("does not support") || normalized.contains("unsupported") {
+        return (
+            "unsupported_feature",
+            false,
+            Some(UNSUPPORTED_SUGGESTION.to_string()),
+        );
+    }
+
+    if normalized.contains("timeout")
+        || normalized.contains("network")
+        || normalized.contains("connection")
+        || normalized.contains("temporarily unavailable")
+        || normalized.contains("failed to create s3 client")
+    {
+        return ("network_error", true, Some(NETWORK_SUGGESTION.to_string()));
+    }
+
+    ("general_error", false, None)
+}
 
 /// Color theme for styled output (exa/eza inspired)
 #[derive(Debug, Clone)]
@@ -203,17 +363,46 @@ impl Formatter {
     ///
     /// Errors are always printed, even in quiet mode.
     pub fn error(&self, message: &str) {
+        self.emit_error(ErrorDescriptor::from_message(message));
+    }
+
+    /// Output an error message with an explicit exit code.
+    pub fn error_with_code(&self, code: ExitCode, message: &str) {
+        self.emit_error(ErrorDescriptor::from_code(code, message));
+    }
+
+    /// Output an error message with an explicit exit code and recovery suggestion.
+    pub fn error_with_suggestion(&self, code: ExitCode, message: &str, suggestion: &str) {
+        self.emit_error(ErrorDescriptor::from_code(code, message).with_suggestion(suggestion));
+    }
+
+    /// Print an error and return the provided exit code.
+    pub fn fail(&self, code: ExitCode, message: &str) -> ExitCode {
+        self.error_with_code(code, message);
+        code
+    }
+
+    /// Print an error with a recovery hint and return the provided exit code.
+    pub fn fail_with_suggestion(
+        &self,
+        code: ExitCode,
+        message: &str,
+        suggestion: &str,
+    ) -> ExitCode {
+        self.error_with_suggestion(code, message, suggestion);
+        code
+    }
+
+    fn emit_error(&self, descriptor: ErrorDescriptor) {
         if self.config.json {
-            let error = serde_json::json!({
-                "error": message
-            });
+            let error = descriptor.to_json_output();
             eprintln!(
                 "{}",
-                serde_json::to_string_pretty(&error).unwrap_or_else(|_| message.to_string())
+                serde_json::to_string_pretty(&error).unwrap_or_else(|_| descriptor.message.clone())
             );
         } else {
             let cross = self.theme.error.apply_to("✗");
-            eprintln!("{cross} {message}");
+            eprintln!("{cross} {}", descriptor.message);
         }
     }
 
@@ -283,5 +472,58 @@ mod tests {
         };
         let formatter = Formatter::new(config);
         assert!(!formatter.colors_enabled());
+    }
+
+    #[test]
+    fn test_error_descriptor_from_code_sets_defaults() {
+        let descriptor =
+            ErrorDescriptor::from_code(ExitCode::NetworkError, "Failed to create S3 client");
+
+        assert_eq!(descriptor.code, Some(ExitCode::NetworkError));
+        assert_eq!(descriptor.error_type, "network_error");
+        assert!(descriptor.retryable);
+        assert_eq!(descriptor.suggestion.as_deref(), Some(NETWORK_SUGGESTION));
+    }
+
+    #[test]
+    fn test_error_descriptor_from_message_infers_not_found() {
+        let descriptor = ErrorDescriptor::from_message("Alias 'local' not found");
+        let json = descriptor.to_json_output();
+
+        assert_eq!(json.error, "Alias 'local' not found");
+        assert_eq!(json.code, None);
+        let details = json.details.expect("details should be present");
+        assert_eq!(details.error_type, "not_found");
+        assert!(!details.retryable);
+        assert_eq!(details.suggestion.as_deref(), Some(NOT_FOUND_SUGGESTION));
+    }
+
+    #[test]
+    fn test_error_descriptor_from_message_prefers_usage_for_invalid_permission() {
+        let descriptor = ErrorDescriptor::from_message("Invalid permission 'download'");
+        let json = descriptor.to_json_output();
+
+        let details = json.details.expect("details should be present");
+        assert_eq!(details.error_type, "usage_error");
+        assert!(!details.retryable);
+        assert_eq!(details.suggestion.as_deref(), Some(USAGE_SUGGESTION));
+    }
+
+    #[test]
+    fn test_error_with_suggestion_overrides_default_hint() {
+        let descriptor = ErrorDescriptor::from_code(
+            ExitCode::UnsupportedFeature,
+            "Backend does not support notifications.",
+        )
+        .with_suggestion("Retry with --force to bypass capability detection.");
+
+        let json = descriptor.to_json_output();
+        let details = json.details.expect("details should be present");
+
+        assert_eq!(details.error_type, "unsupported_feature");
+        assert_eq!(
+            details.suggestion.as_deref(),
+            Some("Retry with --force to bypass capability detection.")
+        );
     }
 }
