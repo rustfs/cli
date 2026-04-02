@@ -3010,6 +3010,16 @@ mod tests {
             Some(404),
             "NoSuchBucket"
         ));
+        assert!(is_missing_cors_configuration_response(
+            None,
+            None,
+            "The CORS configuration does not exist"
+        ));
+        assert!(!is_missing_cors_configuration_response(
+            None,
+            Some(500),
+            "The CORS configuration does not exist"
+        ));
     }
 
     #[tokio::test]
