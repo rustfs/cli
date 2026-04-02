@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::process::{Command, Output};
 
 const GLOBAL_OPTIONS: &[&str] = &[
+    "--format",
     "--json",
     "--no-color",
     "--no-progress",
@@ -103,6 +104,8 @@ fn top_level_command_help_contract() {
             expected_tokens: &[
                 "alias",
                 "admin",
+                "bucket",
+                "object",
                 "ls",
                 "mb",
                 "rb",
@@ -138,6 +141,41 @@ fn top_level_command_help_contract() {
             expected_tokens: &["info", "heal", "user", "policy", "group", "service-account"],
         },
         HelpCase {
+            args: &["bucket"],
+            usage: "Usage: rc bucket [OPTIONS] <COMMAND>",
+            expected_tokens: &[
+                "list",
+                "create",
+                "remove",
+                "event",
+                "version",
+                "quota",
+                "anonymous",
+                "lifecycle",
+                "replication",
+                "Examples:",
+                "rc bucket list local/",
+            ],
+        },
+        HelpCase {
+            args: &["object"],
+            usage: "Usage: rc object [OPTIONS] <COMMAND>",
+            expected_tokens: &[
+                "list",
+                "copy",
+                "move",
+                "remove",
+                "stat",
+                "show",
+                "head",
+                "find",
+                "tree",
+                "share",
+                "Examples:",
+                "rc object copy ./report.json local/my-bucket/reports/",
+            ],
+        },
+        HelpCase {
             args: &["ls"],
             usage: "Usage: rc ls [OPTIONS] <PATH>",
             expected_tokens: &["--recursive", "--versions", "--incomplete", "--summarize"],
@@ -150,6 +188,8 @@ fn top_level_command_help_contract() {
                 "--region",
                 "--with-lock",
                 "--with-versioning",
+                "Examples:",
+                "rc bucket create local/my-bucket",
             ],
         },
         HelpCase {
@@ -183,6 +223,8 @@ fn top_level_command_help_contract() {
                 "--dry-run",
                 "--storage-class",
                 "--content-type",
+                "Examples:",
+                "rc object copy ./report.json local/my-bucket/reports/",
             ],
         },
         HelpCase {
@@ -200,6 +242,8 @@ fn top_level_command_help_contract() {
                 "--incomplete",
                 "--versions",
                 "--bypass",
+                "Examples:",
+                "rc rm local/my-bucket/reports/ --recursive --dry-run",
             ],
         },
         HelpCase {
@@ -262,6 +306,17 @@ fn top_level_command_help_contract() {
             args: &["quota"],
             usage: "Usage: rc quota [OPTIONS] <COMMAND>",
             expected_tokens: &["set", "info", "clear"],
+        },
+        HelpCase {
+            args: &["event"],
+            usage: "Usage: rc event [OPTIONS] <COMMAND>",
+            expected_tokens: &[
+                "add",
+                "list",
+                "remove",
+                "Examples:",
+                "rc bucket event list local/my-bucket",
+            ],
         },
         HelpCase {
             args: &["anonymous"],
@@ -343,7 +398,63 @@ fn nested_subcommand_help_contract() {
         HelpCase {
             args: &["admin", "user", "add"],
             usage: "Usage: rc admin user add [OPTIONS] <ALIAS> <ACCESS_KEY> <SECRET_KEY>",
-            expected_tokens: &[],
+            expected_tokens: &[
+                "Examples:",
+                "rc admin user add local analyst analyst-secret",
+            ],
+        },
+        HelpCase {
+            args: &["bucket", "create"],
+            usage: "Usage: rc bucket create [OPTIONS] <TARGET>",
+            expected_tokens: &[
+                "--ignore-existing",
+                "--region",
+                "--with-lock",
+                "--with-versioning",
+                "Examples:",
+                "rc bucket create local/my-bucket",
+            ],
+        },
+        HelpCase {
+            args: &["bucket", "replication", "add"],
+            usage: "Usage: rc bucket replication add [OPTIONS] --remote-bucket <TARGET_ALIAS/BUCKET> <PATH>",
+            expected_tokens: &[
+                "--remote-bucket",
+                "--priority",
+                "--healthcheck-seconds",
+                "Examples:",
+                "rc bucket replication add local/my-bucket --remote-bucket backup/archive",
+            ],
+        },
+        HelpCase {
+            args: &["bucket", "event", "add"],
+            usage: "Usage: rc bucket event add [OPTIONS] <PATH> <ARN>",
+            expected_tokens: &[
+                "--event",
+                "--force",
+                "Examples:",
+                "rc bucket event add local/my-bucket arn:aws:sqs:us-east-1:123456789012:jobs --event put",
+            ],
+        },
+        HelpCase {
+            args: &["object", "copy"],
+            usage: "Usage: rc object copy [OPTIONS] <SOURCE> <TARGET>",
+            expected_tokens: &[
+                "--recursive",
+                "--preserve",
+                "--continue-on-error",
+                "--overwrite",
+                "--dry-run",
+                "--storage-class",
+                "--content-type",
+                "Examples:",
+                "rc object copy ./report.json local/my-bucket/reports/",
+            ],
+        },
+        HelpCase {
+            args: &["object", "show"],
+            usage: "Usage: rc object show [OPTIONS] <PATH>",
+            expected_tokens: &["--enc-key", "--rewind", "--version-id"],
         },
         HelpCase {
             args: &["admin", "user", "info"],
@@ -591,13 +702,36 @@ fn nested_subcommand_help_contract() {
             args: &["replicate"],
             usage: "Usage: rc replicate [OPTIONS] <COMMAND>",
             expected_tokens: &[
-                "add", "update", "list", "status", "remove", "export", "import",
+                "add",
+                "update",
+                "list",
+                "status",
+                "remove",
+                "export",
+                "import",
+                "Examples:",
+                "rc bucket replication add local/my-bucket --remote-bucket backup/archive",
             ],
         },
         HelpCase {
             args: &["replicate", "add"],
             usage: "Usage: rc replicate add [OPTIONS]",
-            expected_tokens: &["--remote-bucket", "--priority"],
+            expected_tokens: &[
+                "--remote-bucket",
+                "--priority",
+                "Examples:",
+                "rc bucket replication add local/my-bucket --remote-bucket backup/archive",
+            ],
+        },
+        HelpCase {
+            args: &["event", "add"],
+            usage: "Usage: rc event add [OPTIONS] <PATH> <ARN>",
+            expected_tokens: &[
+                "--event",
+                "--force",
+                "Examples:",
+                "rc event add local/my-bucket arn:aws:sns:us-east-1:123456789012:alerts --event delete",
+            ],
         },
         HelpCase {
             args: &["replicate", "list"],

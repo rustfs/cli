@@ -11,8 +11,18 @@ use std::path::{Path, PathBuf};
 use crate::exit_code::ExitCode;
 use crate::output::{Formatter, OutputConfig, ProgressBar};
 
+const CP_AFTER_HELP: &str = "\
+Examples:
+  rc object copy ./report.json local/my-bucket/reports/
+  rc cp ./report.json local/my-bucket/reports/
+  rc object copy local/source-bucket/archive.tar.gz ./downloads/archive.tar.gz";
+
+const REMOTE_PATH_SUGGESTION: &str =
+    "Use a local filesystem path or a remote path in the form alias/bucket[/key].";
+
 /// Copy objects
 #[derive(Args, Debug)]
+#[command(after_help = CP_AFTER_HELP)]
 pub struct CpArgs {
     /// Source path (local path or alias/bucket/key)
     pub source: String,
@@ -69,16 +79,22 @@ pub async fn execute(args: CpArgs, output_config: OutputConfig) -> ExitCode {
     let source = match parse_cp_path(&args.source, alias_manager.as_ref()) {
         Ok(p) => p,
         Err(e) => {
-            formatter.error(&format!("Invalid source path: {e}"));
-            return ExitCode::UsageError;
+            return formatter.fail_with_suggestion(
+                ExitCode::UsageError,
+                &format!("Invalid source path: {e}"),
+                REMOTE_PATH_SUGGESTION,
+            );
         }
     };
 
     let target = match parse_cp_path(&args.target, alias_manager.as_ref()) {
         Ok(p) => p,
         Err(e) => {
-            formatter.error(&format!("Invalid target path: {e}"));
-            return ExitCode::UsageError;
+            return formatter.fail_with_suggestion(
+                ExitCode::UsageError,
+                &format!("Invalid target path: {e}"),
+                REMOTE_PATH_SUGGESTION,
+            );
         }
     };
 
@@ -96,10 +112,11 @@ pub async fn execute(args: CpArgs, output_config: OutputConfig) -> ExitCode {
             // S3 to S3
             copy_s3_to_s3(src, dst, &args, &formatter).await
         }
-        (ParsedPath::Local(_), ParsedPath::Local(_)) => {
-            formatter.error("Cannot copy between two local paths. Use system cp command.");
-            ExitCode::UsageError
-        }
+        (ParsedPath::Local(_), ParsedPath::Local(_)) => formatter.fail_with_suggestion(
+            ExitCode::UsageError,
+            "Cannot copy between two local paths. Use system cp command.",
+            "Use your local shell cp command when both paths are on the filesystem.",
+        ),
     }
 }
 
@@ -131,14 +148,20 @@ async fn copy_local_to_s3(
 ) -> ExitCode {
     // Check if source exists
     if !src.exists() {
-        formatter.error(&format!("Source not found: {}", src.display()));
-        return ExitCode::NotFound;
+        return formatter.fail_with_suggestion(
+            ExitCode::NotFound,
+            &format!("Source not found: {}", src.display()),
+            "Check the local source path and retry the copy command.",
+        );
     }
 
     // If source is a directory, require recursive flag
     if src.is_dir() && !args.recursive {
-        formatter.error("Source is a directory. Use -r/--recursive to copy directories.");
-        return ExitCode::UsageError;
+        return formatter.fail_with_suggestion(
+            ExitCode::UsageError,
+            "Source is a directory. Use -r/--recursive to copy directories.",
+            "Retry with -r or --recursive to copy a directory tree.",
+        );
     }
 
     // Load alias and create client
@@ -153,16 +176,21 @@ async fn copy_local_to_s3(
     let alias = match alias_manager.get(&dst.alias) {
         Ok(a) => a,
         Err(_) => {
-            formatter.error(&format!("Alias '{}' not found", dst.alias));
-            return ExitCode::NotFound;
+            return formatter.fail_with_suggestion(
+                ExitCode::NotFound,
+                &format!("Alias '{}' not found", dst.alias),
+                "Run `rc alias list` to inspect configured aliases or add one with `rc alias set ...`.",
+            );
         }
     };
 
     let client = match S3Client::new(alias).await {
         Ok(c) => c,
         Err(e) => {
-            formatter.error(&format!("Failed to create S3 client: {e}"));
-            return ExitCode::NetworkError;
+            return formatter.fail(
+                ExitCode::NetworkError,
+                &format!("Failed to create S3 client: {e}"),
+            );
         }
     };
 
@@ -238,8 +266,10 @@ async fn upload_file(
     let file_size = match std::fs::metadata(src) {
         Ok(m) => m.len(),
         Err(e) => {
-            formatter.error(&format!("Failed to read {src_display}: {e}"));
-            return ExitCode::GeneralError;
+            return formatter.fail(
+                ExitCode::GeneralError,
+                &format!("Failed to read {src_display}: {e}"),
+            );
         }
     };
 
@@ -276,8 +306,10 @@ async fn upload_file(
             if let Some(ref pb) = progress {
                 pb.finish_and_clear();
             }
-            formatter.error(&format!("Failed to upload {src_display}: {e}"));
-            ExitCode::NetworkError
+            formatter.fail(
+                ExitCode::NetworkError,
+                &format!("Failed to upload {src_display}: {e}"),
+            )
         }
     }
 }
@@ -314,8 +346,10 @@ async fn upload_directory(
     let files = match walk_dir(src, src) {
         Ok(f) => f,
         Err(e) => {
-            formatter.error(&format!("Failed to read directory: {e}"));
-            return ExitCode::GeneralError;
+            return formatter.fail(
+                ExitCode::GeneralError,
+                &format!("Failed to read directory: {e}"),
+            );
         }
     };
 
@@ -374,16 +408,21 @@ async fn copy_s3_to_local(
     let alias = match alias_manager.get(&src.alias) {
         Ok(a) => a,
         Err(_) => {
-            formatter.error(&format!("Alias '{}' not found", src.alias));
-            return ExitCode::NotFound;
+            return formatter.fail_with_suggestion(
+                ExitCode::NotFound,
+                &format!("Alias '{}' not found", src.alias),
+                "Run `rc alias list` to inspect configured aliases or add one with `rc alias set ...`.",
+            );
         }
     };
 
     let client = match S3Client::new(alias).await {
         Ok(c) => c,
         Err(e) => {
-            formatter.error(&format!("Failed to create S3 client: {e}"));
-            return ExitCode::NetworkError;
+            return formatter.fail(
+                ExitCode::NetworkError,
+                &format!("Failed to create S3 client: {e}"),
+            );
         }
     };
 
@@ -427,10 +466,11 @@ async fn download_file(
 
     // Check if destination exists
     if dst_path.exists() && !args.overwrite {
-        formatter.error(&format!(
-            "Destination exists: {dst_display}. Use --overwrite to replace."
-        ));
-        return ExitCode::Conflict;
+        return formatter.fail_with_suggestion(
+            ExitCode::Conflict,
+            &format!("Destination exists: {dst_display}. Use --overwrite to replace."),
+            "Retry with --overwrite if replacing the destination file is intended.",
+        );
     }
 
     // Create parent directories
@@ -438,8 +478,10 @@ async fn download_file(
         && !parent.exists()
         && let Err(e) = std::fs::create_dir_all(parent)
     {
-        formatter.error(&format!("Failed to create directory: {e}"));
-        return ExitCode::GeneralError;
+        return formatter.fail(
+            ExitCode::GeneralError,
+            &format!("Failed to create directory: {e}"),
+        );
     }
 
     // Download object
@@ -448,8 +490,10 @@ async fn download_file(
             let size = data.len() as i64;
 
             if let Err(e) = std::fs::write(&dst_path, &data) {
-                formatter.error(&format!("Failed to write {dst_display}: {e}"));
-                return ExitCode::GeneralError;
+                return formatter.fail(
+                    ExitCode::GeneralError,
+                    &format!("Failed to write {dst_display}: {e}"),
+                );
             }
 
             if formatter.is_json() {
@@ -473,11 +517,16 @@ async fn download_file(
         Err(e) => {
             let err_str = e.to_string();
             if err_str.contains("NotFound") || err_str.contains("NoSuchKey") {
-                formatter.error(&format!("Object not found: {src_display}"));
-                ExitCode::NotFound
+                formatter.fail_with_suggestion(
+                    ExitCode::NotFound,
+                    &format!("Object not found: {src_display}"),
+                    "Check the object key and bucket path, then retry the copy command.",
+                )
             } else {
-                formatter.error(&format!("Failed to download {src_display}: {e}"));
-                ExitCode::NetworkError
+                formatter.fail(
+                    ExitCode::NetworkError,
+                    &format!("Failed to download {src_display}: {e}"),
+                )
             }
         }
     }
@@ -536,8 +585,10 @@ async fn download_prefix(
                 }
             }
             Err(e) => {
-                formatter.error(&format!("Failed to list objects: {e}"));
-                return ExitCode::NetworkError;
+                return formatter.fail(
+                    ExitCode::NetworkError,
+                    &format!("Failed to list objects: {e}"),
+                );
             }
         }
     }
@@ -575,23 +626,31 @@ async fn copy_s3_to_s3(
 
     // For now, only support same-alias copies (server-side copy)
     if src.alias != dst.alias {
-        formatter.error("Cross-alias S3-to-S3 copy not yet supported. Use download + upload.");
-        return ExitCode::UnsupportedFeature;
+        return formatter.fail_with_suggestion(
+            ExitCode::UnsupportedFeature,
+            "Cross-alias S3-to-S3 copy not yet supported. Use download + upload.",
+            "Copy via a local path or split the operation into download and upload steps.",
+        );
     }
 
     let alias = match alias_manager.get(&src.alias) {
         Ok(a) => a,
         Err(_) => {
-            formatter.error(&format!("Alias '{}' not found", src.alias));
-            return ExitCode::NotFound;
+            return formatter.fail_with_suggestion(
+                ExitCode::NotFound,
+                &format!("Alias '{}' not found", src.alias),
+                "Run `rc alias list` to inspect configured aliases or add one with `rc alias set ...`.",
+            );
         }
     };
 
     let client = match S3Client::new(alias).await {
         Ok(c) => c,
         Err(e) => {
-            formatter.error(&format!("Failed to create S3 client: {e}"));
-            return ExitCode::NetworkError;
+            return formatter.fail(
+                ExitCode::NetworkError,
+                &format!("Failed to create S3 client: {e}"),
+            );
         }
     };
 
@@ -627,11 +686,13 @@ async fn copy_s3_to_s3(
         Err(e) => {
             let err_str = e.to_string();
             if err_str.contains("NotFound") || err_str.contains("NoSuchKey") {
-                formatter.error(&format!("Source not found: {src_display}"));
-                ExitCode::NotFound
+                formatter.fail_with_suggestion(
+                    ExitCode::NotFound,
+                    &format!("Source not found: {src_display}"),
+                    "Check the source bucket and object key, then retry the copy command.",
+                )
             } else {
-                formatter.error(&format!("Failed to copy: {e}"));
-                ExitCode::NetworkError
+                formatter.fail(ExitCode::NetworkError, &format!("Failed to copy: {e}"))
             }
         }
     }
