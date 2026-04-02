@@ -12,6 +12,7 @@
 pub mod admin;
 pub mod alias;
 pub mod config;
+pub mod cors;
 pub mod error;
 pub mod lifecycle;
 pub mod path;
@@ -21,6 +22,7 @@ pub mod traits;
 
 pub use alias::{Alias, AliasManager};
 pub use config::{Config, ConfigManager};
+pub use cors::{CorsConfiguration, CorsRule};
 pub use error::{Error, Result};
 pub use lifecycle::{
     LifecycleConfiguration, LifecycleExpiration, LifecycleRule, LifecycleRuleStatus,

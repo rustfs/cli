@@ -2334,6 +2334,7 @@ dependencies = [
  "insta",
  "jiff",
  "mime_guess",
+ "quick-xml",
  "rc-core",
  "rc-s3",
  "serde",

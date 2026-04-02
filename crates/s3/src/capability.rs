@@ -66,6 +66,7 @@ pub fn require_capability(caps: &Capabilities, feature: &str) -> Result<()> {
         "notifications" | "watch" => caps.notifications,
         "lifecycle" => caps.lifecycle,
         "replication" => caps.replication,
+        "cors" => caps.cors,
         _ => false,
     };
 
@@ -95,6 +96,21 @@ mod tests {
             ..Default::default()
         };
         assert!(require_capability(&caps, "versioning").is_err());
+    }
+
+    #[test]
+    fn test_require_capability_cors() {
+        let caps = Capabilities {
+            cors: true,
+            ..Default::default()
+        };
+        assert!(require_capability(&caps, "cors").is_ok());
+
+        let caps = Capabilities {
+            cors: false,
+            ..Default::default()
+        };
+        assert!(require_capability(&caps, "cors").is_err());
     }
 
     #[test]

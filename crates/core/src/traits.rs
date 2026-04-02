@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
+use crate::cors::CorsRule;
 use crate::error::Result;
 use crate::lifecycle::LifecycleRule;
 use crate::path::RemotePath;
@@ -186,6 +187,9 @@ pub struct Capabilities {
 
     /// Supports bucket replication
     pub replication: bool,
+
+    /// Supports bucket CORS configuration
+    pub cors: bool,
 }
 
 /// Bucket notification target type
@@ -374,6 +378,15 @@ pub trait ObjectStore: Send + Sync {
 
     /// Delete bucket replication configuration.
     async fn delete_bucket_replication(&self, bucket: &str) -> Result<()>;
+
+    /// Get bucket CORS rules. Returns empty vec if no CORS config exists.
+    async fn get_bucket_cors(&self, bucket: &str) -> Result<Vec<CorsRule>>;
+
+    /// Set bucket CORS configuration (replaces all rules).
+    async fn set_bucket_cors(&self, bucket: &str, rules: Vec<CorsRule>) -> Result<()>;
+
+    /// Delete bucket CORS configuration.
+    async fn delete_bucket_cors(&self, bucket: &str) -> Result<()>;
     // async fn get_versioning(&self, bucket: &str) -> Result<bool>;
     // async fn set_versioning(&self, bucket: &str, enabled: bool) -> Result<()>;
     // async fn get_tags(&self, path: &RemotePath) -> Result<HashMap<String, String>>;

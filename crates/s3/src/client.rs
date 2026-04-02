@@ -4,6 +4,7 @@
 
 use async_trait::async_trait;
 use aws_credential_types::Credentials;
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sigv4::http_request::{
     SignableBody, SignableRequest, SignatureLocation, SigningSettings, sign,
 };
@@ -20,8 +21,8 @@ use bytes::Bytes;
 use jiff::Timestamp;
 use quick_xml::de::from_str as from_xml_str;
 use rc_core::{
-    Alias, BucketNotification, Capabilities, Error, LifecycleRule, ListOptions, ListResult,
-    NotificationTarget, ObjectInfo, ObjectStore, ObjectVersion, RemotePath,
+    Alias, BucketNotification, Capabilities, CorsRule, Error, LifecycleRule, ListOptions,
+    ListResult, NotificationTarget, ObjectInfo, ObjectStore, ObjectVersion, RemotePath,
     ReplicationConfiguration, Result,
 };
 use reqwest::Method;
@@ -140,6 +141,29 @@ struct ReplicationStatusXml {
     status: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct CorsConfigurationXml {
+    #[serde(rename = "CORSRule", default)]
+    rules: Vec<CorsRuleXml>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct CorsRuleXml {
+    #[serde(rename = "ID")]
+    id: Option<String>,
+    #[serde(rename = "AllowedOrigin", default)]
+    allowed_origins: Vec<String>,
+    #[serde(rename = "AllowedMethod", default)]
+    allowed_methods: Vec<String>,
+    #[serde(rename = "AllowedHeader", default)]
+    allowed_headers: Vec<String>,
+    #[serde(rename = "ExposeHeader", default)]
+    expose_headers: Vec<String>,
+    max_age_seconds: Option<i32>,
+}
+
 fn parse_replication_status(status: Option<&ReplicationStatusXml>) -> Option<bool> {
     status
         .and_then(|value| value.status.as_deref())
@@ -242,6 +266,80 @@ fn append_replication_filter_xml(
         append_tag_xml(xml, key, value);
     }
     xml.push_str("</Filter>");
+}
+
+fn normalize_optional_strings(values: Option<Vec<String>>) -> Option<Vec<String>> {
+    values.filter(|items| !items.is_empty())
+}
+
+fn is_missing_cors_configuration_error(error_text: &str) -> bool {
+    let normalized = error_text.to_ascii_lowercase();
+    normalized.contains("nosuchcorsconfiguration")
+        || normalized.contains("cors configuration does not exist")
+        || normalized.contains("the cors configuration does not exist")
+}
+
+fn is_missing_cors_configuration_response(
+    error_code: Option<&str>,
+    status_code: Option<u16>,
+    error_text: &str,
+) -> bool {
+    let error_code = error_code.map(|code| code.to_ascii_lowercase());
+    if matches!(error_code.as_deref(), Some("nosuchcorsconfiguration")) {
+        return true;
+    }
+
+    if is_missing_cors_configuration_error(error_text) {
+        return true;
+    }
+
+    status_code == Some(404)
+}
+
+fn sdk_cors_rule_to_core(rule: &aws_sdk_s3::types::CorsRule) -> CorsRule {
+    CorsRule {
+        id: rule.id().map(str::to_string),
+        allowed_origins: rule.allowed_origins().to_vec(),
+        allowed_methods: rule.allowed_methods().to_vec(),
+        allowed_headers: normalize_optional_strings(Some(rule.allowed_headers().to_vec())),
+        expose_headers: normalize_optional_strings(Some(rule.expose_headers().to_vec())),
+        max_age_seconds: rule.max_age_seconds(),
+    }
+}
+
+fn core_cors_rule_to_sdk(rule: &CorsRule) -> Result<aws_sdk_s3::types::CorsRule> {
+    aws_sdk_s3::types::CorsRule::builder()
+        .set_id(rule.id.clone())
+        .set_allowed_origins(Some(rule.allowed_origins.clone()))
+        .set_allowed_methods(Some(
+            rule.allowed_methods
+                .iter()
+                .map(|method| method.to_ascii_uppercase())
+                .collect(),
+        ))
+        .set_allowed_headers(normalize_optional_strings(rule.allowed_headers.clone()))
+        .set_expose_headers(normalize_optional_strings(rule.expose_headers.clone()))
+        .set_max_age_seconds(rule.max_age_seconds)
+        .build()
+        .map_err(|e| Error::General(format!("build bucket cors rule: {e}")))
+}
+
+fn parse_cors_configuration_xml(body: &str) -> Result<Vec<CorsRule>> {
+    let config: CorsConfigurationXml =
+        from_xml_str(body).map_err(|e| Error::General(format!("parse bucket cors xml: {e}")))?;
+
+    Ok(config
+        .rules
+        .into_iter()
+        .map(|rule| CorsRule {
+            id: rule.id,
+            allowed_origins: rule.allowed_origins,
+            allowed_methods: rule.allowed_methods,
+            allowed_headers: normalize_optional_strings(Some(rule.allowed_headers)),
+            expose_headers: normalize_optional_strings(Some(rule.expose_headers)),
+            max_age_seconds: rule.max_age_seconds,
+        })
+        .collect())
 }
 
 fn parse_replication_configuration_xml(body: &str) -> Result<ReplicationConfiguration> {
@@ -682,6 +780,27 @@ impl S3Client {
         }
 
         url.set_query(Some("replication="));
+        Ok(url)
+    }
+
+    fn cors_url(&self, bucket: &str) -> Result<reqwest::Url> {
+        let mut url =
+            reqwest::Url::parse(self.alias.endpoint.trim_end_matches('/')).map_err(|e| {
+                Error::Network(format!("Invalid endpoint '{}': {e}", self.alias.endpoint))
+            })?;
+
+        {
+            let mut segments = url.path_segments_mut().map_err(|_| {
+                Error::Network(format!(
+                    "Endpoint '{}' does not support path-style bucket operations",
+                    self.alias.endpoint
+                ))
+            })?;
+            segments.pop_if_empty();
+            segments.push(bucket);
+        }
+
+        url.set_query(Some("cors="));
         Ok(url)
     }
 
@@ -1450,6 +1569,7 @@ impl ObjectStore for S3Client {
             notifications: true,
             lifecycle: true,
             replication: true,
+            cors: true,
         })
     }
 
@@ -1929,6 +2049,112 @@ impl ObjectStore for S3Client {
                     Self::bucket_policy_error_kind(None, None, &error_text)
                 };
                 Self::map_delete_bucket_policy_error(bucket, kind, &error_text)
+            }
+        }
+    }
+
+    async fn get_bucket_cors(&self, bucket: &str) -> Result<Vec<CorsRule>> {
+        let response = match self.inner.get_bucket_cors().bucket(bucket).send().await {
+            Ok(response) => response,
+            Err(error) => {
+                let error_text = error.to_string();
+                if error_text.contains("service error")
+                    && let Ok(url) = self.cors_url(bucket)
+                {
+                    match self.xml_request(Method::GET, url, None, None).await {
+                        Ok(body) => return parse_cors_configuration_xml(&body),
+                        Err(Error::Network(raw_error))
+                            if is_missing_cors_configuration_error(&raw_error)
+                                || raw_error.contains("HTTP 404") =>
+                        {
+                            return Ok(Vec::new());
+                        }
+                        Err(_) => {}
+                    }
+                }
+
+                let missing_config =
+                    if let aws_sdk_s3::error::SdkError::ServiceError(service_err) = &error {
+                        is_missing_cors_configuration_response(
+                            service_err.err().code(),
+                            Some(service_err.raw().status().as_u16()),
+                            &error_text,
+                        )
+                    } else {
+                        is_missing_cors_configuration_response(None, None, &error_text)
+                    };
+
+                if missing_config {
+                    return Ok(Vec::new());
+                }
+                return Err(Error::General(format!("get_bucket_cors: {error_text}")));
+            }
+        };
+
+        Ok(response
+            .cors_rules()
+            .iter()
+            .map(sdk_cors_rule_to_core)
+            .collect())
+    }
+
+    async fn set_bucket_cors(&self, bucket: &str, rules: Vec<CorsRule>) -> Result<()> {
+        let cors_rules = rules
+            .iter()
+            .map(core_cors_rule_to_sdk)
+            .collect::<Result<Vec<_>>>()?;
+        let cors_configuration = aws_sdk_s3::types::CorsConfiguration::builder()
+            .set_cors_rules(Some(cors_rules))
+            .build()
+            .map_err(|e| Error::General(format!("build bucket cors config: {e}")))?;
+
+        self.inner
+            .put_bucket_cors()
+            .bucket(bucket)
+            .cors_configuration(cors_configuration)
+            .send()
+            .await
+            .map_err(|e| Error::General(format!("set_bucket_cors: {e}")))?;
+
+        Ok(())
+    }
+
+    async fn delete_bucket_cors(&self, bucket: &str) -> Result<()> {
+        match self.inner.delete_bucket_cors().bucket(bucket).send().await {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                let error_text = error.to_string();
+                if error_text.contains("service error")
+                    && let Ok(url) = self.cors_url(bucket)
+                {
+                    match self.xml_request(Method::DELETE, url, None, None).await {
+                        Ok(_) => return Ok(()),
+                        Err(Error::Network(raw_error))
+                            if is_missing_cors_configuration_error(&raw_error)
+                                || raw_error.contains("HTTP 404") =>
+                        {
+                            return Ok(());
+                        }
+                        Err(_) => {}
+                    }
+                }
+
+                let missing_config =
+                    if let aws_sdk_s3::error::SdkError::ServiceError(service_err) = &error {
+                        is_missing_cors_configuration_response(
+                            service_err.err().code(),
+                            Some(service_err.raw().status().as_u16()),
+                            &error_text,
+                        )
+                    } else {
+                        is_missing_cors_configuration_response(None, None, &error_text)
+                    };
+
+                if missing_config {
+                    Ok(())
+                } else {
+                    Err(Error::General(format!("delete_bucket_cors: {error_text}")))
+                }
             }
         }
     }
@@ -2668,6 +2894,114 @@ mod tests {
         ];
 
         assert!(S3Client::notifications_equivalent(&expected, &actual));
+    }
+
+    #[test]
+    fn sdk_cors_rule_to_core_preserves_optional_fields() {
+        let sdk_rule = aws_sdk_s3::types::CorsRule::builder()
+            .id("web-app")
+            .allowed_origins("https://app.example.com")
+            .allowed_methods("get")
+            .allowed_headers("Authorization")
+            .expose_headers("ETag")
+            .max_age_seconds(300)
+            .build()
+            .expect("build cors rule");
+
+        let rule = sdk_cors_rule_to_core(&sdk_rule);
+        assert_eq!(rule.id.as_deref(), Some("web-app"));
+        assert_eq!(
+            rule.allowed_origins,
+            vec!["https://app.example.com".to_string()]
+        );
+        assert_eq!(rule.allowed_methods, vec!["get".to_string()]);
+        assert_eq!(
+            rule.allowed_headers,
+            Some(vec!["Authorization".to_string()])
+        );
+        assert_eq!(rule.expose_headers, Some(vec!["ETag".to_string()]));
+        assert_eq!(rule.max_age_seconds, Some(300));
+    }
+
+    #[test]
+    fn core_cors_rule_to_sdk_normalizes_method_case() {
+        let rule = CorsRule {
+            id: Some("public-read".to_string()),
+            allowed_origins: vec!["*".to_string()],
+            allowed_methods: vec!["get".to_string(), "post".to_string()],
+            allowed_headers: Some(vec!["*".to_string()]),
+            expose_headers: None,
+            max_age_seconds: Some(600),
+        };
+
+        let sdk_rule = core_cors_rule_to_sdk(&rule).expect("convert cors rule");
+        assert_eq!(sdk_rule.id(), Some("public-read"));
+        assert_eq!(sdk_rule.allowed_origins(), ["*"]);
+        assert_eq!(sdk_rule.allowed_methods(), ["GET", "POST"]);
+        assert_eq!(sdk_rule.allowed_headers(), ["*"]);
+        assert_eq!(sdk_rule.max_age_seconds(), Some(600));
+    }
+
+    #[test]
+    fn parse_cors_configuration_xml_round_trips_rule_fields() {
+        let body = r#"
+<CORSConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <CORSRule>
+    <ID>mc-rule</ID>
+    <AllowedOrigin>https://console.example.com</AllowedOrigin>
+    <AllowedMethod>GET</AllowedMethod>
+    <AllowedMethod>POST</AllowedMethod>
+    <AllowedHeader>*</AllowedHeader>
+    <ExposeHeader>ETag</ExposeHeader>
+    <MaxAgeSeconds>1200</MaxAgeSeconds>
+  </CORSRule>
+</CORSConfiguration>
+"#;
+
+        let rules = parse_cors_configuration_xml(body).expect("parse cors xml");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].id.as_deref(), Some("mc-rule"));
+        assert_eq!(
+            rules[0].allowed_origins,
+            vec!["https://console.example.com".to_string()]
+        );
+        assert_eq!(
+            rules[0].allowed_methods,
+            vec!["GET".to_string(), "POST".to_string()]
+        );
+        assert_eq!(rules[0].allowed_headers, Some(vec!["*".to_string()]));
+        assert_eq!(rules[0].expose_headers, Some(vec!["ETag".to_string()]));
+        assert_eq!(rules[0].max_age_seconds, Some(1200));
+    }
+
+    #[test]
+    fn missing_cors_configuration_errors_are_detected() {
+        assert!(is_missing_cors_configuration_error(
+            "NoSuchCORSConfiguration"
+        ));
+        assert!(is_missing_cors_configuration_error(
+            "The CORS configuration does not exist"
+        ));
+        assert!(!is_missing_cors_configuration_error("AccessDenied"));
+    }
+
+    #[test]
+    fn missing_cors_configuration_response_detects_code_and_status() {
+        assert!(is_missing_cors_configuration_response(
+            Some("NoSuchCORSConfiguration"),
+            Some(404),
+            "service error"
+        ));
+        assert!(is_missing_cors_configuration_response(
+            None,
+            Some(404),
+            "service error"
+        ));
+        assert!(!is_missing_cors_configuration_response(
+            Some("AccessDenied"),
+            Some(403),
+            "access denied"
+        ));
     }
 
     #[tokio::test]

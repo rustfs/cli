@@ -17,6 +17,7 @@ mod anonymous;
 mod bucket;
 mod cat;
 mod completions;
+mod cors;
 pub mod cp;
 pub mod diff;
 mod event;
@@ -192,6 +193,10 @@ pub enum Commands {
     /// Deprecated: use `rc bucket event`
     Event(event::EventArgs),
 
+    /// Deprecated: use `rc bucket cors`
+    #[command(subcommand)]
+    Cors(cors::CorsCommands),
+
     /// Show differences between locations
     Diff(diff::DiffArgs),
 
@@ -301,6 +306,13 @@ pub async fn execute(cli: Cli) -> ExitCode {
         Commands::Event(args) => {
             event::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
         }
+        Commands::Cors(cmd) => {
+            cors::execute(
+                cors::CorsArgs { command: cmd },
+                output_options.resolve(OutputBehavior::HumanDefault),
+            )
+            .await
+        }
         Commands::Diff(args) => {
             diff::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
         }
@@ -354,6 +366,7 @@ pub async fn execute(cli: Cli) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
 
     #[test]
     fn structured_default_uses_auto_format_when_not_explicit() {
@@ -395,5 +408,68 @@ mod tests {
 
         let resolved = options.resolve(OutputBehavior::HumanDefault);
         assert!(resolved.json);
+    }
+
+    #[test]
+    fn cli_accepts_bucket_cors_subcommand() {
+        let cli = Cli::try_parse_from(["rc", "bucket", "cors", "list", "local/my-bucket"])
+            .expect("parse bucket cors");
+
+        match cli.command {
+            Commands::Bucket(args) => match args.command {
+                bucket::BucketCommands::Cors(cors::CorsCommands::List(arg)) => {
+                    assert_eq!(arg.path, "local/my-bucket");
+                }
+                other => panic!("expected bucket cors list command, got {:?}", other),
+            },
+            other => panic!("expected bucket command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_top_level_cors_subcommand() {
+        let cli = Cli::try_parse_from(["rc", "cors", "remove", "local/my-bucket"])
+            .expect("parse top-level cors");
+
+        match cli.command {
+            Commands::Cors(cors::CorsCommands::Remove(arg)) => {
+                assert_eq!(arg.path, "local/my-bucket");
+            }
+            other => panic!("expected top-level cors remove command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_bucket_cors_get_alias() {
+        let cli = Cli::try_parse_from(["rc", "bucket", "cors", "get", "local/my-bucket"])
+            .expect("parse bucket cors get");
+
+        match cli.command {
+            Commands::Bucket(args) => match args.command {
+                bucket::BucketCommands::Cors(cors::CorsCommands::List(arg)) => {
+                    assert_eq!(arg.path, "local/my-bucket");
+                }
+                other => panic!("expected bucket cors get alias, got {:?}", other),
+            },
+            other => panic!("expected bucket command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_bucket_cors_set_with_positional_source() {
+        let cli =
+            Cli::try_parse_from(["rc", "bucket", "cors", "set", "local/my-bucket", "cors.xml"])
+                .expect("parse bucket cors set with positional source");
+
+        match cli.command {
+            Commands::Bucket(args) => match args.command {
+                bucket::BucketCommands::Cors(cors::CorsCommands::Set(arg)) => {
+                    assert_eq!(arg.path, "local/my-bucket");
+                    assert_eq!(arg.source.as_deref(), Some("cors.xml"));
+                }
+                other => panic!("expected bucket cors set command, got {:?}", other),
+            },
+            other => panic!("expected bucket command, got {:?}", other),
+        }
     }
 }

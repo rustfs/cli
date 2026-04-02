@@ -149,6 +149,14 @@ rc admin service-account create local/ SAKEY123 SASECRET123 --policy ./service-a
 rc event add local/my-bucket arn:aws:sns:us-east-1:123456789012:topic --event 's3:ObjectCreated:*'
 rc event list local/my-bucket
 rc event remove local/my-bucket arn:aws:sns:us-east-1:123456789012:topic
+
+# Manage bucket CORS configuration
+rc bucket cors list local/my-bucket
+rc bucket cors get local/my-bucket
+rc bucket cors set local/my-bucket cors.xml
+cat cors.xml | rc bucket cors set local/my-bucket -
+rc bucket cors set local/my-bucket --file cors.json
+rc cors remove local/my-bucket
 ```
 
 ### Lifecycle (ILM) Operations
@@ -261,6 +269,7 @@ rc admin heal status local --json
 | `tree` | Tree view display |
 | `share` | Generate presigned URLs |
 | `event` | Manage bucket event notifications |
+| `cors` | Manage bucket CORS configuration |
 | `pipe` | Upload from stdin |
 | `version` | Manage bucket versioning |
 | `tag` | Manage bucket and object tags |
