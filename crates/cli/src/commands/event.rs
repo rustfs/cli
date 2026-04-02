@@ -530,6 +530,36 @@ mod tests {
     }
 
     #[test]
+    fn test_upsert_notification_replaces_existing_rule_for_same_arn() {
+        let mut rules = vec![BucketNotification {
+            id: None,
+            target: NotificationTarget::Queue,
+            arn: "arn:aws:sqs:us-east-1:123456789012:q1".to_string(),
+            events: vec!["s3:ObjectRemoved:*".to_string()],
+            prefix: None,
+            suffix: None,
+        }];
+
+        let normalized_events =
+            parse_event_list(&["put,s3:ObjectCreated:*".to_string(), "PUT".to_string()]);
+
+        upsert_notification(
+            &mut rules,
+            BucketNotification {
+                id: None,
+                target: NotificationTarget::Queue,
+                arn: "arn:aws:sqs:us-east-1:123456789012:q1".to_string(),
+                events: normalized_events,
+                prefix: None,
+                suffix: None,
+            },
+        );
+
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].events, vec!["s3:ObjectCreated:*".to_string()]);
+    }
+
+    #[test]
     fn test_parse_event_list_deduplicates_shorthand_and_canonical_names() {
         let events = parse_event_list(&[
             "put,s3:ObjectCreated:*".to_string(),
