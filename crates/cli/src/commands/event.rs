@@ -523,7 +523,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_event_list_deduplicates_shorthand_and_canonical_values_across_groups() {
+    fn test_parse_event_list_deduplicates_shorthand_and_canonical_names() {
         let events = parse_event_list(&[
             "put,s3:ObjectCreated:*".to_string(),
             "GET,s3:ObjectAccessed:*".to_string(),
