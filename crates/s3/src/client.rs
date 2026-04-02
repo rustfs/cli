@@ -289,11 +289,11 @@ fn is_missing_cors_configuration_response(
         return true;
     }
 
-    if is_missing_cors_configuration_error(error_text) {
-        return true;
+    if !is_missing_cors_configuration_error(error_text) {
+        return false;
     }
 
-    status_code == Some(404)
+    status_code.is_none_or(|status| status == 404)
 }
 
 fn sdk_cors_rule_to_core(rule: &aws_sdk_s3::types::CorsRule) -> CorsRule {
@@ -2064,8 +2064,7 @@ impl ObjectStore for S3Client {
                     match self.xml_request(Method::GET, url, None, None).await {
                         Ok(body) => return parse_cors_configuration_xml(&body),
                         Err(Error::Network(raw_error))
-                            if is_missing_cors_configuration_error(&raw_error)
-                                || raw_error.contains("HTTP 404") =>
+                            if is_missing_cors_configuration_error(&raw_error) =>
                         {
                             return Ok(Vec::new());
                         }
@@ -2130,8 +2129,7 @@ impl ObjectStore for S3Client {
                     match self.xml_request(Method::DELETE, url, None, None).await {
                         Ok(_) => return Ok(()),
                         Err(Error::Network(raw_error))
-                            if is_missing_cors_configuration_error(&raw_error)
-                                || raw_error.contains("HTTP 404") =>
+                            if is_missing_cors_configuration_error(&raw_error) =>
                         {
                             return Ok(());
                         }
@@ -2995,12 +2993,22 @@ mod tests {
         assert!(is_missing_cors_configuration_response(
             None,
             Some(404),
-            "service error"
+            "The CORS configuration does not exist"
         ));
         assert!(!is_missing_cors_configuration_response(
             Some("AccessDenied"),
             Some(403),
             "access denied"
+        ));
+        assert!(!is_missing_cors_configuration_response(
+            None,
+            Some(404),
+            "service error"
+        ));
+        assert!(!is_missing_cors_configuration_response(
+            Some("NoSuchBucket"),
+            Some(404),
+            "NoSuchBucket"
         ));
     }
 
