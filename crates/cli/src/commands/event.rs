@@ -530,10 +530,11 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_event_list_deduplicates_shorthand_and_canonical_values() {
+    fn test_parse_event_list_deduplicates_shorthand_and_canonical_names() {
         let events = parse_event_list(&[
-            " put ,s3:ObjectCreated:*".to_string(),
+            "put,s3:ObjectCreated:*".to_string(),
             "GET,s3:ObjectAccessed:*".to_string(),
+            "delete,s3:ObjectRemoved:*".to_string(),
         ]);
 
         assert_eq!(
@@ -541,6 +542,7 @@ mod tests {
             vec![
                 "s3:ObjectAccessed:*".to_string(),
                 "s3:ObjectCreated:*".to_string(),
+                "s3:ObjectRemoved:*".to_string(),
             ]
         );
     }
