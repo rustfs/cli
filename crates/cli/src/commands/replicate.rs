@@ -21,9 +21,20 @@ use crate::output::{Formatter, OutputConfig};
 const DEFAULT_REMOTE_TARGET_PATH: &str = "auto";
 const DEFAULT_REMOTE_TARGET_API: &str = "s3v4";
 const DEFAULT_REPLICATION_STORAGE_CLASS: &str = "STANDARD";
+const REPLICATE_AFTER_HELP: &str = "\
+Examples:
+  rc bucket replication list local/my-bucket
+  rc bucket replication add local/my-bucket --remote-bucket backup/archive
+  rc replicate status local/my-bucket";
+const REPLICATE_ADD_AFTER_HELP: &str = "\
+Examples:
+  rc bucket replication add local/my-bucket --remote-bucket backup/archive
+  rc replicate add local/my-bucket --remote-bucket backup/archive --prefix reports/
+  rc bucket replication add local/my-bucket --remote-bucket backup/archive --replicate delete,existing-objects --sync";
 
 /// Manage bucket replication
 #[derive(Args, Debug)]
+#[command(after_help = REPLICATE_AFTER_HELP)]
 pub struct ReplicateArgs {
     #[command(subcommand)]
     pub command: ReplicateCommands,
@@ -64,6 +75,7 @@ pub struct BucketArg {
 }
 
 #[derive(Args, Debug)]
+#[command(after_help = REPLICATE_ADD_AFTER_HELP)]
 pub struct AddArgs {
     /// Source bucket path (ALIAS/BUCKET)
     pub path: String,
@@ -243,16 +255,22 @@ async fn execute_add(args: AddArgs, output_config: OutputConfig) -> ExitCode {
     let (source_alias, source_bucket) = match parse_bucket_path(&args.path) {
         Ok(parts) => parts,
         Err(error) => {
-            formatter.error(&error);
-            return ExitCode::UsageError;
+            return formatter.fail_with_suggestion(
+                ExitCode::UsageError,
+                &error,
+                "Use a bucket path in the form alias/bucket before retrying the replication command.",
+            );
         }
     };
 
     let (target_alias, target_bucket) = match parse_bucket_path(&args.remote_bucket) {
         Ok(parts) => parts,
         Err(error) => {
-            formatter.error(&format!("Invalid --remote-bucket: {error}"));
-            return ExitCode::UsageError;
+            return formatter.fail_with_suggestion(
+                ExitCode::UsageError,
+                &format!("Invalid --remote-bucket: {error}"),
+                "Use a bucket path in the form alias/bucket for --remote-bucket.",
+            );
         }
     };
 
@@ -312,8 +330,10 @@ async fn execute_add(args: AddArgs, output_config: OutputConfig) -> ExitCode {
     {
         Ok(arn) => arn,
         Err(error) => {
-            formatter.error(&format!("Failed to set remote target: {error}"));
-            return ExitCode::GeneralError;
+            return formatter.fail(
+                ExitCode::GeneralError,
+                &format!("Failed to set remote target: {error}"),
+            );
         }
     };
 
@@ -350,8 +370,10 @@ async fn execute_add(args: AddArgs, output_config: OutputConfig) -> ExitCode {
             rules: Vec::new(),
         },
         Err(error) => {
-            formatter.error(&format!("Failed to get replication config: {error}"));
-            return ExitCode::GeneralError;
+            return formatter.fail(
+                ExitCode::GeneralError,
+                &format!("Failed to get replication config: {error}"),
+            );
         }
     };
 
@@ -380,10 +402,10 @@ async fn execute_add(args: AddArgs, output_config: OutputConfig) -> ExitCode {
             }
             ExitCode::Success
         }
-        Err(error) => {
-            formatter.error(&format!("Failed to set replication config: {error}"));
-            ExitCode::GeneralError
-        }
+        Err(error) => formatter.fail(
+            ExitCode::GeneralError,
+            &format!("Failed to set replication config: {error}"),
+        ),
     }
 }
 
@@ -395,8 +417,11 @@ async fn execute_update(args: UpdateArgs, output_config: OutputConfig) -> ExitCo
     let (source_alias, source_bucket) = match parse_bucket_path(&args.path) {
         Ok(parts) => parts,
         Err(error) => {
-            formatter.error(&error);
-            return ExitCode::UsageError;
+            return formatter.fail_with_suggestion(
+                ExitCode::UsageError,
+                &error,
+                "Use a bucket path in the form alias/bucket before retrying the replication command.",
+            );
         }
     };
 
@@ -409,12 +434,17 @@ async fn execute_update(args: UpdateArgs, output_config: OutputConfig) -> ExitCo
     let mut config = match s3_client.get_bucket_replication(&source_bucket).await {
         Ok(Some(config)) => config,
         Ok(None) => {
-            formatter.error("No replication configuration found on this bucket");
-            return ExitCode::NotFound;
+            return formatter.fail_with_suggestion(
+                ExitCode::NotFound,
+                "No replication configuration found on this bucket",
+                "Run `rc bucket replication add ...` to create the first replication rule for this bucket.",
+            );
         }
         Err(error) => {
-            formatter.error(&format!("Failed to get replication config: {error}"));
-            return ExitCode::GeneralError;
+            return formatter.fail(
+                ExitCode::GeneralError,
+                &format!("Failed to get replication config: {error}"),
+            );
         }
     };
 
@@ -982,17 +1012,20 @@ fn resolve_alias(alias_name: &str, formatter: &Formatter) -> Result<rc_core::Ali
     let alias_manager = match AliasManager::new() {
         Ok(manager) => manager,
         Err(error) => {
-            formatter.error(&format!("Failed to load aliases: {error}"));
-            return Err(ExitCode::GeneralError);
+            return Err(formatter.fail(
+                ExitCode::GeneralError,
+                &format!("Failed to load aliases: {error}"),
+            ));
         }
     };
 
     match alias_manager.get(alias_name) {
         Ok(alias) => Ok(alias),
-        Err(_) => {
-            formatter.error(&format!("Alias '{alias_name}' not found"));
-            Err(ExitCode::NotFound)
-        }
+        Err(_) => Err(formatter.fail_with_suggestion(
+            ExitCode::NotFound,
+            &format!("Alias '{alias_name}' not found"),
+            "Run `rc alias list` to inspect configured aliases or add one with `rc alias set ...`.",
+        )),
     }
 }
 
@@ -1010,8 +1043,10 @@ async fn setup_s3_client(
     let client = match S3Client::new(alias).await {
         Ok(client) => client,
         Err(error) => {
-            formatter.error(&format!("Failed to create S3 client: {error}"));
-            return Err(ExitCode::NetworkError);
+            return Err(formatter.fail(
+                ExitCode::NetworkError,
+                &format!("Failed to create S3 client: {error}"),
+            ));
         }
     };
 
@@ -1021,26 +1056,36 @@ async fn setup_s3_client(
             if force {
                 rc_core::Capabilities::default()
             } else {
-                formatter.error(&format!("Failed to detect capabilities: {error}"));
-                return Err(ExitCode::NetworkError);
+                return Err(formatter.fail(
+                    ExitCode::NetworkError,
+                    &format!("Failed to detect capabilities: {error}"),
+                ));
             }
         }
     };
 
     if !force && !caps.replication {
-        formatter.error("Backend does not support replication. Use --force to attempt anyway.");
-        return Err(ExitCode::UnsupportedFeature);
+        return Err(formatter.fail_with_suggestion(
+            ExitCode::UnsupportedFeature,
+            "Backend does not support replication. Use --force to attempt anyway.",
+            "Retry with --force only if you know the backend supports bucket replication.",
+        ));
     }
 
     match client.bucket_exists(bucket).await {
         Ok(true) => {}
         Ok(false) => {
-            formatter.error(&format!("Bucket '{bucket}' does not exist"));
-            return Err(ExitCode::NotFound);
+            return Err(formatter.fail_with_suggestion(
+                ExitCode::NotFound,
+                &format!("Bucket '{bucket}' does not exist"),
+                "Check the bucket path and retry the replication command.",
+            ));
         }
         Err(error) => {
-            formatter.error(&format!("Failed to check bucket: {error}"));
-            return Err(ExitCode::NetworkError);
+            return Err(formatter.fail(
+                ExitCode::NetworkError,
+                &format!("Failed to check bucket: {error}"),
+            ));
         }
     }
 
@@ -1052,10 +1097,10 @@ fn setup_admin_client(alias_name: &str, formatter: &Formatter) -> Result<AdminCl
 
     match AdminClient::new(&alias) {
         Ok(client) => Ok(client),
-        Err(error) => {
-            formatter.error(&format!("Failed to create admin client: {error}"));
-            Err(ExitCode::GeneralError)
-        }
+        Err(error) => Err(formatter.fail(
+            ExitCode::GeneralError,
+            &format!("Failed to create admin client: {error}"),
+        )),
     }
 }
 
