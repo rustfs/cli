@@ -91,14 +91,14 @@ pub async fn execute(args: LsArgs, output_config: OutputConfig) -> ExitCode {
         }
     };
 
-    if bucket.is_none() {
-        if args.recursive {
-            // If no bucket specified & recursive flag is provided, list all objects on the server
-            return list_all_objects(&client, alias_name, &formatter, args.summarize).await;
-        } else {
-            // Else no bucket specified, list buckets
-            return list_buckets(&client, &formatter, args.summarize).await;
-        }
+    if let Some(list_mode) = alias_listing_mode(bucket.as_ref(), args.recursive) {
+        return match list_mode {
+            AliasListingMode::Buckets => list_buckets(&client, &formatter, args.summarize).await,
+            // Keep mc-compatible behavior for `ls alias/ -r`.
+            AliasListingMode::AllObjects => {
+                list_all_objects(&client, alias_name, &formatter, args.summarize).await
+            }
+        };
     }
 
     let bucket = bucket.unwrap();
@@ -390,6 +390,24 @@ async fn list_objects_with_paging(
     Ok((all_items, is_truncated, continuation_token))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AliasListingMode {
+    Buckets,
+    AllObjects,
+}
+
+fn alias_listing_mode(bucket: Option<&String>, recursive: bool) -> Option<AliasListingMode> {
+    if bucket.is_some() {
+        return None;
+    }
+
+    if recursive {
+        Some(AliasListingMode::AllObjects)
+    } else {
+        Some(AliasListingMode::Buckets)
+    }
+}
+
 /// Parse ls path into (alias, bucket, prefix)
 fn parse_ls_path(path: &str) -> Result<(String, Option<String>, Option<String>), String> {
     let path = path.trim_end_matches('/');
@@ -451,5 +469,28 @@ mod tests {
     #[test]
     fn test_parse_ls_path_empty() {
         assert!(parse_ls_path("").is_err());
+    }
+
+    #[test]
+    fn test_alias_listing_mode_lists_all_objects_for_recursive_alias_path() {
+        assert_eq!(
+            alias_listing_mode(None, true),
+            Some(AliasListingMode::AllObjects)
+        );
+    }
+
+    #[test]
+    fn test_alias_listing_mode_lists_buckets_without_recursive_flag() {
+        assert_eq!(
+            alias_listing_mode(None, false),
+            Some(AliasListingMode::Buckets)
+        );
+    }
+
+    #[test]
+    fn test_alias_listing_mode_ignores_alias_only_logic_when_bucket_is_present() {
+        let bucket = "demo".to_string();
+        assert_eq!(alias_listing_mode(Some(&bucket), false), None);
+        assert_eq!(alias_listing_mode(Some(&bucket), true), None);
     }
 }

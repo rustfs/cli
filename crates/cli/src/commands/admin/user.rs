@@ -10,6 +10,12 @@ use crate::exit_code::ExitCode;
 use crate::output::Formatter;
 use rc_core::admin::{AdminApi, User, UserStatus};
 
+const ADD_USER_AFTER_HELP: &str = "\
+Examples:
+  rc admin user add local analyst analyst-secret
+  rc admin user add local deployer deployer-secret
+  rc admin user add production readonly-user long-secret-value";
+
 /// User management subcommands
 #[derive(Subcommand, Debug)]
 pub enum UserCommands {
@@ -41,6 +47,7 @@ pub struct ListArgs {
 }
 
 #[derive(clap::Args, Debug)]
+#[command(after_help = ADD_USER_AFTER_HELP)]
 pub struct AddArgs {
     /// Alias name of the server
     pub alias: String,
@@ -187,13 +194,19 @@ async fn execute_add(args: AddArgs, formatter: &Formatter) -> ExitCode {
     };
 
     if args.access_key.is_empty() {
-        formatter.error("Access key cannot be empty");
-        return ExitCode::UsageError;
+        return formatter.fail_with_suggestion(
+            ExitCode::UsageError,
+            "Access key cannot be empty",
+            "Provide a non-empty access key for the new user.",
+        );
     }
 
     if args.secret_key.len() < 8 {
-        formatter.error("Secret key must be at least 8 characters long");
-        return ExitCode::UsageError;
+        return formatter.fail_with_suggestion(
+            ExitCode::UsageError,
+            "Secret key must be at least 8 characters long",
+            "Provide a secret key that is at least 8 characters long.",
+        );
     }
 
     match client.create_user(&args.access_key, &args.secret_key).await {
@@ -212,10 +225,10 @@ async fn execute_add(args: AddArgs, formatter: &Formatter) -> ExitCode {
             }
             ExitCode::Success
         }
-        Err(e) => {
-            formatter.error(&format!("Failed to create user: {e}"));
-            ExitCode::GeneralError
-        }
+        Err(e) => formatter.fail(
+            ExitCode::GeneralError,
+            &format!("Failed to create user: {e}"),
+        ),
     }
 }
 
