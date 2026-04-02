@@ -10,8 +10,15 @@ use serde::Serialize;
 use crate::exit_code::ExitCode;
 use crate::output::{Formatter, OutputConfig};
 
+const RM_AFTER_HELP: &str = "\
+Examples:
+  rc object remove local/my-bucket/reports/2026-04.csv
+  rc rm local/my-bucket/reports/ --recursive --dry-run
+  rc object remove local/my-bucket/archive/ --recursive --force";
+
 /// Remove objects
 #[derive(Args, Debug)]
+#[command(after_help = RM_AFTER_HELP)]
 pub struct RmArgs {
     /// Object path(s) to remove (alias/bucket/key or alias/bucket/prefix/)
     #[arg(required = true)]
@@ -109,8 +116,12 @@ async fn process_rm_path(
     let (alias_name, bucket, key) = match parse_rm_path(path_str) {
         Ok(parsed) => parsed,
         Err(e) => {
-            formatter.error(&e);
-            return Err((ExitCode::UsageError, vec![path_str.to_string()]));
+            let code = formatter.fail_with_suggestion(
+                ExitCode::UsageError,
+                &e,
+                "Use a remote path in the form alias/bucket[/key] before retrying the remove command.",
+            );
+            return Err((code, vec![path_str.to_string()]));
         }
     };
 
@@ -126,8 +137,12 @@ async fn process_rm_path(
     let alias = match alias_manager.get(&alias_name) {
         Ok(a) => a,
         Err(_) => {
-            formatter.error(&format!("Alias '{alias_name}' not found"));
-            return Err((ExitCode::NotFound, vec![]));
+            let code = formatter.fail_with_suggestion(
+                ExitCode::NotFound,
+                &format!("Alias '{alias_name}' not found"),
+                "Run `rc alias list` to inspect configured aliases or add one with `rc alias set ...`.",
+            );
+            return Err((code, vec![]));
         }
     };
 
@@ -135,8 +150,11 @@ async fn process_rm_path(
     let client = match S3Client::new(alias).await {
         Ok(c) => c,
         Err(e) => {
-            formatter.error(&format!("Failed to create S3 client: {e}"));
-            return Err((ExitCode::NetworkError, vec![]));
+            let code = formatter.fail(
+                ExitCode::NetworkError,
+                &format!("Failed to create S3 client: {e}"),
+            );
+            return Err((code, vec![]));
         }
     };
 
@@ -183,15 +201,23 @@ async fn delete_single(
                     // Force mode: ignore not found errors
                     Ok(vec![])
                 } else {
-                    formatter.error(&format!("Object not found: {full_path}"));
-                    Err((ExitCode::NotFound, vec![full_path]))
+                    let code = formatter.fail_with_suggestion(
+                        ExitCode::NotFound,
+                        &format!("Object not found: {full_path}"),
+                        "Check the object key or retry with --force if missing objects are acceptable.",
+                    );
+                    Err((code, vec![full_path]))
                 }
             } else if err_str.contains("AccessDenied") {
-                formatter.error(&format!("Access denied: {full_path}"));
-                Err((ExitCode::AuthError, vec![full_path]))
+                let code =
+                    formatter.fail(ExitCode::AuthError, &format!("Access denied: {full_path}"));
+                Err((code, vec![full_path]))
             } else {
-                formatter.error(&format!("Failed to remove {full_path}: {e}"));
-                Err((ExitCode::NetworkError, vec![full_path]))
+                let code = formatter.fail(
+                    ExitCode::NetworkError,
+                    &format!("Failed to remove {full_path}: {e}"),
+                );
+                Err((code, vec![full_path]))
             }
         }
     }
@@ -236,11 +262,18 @@ async fn delete_recursive(
             Err(e) => {
                 let err_str = e.to_string();
                 if err_str.contains("NotFound") || err_str.contains("NoSuchBucket") {
-                    formatter.error(&format!("Bucket not found: {bucket}"));
-                    return Err((ExitCode::NotFound, vec![]));
+                    let code = formatter.fail_with_suggestion(
+                        ExitCode::NotFound,
+                        &format!("Bucket not found: {bucket}"),
+                        "Check the bucket path and retry the remove command.",
+                    );
+                    return Err((code, vec![]));
                 }
-                formatter.error(&format!("Failed to list objects: {e}"));
-                return Err((ExitCode::NetworkError, vec![]));
+                let code = formatter.fail(
+                    ExitCode::NetworkError,
+                    &format!("Failed to list objects: {e}"),
+                );
+                return Err((code, vec![]));
             }
         }
     }
@@ -286,7 +319,10 @@ async fn delete_recursive(
                 }
             }
             Err(e) => {
-                formatter.error(&format!("Failed to delete batch: {e}"));
+                formatter.error_with_code(
+                    ExitCode::GeneralError,
+                    &format!("Failed to delete batch: {e}"),
+                );
                 for key in chunk_keys {
                     failed.push(format!("{alias_name}/{bucket}/{key}"));
                 }
