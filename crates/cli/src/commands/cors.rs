@@ -377,10 +377,12 @@ fn parse_bucket_path(path: &str) -> Result<(String, String), String> {
         return Err("Bucket path must be in format alias/bucket".to_string());
     }
 
-    Ok((
-        parts[0].to_string(),
-        parts[1].trim_end_matches('/').to_string(),
-    ))
+    let bucket = parts[1].trim_end_matches('/');
+    if bucket.is_empty() {
+        return Err("Bucket path must be in format alias/bucket".to_string());
+    }
+
+    Ok((parts[0].to_string(), bucket.to_string()))
 }
 
 fn parse_cors_configuration(contents: &str) -> Result<CorsConfiguration, String> {
@@ -531,6 +533,7 @@ mod tests {
         assert!(parse_bucket_path("").is_err());
         assert!(parse_bucket_path("local").is_err());
         assert!(parse_bucket_path("/bucket").is_err());
+        assert!(parse_bucket_path("local///").is_err());
     }
 
     #[test]
