@@ -621,6 +621,28 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_cors_configuration_drops_blank_optional_headers() {
+        let config = parse_cors_configuration(
+            r#"{
+                "rules": [
+                    {
+                        "allowedOrigins": ["https://app.example.com"],
+                        "allowedMethods": ["get"],
+                        "allowedHeaders": ["   "],
+                        "exposeHeaders": ["", "   "]
+                    }
+                ]
+            }"#,
+        )
+        .expect("parse config with blank optional headers");
+
+        assert_eq!(config.rules.len(), 1);
+        assert_eq!(config.rules[0].allowed_headers, None);
+        assert_eq!(config.rules[0].expose_headers, None);
+        assert_eq!(config.rules[0].allowed_methods, vec!["GET".to_string()]);
+    }
+
+    #[test]
     fn test_cors_input_source_prefers_positional_argument() {
         let args = SetCorsArgs {
             path: "local/my-bucket".to_string(),
@@ -642,6 +664,18 @@ mod tests {
         };
 
         assert_eq!(cors_input_source(&args).as_deref(), Ok("cors.json"));
+    }
+
+    #[test]
+    fn test_cors_input_source_rejects_conflicting_inputs() {
+        let args = SetCorsArgs {
+            path: "local/my-bucket".to_string(),
+            source: Some("cors.xml".to_string()),
+            file: Some("cors.json".to_string()),
+            force: false,
+        };
+
+        assert!(cors_input_source(&args).is_err());
     }
 
     #[test]
