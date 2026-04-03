@@ -589,6 +589,40 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_cors_configuration_rejects_empty_allowed_origin() {
+        let error = parse_cors_configuration(
+            r#"{
+                "rules": [
+                    {
+                        "allowedOrigins": [" https://app.example.com ", "   "],
+                        "allowedMethods": ["GET"]
+                    }
+                ]
+            }"#,
+        )
+        .expect_err("empty allowed origin");
+
+        assert!(error.contains("empty allowed origin"));
+    }
+
+    #[test]
+    fn test_parse_cors_configuration_rejects_empty_allowed_method() {
+        let error = parse_cors_configuration(
+            r#"{
+                "rules": [
+                    {
+                        "allowedOrigins": ["*"],
+                        "allowedMethods": ["GET", " "]
+                    }
+                ]
+            }"#,
+        )
+        .expect_err("empty allowed method");
+
+        assert!(error.contains("empty allowed method"));
+    }
+
+    #[test]
     fn test_parse_cors_configuration_accepts_xml() {
         let config = parse_cors_configuration(
             r#"
