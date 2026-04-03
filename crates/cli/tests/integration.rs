@@ -2375,6 +2375,181 @@ mod version_operations {
         // Cleanup
         cleanup_bucket(config_dir.path(), &bucket_name);
     }
+
+    #[test]
+    fn test_rm_purge_permanently_deletes_versioned_object() {
+        let (config_dir, bucket_name) = match setup_with_alias("rmpurge") {
+            Some(v) => v,
+            None => {
+                eprintln!("Skipping: S3 test config not available");
+                return;
+            }
+        };
+
+        let enable_output = run_rc(
+            &[
+                "version",
+                "enable",
+                &format!("test/{}", bucket_name),
+                "--json",
+            ],
+            config_dir.path(),
+        );
+        if !enable_output.status.success() {
+            eprintln!(
+                "Enable versioning not supported: {}",
+                String::from_utf8_lossy(&enable_output.stderr)
+            );
+            cleanup_bucket(config_dir.path(), &bucket_name);
+            return;
+        }
+
+        let temp_file = tempfile::NamedTempFile::new().expect("Failed to create temp file");
+        std::fs::write(temp_file.path(), "versioned delete content").expect("Failed to write");
+
+        let normal_key = "normal-delete.txt";
+        let purge_key = "purge-delete.txt";
+
+        let upload_output = run_rc(
+            &[
+                "cp",
+                temp_file
+                    .path()
+                    .to_str()
+                    .expect("Temp file path should be UTF-8"),
+                &format!("test/{}/{}", bucket_name, normal_key),
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            upload_output.status.success(),
+            "Failed to upload normal delete object: {}",
+            String::from_utf8_lossy(&upload_output.stderr)
+        );
+
+        let delete_output = run_rc(
+            &[
+                "rm",
+                &format!("test/{}/{}", bucket_name, normal_key),
+                "--json",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            delete_output.status.success(),
+            "Failed to delete versioned object: {}",
+            String::from_utf8_lossy(&delete_output.stderr)
+        );
+
+        let normal_versions_output = run_rc(
+            &[
+                "version",
+                "list",
+                &format!("test/{}/{}", bucket_name, normal_key),
+                "--json",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            normal_versions_output.status.success(),
+            "Failed to list versions after normal rm: {}",
+            String::from_utf8_lossy(&normal_versions_output.stderr)
+        );
+
+        let normal_stdout = String::from_utf8_lossy(&normal_versions_output.stdout);
+        let normal_versions: serde_json::Value =
+            serde_json::from_str(&normal_stdout).expect("Invalid JSON version list");
+        let normal_versions = normal_versions
+            .as_array()
+            .expect("Version list should be a JSON array");
+        assert_eq!(
+            normal_versions.len(),
+            2,
+            "Expected one object version plus one delete marker after normal rm"
+        );
+        assert!(
+            normal_versions.iter().any(|entry| {
+                entry["is_delete_marker"].as_bool() == Some(true)
+                    && entry["is_latest"].as_bool() == Some(true)
+            }),
+            "Expected latest version to be a delete marker after normal rm"
+        );
+
+        let purge_upload_output = run_rc(
+            &[
+                "cp",
+                temp_file
+                    .path()
+                    .to_str()
+                    .expect("Temp file path should be UTF-8"),
+                &format!("test/{}/{}", bucket_name, purge_key),
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            purge_upload_output.status.success(),
+            "Failed to upload purge delete object: {}",
+            String::from_utf8_lossy(&purge_upload_output.stderr)
+        );
+
+        let purge_delete_output = run_rc(
+            &[
+                "rm",
+                &format!("test/{}/{}", bucket_name, purge_key),
+                "--purge",
+                "--json",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            purge_delete_output.status.success(),
+            "Failed to purge versioned object: {}",
+            String::from_utf8_lossy(&purge_delete_output.stderr)
+        );
+
+        let purge_versions_output = run_rc(
+            &[
+                "version",
+                "list",
+                &format!("test/{}/{}", bucket_name, purge_key),
+                "--json",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            purge_versions_output.status.success(),
+            "Failed to list versions after purge rm: {}",
+            String::from_utf8_lossy(&purge_versions_output.stderr)
+        );
+
+        let purge_stdout = String::from_utf8_lossy(&purge_versions_output.stdout);
+        let purge_versions: serde_json::Value =
+            serde_json::from_str(&purge_stdout).expect("Invalid JSON version list");
+        let purge_versions = purge_versions
+            .as_array()
+            .expect("Version list should be a JSON array");
+        assert!(
+            purge_versions.is_empty(),
+            "Expected purge rm to permanently remove all versions"
+        );
+
+        let normal_cleanup_output = run_rc(
+            &[
+                "rm",
+                &format!("test/{}/{}", bucket_name, normal_key),
+                "--purge",
+                "--json",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            normal_cleanup_output.status.success(),
+            "Failed to purge cleanup object: {}",
+            String::from_utf8_lossy(&normal_cleanup_output.stderr)
+        );
+
+        cleanup_bucket(config_dir.path(), &bucket_name);
+    }
 }
 
 mod tag_operations {

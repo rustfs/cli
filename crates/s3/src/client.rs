@@ -37,6 +37,7 @@ use tokio::io::AsyncReadExt;
 const SINGLE_PUT_OBJECT_MAX_SIZE: u64 = crate::multipart::DEFAULT_PART_SIZE;
 const S3_SERVICE_NAME: &str = "s3";
 const S3_REPLICATION_XML_NAMESPACE: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
+const RUSTFS_FORCE_DELETE_HEADER: &str = "x-rustfs-force-delete";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BucketPolicyErrorKind {
@@ -651,6 +652,13 @@ pub struct S3Client {
     alias: Alias,
 }
 
+/// Request-level options for delete operations.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DeleteRequestOptions {
+    /// Ask RustFS to permanently delete data instead of creating delete markers.
+    pub force_delete: bool,
+}
+
 impl S3Client {
     /// Create a new S3 client from an alias configuration
     pub async fn new(alias: Alias) -> Result<Self> {
@@ -711,6 +719,104 @@ impl S3Client {
     /// Get the underlying aws-sdk-s3 client
     pub fn inner(&self) -> &aws_sdk_s3::Client {
         &self.inner
+    }
+
+    /// Delete an object with RustFS-specific request options.
+    pub async fn delete_object_with_options(
+        &self,
+        path: &RemotePath,
+        options: DeleteRequestOptions,
+    ) -> Result<()> {
+        let mut request = self
+            .inner
+            .delete_object()
+            .bucket(&path.bucket)
+            .key(&path.key)
+            .customize();
+
+        if options.force_delete {
+            request = request.mutate_request(|request| {
+                request
+                    .headers_mut()
+                    .insert(RUSTFS_FORCE_DELETE_HEADER, "true");
+            });
+        }
+
+        request.send().await.map_err(|e| {
+            let err_str = e.to_string();
+            if err_str.contains("NotFound") || err_str.contains("NoSuchKey") {
+                Error::NotFound(path.to_string())
+            } else {
+                Error::Network(err_str)
+            }
+        })?;
+
+        Ok(())
+    }
+
+    /// Delete multiple objects with RustFS-specific request options.
+    pub async fn delete_objects_with_options(
+        &self,
+        bucket: &str,
+        keys: Vec<String>,
+        options: DeleteRequestOptions,
+    ) -> Result<Vec<String>> {
+        use aws_sdk_s3::types::{Delete, ObjectIdentifier};
+
+        if keys.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let objects: Vec<ObjectIdentifier> =
+            keys.iter()
+                .map(|key| {
+                    ObjectIdentifier::builder().key(key).build().map_err(|e| {
+                        Error::General(format!("invalid delete object identifier: {e}"))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+        let delete = Delete::builder()
+            .set_objects(Some(objects))
+            .build()
+            .map_err(|e| Error::General(e.to_string()))?;
+
+        let mut request = self
+            .inner
+            .delete_objects()
+            .bucket(bucket)
+            .delete(delete)
+            .customize();
+
+        if options.force_delete {
+            request = request.mutate_request(|request| {
+                request
+                    .headers_mut()
+                    .insert(RUSTFS_FORCE_DELETE_HEADER, "true");
+            });
+        }
+
+        let response = request
+            .send()
+            .await
+            .map_err(|e| Error::Network(e.to_string()))?;
+
+        let deleted: Vec<String> = response
+            .deleted()
+            .iter()
+            .filter_map(|d| d.key().map(|k| k.to_string()))
+            .collect();
+
+        if !response.errors().is_empty() {
+            let error_keys: Vec<String> = response
+                .errors()
+                .iter()
+                .filter_map(|e| e.key().map(|k| k.to_string()))
+                .collect();
+            tracing::warn!("Failed to delete some objects: {:?}", error_keys);
+        }
+
+        Ok(deleted)
     }
 
     /// Format AWS SDK error into a detailed error message
@@ -1636,68 +1742,13 @@ impl ObjectStore for S3Client {
     }
 
     async fn delete_object(&self, path: &RemotePath) -> Result<()> {
-        self.inner
-            .delete_object()
-            .bucket(&path.bucket)
-            .key(&path.key)
-            .send()
+        self.delete_object_with_options(path, DeleteRequestOptions::default())
             .await
-            .map_err(|e| {
-                let err_str = e.to_string();
-                if err_str.contains("NotFound") || err_str.contains("NoSuchKey") {
-                    Error::NotFound(path.to_string())
-                } else {
-                    Error::Network(err_str)
-                }
-            })?;
-
-        Ok(())
     }
 
     async fn delete_objects(&self, bucket: &str, keys: Vec<String>) -> Result<Vec<String>> {
-        use aws_sdk_s3::types::{Delete, ObjectIdentifier};
-
-        if keys.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let objects: Vec<ObjectIdentifier> = keys
-            .iter()
-            .map(|k| ObjectIdentifier::builder().key(k).build().unwrap())
-            .collect();
-
-        let delete = Delete::builder()
-            .set_objects(Some(objects))
-            .build()
-            .map_err(|e| Error::General(e.to_string()))?;
-
-        let response = self
-            .inner
-            .delete_objects()
-            .bucket(bucket)
-            .delete(delete)
-            .send()
+        self.delete_objects_with_options(bucket, keys, DeleteRequestOptions::default())
             .await
-            .map_err(|e| Error::Network(e.to_string()))?;
-
-        // Collect deleted keys
-        let deleted: Vec<String> = response
-            .deleted()
-            .iter()
-            .filter_map(|d| d.key().map(|k| k.to_string()))
-            .collect();
-
-        // Check for errors
-        if !response.errors().is_empty() {
-            let error_keys: Vec<String> = response
-                .errors()
-                .iter()
-                .filter_map(|e| e.key().map(|k| k.to_string()))
-                .collect();
-            tracing::warn!("Failed to delete some objects: {:?}", error_keys);
-        }
-
-        Ok(deleted)
     }
 
     async fn copy_object(&self, src: &RemotePath, dst: &RemotePath) -> Result<ObjectInfo> {
@@ -2618,7 +2669,38 @@ impl ObjectStore for S3Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aws_smithy_http_client::test_util::{CaptureRequestReceiver, capture_request};
     use std::collections::HashMap;
+
+    fn test_s3_client(
+        response: Option<http::Response<SdkBody>>,
+    ) -> (S3Client, CaptureRequestReceiver) {
+        let (http_client, request_receiver) = capture_request(response);
+        let credentials = Credentials::new(
+            "access-key",
+            "secret-key",
+            None,
+            None,
+            "rc-test-credentials",
+        );
+        let config = aws_sdk_s3::config::Builder::new()
+            .credentials_provider(credentials)
+            .endpoint_url("https://example.com")
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .force_path_style(true)
+            .behavior_version_latest()
+            .http_client(http_client)
+            .build();
+
+        let alias = Alias::new("test", "https://example.com", "access-key", "secret-key");
+        let client = S3Client {
+            inner: aws_sdk_s3::Client::from_conf(config),
+            xml_http_client: reqwest::Client::new(),
+            alias,
+        };
+
+        (client, request_receiver)
+    }
 
     #[test]
     fn test_object_info_creation() {
@@ -3062,6 +3144,55 @@ mod tests {
             crate::multipart::DEFAULT_PART_SIZE
         ));
         assert!(!S3Client::should_use_multipart(SINGLE_PUT_OBJECT_MAX_SIZE));
+    }
+
+    #[tokio::test]
+    async fn delete_object_with_force_delete_sets_rustfs_header() {
+        let (client, request_receiver) = test_s3_client(None);
+        let path = RemotePath::new("test", "bucket", "key.txt");
+
+        let _ = client
+            .delete_object_with_options(&path, DeleteRequestOptions { force_delete: true })
+            .await;
+
+        let request = request_receiver.expect_request();
+        assert_eq!(request.headers().get("x-rustfs-force-delete"), Some("true"));
+    }
+
+    #[tokio::test]
+    async fn delete_object_without_force_delete_omits_rustfs_header() {
+        let (client, request_receiver) = test_s3_client(None);
+        let path = RemotePath::new("test", "bucket", "key.txt");
+
+        let _ = client
+            .delete_object_with_options(&path, DeleteRequestOptions::default())
+            .await;
+
+        let request = request_receiver.expect_request();
+        assert!(request.headers().get("x-rustfs-force-delete").is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_objects_with_force_delete_sets_rustfs_header() {
+        let response = http::Response::builder()
+            .status(200)
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/" />"#,
+            ))
+            .expect("build delete objects response");
+        let (client, request_receiver) = test_s3_client(Some(response));
+
+        let _ = client
+            .delete_objects_with_options(
+                "bucket",
+                vec!["key.txt".to_string()],
+                DeleteRequestOptions { force_delete: true },
+            )
+            .await;
+
+        let request = request_receiver.expect_request();
+        assert_eq!(request.headers().get("x-rustfs-force-delete"), Some("true"));
     }
 
     #[tokio::test]

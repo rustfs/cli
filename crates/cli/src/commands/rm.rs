@@ -4,7 +4,7 @@
 
 use clap::Args;
 use rc_core::{AliasManager, ListOptions, ObjectStore as _, RemotePath};
-use rc_s3::S3Client;
+use rc_s3::{DeleteRequestOptions, S3Client};
 use serde::Serialize;
 
 use crate::exit_code::ExitCode;
@@ -47,6 +47,10 @@ pub struct RmArgs {
     /// Bypass governance retention
     #[arg(long)]
     pub bypass: bool,
+
+    /// Permanently delete objects using the RustFS force-delete header
+    #[arg(long)]
+    pub purge: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -186,7 +190,10 @@ async fn delete_single(
         return Ok(vec![full_path]);
     }
 
-    match client.delete_object(&path).await {
+    match client
+        .delete_object_with_options(&path, delete_request_options(args))
+        .await
+    {
         Ok(()) => {
             if !formatter.is_json() {
                 let styled_path = formatter.style_file(&full_path);
@@ -307,7 +314,10 @@ async fn delete_recursive(
     for chunk in keys_to_delete.chunks(1000) {
         let chunk_keys: Vec<String> = chunk.to_vec();
 
-        match client.delete_objects(bucket, chunk_keys.clone()).await {
+        match client
+            .delete_objects_with_options(bucket, chunk_keys.clone(), delete_request_options(args))
+            .await
+        {
             Ok(deleted_keys) => {
                 for key in &deleted_keys {
                     let full_path = format!("{alias_name}/{bucket}/{key}");
@@ -366,6 +376,12 @@ fn parse_rm_path(path: &str) -> Result<(String, String, String), String> {
     Ok((alias, bucket, key))
 }
 
+fn delete_request_options(args: &RmArgs) -> DeleteRequestOptions {
+    DeleteRequestOptions {
+        force_delete: args.purge,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,5 +418,22 @@ mod tests {
     #[test]
     fn test_parse_rm_path_empty() {
         assert!(parse_rm_path("").is_err());
+    }
+
+    #[test]
+    fn test_delete_request_options_enable_force_delete_for_purge() {
+        let args = RmArgs {
+            paths: vec!["test/bucket/object.txt".to_string()],
+            recursive: false,
+            force: false,
+            dry_run: false,
+            incomplete: false,
+            versions: false,
+            bypass: false,
+            purge: true,
+        };
+
+        let options = delete_request_options(&args);
+        assert!(options.force_delete);
     }
 }

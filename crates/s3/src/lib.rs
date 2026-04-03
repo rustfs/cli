@@ -10,5 +10,5 @@ pub mod client;
 pub mod multipart;
 
 pub use admin::AdminClient;
-pub use client::S3Client;
+pub use client::{DeleteRequestOptions, S3Client};
 pub use multipart::{MultipartConfig, UploadState};

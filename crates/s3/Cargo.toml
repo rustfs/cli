@@ -53,5 +53,6 @@ serde_json.workspace = true
 quick-xml.workspace = true
 
 [dev-dependencies]
+aws-smithy-http-client = { version = "1.1.5", features = ["test-util"] }
 tempfile.workspace = true
 mockall.workspace = true
