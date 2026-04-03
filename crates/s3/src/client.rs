@@ -3350,6 +3350,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_objects_without_force_delete_omits_rustfs_header() {
+        let response = http::Response::builder()
+            .status(200)
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/" />"#,
+            ))
+            .expect("build delete objects response");
+        let (client, request_receiver) = test_s3_client(Some(response));
+
+        let _ = client
+            .delete_objects_with_options(
+                "bucket",
+                vec!["key.txt".to_string()],
+                DeleteRequestOptions::default(),
+            )
+            .await;
+
+        let request = request_receiver.expect_request();
+        assert!(request.headers().get("x-rustfs-force-delete").is_none());
+    }
+
+    #[tokio::test]
     async fn delete_objects_wrapper_uses_default_options_without_rustfs_header() {
         let response = http::Response::builder()
             .status(200)
@@ -3364,6 +3387,19 @@ mod tests {
 
         let request = request_receiver.expect_request();
         assert!(request.headers().get("x-rustfs-force-delete").is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_objects_with_empty_keys_skips_http_request() {
+        let (client, request_receiver) = test_s3_client(None);
+
+        let deleted = client
+            .delete_objects_with_options("bucket", Vec::new(), DeleteRequestOptions::default())
+            .await
+            .expect("empty delete should succeed");
+
+        assert!(deleted.is_empty());
+        request_receiver.expect_no_request();
     }
 
     #[tokio::test]
