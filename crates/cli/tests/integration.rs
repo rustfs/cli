@@ -2550,6 +2550,105 @@ mod version_operations {
 
         cleanup_bucket(config_dir.path(), &bucket_name);
     }
+
+    #[test]
+    fn test_rm_recursive_purge_permanently_deletes_versioned_prefix() {
+        let (config_dir, bucket_name) = match setup_with_alias("rmpurgeprefix") {
+            Some(v) => v,
+            None => {
+                eprintln!("Skipping: S3 test config not available");
+                return;
+            }
+        };
+
+        let enable_output = run_rc(
+            &[
+                "version",
+                "enable",
+                &format!("test/{}", bucket_name),
+                "--json",
+            ],
+            config_dir.path(),
+        );
+        if !enable_output.status.success() {
+            eprintln!(
+                "Enable versioning not supported: {}",
+                String::from_utf8_lossy(&enable_output.stderr)
+            );
+            cleanup_bucket(config_dir.path(), &bucket_name);
+            return;
+        }
+
+        let temp_file = tempfile::NamedTempFile::new().expect("Failed to create temp file");
+        std::fs::write(temp_file.path(), "recursive purge content").expect("Failed to write");
+
+        let keys = ["purge-prefix/a.txt", "purge-prefix/nested/b.txt"];
+
+        for key in keys {
+            let upload_output = run_rc(
+                &[
+                    "cp",
+                    temp_file
+                        .path()
+                        .to_str()
+                        .expect("Temp file path should be UTF-8"),
+                    &format!("test/{}/{}", bucket_name, key),
+                ],
+                config_dir.path(),
+            );
+            assert!(
+                upload_output.status.success(),
+                "Failed to upload recursive purge object {key}: {}",
+                String::from_utf8_lossy(&upload_output.stderr)
+            );
+        }
+
+        let purge_output = run_rc(
+            &[
+                "rm",
+                "--recursive",
+                "--purge",
+                &format!("test/{}/purge-prefix/", bucket_name),
+                "--json",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            purge_output.status.success(),
+            "Failed to purge recursive prefix: {}",
+            String::from_utf8_lossy(&purge_output.stderr)
+        );
+
+        for key in keys {
+            let versions_output = run_rc(
+                &[
+                    "version",
+                    "list",
+                    &format!("test/{}/{}", bucket_name, key),
+                    "--json",
+                ],
+                config_dir.path(),
+            );
+            assert!(
+                versions_output.status.success(),
+                "Failed to list versions after recursive purge for {key}: {}",
+                String::from_utf8_lossy(&versions_output.stderr)
+            );
+
+            let stdout = String::from_utf8_lossy(&versions_output.stdout);
+            let versions: serde_json::Value =
+                serde_json::from_str(&stdout).expect("Invalid JSON version list");
+            let versions = versions
+                .as_array()
+                .expect("Version list should be a JSON array");
+            assert!(
+                versions.is_empty(),
+                "Expected recursive purge to permanently remove all versions for {key}"
+            );
+        }
+
+        cleanup_bucket(config_dir.path(), &bucket_name);
+    }
 }
 
 mod tag_operations {
