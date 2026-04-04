@@ -3196,6 +3196,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_objects_with_empty_keys_skips_request() {
+        let (client, request_receiver) = test_s3_client(None);
+
+        let deleted = client
+            .delete_objects_with_options("bucket", Vec::new(), DeleteRequestOptions::default())
+            .await
+            .expect("empty delete batch should succeed");
+
+        assert!(deleted.is_empty());
+        request_receiver.expect_no_request();
+    }
+
+    #[tokio::test]
     async fn read_next_part_fills_buffer_until_eof() {
         use tokio::io::AsyncWriteExt;
 
