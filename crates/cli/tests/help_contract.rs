@@ -238,6 +238,7 @@ fn top_level_command_help_contract() {
             expected_tokens: &[
                 "--recursive",
                 "--force",
+                "--purge",
                 "--dry-run",
                 "--incomplete",
                 "--versions",
