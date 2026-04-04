@@ -123,6 +123,7 @@ fn top_level_command_help_contract() {
                 "share",
                 "version",
                 "tag",
+                "cors",
                 "quota",
                 "anonymous",
                 "ilm",
@@ -303,6 +304,11 @@ fn top_level_command_help_contract() {
             expected_tokens: &["list", "set", "remove"],
         },
         HelpCase {
+            args: &["cors"],
+            usage: "Usage: rc cors [OPTIONS] <COMMAND>",
+            expected_tokens: &["Deprecated: use `rc bucket cors`", "list", "set", "remove"],
+        },
+        HelpCase {
             args: &["quota"],
             usage: "Usage: rc quota [OPTIONS] <COMMAND>",
             expected_tokens: &["set", "info", "clear"],
@@ -435,6 +441,11 @@ fn nested_subcommand_help_contract() {
                 "Examples:",
                 "rc bucket event add local/my-bucket arn:aws:sqs:us-east-1:123456789012:jobs --event put",
             ],
+        },
+        HelpCase {
+            args: &["bucket", "cors"],
+            usage: "Usage: rc bucket cors [OPTIONS] <COMMAND>",
+            expected_tokens: &["list", "set", "remove"],
         },
         HelpCase {
             args: &["object", "copy"],
