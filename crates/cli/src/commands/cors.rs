@@ -378,7 +378,7 @@ fn parse_bucket_path(path: &str) -> Result<(String, String), String> {
     }
 
     let bucket = parts[1].trim_end_matches('/');
-    if bucket.is_empty() {
+    if bucket.is_empty() || bucket.contains('/') {
         return Err("Bucket path must be in format alias/bucket".to_string());
     }
 
@@ -533,6 +533,8 @@ mod tests {
         assert!(parse_bucket_path("").is_err());
         assert!(parse_bucket_path("local").is_err());
         assert!(parse_bucket_path("/bucket").is_err());
+        assert!(parse_bucket_path("local//bucket").is_err());
+        assert!(parse_bucket_path("local/my-bucket/nested").is_err());
         assert!(parse_bucket_path("local///").is_err());
     }
 
