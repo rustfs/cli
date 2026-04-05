@@ -726,4 +726,34 @@ mod tests {
 
         assert!(cors_input_source(&args).is_err());
     }
+
+    #[tokio::test]
+    async fn test_read_cors_source_reads_file_contents() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let source_path = temp_dir.path().join("cors.json");
+        tokio::fs::write(
+            &source_path,
+            r#"{"rules":[{"allowedOrigins":["*"],"allowedMethods":["GET"]}]}"#,
+        )
+        .await
+        .expect("write cors source");
+
+        let contents = read_cors_source(source_path.to_str().expect("utf-8 path"))
+            .await
+            .expect("read cors source");
+
+        assert!(contents.contains("\"allowedOrigins\":[\"*\"]"));
+    }
+
+    #[tokio::test]
+    async fn test_read_cors_source_missing_file_returns_error() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let missing_path = temp_dir.path().join("missing-cors.json");
+
+        let error = read_cors_source(missing_path.to_str().expect("utf-8 path"))
+            .await
+            .expect_err("missing source should fail");
+
+        assert!(!error.is_empty());
+    }
 }
