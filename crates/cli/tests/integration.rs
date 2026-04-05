@@ -2515,6 +2515,7 @@ mod version_operations {
         std::fs::write(temp_file.path(), "versioned delete content").expect("Failed to write");
 
         let normal_key = "normal-delete.txt";
+        let force_key = "force-delete.txt";
         let purge_key = "purge-delete.txt";
 
         let upload_output = run_rc(
@@ -2580,6 +2581,72 @@ mod version_operations {
                     && entry["is_latest"].as_bool() == Some(true)
             }),
             "Expected latest version to be a delete marker after normal rm"
+        );
+
+        let force_upload_output = run_rc(
+            &[
+                "cp",
+                temp_file
+                    .path()
+                    .to_str()
+                    .expect("Temp file path should be UTF-8"),
+                &format!("test/{}/{}", bucket_name, force_key),
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            force_upload_output.status.success(),
+            "Failed to upload force delete object: {}",
+            String::from_utf8_lossy(&force_upload_output.stderr)
+        );
+
+        let force_delete_output = run_rc(
+            &[
+                "rm",
+                &format!("test/{}/{}", bucket_name, force_key),
+                "--force",
+                "--json",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            force_delete_output.status.success(),
+            "Failed to force delete versioned object: {}",
+            String::from_utf8_lossy(&force_delete_output.stderr)
+        );
+
+        let force_versions_output = run_rc(
+            &[
+                "version",
+                "list",
+                &format!("test/{}/{}", bucket_name, force_key),
+                "--json",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            force_versions_output.status.success(),
+            "Failed to list versions after force rm: {}",
+            String::from_utf8_lossy(&force_versions_output.stderr)
+        );
+
+        let force_stdout = String::from_utf8_lossy(&force_versions_output.stdout);
+        let force_versions: serde_json::Value =
+            serde_json::from_str(&force_stdout).expect("Invalid JSON version list");
+        let force_versions = force_versions
+            .as_array()
+            .expect("Version list should be a JSON array");
+        assert_eq!(
+            force_versions.len(),
+            2,
+            "Expected --force rm to keep the object version and create a delete marker"
+        );
+        assert!(
+            force_versions.iter().any(|entry| {
+                entry["is_delete_marker"].as_bool() == Some(true)
+                    && entry["is_latest"].as_bool() == Some(true)
+            }),
+            "Expected latest version to be a delete marker after force rm"
         );
 
         let purge_upload_output = run_rc(
@@ -2654,6 +2721,21 @@ mod version_operations {
             normal_cleanup_output.status.success(),
             "Failed to purge cleanup object: {}",
             String::from_utf8_lossy(&normal_cleanup_output.stderr)
+        );
+
+        let force_cleanup_output = run_rc(
+            &[
+                "rm",
+                &format!("test/{}/{}", bucket_name, force_key),
+                "--purge",
+                "--json",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            force_cleanup_output.status.success(),
+            "Failed to purge force cleanup object: {}",
+            String::from_utf8_lossy(&force_cleanup_output.stderr)
         );
 
         cleanup_bucket(config_dir.path(), &bucket_name);
