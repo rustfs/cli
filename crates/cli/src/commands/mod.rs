@@ -440,6 +440,34 @@ mod tests {
     }
 
     #[test]
+    fn cli_accepts_top_level_cors_get_alias() {
+        let cli =
+            Cli::try_parse_from(["rc", "cors", "get", "local/my-bucket"]).expect("parse cors get");
+
+        match cli.command {
+            Commands::Cors(cors::CorsCommands::List(arg)) => {
+                assert_eq!(arg.path, "local/my-bucket");
+            }
+            other => panic!("expected top-level cors get alias, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_top_level_event_subcommand() {
+        let cli = Cli::try_parse_from(["rc", "event", "list", "local/my-bucket"])
+            .expect("parse top-level event");
+
+        match cli.command {
+            Commands::Event(event::EventArgs {
+                command: event::EventCommands::List(arg),
+            }) => {
+                assert_eq!(arg.path, "local/my-bucket");
+            }
+            other => panic!("expected top-level event list command, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn cli_accepts_bucket_cors_get_alias() {
         let cli = Cli::try_parse_from(["rc", "bucket", "cors", "get", "local/my-bucket"])
             .expect("parse bucket cors get");
