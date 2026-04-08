@@ -176,6 +176,21 @@ fn top_level_command_help_contract() {
             ],
         },
         HelpCase {
+            args: &["object", "remove"],
+            usage: "Usage: rc object remove [OPTIONS] <PATHS>...",
+            expected_tokens: &[
+                "--recursive",
+                "--force",
+                "--dry-run",
+                "--incomplete",
+                "--versions",
+                "--bypass",
+                "--purge",
+                "Examples:",
+                "rc object remove local/my-bucket/reports/2026-04.csv",
+            ],
+        },
+        HelpCase {
             args: &["ls"],
             usage: "Usage: rc ls [OPTIONS] <PATH>",
             expected_tokens: &["--recursive", "--versions", "--incomplete", "--summarize"],
