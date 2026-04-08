@@ -472,4 +472,41 @@ mod tests {
             other => panic!("expected bucket command, got {:?}", other),
         }
     }
+
+    #[test]
+    fn cli_accepts_rm_purge_flag() {
+        let cli = Cli::try_parse_from(["rc", "rm", "local/my-bucket/object.txt", "--purge"])
+            .expect("parse rm purge");
+
+        match cli.command {
+            Commands::Rm(arg) => {
+                assert_eq!(arg.paths, vec!["local/my-bucket/object.txt"]);
+                assert!(arg.purge);
+            }
+            other => panic!("expected rm command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_object_remove_purge_flag() {
+        let cli = Cli::try_parse_from([
+            "rc",
+            "object",
+            "remove",
+            "local/my-bucket/object.txt",
+            "--purge",
+        ])
+        .expect("parse object remove purge");
+
+        match cli.command {
+            Commands::Object(args) => match args.command {
+                object::ObjectCommands::Remove(arg) => {
+                    assert_eq!(arg.paths, vec!["local/my-bucket/object.txt"]);
+                    assert!(arg.purge);
+                }
+                other => panic!("expected object remove command, got {:?}", other),
+            },
+            other => panic!("expected object command, got {:?}", other),
+        }
+    }
 }
