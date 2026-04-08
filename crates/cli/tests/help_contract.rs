@@ -122,6 +122,7 @@ fn top_level_command_help_contract() {
                 "tree",
                 "share",
                 "version",
+                "cors",
                 "tag",
                 "quota",
                 "anonymous",
@@ -148,6 +149,7 @@ fn top_level_command_help_contract() {
                 "create",
                 "remove",
                 "event",
+                "cors",
                 "version",
                 "quota",
                 "anonymous",
@@ -242,9 +244,15 @@ fn top_level_command_help_contract() {
                 "--incomplete",
                 "--versions",
                 "--bypass",
+                "--purge",
                 "Examples:",
                 "rc rm local/my-bucket/reports/ --recursive --dry-run",
             ],
+        },
+        HelpCase {
+            args: &["cors"],
+            usage: "Usage: rc cors [OPTIONS] <COMMAND>",
+            expected_tokens: &["Deprecated: use `rc bucket cors`", "list", "set", "remove"],
         },
         HelpCase {
             args: &["pipe"],
@@ -435,6 +443,16 @@ fn nested_subcommand_help_contract() {
                 "Examples:",
                 "rc bucket event add local/my-bucket arn:aws:sqs:us-east-1:123456789012:jobs --event put",
             ],
+        },
+        HelpCase {
+            args: &["bucket", "cors"],
+            usage: "Usage: rc bucket cors [OPTIONS] <COMMAND>",
+            expected_tokens: &["Manage bucket CORS rules", "list", "set", "remove"],
+        },
+        HelpCase {
+            args: &["bucket", "cors", "set"],
+            usage: "Usage: rc bucket cors set [OPTIONS] <PATH> [SOURCE]",
+            expected_tokens: &["--file", "--force", "read from stdin"],
         },
         HelpCase {
             args: &["object", "copy"],
