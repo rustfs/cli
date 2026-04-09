@@ -440,6 +440,46 @@ mod tests {
     }
 
     #[test]
+    fn cli_accepts_top_level_cors_set_with_positional_source() {
+        let cli = Cli::try_parse_from(["rc", "cors", "set", "local/my-bucket", "cors.xml"])
+            .expect("parse top-level cors set with positional source");
+
+        match cli.command {
+            Commands::Cors(cors::CorsCommands::Set(arg)) => {
+                assert_eq!(arg.path, "local/my-bucket");
+                assert_eq!(arg.source.as_deref(), Some("cors.xml"));
+                assert_eq!(arg.file, None);
+                assert!(!arg.force);
+            }
+            other => panic!("expected top-level cors set command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_top_level_cors_set_with_legacy_file_flag() {
+        let cli = Cli::try_parse_from([
+            "rc",
+            "cors",
+            "set",
+            "local/my-bucket",
+            "--file",
+            "cors.json",
+            "--force",
+        ])
+        .expect("parse top-level cors set with --file");
+
+        match cli.command {
+            Commands::Cors(cors::CorsCommands::Set(arg)) => {
+                assert_eq!(arg.path, "local/my-bucket");
+                assert_eq!(arg.source, None);
+                assert_eq!(arg.file.as_deref(), Some("cors.json"));
+                assert!(arg.force);
+            }
+            other => panic!("expected top-level cors set command, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn cli_accepts_bucket_cors_get_alias() {
         let cli = Cli::try_parse_from(["rc", "bucket", "cors", "get", "local/my-bucket"])
             .expect("parse bucket cors get");
