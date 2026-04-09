@@ -472,4 +472,27 @@ mod tests {
             other => panic!("expected bucket command, got {:?}", other),
         }
     }
+
+    #[test]
+    fn cli_accepts_object_remove_with_purge_flag() {
+        let cli = Cli::try_parse_from([
+            "rc",
+            "object",
+            "remove",
+            "local/my-bucket/object.txt",
+            "--purge",
+        ])
+        .expect("parse object remove with purge");
+
+        match cli.command {
+            Commands::Object(args) => match args.command {
+                object::ObjectCommands::Remove(arg) => {
+                    assert_eq!(arg.paths, vec!["local/my-bucket/object.txt".to_string()]);
+                    assert!(arg.purge);
+                }
+                other => panic!("expected object remove command, got {:?}", other),
+            },
+            other => panic!("expected object command, got {:?}", other),
+        }
+    }
 }
