@@ -2675,6 +2675,13 @@ mod tests {
     fn test_s3_client(
         response: Option<http::Response<SdkBody>>,
     ) -> (S3Client, CaptureRequestReceiver) {
+        test_s3_client_with_endpoint("https://example.com", response)
+    }
+
+    fn test_s3_client_with_endpoint(
+        endpoint: &str,
+        response: Option<http::Response<SdkBody>>,
+    ) -> (S3Client, CaptureRequestReceiver) {
         let (http_client, request_receiver) = capture_request(response);
         let credentials = Credentials::new(
             "access-key",
@@ -2685,14 +2692,14 @@ mod tests {
         );
         let config = aws_sdk_s3::config::Builder::new()
             .credentials_provider(credentials)
-            .endpoint_url("https://example.com")
+            .endpoint_url(endpoint)
             .region(aws_sdk_s3::config::Region::new("us-east-1"))
             .force_path_style(true)
             .behavior_version_latest()
             .http_client(http_client)
             .build();
 
-        let alias = Alias::new("test", "https://example.com", "access-key", "secret-key");
+        let alias = Alias::new("test", endpoint, "access-key", "secret-key");
         let client = S3Client {
             inner: aws_sdk_s3::Client::from_conf(config),
             xml_http_client: reqwest::Client::new(),
@@ -3052,6 +3059,27 @@ mod tests {
         assert_eq!(rules[0].allowed_headers, Some(vec!["*".to_string()]));
         assert_eq!(rules[0].expose_headers, Some(vec!["ETag".to_string()]));
         assert_eq!(rules[0].max_age_seconds, Some(1200));
+    }
+
+    #[test]
+    fn cors_url_uses_path_style_bucket_and_query() {
+        let (client, _) = test_s3_client(None);
+
+        let url = client.cors_url("bucket-name").expect("build cors url");
+
+        assert_eq!(url.as_str(), "https://example.com/bucket-name?cors=");
+    }
+
+    #[test]
+    fn cors_url_rejects_endpoints_without_path_segments() {
+        let (client, _) = test_s3_client_with_endpoint("mailto:test@example.com", None);
+
+        match client.cors_url("bucket-name") {
+            Err(Error::Network(message)) => {
+                assert!(message.contains("does not support path-style bucket operations"));
+            }
+            other => panic!("expected path-style endpoint error, got {other:?}"),
+        }
     }
 
     #[test]
