@@ -69,6 +69,31 @@ fn run_rc(args: &[&str], config_dir: &std::path::Path) -> Output {
     cmd.output().expect("Failed to execute rc command")
 }
 
+/// Run rc command with piped stdin in the test environment
+fn run_rc_with_stdin(args: &[&str], config_dir: &std::path::Path, stdin: &str) -> Output {
+    let mut cmd = Command::new(rc_binary());
+    cmd.args(args);
+
+    for (key, value) in setup_test_env(config_dir) {
+        cmd.env(key, value);
+    }
+
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let mut child = cmd.spawn().expect("Failed to spawn rc command");
+    {
+        use std::io::Write;
+        let child_stdin = child.stdin.as_mut().expect("Failed to open stdin");
+        child_stdin
+            .write_all(stdin.as_bytes())
+            .expect("Failed to write to stdin");
+    }
+
+    child.wait_with_output().expect("Failed to wait for rc")
+}
+
 /// Wait for the S3 service to respond to list requests
 fn wait_for_s3_ready(config_dir: &std::path::Path) -> bool {
     for _ in 0..30 {
@@ -343,6 +368,88 @@ mod bucket_operations {
         );
 
         // Cleanup
+        cleanup_bucket(config_dir.path(), &bucket_name);
+    }
+
+    #[test]
+    fn test_bucket_cors_set_accepts_stdin_source() {
+        let (config_dir, bucket_name) = match setup_with_alias("corsstdin") {
+            Some(v) => v,
+            None => {
+                eprintln!("Skipping: S3 test config not available");
+                return;
+            }
+        };
+
+        let cors_config = r#"{
+            "rules": [
+                {
+                    "id": "stdin-rule",
+                    "allowedOrigins": ["https://app.example.com"],
+                    "allowedMethods": ["get", "put"],
+                    "allowedHeaders": ["Authorization"],
+                    "exposeHeaders": ["ETag"],
+                    "maxAgeSeconds": 600
+                }
+            ]
+        }"#;
+
+        let set_output = run_rc_with_stdin(
+            &[
+                "bucket",
+                "cors",
+                "set",
+                &format!("test/{}", bucket_name),
+                "-",
+                "--json",
+            ],
+            config_dir.path(),
+            cors_config,
+        );
+        assert!(
+            set_output.status.success(),
+            "Failed to set bucket CORS from stdin: {}",
+            String::from_utf8_lossy(&set_output.stderr)
+        );
+
+        let list_output = run_rc(
+            &[
+                "bucket",
+                "cors",
+                "list",
+                &format!("test/{}", bucket_name),
+                "--json",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            list_output.status.success(),
+            "Failed to list bucket CORS after stdin set: {}",
+            String::from_utf8_lossy(&list_output.stderr)
+        );
+
+        let stdout = String::from_utf8_lossy(&list_output.stdout);
+        let listed: serde_json::Value =
+            serde_json::from_str(&stdout).expect("Invalid JSON CORS list");
+        assert_eq!(listed["bucket"].as_str(), Some(bucket_name.as_str()));
+
+        let rules = listed["rules"]
+            .as_array()
+            .expect("CORS rules should be a JSON array");
+        assert_eq!(rules.len(), 1, "Expected one CORS rule from stdin input");
+        assert_eq!(rules[0]["id"].as_str(), Some("stdin-rule"));
+        assert_eq!(
+            rules[0]["allowed_methods"].as_array().map(|methods| methods
+                .iter()
+                .filter_map(|method| method.as_str())
+                .collect::<Vec<_>>()),
+            Some(vec!["GET", "PUT"])
+        );
+
+        let _ = run_rc(
+            &["bucket", "cors", "remove", &format!("test/{}", bucket_name)],
+            config_dir.path(),
+        );
         cleanup_bucket(config_dir.path(), &bucket_name);
     }
 }
