@@ -521,6 +521,27 @@ mod tests {
     }
 
     #[test]
+    fn test_error_descriptor_from_message_classifies_other_auth_failures() {
+        for message in [
+            "Unauthorized request for alias 'local'",
+            "Forbidden: bucket access denied",
+            "Authentication failed for alias 'local'",
+        ] {
+            let descriptor = ErrorDescriptor::from_message(message);
+            let json = descriptor.to_json_output();
+            let details = json.details.expect("details should be present");
+
+            assert_eq!(details.error_type, "auth_error", "message: {message}");
+            assert!(!details.retryable, "message: {message}");
+            assert_eq!(
+                details.suggestion.as_deref(),
+                Some(AUTH_SUGGESTION),
+                "message: {message}"
+            );
+        }
+    }
+
+    #[test]
     fn test_error_with_suggestion_overrides_default_hint() {
         let descriptor = ErrorDescriptor::from_code(
             ExitCode::UnsupportedFeature,
