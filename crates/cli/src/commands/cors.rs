@@ -680,6 +680,28 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_cors_configuration_xml_drops_blank_optional_headers() {
+        let config = parse_cors_configuration(
+            r#"
+<CORSConfiguration>
+  <CORSRule>
+    <AllowedOrigin>https://console.example.com</AllowedOrigin>
+    <AllowedMethod>get</AllowedMethod>
+    <AllowedHeader>   </AllowedHeader>
+    <ExposeHeader></ExposeHeader>
+  </CORSRule>
+</CORSConfiguration>
+"#,
+        )
+        .expect("parse xml config with blank optional headers");
+
+        assert_eq!(config.rules.len(), 1);
+        assert_eq!(config.rules[0].allowed_headers, None);
+        assert_eq!(config.rules[0].expose_headers, None);
+        assert_eq!(config.rules[0].allowed_methods, vec!["GET".to_string()]);
+    }
+
+    #[test]
     fn test_cors_input_source_prefers_positional_argument() {
         let args = SetCorsArgs {
             path: "local/my-bucket".to_string(),
