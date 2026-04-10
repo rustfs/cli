@@ -532,6 +532,7 @@ mod tests {
     fn test_parse_bucket_path_error() {
         assert!(parse_bucket_path("").is_err());
         assert!(parse_bucket_path("local").is_err());
+        assert!(parse_bucket_path("local/").is_err());
         assert!(parse_bucket_path("/bucket").is_err());
         assert!(parse_bucket_path("local///").is_err());
     }
@@ -589,6 +590,40 @@ mod tests {
         .expect_err("invalid method");
 
         assert!(error.contains("unsupported method"));
+    }
+
+    #[test]
+    fn test_parse_cors_configuration_rejects_missing_allowed_origin() {
+        let error = parse_cors_configuration(
+            r#"{
+                "rules": [
+                    {
+                        "allowedOrigins": [],
+                        "allowedMethods": ["GET"]
+                    }
+                ]
+            }"#,
+        )
+        .expect_err("missing allowed origin");
+
+        assert!(error.contains("at least one allowed origin"));
+    }
+
+    #[test]
+    fn test_parse_cors_configuration_rejects_missing_allowed_method() {
+        let error = parse_cors_configuration(
+            r#"{
+                "rules": [
+                    {
+                        "allowedOrigins": ["*"],
+                        "allowedMethods": []
+                    }
+                ]
+            }"#,
+        )
+        .expect_err("missing allowed method");
+
+        assert!(error.contains("at least one allowed method"));
     }
 
     #[test]
