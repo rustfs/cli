@@ -3105,6 +3105,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_bucket_cors_missing_configuration_returns_empty_rules() {
+        let response = http::Response::builder()
+            .status(404)
+            .header("x-amz-error-code", "NoSuchCORSConfiguration")
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error>
+  <Code>NoSuchCORSConfiguration</Code>
+  <Message>The CORS configuration does not exist</Message>
+</Error>"#,
+            ))
+            .expect("build missing cors response");
+        let (client, _) = test_s3_client(Some(response));
+
+        let rules = client
+            .get_bucket_cors("bucket")
+            .await
+            .expect("missing cors config should be treated as empty");
+
+        assert!(rules.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_bucket_cors_missing_configuration_is_successful() {
+        let response = http::Response::builder()
+            .status(404)
+            .header("x-amz-error-code", "NoSuchCORSConfiguration")
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error>
+  <Code>NoSuchCORSConfiguration</Code>
+  <Message>The CORS configuration does not exist</Message>
+</Error>"#,
+            ))
+            .expect("build missing cors response");
+        let (client, _) = test_s3_client(Some(response));
+
+        client
+            .delete_bucket_cors("bucket")
+            .await
+            .expect("missing cors config should be treated as successful delete");
+    }
+
+    #[tokio::test]
     async fn reqwest_connector_insecure_without_ca_bundle_succeeds() {
         // When insecure is true and no CA bundle is provided, the connector should be created.
         let connector = ReqwestConnector::new(true, None).await;
