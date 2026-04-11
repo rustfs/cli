@@ -2966,6 +2966,97 @@ mod option_behavior_operations {
     }
 
     #[test]
+    fn test_rm_purge_dry_run_does_not_delete_versioned_object() {
+        let (config_dir, bucket_name) = match setup_with_alias("rmpurgedryrun") {
+            Some(v) => v,
+            None => {
+                eprintln!("Skipping: S3 test config not available");
+                return;
+            }
+        };
+
+        let enable_output = run_rc(
+            &[
+                "version",
+                "enable",
+                &format!("test/{}", bucket_name),
+                "--json",
+            ],
+            config_dir.path(),
+        );
+        if !enable_output.status.success() {
+            eprintln!(
+                "Enable versioning not supported: {}",
+                String::from_utf8_lossy(&enable_output.stderr)
+            );
+            cleanup_bucket(config_dir.path(), &bucket_name);
+            return;
+        }
+
+        upload_text_object(
+            config_dir.path(),
+            &bucket_name,
+            "keep-version.txt",
+            "rm purge dry run source",
+        );
+
+        let dry_run_output = run_rc(
+            &[
+                "rm",
+                &format!("test/{}/keep-version.txt", bucket_name),
+                "--purge",
+                "--dry-run",
+                "--json",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            dry_run_output.status.success(),
+            "rm --purge --dry-run failed: {}",
+            String::from_utf8_lossy(&dry_run_output.stderr)
+        );
+
+        let versions_output = run_rc(
+            &[
+                "version",
+                "list",
+                &format!("test/{}/keep-version.txt", bucket_name),
+                "--json",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            versions_output.status.success(),
+            "Failed to list versions after rm --purge --dry-run: {}",
+            String::from_utf8_lossy(&versions_output.stderr)
+        );
+
+        let versions_stdout = String::from_utf8_lossy(&versions_output.stdout);
+        let versions: serde_json::Value =
+            serde_json::from_str(&versions_stdout).expect("Invalid JSON version list");
+        let versions = versions
+            .as_array()
+            .expect("Version list should be a JSON array");
+        assert_eq!(
+            versions.len(),
+            1,
+            "Object should keep its only version after rm --purge --dry-run"
+        );
+        assert_eq!(
+            versions[0]["key"].as_str(),
+            Some("keep-version.txt"),
+            "Version list should still include the uploaded object"
+        );
+        assert_eq!(
+            versions[0]["is_delete_marker"].as_bool(),
+            Some(false),
+            "rm --purge --dry-run must not create a delete marker"
+        );
+
+        cleanup_bucket(config_dir.path(), &bucket_name);
+    }
+
+    #[test]
     fn test_head_bytes_returns_prefix_bytes() {
         let (config_dir, bucket_name) = match setup_with_alias("headbytes") {
             Some(v) => v,
