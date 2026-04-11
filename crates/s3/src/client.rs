@@ -3004,6 +3004,19 @@ mod tests {
     }
 
     #[test]
+    fn sdk_cors_rule_to_core_drops_empty_optional_headers() {
+        let sdk_rule = aws_sdk_s3::types::CorsRule::builder()
+            .allowed_origins("https://app.example.com")
+            .allowed_methods("GET")
+            .build()
+            .expect("build cors rule");
+
+        let rule = sdk_cors_rule_to_core(&sdk_rule);
+        assert_eq!(rule.allowed_headers, None);
+        assert_eq!(rule.expose_headers, None);
+    }
+
+    #[test]
     fn core_cors_rule_to_sdk_normalizes_method_case() {
         let rule = CorsRule {
             id: Some("public-read".to_string()),
@@ -3020,6 +3033,22 @@ mod tests {
         assert_eq!(sdk_rule.allowed_methods(), ["GET", "POST"]);
         assert_eq!(sdk_rule.allowed_headers(), ["*"]);
         assert_eq!(sdk_rule.max_age_seconds(), Some(600));
+    }
+
+    #[test]
+    fn core_cors_rule_to_sdk_drops_empty_optional_headers() {
+        let rule = CorsRule {
+            id: None,
+            allowed_origins: vec!["https://app.example.com".to_string()],
+            allowed_methods: vec!["GET".to_string()],
+            allowed_headers: Some(Vec::new()),
+            expose_headers: Some(Vec::new()),
+            max_age_seconds: None,
+        };
+
+        let sdk_rule = core_cors_rule_to_sdk(&rule).expect("convert cors rule");
+        assert!(sdk_rule.allowed_headers().is_empty());
+        assert!(sdk_rule.expose_headers().is_empty());
     }
 
     #[test]
