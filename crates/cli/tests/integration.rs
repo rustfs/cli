@@ -2494,7 +2494,8 @@ mod version_operations {
 
         let purge_delete_output = run_rc(
             &[
-                "rm",
+                "object",
+                "remove",
                 &format!("test/{}/{}", bucket_name, purge_key),
                 "--purge",
                 "--json",
@@ -2503,7 +2504,7 @@ mod version_operations {
         );
         assert!(
             purge_delete_output.status.success(),
-            "Failed to purge versioned object: {}",
+            "Failed to purge versioned object through object remove: {}",
             String::from_utf8_lossy(&purge_delete_output.stderr)
         );
 
