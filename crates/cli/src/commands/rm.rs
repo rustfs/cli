@@ -369,6 +369,10 @@ fn parse_rm_path(path: &str) -> Result<(String, String, String), String> {
         String::new()
     };
 
+    if alias.is_empty() {
+        return Err("Alias name cannot be empty".to_string());
+    }
+
     if bucket.is_empty() {
         return Err("Bucket name cannot be empty".to_string());
     }
@@ -418,6 +422,11 @@ mod tests {
     #[test]
     fn test_parse_rm_path_empty() {
         assert!(parse_rm_path("").is_err());
+    }
+
+    #[test]
+    fn test_parse_rm_path_empty_alias() {
+        assert!(parse_rm_path("/mybucket/file.txt").is_err());
     }
 
     #[test]
