@@ -3196,6 +3196,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_objects_without_force_delete_omits_rustfs_header() {
+        let response = http::Response::builder()
+            .status(200)
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/" />"#,
+            ))
+            .expect("build delete objects response");
+        let (client, request_receiver) = test_s3_client(Some(response));
+
+        let _ = client
+            .delete_objects_with_options(
+                "bucket",
+                vec!["key.txt".to_string()],
+                DeleteRequestOptions::default(),
+            )
+            .await;
+
+        let request = request_receiver.expect_request();
+        assert!(request.headers().get("x-rustfs-force-delete").is_none());
+    }
+
+    #[tokio::test]
     async fn read_next_part_fills_buffer_until_eof() {
         use tokio::io::AsyncWriteExt;
 

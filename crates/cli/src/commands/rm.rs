@@ -436,4 +436,21 @@ mod tests {
         let options = delete_request_options(&args);
         assert!(options.force_delete);
     }
+
+    #[test]
+    fn test_delete_request_options_disable_force_delete_without_purge() {
+        let args = RmArgs {
+            paths: vec!["test/bucket/object.txt".to_string()],
+            recursive: false,
+            force: false,
+            dry_run: false,
+            incomplete: false,
+            versions: false,
+            bypass: false,
+            purge: false,
+        };
+
+        let options = delete_request_options(&args);
+        assert!(!options.force_delete);
+    }
 }
