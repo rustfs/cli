@@ -3173,6 +3173,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_object_wrapper_uses_default_options_without_rustfs_header() {
+        let (client, request_receiver) = test_s3_client(None);
+        let path = RemotePath::new("test", "bucket", "key.txt");
+
+        let _ = ObjectStore::delete_object(&client, &path).await;
+
+        let request = request_receiver.expect_request();
+        assert!(request.headers().get("x-rustfs-force-delete").is_none());
+    }
+
+    #[tokio::test]
     async fn delete_objects_with_force_delete_sets_rustfs_header() {
         let response = http::Response::builder()
             .status(200)
@@ -3193,6 +3204,23 @@ mod tests {
 
         let request = request_receiver.expect_request();
         assert_eq!(request.headers().get("x-rustfs-force-delete"), Some("true"));
+    }
+
+    #[tokio::test]
+    async fn delete_objects_wrapper_uses_default_options_without_rustfs_header() {
+        let response = http::Response::builder()
+            .status(200)
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/" />"#,
+            ))
+            .expect("build delete objects response");
+        let (client, request_receiver) = test_s3_client(Some(response));
+
+        let _ = ObjectStore::delete_objects(&client, "bucket", vec!["key.txt".to_string()]).await;
+
+        let request = request_receiver.expect_request();
+        assert!(request.headers().get("x-rustfs-force-delete").is_none());
     }
 
     #[tokio::test]
