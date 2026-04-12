@@ -455,6 +455,22 @@ mod tests {
     }
 
     #[test]
+    fn cli_accepts_bucket_list_alias() {
+        let cli =
+            Cli::try_parse_from(["rc", "bucket", "ls", "local/"]).expect("parse bucket ls alias");
+
+        match cli.command {
+            Commands::Bucket(args) => match args.command {
+                bucket::BucketCommands::List(arg) => {
+                    assert_eq!(arg.path, "local/");
+                }
+                other => panic!("expected bucket list alias, got {:?}", other),
+            },
+            other => panic!("expected bucket command, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn cli_accepts_top_level_cors_subcommand() {
         let cli = Cli::try_parse_from(["rc", "cors", "remove", "local/my-bucket"])
             .expect("parse top-level cors");
@@ -492,6 +508,22 @@ mod tests {
                 assert_eq!(arg.path, "local/my-bucket");
             }
             other => panic!("expected top-level event list command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_object_list_alias() {
+        let cli = Cli::try_parse_from(["rc", "object", "ls", "local/my-bucket/logs/"])
+            .expect("parse object ls alias");
+
+        match cli.command {
+            Commands::Object(args) => match args.command {
+                object::ObjectCommands::List(arg) => {
+                    assert_eq!(arg.path, "local/my-bucket/logs/");
+                }
+                other => panic!("expected object list alias, got {:?}", other),
+            },
+            other => panic!("expected object command, got {:?}", other),
         }
     }
 
