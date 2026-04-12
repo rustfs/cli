@@ -579,4 +579,43 @@ mod tests {
             other => panic!("expected bucket command, got {:?}", other),
         }
     }
+
+    #[test]
+    fn cli_accepts_bucket_remove_subcommand() {
+        let cli = Cli::try_parse_from(["rc", "bucket", "remove", "local/my-bucket"])
+            .expect("parse bucket remove");
+
+        match cli.command {
+            Commands::Bucket(args) => match args.command {
+                bucket::BucketCommands::Remove(arg) => {
+                    assert_eq!(arg.target, "local/my-bucket");
+                }
+                other => panic!("expected bucket remove command, got {:?}", other),
+            },
+            other => panic!("expected bucket command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_object_remove_subcommand() {
+        let cli = Cli::try_parse_from([
+            "rc",
+            "object",
+            "remove",
+            "local/my-bucket/report.csv",
+            "--dry-run",
+        ])
+        .expect("parse object remove");
+
+        match cli.command {
+            Commands::Object(args) => match args.command {
+                object::ObjectCommands::Remove(arg) => {
+                    assert_eq!(arg.paths, vec!["local/my-bucket/report.csv".to_string()]);
+                    assert!(arg.dry_run);
+                }
+                other => panic!("expected object remove command, got {:?}", other),
+            },
+            other => panic!("expected object command, got {:?}", other),
+        }
+    }
 }
