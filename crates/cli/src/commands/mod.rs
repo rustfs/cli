@@ -411,6 +411,34 @@ mod tests {
     }
 
     #[test]
+    fn explicit_human_overrides_structured_default() {
+        let options = GlobalOutputOptions {
+            format: Some(OutputFormat::Human),
+            json: false,
+            no_color: false,
+            no_progress: false,
+            quiet: false,
+        };
+
+        let resolved = options.resolve(OutputBehavior::StructuredDefault);
+        assert!(!resolved.json);
+    }
+
+    #[test]
+    fn explicit_auto_overrides_human_default() {
+        let options = GlobalOutputOptions {
+            format: Some(OutputFormat::Auto),
+            json: false,
+            no_color: false,
+            no_progress: false,
+            quiet: false,
+        };
+
+        let resolved = options.resolve(OutputBehavior::HumanDefault);
+        assert_eq!(resolved.json, !std::io::stdout().is_terminal());
+    }
+
+    #[test]
     fn cli_accepts_bucket_cors_subcommand() {
         let cli = Cli::try_parse_from(["rc", "bucket", "cors", "list", "local/my-bucket"])
             .expect("parse bucket cors");
