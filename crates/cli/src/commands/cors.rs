@@ -592,6 +592,38 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_cors_configuration_xml_rejects_missing_allowed_origin() {
+        let error = parse_cors_configuration(
+            r#"
+<CORSConfiguration>
+  <CORSRule>
+    <AllowedMethod>GET</AllowedMethod>
+  </CORSRule>
+</CORSConfiguration>
+"#,
+        )
+        .expect_err("missing xml allowed origin");
+
+        assert!(error.contains("at least one allowed origin"));
+    }
+
+    #[test]
+    fn test_parse_cors_configuration_xml_rejects_missing_allowed_method() {
+        let error = parse_cors_configuration(
+            r#"
+<CORSConfiguration>
+  <CORSRule>
+    <AllowedOrigin>https://console.example.com</AllowedOrigin>
+  </CORSRule>
+</CORSConfiguration>
+"#,
+        )
+        .expect_err("missing xml allowed method");
+
+        assert!(error.contains("at least one allowed method"));
+    }
+
+    #[test]
     fn test_parse_cors_configuration_rejects_empty_allowed_origin() {
         let error = parse_cors_configuration(
             r#"{
