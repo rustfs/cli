@@ -410,11 +410,11 @@ fn parse_event_list(values: &[String]) -> Vec<String> {
 
 fn normalize_event_name(value: &str) -> String {
     match value.to_ascii_lowercase().as_str() {
-        "put" => "s3:ObjectCreated:*".to_string(),
-        "get" => "s3:ObjectAccessed:*".to_string(),
-        "delete" => "s3:ObjectRemoved:*".to_string(),
-        "replica" => "s3:Replication:*".to_string(),
-        "ilm" => "s3:ObjectTransition:*".to_string(),
+        "put" | "s3:objectcreated:*" => "s3:ObjectCreated:*".to_string(),
+        "get" | "s3:objectaccessed:*" => "s3:ObjectAccessed:*".to_string(),
+        "delete" | "s3:objectremoved:*" => "s3:ObjectRemoved:*".to_string(),
+        "replica" | "s3:replication:*" => "s3:Replication:*".to_string(),
+        "ilm" | "s3:objecttransition:*" => "s3:ObjectTransition:*".to_string(),
         _ => value.to_string(),
     }
 }
@@ -574,6 +574,22 @@ mod tests {
             events,
             vec![
                 "s3:ObjectAccessed:*".to_string(),
+                "s3:ObjectCreated:*".to_string(),
+                "s3:ObjectRemoved:*".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_event_list_deduplicates_mixed_case_canonical_names() {
+        let events = parse_event_list(&[
+            "PUT,S3:objectcreated:*".to_string(),
+            "delete,S3:OBJECTREMOVED:*".to_string(),
+        ]);
+
+        assert_eq!(
+            events,
+            vec![
                 "s3:ObjectCreated:*".to_string(),
                 "s3:ObjectRemoved:*".to_string(),
             ]
