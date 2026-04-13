@@ -437,6 +437,15 @@ fn nested_subcommand_help_contract() {
             ],
         },
         HelpCase {
+            args: &["bucket", "event", "remove"],
+            usage: "Usage: rc bucket event remove [OPTIONS] <PATH> <ARN>",
+            expected_tokens: &[
+                "--force",
+                "Examples:",
+                "rc event remove local/my-bucket arn:aws:sns:us-east-1:123456789012:alerts",
+            ],
+        },
+        HelpCase {
             args: &["object", "copy"],
             usage: "Usage: rc object copy [OPTIONS] <SOURCE> <TARGET>",
             expected_tokens: &[
@@ -731,6 +740,15 @@ fn nested_subcommand_help_contract() {
                 "--force",
                 "Examples:",
                 "rc event add local/my-bucket arn:aws:sns:us-east-1:123456789012:alerts --event delete",
+            ],
+        },
+        HelpCase {
+            args: &["event", "remove"],
+            usage: "Usage: rc event remove [OPTIONS] <PATH> <ARN>",
+            expected_tokens: &[
+                "--force",
+                "Examples:",
+                "rc event remove local/my-bucket arn:aws:sns:us-east-1:123456789012:alerts",
             ],
         },
         HelpCase {

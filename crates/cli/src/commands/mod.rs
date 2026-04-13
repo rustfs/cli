@@ -472,4 +472,28 @@ mod tests {
             other => panic!("expected bucket command, got {:?}", other),
         }
     }
+
+    #[test]
+    fn cli_accepts_bucket_event_remove_subcommand() {
+        let cli = Cli::try_parse_from([
+            "rc",
+            "bucket",
+            "event",
+            "remove",
+            "local/my-bucket",
+            "arn:aws:sns:us-east-1:123456789012:alerts",
+        ])
+        .expect("parse bucket event remove");
+
+        match cli.command {
+            Commands::Bucket(args) => match args.command {
+                bucket::BucketCommands::Event(event::EventCommands::Remove(arg)) => {
+                    assert_eq!(arg.path, "local/my-bucket");
+                    assert_eq!(arg.arn, "arn:aws:sns:us-east-1:123456789012:alerts");
+                }
+                other => panic!("expected bucket event remove command, got {:?}", other),
+            },
+            other => panic!("expected bucket command, got {:?}", other),
+        }
+    }
 }
