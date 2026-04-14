@@ -512,6 +512,33 @@ mod tests {
     }
 
     #[test]
+    fn cli_accepts_top_level_event_add_subcommand() {
+        let cli = Cli::try_parse_from([
+            "rc",
+            "event",
+            "add",
+            "local/my-bucket",
+            "arn:aws:sqs:us-east-1:123456789012:jobs",
+            "--event",
+            "put,delete",
+            "--force",
+        ])
+        .expect("parse top-level event add");
+
+        match cli.command {
+            Commands::Event(event::EventArgs {
+                command: event::EventCommands::Add(arg),
+            }) => {
+                assert_eq!(arg.path, "local/my-bucket");
+                assert_eq!(arg.arn, "arn:aws:sqs:us-east-1:123456789012:jobs");
+                assert_eq!(arg.events, vec!["put,delete".to_string()]);
+                assert!(arg.force);
+            }
+            other => panic!("expected top-level event add command, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn cli_accepts_object_list_alias() {
         let cli = Cli::try_parse_from(["rc", "object", "ls", "local/my-bucket/logs/"])
             .expect("parse object ls alias");
@@ -524,6 +551,30 @@ mod tests {
                 other => panic!("expected object list alias, got {:?}", other),
             },
             other => panic!("expected object command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_top_level_event_remove_subcommand() {
+        let cli = Cli::try_parse_from([
+            "rc",
+            "event",
+            "remove",
+            "local/my-bucket",
+            "arn:aws:sns:us-east-1:123456789012:alerts",
+            "--force",
+        ])
+        .expect("parse top-level event remove");
+
+        match cli.command {
+            Commands::Event(event::EventArgs {
+                command: event::EventCommands::Remove(arg),
+            }) => {
+                assert_eq!(arg.path, "local/my-bucket");
+                assert_eq!(arg.arn, "arn:aws:sns:us-east-1:123456789012:alerts");
+                assert!(arg.force);
+            }
+            other => panic!("expected top-level event remove command, got {:?}", other),
         }
     }
 
