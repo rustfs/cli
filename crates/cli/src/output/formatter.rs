@@ -148,7 +148,10 @@ fn infer_error_metadata(message: &str) -> (&'static str, bool, Option<String>) {
         return ("conflict", false, Some(CONFLICT_SUGGESTION.to_string()));
     }
 
-    if normalized.contains("does not support") || normalized.contains("unsupported") {
+    if normalized.contains("does not support")
+        || normalized.contains("unsupported")
+        || normalized.contains("not yet supported")
+    {
         return (
             "unsupported_feature",
             false,
@@ -539,6 +542,30 @@ mod tests {
                 "message: {message}"
             );
         }
+    }
+
+    #[test]
+    fn test_error_descriptor_from_message_infers_conflict() {
+        let descriptor = ErrorDescriptor::from_message("Destination exists: report.json");
+        let json = descriptor.to_json_output();
+
+        let details = json.details.expect("details should be present");
+        assert_eq!(details.error_type, "conflict");
+        assert!(!details.retryable);
+        assert_eq!(details.suggestion.as_deref(), Some(CONFLICT_SUGGESTION));
+    }
+
+    #[test]
+    fn test_error_descriptor_from_message_infers_unsupported_feature() {
+        let descriptor = ErrorDescriptor::from_message(
+            "Cross-alias S3-to-S3 copy not yet supported. Use download + upload.",
+        );
+        let json = descriptor.to_json_output();
+
+        let details = json.details.expect("details should be present");
+        assert_eq!(details.error_type, "unsupported_feature");
+        assert!(!details.retryable);
+        assert_eq!(details.suggestion.as_deref(), Some(UNSUPPORTED_SUGGESTION));
     }
 
     #[test]
