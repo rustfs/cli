@@ -726,4 +726,54 @@ mod tests {
 
         assert!(cors_input_source(&args).is_err());
     }
+
+    #[tokio::test]
+    async fn test_execute_list_rejects_empty_normalized_bucket_path() {
+        let code = execute(
+            CorsArgs {
+                command: CorsCommands::List(BucketArg {
+                    path: "local///".to_string(),
+                    force: false,
+                }),
+            },
+            OutputConfig::default(),
+        )
+        .await;
+
+        assert_eq!(code, ExitCode::UsageError);
+    }
+
+    #[tokio::test]
+    async fn test_execute_set_rejects_empty_normalized_bucket_path_before_reading_source() {
+        let code = execute(
+            CorsArgs {
+                command: CorsCommands::Set(SetCorsArgs {
+                    path: "local///".to_string(),
+                    source: Some("missing-cors.json".to_string()),
+                    file: None,
+                    force: false,
+                }),
+            },
+            OutputConfig::default(),
+        )
+        .await;
+
+        assert_eq!(code, ExitCode::UsageError);
+    }
+
+    #[tokio::test]
+    async fn test_execute_remove_rejects_empty_normalized_bucket_path() {
+        let code = execute(
+            CorsArgs {
+                command: CorsCommands::Remove(BucketArg {
+                    path: "local///".to_string(),
+                    force: false,
+                }),
+            },
+            OutputConfig::default(),
+        )
+        .await;
+
+        assert_eq!(code, ExitCode::UsageError);
+    }
 }
