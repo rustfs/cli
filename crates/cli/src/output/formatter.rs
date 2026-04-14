@@ -569,6 +569,18 @@ mod tests {
     }
 
     #[test]
+    fn test_error_descriptor_from_message_infers_retryable_network_error() {
+        let descriptor =
+            ErrorDescriptor::from_message("Service temporarily unavailable while connecting");
+        let json = descriptor.to_json_output();
+
+        let details = json.details.expect("details should be present");
+        assert_eq!(details.error_type, "network_error");
+        assert!(details.retryable);
+        assert_eq!(details.suggestion.as_deref(), Some(NETWORK_SUGGESTION));
+    }
+
+    #[test]
     fn test_error_with_suggestion_overrides_default_hint() {
         let descriptor = ErrorDescriptor::from_code(
             ExitCode::UnsupportedFeature,
