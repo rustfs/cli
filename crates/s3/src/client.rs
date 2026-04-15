@@ -789,8 +789,23 @@ impl S3Client {
         }
 
         request.send().await.map_err(|e| {
-            let err_str = e.to_string();
-            if err_str.contains("NotFound") || err_str.contains("NoSuchKey") {
+            let err_str = Self::format_sdk_error(&e);
+            let is_missing_key = if let aws_sdk_s3::error::SdkError::ServiceError(service_err) = &e
+            {
+                let code = service_err.err().code().or_else(|| {
+                    service_err
+                        .raw()
+                        .headers()
+                        .get("x-amz-error-code")
+                        .and_then(|value| std::str::from_utf8(value.as_bytes()).ok())
+                });
+                matches!(code, Some("NoSuchKey") | Some("NotFound"))
+                    || service_err.raw().status().as_u16() == 404
+            } else {
+                err_str.contains("NotFound") || err_str.contains("NoSuchKey")
+            };
+
+            if is_missing_key {
                 Error::NotFound(path.to_string())
             } else {
                 Error::Network(err_str)
@@ -3346,6 +3361,58 @@ mod tests {
 
         let request = request_receiver.expect_request();
         assert!(request.headers().get("x-rustfs-force-delete").is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_object_with_options_maps_missing_keys_to_not_found() {
+        let response = http::Response::builder()
+            .status(404)
+            .header("x-amz-error-code", "NoSuchKey")
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error>
+  <Code>NoSuchKey</Code>
+  <Message>The specified key does not exist.</Message>
+</Error>"#,
+            ))
+            .expect("build delete object response");
+        let (client, _request_receiver) = test_s3_client(Some(response));
+        let path = RemotePath::new("test", "bucket", "missing.txt");
+
+        let result = client
+            .delete_object_with_options(&path, DeleteRequestOptions::default())
+            .await;
+
+        match result {
+            Err(Error::NotFound(message)) => assert_eq!(message, path.to_string()),
+            other => panic!("Expected NotFound for missing key, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_object_with_options_maps_other_failures_to_network() {
+        let response = http::Response::builder()
+            .status(500)
+            .header("x-amz-error-code", "InternalError")
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error>
+  <Code>InternalError</Code>
+  <Message>Something went wrong.</Message>
+</Error>"#,
+            ))
+            .expect("build delete object response");
+        let (client, _request_receiver) = test_s3_client(Some(response));
+        let path = RemotePath::new("test", "bucket", "key.txt");
+
+        let result = client
+            .delete_object_with_options(&path, DeleteRequestOptions::default())
+            .await;
+
+        match result {
+            Err(Error::Network(message)) => assert!(message.contains("InternalError")),
+            other => panic!("Expected Network for delete failure, got: {other:?}"),
+        }
     }
 
     #[tokio::test]
