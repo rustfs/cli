@@ -472,4 +472,20 @@ mod tests {
             other => panic!("expected bucket command, got {:?}", other),
         }
     }
+
+    #[test]
+    fn cli_accepts_object_stat_subcommand() {
+        let cli = Cli::try_parse_from(["rc", "object", "stat", "local/my-bucket/report.json"])
+            .expect("parse object stat");
+
+        match cli.command {
+            Commands::Object(args) => match args.command {
+                object::ObjectCommands::Stat(arg) => {
+                    assert_eq!(arg.path, "local/my-bucket/report.json");
+                }
+                other => panic!("expected object stat command, got {:?}", other),
+            },
+            other => panic!("expected object command, got {:?}", other),
+        }
+    }
 }

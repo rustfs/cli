@@ -457,6 +457,16 @@ fn nested_subcommand_help_contract() {
             expected_tokens: &["--enc-key", "--rewind", "--version-id"],
         },
         HelpCase {
+            args: &["object", "stat"],
+            usage: "Usage: rc object stat [OPTIONS] <PATH>",
+            expected_tokens: &["--version-id", "--rewind"],
+        },
+        HelpCase {
+            args: &["object", "share"],
+            usage: "Usage: rc object share [OPTIONS] <PATH>",
+            expected_tokens: &["--expire", "--upload", "--content-type"],
+        },
+        HelpCase {
             args: &["admin", "user", "info"],
             usage: "Usage: rc admin user info [OPTIONS] <ALIAS> <ACCESS_KEY>",
             expected_tokens: &[],
