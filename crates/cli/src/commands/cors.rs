@@ -533,6 +533,8 @@ mod tests {
         assert!(parse_bucket_path("").is_err());
         assert!(parse_bucket_path("local").is_err());
         assert!(parse_bucket_path("/bucket").is_err());
+        assert!(parse_bucket_path("local/").is_err());
+        assert!(parse_bucket_path("local//").is_err());
         assert!(parse_bucket_path("local///").is_err());
     }
 
