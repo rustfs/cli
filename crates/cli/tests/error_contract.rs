@@ -1,0 +1,75 @@
+//! CLI error output contract tests.
+//!
+//! These tests cover local validation paths that do not require a running S3
+//! backend but still need stable JSON error metadata.
+
+use std::path::PathBuf;
+use std::process::{Command, Output};
+
+fn rc_binary() -> PathBuf {
+    if let Ok(path) = std::env::var("CARGO_BIN_EXE_rc") {
+        return PathBuf::from(path);
+    }
+
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("cli crate has parent directory")
+        .parent()
+        .expect("workspace root exists")
+        .to_path_buf();
+
+    let debug_binary = workspace_root.join("target/debug/rc");
+    if debug_binary.exists() {
+        return debug_binary;
+    }
+
+    workspace_root.join("target/release/rc")
+}
+
+fn run_rc(args: &[&str]) -> Output {
+    Command::new(rc_binary())
+        .args(args)
+        .output()
+        .expect("failed to execute rc")
+}
+
+#[test]
+fn cp_local_to_local_json_error_reports_usage_metadata() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let source = temp_dir.path().join("source.txt");
+    let target = temp_dir.path().join("target.txt");
+    std::fs::write(&source, b"source").expect("write source file");
+    std::fs::write(&target, b"target").expect("write target file");
+
+    let output = run_rc(&[
+        "cp",
+        source.to_str().expect("source path is valid utf-8"),
+        target.to_str().expect("target path is valid utf-8"),
+        "--json",
+    ]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        output.stdout.is_empty(),
+        "usage JSON errors should be emitted on stderr"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let json: serde_json::Value = serde_json::from_str(&stderr).expect("stderr is valid JSON");
+
+    assert_eq!(
+        json["error"],
+        "Cannot copy between two local paths. Use system cp command."
+    );
+    assert_eq!(json["code"], 2);
+    assert_eq!(json["details"]["type"], "usage_error");
+    assert_eq!(
+        json["details"]["message"],
+        "Cannot copy between two local paths. Use system cp command."
+    );
+    assert_eq!(json["details"]["retryable"], false);
+    assert_eq!(
+        json["details"]["suggestion"],
+        "Use your local shell cp command when both paths are on the filesystem."
+    );
+}
