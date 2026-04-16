@@ -440,6 +440,19 @@ mod tests {
     }
 
     #[test]
+    fn cli_accepts_top_level_cors_get_alias() {
+        let cli = Cli::try_parse_from(["rc", "cors", "get", "local/my-bucket"])
+            .expect("parse top-level cors get");
+
+        match cli.command {
+            Commands::Cors(cors::CorsCommands::List(arg)) => {
+                assert_eq!(arg.path, "local/my-bucket");
+            }
+            other => panic!("expected top-level cors get alias, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn cli_accepts_bucket_cors_get_alias() {
         let cli = Cli::try_parse_from(["rc", "bucket", "cors", "get", "local/my-bucket"])
             .expect("parse bucket cors get");
@@ -450,6 +463,24 @@ mod tests {
                     assert_eq!(arg.path, "local/my-bucket");
                 }
                 other => panic!("expected bucket cors get alias, got {:?}", other),
+            },
+            other => panic!("expected bucket command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_bucket_cors_list_force_flag() {
+        let cli =
+            Cli::try_parse_from(["rc", "bucket", "cors", "list", "local/my-bucket", "--force"])
+                .expect("parse bucket cors list with force");
+
+        match cli.command {
+            Commands::Bucket(args) => match args.command {
+                bucket::BucketCommands::Cors(cors::CorsCommands::List(arg)) => {
+                    assert_eq!(arg.path, "local/my-bucket");
+                    assert!(arg.force);
+                }
+                other => panic!("expected bucket cors list command, got {:?}", other),
             },
             other => panic!("expected bucket command, got {:?}", other),
         }
