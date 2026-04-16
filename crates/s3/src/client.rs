@@ -3022,6 +3022,48 @@ mod tests {
         assert_eq!(sdk_rule.max_age_seconds(), Some(600));
     }
 
+    #[tokio::test]
+    async fn set_bucket_cors_sends_rule_fields() {
+        let response = http::Response::builder()
+            .status(200)
+            .body(SdkBody::from(""))
+            .expect("build put bucket cors response");
+        let (client, request_receiver) = test_s3_client(Some(response));
+
+        client
+            .set_bucket_cors(
+                "bucket",
+                vec![CorsRule {
+                    id: Some("web-app".to_string()),
+                    allowed_origins: vec!["https://app.example.com".to_string()],
+                    allowed_methods: vec!["GET".to_string(), "POST".to_string()],
+                    allowed_headers: Some(vec!["Authorization".to_string()]),
+                    expose_headers: Some(vec!["ETag".to_string()]),
+                    max_age_seconds: Some(600),
+                }],
+            )
+            .await
+            .expect("set bucket cors");
+
+        let request = request_receiver.expect_request();
+        assert_eq!(request.method(), http::Method::PUT);
+        assert!(
+            request.uri().to_string().contains("?cors"),
+            "expected bucket CORS subresource in URI: {}",
+            request.uri()
+        );
+
+        let body = request.body().bytes().expect("request body bytes");
+        let body = std::str::from_utf8(body).expect("request body is utf8");
+        assert!(body.contains("<ID>web-app</ID>"));
+        assert!(body.contains("<AllowedOrigin>https://app.example.com</AllowedOrigin>"));
+        assert!(body.contains("<AllowedMethod>GET</AllowedMethod>"));
+        assert!(body.contains("<AllowedMethod>POST</AllowedMethod>"));
+        assert!(body.contains("<AllowedHeader>Authorization</AllowedHeader>"));
+        assert!(body.contains("<ExposeHeader>ETag</ExposeHeader>"));
+        assert!(body.contains("<MaxAgeSeconds>600</MaxAgeSeconds>"));
+    }
+
     #[test]
     fn parse_cors_configuration_xml_round_trips_rule_fields() {
         let body = r#"
