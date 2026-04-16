@@ -3425,6 +3425,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_objects_with_partial_errors_returns_deleted_keys() {
+        let response = http::Response::builder()
+            .status(200)
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Deleted>
+    <Key>kept.txt</Key>
+  </Deleted>
+  <Error>
+    <Key>failed.txt</Key>
+    <Code>AccessDenied</Code>
+    <Message>Access Denied</Message>
+  </Error>
+</DeleteResult>"#,
+            ))
+            .expect("build partial delete response");
+        let (client, request_receiver) = test_s3_client(Some(response));
+
+        let deleted = client
+            .delete_objects_with_options(
+                "bucket",
+                vec!["kept.txt".to_string(), "failed.txt".to_string()],
+                DeleteRequestOptions::default(),
+            )
+            .await
+            .expect("partial delete should still return deleted keys");
+
+        let request = request_receiver.expect_request();
+        assert_eq!(request.uri(), "https://example.com/bucket/?delete");
+        assert_eq!(deleted, vec!["kept.txt".to_string()]);
+    }
+
+    #[tokio::test]
     async fn read_next_part_fills_buffer_until_eof() {
         use tokio::io::AsyncWriteExt;
 
