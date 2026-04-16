@@ -799,15 +799,16 @@ fn parse_bucket_path(path: &str) -> Result<(String, String), String> {
         return Err("Path cannot be empty".to_string());
     }
 
-    let parts: Vec<&str> = path.splitn(2, '/').collect();
+    let parts: Vec<&str> = path.split('/').collect();
     if parts.len() < 2 || parts[0].is_empty() || parts[1].is_empty() {
         return Err("Bucket path must be in format alias/bucket".to_string());
     }
 
-    Ok((
-        parts[0].to_string(),
-        parts[1].trim_end_matches('/').to_string(),
-    ))
+    if parts.iter().skip(2).any(|part| !part.is_empty()) {
+        return Err("Bucket path must not include an object key".to_string());
+    }
+
+    Ok((parts[0].to_string(), parts[1].to_string()))
 }
 
 fn generate_rule_id() -> String {
@@ -866,6 +867,8 @@ mod tests {
         assert!(parse_bucket_path("").is_err());
         assert!(parse_bucket_path("local").is_err());
         assert!(parse_bucket_path("/bucket").is_err());
+        assert!(parse_bucket_path("local/my-bucket/key.txt").is_err());
+        assert!(parse_bucket_path("local/my-bucket/path/to/key.txt").is_err());
     }
 
     #[test]
