@@ -96,6 +96,20 @@ fn assert_help_case(case: &HelpCase) {
 }
 
 #[test]
+fn binary_version_matches_package_version() {
+    let output = run_rc(&["--version"]);
+
+    assert!(
+        output.status.success(),
+        "version output should succeed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.trim(), format!("rc {}", env!("CARGO_PKG_VERSION")));
+}
+
+#[test]
 fn top_level_command_help_contract() {
     let cases = [
         HelpCase {
