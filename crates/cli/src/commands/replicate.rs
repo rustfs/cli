@@ -994,10 +994,14 @@ fn parse_bucket_path(path: &str) -> Result<(String, String), String> {
         return Err("Path cannot be empty".to_string());
     }
 
-    let parts: Vec<&str> = path.splitn(2, '/').collect();
+    let parts: Vec<&str> = path.splitn(3, '/').collect();
 
     if parts.len() < 2 || parts[0].is_empty() {
         return Err("Alias name is required (ALIAS/BUCKET)".to_string());
+    }
+
+    if parts.get(2).is_some_and(|key| !key.is_empty()) {
+        return Err("Replication path must target a bucket, not an object path".to_string());
     }
 
     let bucket = parts[1].trim_end_matches('/');
@@ -1279,6 +1283,7 @@ mod tests {
         assert!(parse_bucket_path("local").is_err());
         assert!(parse_bucket_path("/bucket").is_err());
         assert!(parse_bucket_path("local/").is_err());
+        assert!(parse_bucket_path("local/my-bucket/object.txt").is_err());
     }
 
     #[test]
