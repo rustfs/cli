@@ -102,6 +102,20 @@ impl From<&HealStatus> for HealStatusOutput {
     }
 }
 
+fn has_heal_status_details(status: &HealStatus) -> bool {
+    status.healing
+        || !status.heal_id.is_empty()
+        || !status.bucket.is_empty()
+        || !status.object.is_empty()
+        || status.items_scanned > 0
+        || status.items_healed > 0
+        || status.items_failed > 0
+        || status.bytes_scanned > 0
+        || status.bytes_healed > 0
+        || status.started.is_some()
+        || status.last_update.is_some()
+}
+
 /// JSON output for heal operations
 #[derive(Serialize)]
 struct HealOperationOutput {
@@ -216,11 +230,14 @@ async fn execute_start(args: StartArgs, formatter: &Formatter) -> ExitCode {
 
     match client.heal_start(request).await {
         Ok(status) => {
+            let status_output =
+                has_heal_status_details(&status).then(|| HealStatusOutput::from(&status));
+
             if formatter.is_json() {
                 let output = HealOperationOutput {
                     success: true,
                     message: "Heal operation started successfully".to_string(),
-                    status: Some(HealStatusOutput::from(&status)),
+                    status: status_output,
                 };
                 formatter.json(&output);
             } else {
@@ -229,8 +246,10 @@ async fn execute_start(args: StartArgs, formatter: &Formatter) -> ExitCode {
                 } else {
                     formatter.success("Heal operation started successfully.");
                 }
-                formatter.println("");
-                print_heal_status(&status, formatter);
+                if has_heal_status_details(&status) {
+                    formatter.println("");
+                    print_heal_status(&status, formatter);
+                }
             }
             ExitCode::Success
         }
@@ -354,5 +373,20 @@ mod tests {
         assert_eq!(output.bucket, "test-bucket");
         assert_eq!(output.items_scanned, 1000);
         assert_eq!(output.items_healed, 50);
+    }
+
+    #[test]
+    fn test_has_heal_status_details() {
+        assert!(!has_heal_status_details(&HealStatus::default()));
+
+        assert!(has_heal_status_details(&HealStatus {
+            healing: true,
+            ..Default::default()
+        }));
+
+        assert!(has_heal_status_details(&HealStatus {
+            started: Some("2024-01-01T10:00:00Z".to_string()),
+            ..Default::default()
+        }));
     }
 }

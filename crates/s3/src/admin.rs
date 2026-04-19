@@ -11,7 +11,7 @@ use aws_sigv4::http_request::{
 use aws_sigv4::sign::v4;
 use rc_core::admin::{
     AdminApi, BucketQuota, ClusterInfo, CreateServiceAccountRequest, Group, GroupStatus,
-    HealStartRequest, HealStatus, Policy, PolicyEntity, PolicyInfo, ServiceAccount,
+    HealScanMode, HealStartRequest, HealStatus, Policy, PolicyEntity, PolicyInfo, ServiceAccount,
     ServiceAccountCreateResponse, UpdateGroupMembersRequest, User, UserStatus,
 };
 use rc_core::{Alias, Error, Result};
@@ -296,7 +296,7 @@ impl AdminClient {
             StatusCode::NOT_FOUND => Error::NotFound(body.to_string()),
             StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED => Error::Auth(body.to_string()),
             StatusCode::CONFLICT => Error::Conflict(body.to_string()),
-            StatusCode::BAD_REQUEST => Error::InvalidPath(body.to_string()),
+            StatusCode::BAD_REQUEST => Error::General(format!("Bad request: {body}")),
             _ => Error::Network(format!("HTTP {}: {}", status.as_u16(), body)),
         }
     }
@@ -361,6 +361,87 @@ struct ServiceAccountInfo {
     implied_policy: Option<bool>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BackgroundHealStatusResponse {
+    #[serde(default)]
+    bitrot_start_time: Option<String>,
+}
+
+impl From<BackgroundHealStatusResponse> for HealStatus {
+    fn from(response: BackgroundHealStatusResponse) -> Self {
+        Self {
+            healing: response.bitrot_start_time.is_some(),
+            started: response.bitrot_start_time,
+            ..Default::default()
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct RustfsHealOptions {
+    recursive: bool,
+    #[serde(rename = "dryRun")]
+    dry_run: bool,
+    remove: bool,
+    recreate: bool,
+    #[serde(rename = "scanMode")]
+    scan_mode: u8,
+    #[serde(rename = "updateParity")]
+    update_parity: bool,
+    #[serde(rename = "nolock")]
+    no_lock: bool,
+}
+
+impl From<&HealStartRequest> for RustfsHealOptions {
+    fn from(request: &HealStartRequest) -> Self {
+        Self {
+            recursive: false,
+            dry_run: request.dry_run,
+            remove: request.remove,
+            recreate: request.recreate,
+            scan_mode: rustfs_heal_scan_mode(request.scan_mode),
+            update_parity: false,
+            no_lock: false,
+        }
+    }
+}
+
+fn rustfs_heal_scan_mode(scan_mode: HealScanMode) -> u8 {
+    match scan_mode {
+        HealScanMode::Normal => 1,
+        HealScanMode::Deep => 2,
+    }
+}
+
+fn rustfs_heal_path(request: &HealStartRequest) -> Result<String> {
+    let bucket = request
+        .bucket
+        .as_deref()
+        .filter(|bucket| !bucket.is_empty());
+    let prefix = request
+        .prefix
+        .as_deref()
+        .filter(|prefix| !prefix.is_empty());
+
+    match (bucket, prefix) {
+        (None, None) => Ok("/heal/".to_string()),
+        (Some(bucket), None) => Ok(format!("/heal/{}", urlencoding::encode(bucket))),
+        (Some(bucket), Some(prefix)) => Ok(format!(
+            "/heal/{}/{}",
+            urlencoding::encode(bucket),
+            urlencoding::encode(prefix)
+        )),
+        (None, Some(_)) => Err(Error::InvalidPath(
+            "heal prefix requires a bucket target".to_string(),
+        )),
+    }
+}
+
+fn rustfs_heal_body(request: &HealStartRequest) -> Result<Vec<u8>> {
+    serde_json::to_vec(&RustfsHealOptions::from(request)).map_err(Error::Json)
+}
+
 /// Request body for setting bucket quota
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -378,18 +459,29 @@ impl AdminApi for AdminClient {
     }
 
     async fn heal_status(&self) -> Result<HealStatus> {
-        self.request(Method::GET, "/heal/status", None, None).await
+        let response: BackgroundHealStatusResponse = self
+            .request(Method::POST, "/background-heal/status", None, None)
+            .await?;
+        Ok(response.into())
     }
 
     async fn heal_start(&self, request: HealStartRequest) -> Result<HealStatus> {
-        let body = serde_json::to_vec(&request).map_err(Error::Json)?;
-        self.request(Method::POST, "/heal/start", None, Some(&body))
-            .await
+        let path = rustfs_heal_path(&request)?;
+        let body = rustfs_heal_body(&request)?;
+        self.request_no_response(Method::POST, &path, None, Some(&body))
+            .await?;
+        Ok(HealStatus::default())
     }
 
     async fn heal_stop(&self) -> Result<()> {
-        self.request_no_response(Method::POST, "/heal/stop", None, None)
-            .await
+        let body = rustfs_heal_body(&HealStartRequest::default())?;
+        self.request_no_response(
+            Method::POST,
+            "/heal/",
+            Some(&[("forceStop", "true")]),
+            Some(&body),
+        )
+        .await
     }
 
     // ==================== User Operations ====================
@@ -844,6 +936,93 @@ mod tests {
             hash,
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
+    }
+
+    #[test]
+    fn test_rustfs_heal_path_matches_admin_routes() {
+        assert_eq!(
+            rustfs_heal_path(&HealStartRequest::default()).expect("root path"),
+            "/heal/"
+        );
+
+        let bucket_request = HealStartRequest {
+            bucket: Some("photos".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            rustfs_heal_path(&bucket_request).expect("bucket path"),
+            "/heal/photos"
+        );
+
+        let prefix_request = HealStartRequest {
+            bucket: Some("photos".to_string()),
+            prefix: Some("2026/raw".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            rustfs_heal_path(&prefix_request).expect("prefix path"),
+            "/heal/photos/2026%2Fraw"
+        );
+
+        let invalid_request = HealStartRequest {
+            prefix: Some("2026/raw".to_string()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            rustfs_heal_path(&invalid_request),
+            Err(Error::InvalidPath(_))
+        ));
+    }
+
+    #[test]
+    fn test_rustfs_heal_body_matches_server_heal_options() {
+        let request = HealStartRequest {
+            scan_mode: HealScanMode::Deep,
+            remove: true,
+            recreate: true,
+            dry_run: true,
+            ..Default::default()
+        };
+
+        let body = rustfs_heal_body(&request).expect("heal options should serialize");
+        let value: serde_json::Value =
+            serde_json::from_slice(&body).expect("heal options body should be JSON");
+
+        assert_eq!(value["recursive"], false);
+        assert_eq!(value["dryRun"], true);
+        assert_eq!(value["remove"], true);
+        assert_eq!(value["recreate"], true);
+        assert_eq!(value["scanMode"], 2);
+        assert_eq!(value["updateParity"], false);
+        assert_eq!(value["nolock"], false);
+        assert!(value.get("bucket").is_none());
+        assert!(value.get("prefix").is_none());
+    }
+
+    #[test]
+    fn test_background_heal_status_response_maps_to_heal_status() {
+        let status = HealStatus::from(BackgroundHealStatusResponse {
+            bitrot_start_time: Some("2026-04-19T10:00:00Z".to_string()),
+        });
+
+        assert!(status.healing);
+        assert_eq!(status.started.as_deref(), Some("2026-04-19T10:00:00Z"));
+
+        let idle = HealStatus::from(BackgroundHealStatusResponse {
+            bitrot_start_time: None,
+        });
+        assert!(!idle.healing);
+        assert!(idle.started.is_none());
+    }
+
+    #[test]
+    fn test_bad_request_maps_to_general_admin_error() {
+        let alias = Alias::new("test", "http://localhost:9000", "access", "secret");
+        let client = AdminClient::new(&alias).expect("admin client should build");
+
+        let error = client.map_error(StatusCode::BAD_REQUEST, "err request body parse");
+        assert!(matches!(error, Error::General(_)));
+        assert_eq!(error.to_string(), "Bad request: err request body parse");
     }
 
     #[test]
