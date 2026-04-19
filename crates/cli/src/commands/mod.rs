@@ -472,4 +472,55 @@ mod tests {
             other => panic!("expected bucket command, got {:?}", other),
         }
     }
+
+    #[test]
+    fn cli_accepts_bucket_lifecycle_subcommand() {
+        let cli = Cli::try_parse_from([
+            "rc",
+            "bucket",
+            "lifecycle",
+            "rule",
+            "list",
+            "local/my-bucket",
+        ])
+        .expect("parse bucket lifecycle rule list");
+
+        match cli.command {
+            Commands::Bucket(args) => match args.command {
+                bucket::BucketCommands::Lifecycle(ilm::IlmArgs {
+                    command: ilm::IlmCommands::Rule(ilm::rule::RuleCommands::List(arg)),
+                }) => {
+                    assert_eq!(arg.path, "local/my-bucket");
+                    assert!(!arg.force);
+                }
+                other => panic!(
+                    "expected bucket lifecycle rule list command, got {:?}",
+                    other
+                ),
+            },
+            other => panic!("expected bucket command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_bucket_replication_subcommand() {
+        let cli = Cli::try_parse_from(["rc", "bucket", "replication", "status", "local/my-bucket"])
+            .expect("parse bucket replication status");
+
+        match cli.command {
+            Commands::Bucket(args) => match args.command {
+                bucket::BucketCommands::Replication(replicate::ReplicateArgs {
+                    command: replicate::ReplicateCommands::Status(arg),
+                }) => {
+                    assert_eq!(arg.path, "local/my-bucket");
+                    assert!(!arg.force);
+                }
+                other => panic!(
+                    "expected bucket replication status command, got {:?}",
+                    other
+                ),
+            },
+            other => panic!("expected bucket command, got {:?}", other),
+        }
+    }
 }
