@@ -473,9 +473,23 @@ fn nested_subcommand_help_contract() {
             ],
         },
         HelpCase {
+            args: &["bucket", "event", "remove"],
+            usage: "Usage: rc bucket event remove [OPTIONS] <PATH> <ARN>",
+            expected_tokens: &[
+                "--force",
+                "Examples:",
+                "rc event remove local/my-bucket arn:aws:sns:us-east-1:123456789012:alerts",
+            ],
+        },
+        HelpCase {
             args: &["bucket", "cors"],
             usage: "Usage: rc bucket cors [OPTIONS] <COMMAND>",
             expected_tokens: &["list", "set", "remove"],
+        },
+        HelpCase {
+            args: &["bucket", "cors", "set"],
+            usage: "Usage: rc bucket cors set [OPTIONS] <PATH> [SOURCE]",
+            expected_tokens: &["--file", "--force", "read from stdin"],
         },
         HelpCase {
             args: &["object", "copy"],
@@ -496,6 +510,16 @@ fn nested_subcommand_help_contract() {
             args: &["object", "show"],
             usage: "Usage: rc object show [OPTIONS] <PATH>",
             expected_tokens: &["--enc-key", "--rewind", "--version-id"],
+        },
+        HelpCase {
+            args: &["object", "stat"],
+            usage: "Usage: rc object stat [OPTIONS] <PATH>",
+            expected_tokens: &["--version-id", "--rewind"],
+        },
+        HelpCase {
+            args: &["object", "share"],
+            usage: "Usage: rc object share [OPTIONS] <PATH>",
+            expected_tokens: &["--expire", "--upload", "--content-type"],
         },
         HelpCase {
             args: &["admin", "user", "info"],
@@ -772,6 +796,15 @@ fn nested_subcommand_help_contract() {
                 "--force",
                 "Examples:",
                 "rc event add local/my-bucket arn:aws:sns:us-east-1:123456789012:alerts --event delete",
+            ],
+        },
+        HelpCase {
+            args: &["event", "remove"],
+            usage: "Usage: rc event remove [OPTIONS] <PATH> <ARN>",
+            expected_tokens: &[
+                "--force",
+                "Examples:",
+                "rc event remove local/my-bucket arn:aws:sns:us-east-1:123456789012:alerts",
             ],
         },
         HelpCase {

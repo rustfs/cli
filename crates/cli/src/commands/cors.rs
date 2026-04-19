@@ -534,6 +534,7 @@ mod tests {
         assert!(parse_bucket_path("local").is_err());
         assert!(parse_bucket_path("local/").is_err());
         assert!(parse_bucket_path("/bucket").is_err());
+        assert!(parse_bucket_path("local//").is_err());
         assert!(parse_bucket_path("local//bucket").is_err());
         assert!(parse_bucket_path("local/my-bucket/nested").is_err());
         assert!(parse_bucket_path("local///").is_err());
@@ -593,6 +594,40 @@ mod tests {
         .expect_err("invalid method");
 
         assert!(error.contains("unsupported method"));
+    }
+
+    #[test]
+    fn test_parse_cors_configuration_rejects_missing_allowed_origin() {
+        let error = parse_cors_configuration(
+            r#"{
+                "rules": [
+                    {
+                        "allowedOrigins": [],
+                        "allowedMethods": ["GET"]
+                    }
+                ]
+            }"#,
+        )
+        .expect_err("missing allowed origin");
+
+        assert!(error.contains("at least one allowed origin"));
+    }
+
+    #[test]
+    fn test_parse_cors_configuration_rejects_missing_allowed_method() {
+        let error = parse_cors_configuration(
+            r#"{
+                "rules": [
+                    {
+                        "allowedOrigins": ["*"],
+                        "allowedMethods": []
+                    }
+                ]
+            }"#,
+        )
+        .expect_err("missing allowed method");
+
+        assert!(error.contains("at least one allowed method"));
     }
 
     #[test]
@@ -716,6 +751,28 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_cors_configuration_xml_drops_blank_optional_headers() {
+        let config = parse_cors_configuration(
+            r#"
+<CORSConfiguration>
+  <CORSRule>
+    <AllowedOrigin>https://console.example.com</AllowedOrigin>
+    <AllowedMethod>get</AllowedMethod>
+    <AllowedHeader>   </AllowedHeader>
+    <ExposeHeader></ExposeHeader>
+  </CORSRule>
+</CORSConfiguration>
+"#,
+        )
+        .expect("parse xml config with blank optional headers");
+
+        assert_eq!(config.rules.len(), 1);
+        assert_eq!(config.rules[0].allowed_headers, None);
+        assert_eq!(config.rules[0].expose_headers, None);
+        assert_eq!(config.rules[0].allowed_methods, vec!["GET".to_string()]);
+    }
+
+    #[test]
     fn test_cors_input_source_prefers_positional_argument() {
         let args = SetCorsArgs {
             path: "local/my-bucket".to_string(),
@@ -761,6 +818,56 @@ mod tests {
         };
 
         assert!(cors_input_source(&args).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_execute_list_rejects_empty_normalized_bucket_path() {
+        let code = execute(
+            CorsArgs {
+                command: CorsCommands::List(BucketArg {
+                    path: "local///".to_string(),
+                    force: false,
+                }),
+            },
+            OutputConfig::default(),
+        )
+        .await;
+
+        assert_eq!(code, ExitCode::UsageError);
+    }
+
+    #[tokio::test]
+    async fn test_execute_set_rejects_empty_normalized_bucket_path_before_reading_source() {
+        let code = execute(
+            CorsArgs {
+                command: CorsCommands::Set(SetCorsArgs {
+                    path: "local///".to_string(),
+                    source: Some("missing-cors.json".to_string()),
+                    file: None,
+                    force: false,
+                }),
+            },
+            OutputConfig::default(),
+        )
+        .await;
+
+        assert_eq!(code, ExitCode::UsageError);
+    }
+
+    #[tokio::test]
+    async fn test_execute_remove_rejects_empty_normalized_bucket_path() {
+        let code = execute(
+            CorsArgs {
+                command: CorsCommands::Remove(BucketArg {
+                    path: "local///".to_string(),
+                    force: false,
+                }),
+            },
+            OutputConfig::default(),
+        )
+        .await;
+
+        assert_eq!(code, ExitCode::UsageError);
     }
 
     #[tokio::test]

@@ -613,6 +613,64 @@ mod tests {
     }
 
     #[test]
+    fn cli_accepts_top_level_cors_set_with_positional_source() {
+        let cli = Cli::try_parse_from(["rc", "cors", "set", "local/my-bucket", "cors.xml"])
+            .expect("parse top-level cors set with positional source");
+
+        match cli.command {
+            Commands::Cors(cors::CorsCommands::Set(arg)) => {
+                assert_eq!(arg.path, "local/my-bucket");
+                assert_eq!(arg.source.as_deref(), Some("cors.xml"));
+                assert_eq!(arg.file, None);
+                assert!(!arg.force);
+            }
+            other => panic!("expected top-level cors set command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_top_level_cors_set_with_legacy_file_flag() {
+        let cli = Cli::try_parse_from([
+            "rc",
+            "cors",
+            "set",
+            "local/my-bucket",
+            "--file",
+            "cors.json",
+            "--force",
+        ])
+        .expect("parse top-level cors set with --file");
+
+        match cli.command {
+            Commands::Cors(cors::CorsCommands::Set(arg)) => {
+                assert_eq!(arg.path, "local/my-bucket");
+                assert_eq!(arg.source, None);
+                assert_eq!(arg.file.as_deref(), Some("cors.json"));
+                assert!(arg.force);
+            }
+            other => panic!("expected top-level cors set command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_bucket_cors_list_force_flag() {
+        let cli =
+            Cli::try_parse_from(["rc", "bucket", "cors", "list", "local/my-bucket", "--force"])
+                .expect("parse bucket cors list with force");
+
+        match cli.command {
+            Commands::Bucket(args) => match args.command {
+                bucket::BucketCommands::Cors(cors::CorsCommands::List(arg)) => {
+                    assert_eq!(arg.path, "local/my-bucket");
+                    assert!(arg.force);
+                }
+                other => panic!("expected bucket cors list command, got {:?}", other),
+            },
+            other => panic!("expected bucket command, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn cli_accepts_bucket_lifecycle_subcommand() {
         let cli = Cli::try_parse_from([
             "rc",
@@ -697,6 +755,253 @@ mod tests {
                     assert!(arg.dry_run);
                 }
                 other => panic!("expected object remove command, got {:?}", other),
+            },
+            other => panic!("expected object command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_bucket_event_remove_subcommand() {
+        let cli = Cli::try_parse_from([
+            "rc",
+            "bucket",
+            "event",
+            "remove",
+            "local/my-bucket",
+            "arn:aws:sns:us-east-1:123456789012:alerts",
+        ])
+        .expect("parse bucket event remove");
+
+        match cli.command {
+            Commands::Bucket(args) => match args.command {
+                bucket::BucketCommands::Event(event::EventCommands::Remove(arg)) => {
+                    assert_eq!(arg.path, "local/my-bucket");
+                    assert_eq!(arg.arn, "arn:aws:sns:us-east-1:123456789012:alerts");
+                }
+                other => panic!("expected bucket event remove command, got {:?}", other),
+            },
+            other => panic!("expected bucket command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_rm_purge_flag() {
+        let cli = Cli::try_parse_from(["rc", "rm", "local/my-bucket/object.txt", "--purge"])
+            .expect("parse rm purge");
+
+        match cli.command {
+            Commands::Rm(arg) => {
+                assert_eq!(arg.paths, vec!["local/my-bucket/object.txt".to_string()]);
+                assert!(arg.purge);
+            }
+            other => panic!("expected rm command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_object_remove_purge_flag() {
+        let cli = Cli::try_parse_from([
+            "rc",
+            "object",
+            "remove",
+            "local/my-bucket/object.txt",
+            "--purge",
+        ])
+        .expect("parse object remove purge");
+
+        match cli.command {
+            Commands::Object(args) => match args.command {
+                object::ObjectCommands::Remove(arg) => {
+                    assert_eq!(arg.paths, vec!["local/my-bucket/object.txt".to_string()]);
+                    assert!(arg.purge);
+                }
+                other => panic!("expected object remove command, got {:?}", other),
+            },
+            other => panic!("expected object command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_object_stat_subcommand() {
+        let cli = Cli::try_parse_from(["rc", "object", "stat", "local/my-bucket/report.json"])
+            .expect("parse object stat");
+
+        match cli.command {
+            Commands::Object(args) => match args.command {
+                object::ObjectCommands::Stat(arg) => {
+                    assert_eq!(arg.path, "local/my-bucket/report.json");
+                }
+                other => panic!("expected object stat command, got {:?}", other),
+            },
+            other => panic!("expected object command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_object_copy_with_transfer_options() {
+        let cli = Cli::try_parse_from([
+            "rc",
+            "object",
+            "copy",
+            "./report.json",
+            "local/my-bucket/reports/",
+            "--content-type",
+            "application/json",
+            "--storage-class",
+            "STANDARD_IA",
+            "--dry-run",
+        ])
+        .expect("parse object copy with transfer options");
+
+        match cli.command {
+            Commands::Object(args) => match args.command {
+                object::ObjectCommands::Copy(arg) => {
+                    assert_eq!(arg.source, "./report.json");
+                    assert_eq!(arg.target, "local/my-bucket/reports/");
+                    assert_eq!(arg.content_type.as_deref(), Some("application/json"));
+                    assert_eq!(arg.storage_class.as_deref(), Some("STANDARD_IA"));
+                    assert!(arg.dry_run);
+                }
+                other => panic!("expected object copy command, got {:?}", other),
+            },
+            other => panic!("expected object command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_object_move_with_recursive_dry_run() {
+        let cli = Cli::try_parse_from([
+            "rc",
+            "object",
+            "move",
+            "local/source-bucket/logs/",
+            "local/archive-bucket/logs/",
+            "--recursive",
+            "--dry-run",
+            "--continue-on-error",
+        ])
+        .expect("parse object move with recursive dry-run");
+
+        match cli.command {
+            Commands::Object(args) => match args.command {
+                object::ObjectCommands::Move(arg) => {
+                    assert_eq!(arg.source, "local/source-bucket/logs/");
+                    assert_eq!(arg.target, "local/archive-bucket/logs/");
+                    assert!(arg.recursive);
+                    assert!(arg.dry_run);
+                    assert!(arg.continue_on_error);
+                }
+                other => panic!("expected object move command, got {:?}", other),
+            },
+            other => panic!("expected object command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_object_show_and_head_options() {
+        let show_cli = Cli::try_parse_from([
+            "rc",
+            "object",
+            "show",
+            "local/my-bucket/report.json",
+            "--version-id",
+            "v1",
+            "--rewind",
+            "1h",
+        ])
+        .expect("parse object show options");
+
+        match show_cli.command {
+            Commands::Object(args) => match args.command {
+                object::ObjectCommands::Show(arg) => {
+                    assert_eq!(arg.path, "local/my-bucket/report.json");
+                    assert_eq!(arg.version_id.as_deref(), Some("v1"));
+                    assert_eq!(arg.rewind.as_deref(), Some("1h"));
+                }
+                other => panic!("expected object show command, got {:?}", other),
+            },
+            other => panic!("expected object command, got {:?}", other),
+        }
+
+        let head_cli = Cli::try_parse_from([
+            "rc",
+            "object",
+            "head",
+            "local/my-bucket/report.json",
+            "--bytes",
+            "128",
+            "--version-id",
+            "v2",
+        ])
+        .expect("parse object head options");
+
+        match head_cli.command {
+            Commands::Object(args) => match args.command {
+                object::ObjectCommands::Head(arg) => {
+                    assert_eq!(arg.path, "local/my-bucket/report.json");
+                    assert_eq!(arg.bytes, Some(128));
+                    assert_eq!(arg.version_id.as_deref(), Some("v2"));
+                }
+                other => panic!("expected object head command, got {:?}", other),
+            },
+            other => panic!("expected object command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_object_find_and_tree_options() {
+        let find_cli = Cli::try_parse_from([
+            "rc",
+            "object",
+            "find",
+            "local/my-bucket/logs/",
+            "--name",
+            "*.json",
+            "--maxdepth",
+            "2",
+            "--count",
+            "--print",
+        ])
+        .expect("parse object find options");
+
+        match find_cli.command {
+            Commands::Object(args) => match args.command {
+                object::ObjectCommands::Find(arg) => {
+                    assert_eq!(arg.path, "local/my-bucket/logs/");
+                    assert_eq!(arg.name.as_deref(), Some("*.json"));
+                    assert_eq!(arg.maxdepth, 2);
+                    assert!(arg.count);
+                    assert!(arg.print);
+                }
+                other => panic!("expected object find command, got {:?}", other),
+            },
+            other => panic!("expected object command, got {:?}", other),
+        }
+
+        let tree_cli = Cli::try_parse_from([
+            "rc",
+            "object",
+            "tree",
+            "local/my-bucket/logs/",
+            "--level",
+            "4",
+            "--size",
+            "--pattern",
+            "*.json",
+            "--full-path",
+        ])
+        .expect("parse object tree options");
+
+        match tree_cli.command {
+            Commands::Object(args) => match args.command {
+                object::ObjectCommands::Tree(arg) => {
+                    assert_eq!(arg.path, "local/my-bucket/logs/");
+                    assert_eq!(arg.level, 4);
+                    assert!(arg.size);
+                    assert_eq!(arg.pattern.as_deref(), Some("*.json"));
+                    assert!(arg.full_path);
+                }
+                other => panic!("expected object tree command, got {:?}", other),
             },
             other => panic!("expected object command, got {:?}", other),
         }

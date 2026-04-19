@@ -22,6 +22,11 @@ Examples:
   rc event add local/my-bucket arn:aws:sns:us-east-1:123456789012:alerts --event delete
   rc bucket event add local/my-bucket arn:aws:lambda:us-east-1:123456789012:function:thumbnail --event put,delete";
 
+const EVENT_REMOVE_AFTER_HELP: &str = "\
+Examples:
+  rc bucket event remove local/my-bucket arn:aws:sqs:us-east-1:123456789012:jobs
+  rc event remove local/my-bucket arn:aws:sns:us-east-1:123456789012:alerts";
+
 /// Manage bucket event notifications
 #[derive(Args, Debug)]
 #[command(after_help = EVENT_AFTER_HELP)]
@@ -71,6 +76,7 @@ pub struct AddArgs {
 }
 
 #[derive(Args, Debug)]
+#[command(after_help = EVENT_REMOVE_AFTER_HELP)]
 pub struct RemoveArgs {
     /// Path to the bucket (alias/bucket)
     pub path: String,
@@ -480,6 +486,7 @@ mod tests {
         assert!(parse_bucket_path("local").is_err());
         assert!(parse_bucket_path("/bucket").is_err());
         assert!(parse_bucket_path("local/my-bucket/prefix").is_err());
+        assert!(parse_bucket_path("local///").is_err());
     }
 
     #[test]
