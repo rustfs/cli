@@ -721,6 +721,52 @@ impl S3Client {
         &self.inner
     }
 
+    /// Download object content and report downloaded bytes after each received chunk.
+    pub async fn get_object_with_progress(
+        &self,
+        path: &RemotePath,
+        mut on_progress: impl FnMut(u64, Option<u64>) + Send,
+    ) -> Result<Vec<u8>> {
+        let response = self
+            .inner
+            .get_object()
+            .bucket(&path.bucket)
+            .key(&path.key)
+            .send()
+            .await
+            .map_err(|e| {
+                let err_str = e.to_string();
+                if err_str.contains("NotFound") || err_str.contains("NoSuchKey") {
+                    Error::NotFound(path.to_string())
+                } else {
+                    Error::Network(err_str)
+                }
+            })?;
+
+        let content_length = response
+            .content_length()
+            .and_then(|length| u64::try_from(length).ok());
+        let mut data = Vec::with_capacity(
+            content_length
+                .and_then(|length| usize::try_from(length).ok())
+                .unwrap_or_default(),
+        );
+        let mut body = response.body;
+        let mut bytes_downloaded = 0u64;
+
+        while let Some(chunk) = body
+            .try_next()
+            .await
+            .map_err(|e| Error::Network(e.to_string()))?
+        {
+            bytes_downloaded += chunk.len() as u64;
+            data.extend_from_slice(&chunk);
+            on_progress(bytes_downloaded, content_length);
+        }
+
+        Ok(data)
+    }
+
     /// Delete an object with RustFS-specific request options.
     pub async fn delete_object_with_options(
         &self,
@@ -1680,31 +1726,7 @@ impl ObjectStore for S3Client {
     }
 
     async fn get_object(&self, path: &RemotePath) -> Result<Vec<u8>> {
-        let response = self
-            .inner
-            .get_object()
-            .bucket(&path.bucket)
-            .key(&path.key)
-            .send()
-            .await
-            .map_err(|e| {
-                let err_str = e.to_string();
-                if err_str.contains("NotFound") || err_str.contains("NoSuchKey") {
-                    Error::NotFound(path.to_string())
-                } else {
-                    Error::Network(err_str)
-                }
-            })?;
-
-        let data = response
-            .body
-            .collect()
-            .await
-            .map_err(|e| Error::Network(e.to_string()))?
-            .into_bytes()
-            .to_vec();
-
-        Ok(data)
+        self.get_object_with_progress(path, |_, _| {}).await
     }
 
     async fn put_object(

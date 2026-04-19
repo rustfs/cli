@@ -205,6 +205,27 @@ async fn copy_local_to_s3(
 
 /// Multipart upload threshold: files at least this size use multipart upload (64 MiB)
 const MULTIPART_THRESHOLD: u64 = 64 * 1024 * 1024;
+/// Download progress threshold: avoid flicker for tiny downloads while surfacing meaningful waits.
+const DOWNLOAD_PROGRESS_THRESHOLD: u64 = 4 * 1024 * 1024;
+
+fn update_download_progress(
+    progress: &mut Option<ProgressBar>,
+    output_config: &OutputConfig,
+    bytes_downloaded: u64,
+    total_size: Option<u64>,
+) {
+    let Some(total_size) = total_size else {
+        return;
+    };
+
+    if total_size < DOWNLOAD_PROGRESS_THRESHOLD {
+        return;
+    }
+
+    let progress_bar =
+        progress.get_or_insert_with(|| ProgressBar::new(output_config.clone(), total_size));
+    progress_bar.set_position(bytes_downloaded);
+}
 
 fn print_upload_success(
     formatter: &Formatter,
@@ -484,8 +505,21 @@ async fn download_file(
         );
     }
 
+    let output_config = formatter.output_config();
+    let mut progress = None;
+
     // Download object
-    match client.get_object(src).await {
+    let result = client
+        .get_object_with_progress(src, |bytes_downloaded, total_size| {
+            update_download_progress(&mut progress, &output_config, bytes_downloaded, total_size);
+        })
+        .await;
+
+    if let Some(ref pb) = progress {
+        pb.finish_and_clear();
+    }
+
+    match result {
         Ok(data) => {
             let size = data.len() as i64;
 
@@ -765,6 +799,38 @@ mod tests {
             assert_eq!(r.bucket, "bucket");
             assert_eq!(r.key, "dir1/dir2/file.txt");
         }
+    }
+
+    #[test]
+    fn test_download_progress_created_for_large_transfer() {
+        let output_config = OutputConfig::default();
+        let mut progress = None;
+
+        update_download_progress(
+            &mut progress,
+            &output_config,
+            1024,
+            Some(DOWNLOAD_PROGRESS_THRESHOLD),
+        );
+
+        let progress = progress.expect("large download should create progress bar");
+        assert!(progress.is_visible());
+        progress.finish_and_clear();
+    }
+
+    #[test]
+    fn test_download_progress_skips_small_transfer() {
+        let output_config = OutputConfig::default();
+        let mut progress = None;
+
+        update_download_progress(
+            &mut progress,
+            &output_config,
+            1024,
+            Some(DOWNLOAD_PROGRESS_THRESHOLD - 1),
+        );
+
+        assert!(progress.is_none());
     }
 
     #[test]
