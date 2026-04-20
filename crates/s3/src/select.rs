@@ -22,7 +22,7 @@ pub async fn select_object_content(
     options: &SelectOptions,
     writer: &mut (dyn AsyncWrite + Send + Unpin),
 ) -> Result<()> {
-    let input = build_input_serialization(options);
+    let input = build_input_serialization(options)?;
     let output = build_output_serialization(options);
 
     // aws-sdk-s3 `SelectObjectContent` does not expose object `VersionId`; the current object is used.
@@ -62,7 +62,15 @@ fn compression_type(c: SelectCompression) -> CompressionType {
     }
 }
 
-fn build_input_serialization(options: &SelectOptions) -> InputSerialization {
+fn build_input_serialization(options: &SelectOptions) -> Result<InputSerialization> {
+    if matches!(options.input_format, SelectInputFormat::Parquet)
+        && !matches!(options.compression, SelectCompression::None)
+    {
+        return Err(Error::General(
+            "Parquet input does not support whole-object GZIP or BZIP2 compression.".to_string(),
+        ));
+    }
+
     let compression = compression_type(options.compression);
     let mut b = InputSerialization::builder().compression_type(compression);
     match options.input_format {
@@ -82,7 +90,7 @@ fn build_input_serialization(options: &SelectOptions) -> InputSerialization {
             b = b.parquet(pq);
         }
     }
-    b.build()
+    Ok(b.build())
 }
 
 fn build_output_serialization(options: &SelectOptions) -> OutputSerialization {
@@ -173,7 +181,7 @@ fn classify_aws_code(code: Option<&str>, text: &str) -> Error {
         Some(_) if text.contains("NotImplemented") => {
             Error::UnsupportedFeature("The backend does not support S3 Select.".to_string())
         }
-        Some(_) => Error::Network(text.to_string()),
+        Some(_) => Error::General(text.to_string()),
         None => classify_aws_code_missing_metadata(text),
     }
 }
@@ -189,13 +197,14 @@ fn classify_aws_code_missing_metadata(text: &str) -> Error {
     if text.contains("NoSuchBucket") {
         return Error::NotFound("Bucket not found".to_string());
     }
-    Error::Network(text.to_string())
+    Error::General(text.to_string())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::classify_aws_code;
+    use super::{build_input_serialization, classify_aws_code};
     use rc_core::Error;
+    use rc_core::{SelectCompression, SelectInputFormat, SelectOptions, SelectOutputFormat};
 
     #[test]
     fn classify_maps_no_such_key() {
@@ -212,7 +221,7 @@ mod tests {
     #[test]
     fn classify_fallback_network() {
         let e = classify_aws_code(Some("SlowDown"), "rate limited");
-        assert!(matches!(e, Error::Network(_)));
+        assert!(matches!(e, Error::General(_)));
     }
 
     #[test]
@@ -225,5 +234,37 @@ mod tests {
     fn classify_maps_invalid_argument() {
         let e = classify_aws_code(Some("InvalidArgument"), "bad expr");
         assert!(matches!(e, Error::General(_)));
+    }
+
+    #[test]
+    fn classify_missing_code_unknown_maps_general() {
+        let e = classify_aws_code(None, "Service error: query parsing failed");
+        assert!(matches!(e, Error::General(_)));
+    }
+
+    #[test]
+    fn parquet_rejects_whole_object_compression() {
+        let options = SelectOptions {
+            expression: "SELECT * FROM S3Object".to_string(),
+            input_format: SelectInputFormat::Parquet,
+            output_format: SelectOutputFormat::Csv,
+            compression: SelectCompression::Gzip,
+        };
+
+        let error = build_input_serialization(&options)
+            .expect_err("parquet should reject whole-object compression");
+        assert!(matches!(error, Error::General(_)));
+    }
+
+    #[test]
+    fn parquet_allows_no_compression() {
+        let options = SelectOptions {
+            expression: "SELECT * FROM S3Object".to_string(),
+            input_format: SelectInputFormat::Parquet,
+            output_format: SelectOutputFormat::Csv,
+            compression: SelectCompression::None,
+        };
+
+        build_input_serialization(&options).expect("parquet without whole-object compression");
     }
 }
