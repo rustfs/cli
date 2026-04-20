@@ -1725,8 +1725,8 @@ impl ObjectStore for S3Client {
     }
 
     async fn capabilities(&self) -> Result<Capabilities> {
-        // Best-effort hints for common S3-compatible backends. `select` is not inferred here;
-        // use [`ObjectStore::probe_select_support`] (e.g. from `rc sql`).
+        // Best-effort hints for common S3-compatible backends. `select` is not inferred here
+        // because `rc sql` determines support from the real request result.
         Ok(Capabilities {
             versioning: true,
             object_lock: false,
@@ -2700,10 +2700,6 @@ impl ObjectStore for S3Client {
                 ))
             })?;
         Ok(())
-    }
-
-    async fn probe_select_support(&self, bucket: &str) -> Result<bool> {
-        crate::select::probe_select_support(&self.inner, bucket).await
     }
 
     async fn select_object_content(

@@ -332,7 +332,6 @@ fn top_level_command_help_contract() {
                 "--input-format",
                 "--output-format",
                 "--compression",
-                "--force",
             ],
         },
         HelpCase {

@@ -1,8 +1,4 @@
 //! sql command — S3 Select queries on objects.
-//!
-//! Unless `--force` is set, this command issues a lightweight `SelectObjectContent` probe against
-//! a non-existent key in the target bucket before running your query, so support is detected
-//! reliably (extra request; may incur cost on some backends).
 
 use clap::{Args, ValueEnum};
 use rc_core::{
@@ -35,11 +31,6 @@ pub struct SqlArgs {
     /// Compression of the stored object (input decompression)
     #[arg(long, value_enum, default_value_t = CompressionArg::None)]
     pub compression: CompressionArg,
-
-    /// Skip the pre-flight Select probe (one fewer `SelectObjectContent` call); use only if you
-    /// trust the backend supports S3 Select or probe fails incorrectly
-    #[arg(long)]
-    pub force: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -133,21 +124,6 @@ pub async fn execute(args: SqlArgs, output_config: OutputConfig) -> ExitCode {
         }
     };
 
-    if !args.force {
-        match client.probe_select_support(&remote.bucket).await {
-            Ok(true) => {}
-            Ok(false) => {
-                formatter
-                    .error("Backend does not support S3 Select. Use --force to attempt anyway.");
-                return ExitCode::UnsupportedFeature;
-            }
-            Err(e) => {
-                formatter.error(&format!("Failed to probe S3 Select support: {e}"));
-                return exit_code_from_error(&e);
-            }
-        }
-    }
-
     let options = SelectOptions {
         expression: args.query,
         input_format: args.input_format.into(),
@@ -186,7 +162,6 @@ mod tests {
             input_format: InputFormatArg::Csv,
             output_format: OutputFormatArg::Csv,
             compression: CompressionArg::None,
-            force: false,
         };
         let code = execute(args, OutputConfig::default()).await;
         assert_eq!(code, ExitCode::UsageError);
@@ -200,7 +175,6 @@ mod tests {
             input_format: InputFormatArg::Csv,
             output_format: OutputFormatArg::Csv,
             compression: CompressionArg::None,
-            force: false,
         };
         let code = execute(args, OutputConfig::default()).await;
         assert_eq!(code, ExitCode::UsageError);

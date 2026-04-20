@@ -178,8 +178,10 @@ pub struct Capabilities {
     /// Supports anonymous bucket access policies
     pub anonymous: bool,
 
-    /// S3 Select (`SelectObjectContent`). **Not set by [`ObjectStore::capabilities`]** (it stays
-    /// `false` there); use [`ObjectStore::probe_select_support`] to detect support per bucket.
+    /// S3 Select (`SelectObjectContent`).
+    ///
+    /// This remains `false` in generic capability hints because support is determined by issuing
+    /// a real request against the target object.
     pub select: bool,
 
     /// Supports event notifications
@@ -390,11 +392,6 @@ pub trait ObjectStore: Send + Sync {
 
     /// Delete bucket CORS configuration.
     async fn delete_bucket_cors(&self, bucket: &str) -> Result<()>;
-
-    /// Whether this store supports S3 Select for `bucket` (`SelectObjectContent`).
-    ///
-    /// Implementations that do not support Select should return `Ok(false)`.
-    async fn probe_select_support(&self, bucket: &str) -> Result<bool>;
 
     /// Run S3 Select on an object and stream result payloads to `writer`.
     async fn select_object_content(
