@@ -889,91 +889,114 @@ impl AdminApi for AdminClient {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
     use std::sync::mpsc;
+    use std::thread;
     use tempfile::tempdir;
 
-    struct CapturedRequest {
+    #[derive(Debug)]
+    struct CapturedAdminRequest {
         method: String,
         target: String,
         body: Vec<u8>,
     }
 
-    fn start_admin_test_server(
-        response_body: &'static str,
-    ) -> (String, mpsc::Receiver<CapturedRequest>) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
-        let endpoint = format!(
-            "http://{}",
-            listener.local_addr().expect("read test server address")
-        );
-        let (sender, receiver) = mpsc::channel();
+    fn read_admin_request(stream: &mut TcpStream) -> CapturedAdminRequest {
+        let mut buffer = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        let header_end = loop {
+            let read = stream.read(&mut chunk).expect("read HTTP request");
+            assert!(read > 0, "client closed connection before headers");
+            buffer.extend_from_slice(&chunk[..read]);
 
-        std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept admin request");
-            let mut request = Vec::new();
-            let mut buffer = [0_u8; 1024];
-            let mut headers_end = None;
-            let mut content_length = 0_usize;
-
-            loop {
-                let read = stream.read(&mut buffer).expect("read admin request");
-                assert!(read > 0, "client closed connection before sending request");
-                request.extend_from_slice(&buffer[..read]);
-
-                if headers_end.is_none()
-                    && let Some(position) =
-                        request.windows(4).position(|window| window == b"\r\n\r\n")
-                {
-                    headers_end = Some(position + 4);
-                    let headers = std::str::from_utf8(&request[..position])
-                        .expect("request headers are UTF-8");
-                    content_length = headers
-                        .lines()
-                        .find_map(|line| {
-                            let (name, value) = line.split_once(':')?;
-                            name.eq_ignore_ascii_case("content-length").then(|| {
-                                value.trim().parse::<usize>().expect("valid content-length")
-                            })
-                        })
-                        .unwrap_or(0);
-                }
-
-                if let Some(end) = headers_end
-                    && request.len() >= end + content_length
-                {
-                    break;
-                }
+            if let Some(position) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                break position + 4;
             }
+        };
 
-            let headers_end = headers_end.expect("request headers end marker");
-            let headers =
-                std::str::from_utf8(&request[..headers_end]).expect("request headers are UTF-8");
-            let request_line = headers.lines().next().expect("request line exists");
-            let mut request_parts = request_line.split_whitespace();
-            let method = request_parts.next().expect("request method").to_string();
-            let target = request_parts.next().expect("request target").to_string();
-            let body = request[headers_end..headers_end + content_length].to_vec();
+        let headers = String::from_utf8_lossy(&buffer[..header_end]).into_owned();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().expect("valid content length"))
+            })
+            .unwrap_or(0);
 
-            sender
-                .send(CapturedRequest {
-                    method,
-                    target,
-                    body,
-                })
-                .expect("send captured request");
+        while buffer.len() - header_end < content_length {
+            let read = stream.read(&mut chunk).expect("read HTTP request body");
+            assert!(read > 0, "client closed connection before body");
+            buffer.extend_from_slice(&chunk[..read]);
+        }
+
+        let request_line = headers.lines().next().expect("request line");
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next().expect("request method").to_string();
+        let target = parts.next().expect("request target").to_string();
+        let body = buffer[header_end..header_end + content_length].to_vec();
+
+        CapturedAdminRequest {
+            method,
+            target,
+            body,
+        }
+    }
+
+    fn start_admin_test_server(
+        response_status: &str,
+        response_body: &'static str,
+    ) -> (
+        String,
+        mpsc::Receiver<CapturedAdminRequest>,
+        thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        let (sender, receiver) = mpsc::channel();
+        let response_status = response_status.to_string();
+
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let request = read_admin_request(&mut stream);
+            sender.send(request).expect("send captured request");
 
             let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
-                response_body.len(),
-                response_body
+                "HTTP/1.1 {response_status}\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{response_body}",
+                response_body.len()
             );
             stream
                 .write_all(response.as_bytes())
-                .expect("write admin response");
+                .expect("write HTTP response");
         });
 
-        (endpoint, receiver)
+        (endpoint, receiver, handle)
+    }
+
+    fn admin_client_for_endpoint(endpoint: &str) -> AdminClient {
+        let alias = Alias::new("test", endpoint, "access", "secret");
+        AdminClient::new(&alias).expect("admin client should build")
+    }
+
+    fn assert_heal_options_body(
+        body: &[u8],
+        scan_mode: u8,
+        remove: bool,
+        recreate: bool,
+        dry_run: bool,
+    ) {
+        let value: serde_json::Value =
+            serde_json::from_slice(body).expect("heal request body should be JSON");
+
+        assert_eq!(value["recursive"], false);
+        assert_eq!(value["dryRun"], dry_run);
+        assert_eq!(value["remove"], remove);
+        assert_eq!(value["recreate"], recreate);
+        assert_eq!(value["scanMode"], scan_mode);
+        assert_eq!(value["updateParity"], false);
+        assert_eq!(value["nolock"], false);
+        assert!(value.get("bucket").is_none());
+        assert!(value.get("prefix").is_none());
     }
 
     #[test]
@@ -1085,76 +1108,6 @@ mod tests {
         assert!(value.get("prefix").is_none());
     }
 
-    #[tokio::test]
-    async fn test_heal_status_posts_background_heal_endpoint() {
-        let (endpoint, receiver) =
-            start_admin_test_server(r#"{"bitrotStartTime":"2026-04-19T10:00:00Z"}"#);
-        let alias = Alias::new("test", &endpoint, "access", "secret");
-        let client = AdminClient::new(&alias).expect("admin client should build");
-
-        let status = client.heal_status().await.expect("heal status succeeds");
-
-        assert!(status.healing);
-        assert_eq!(status.started.as_deref(), Some("2026-04-19T10:00:00Z"));
-
-        let request = receiver.recv().expect("capture admin request");
-        assert_eq!(request.method, "POST");
-        assert_eq!(request.target, "/rustfs/admin/v3/background-heal/status");
-        assert!(request.body.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_heal_start_posts_encoded_target_and_options() {
-        let (endpoint, receiver) = start_admin_test_server("");
-        let alias = Alias::new("test", &endpoint, "access", "secret");
-        let client = AdminClient::new(&alias).expect("admin client should build");
-
-        let status = client
-            .heal_start(HealStartRequest {
-                bucket: Some("raw photos".to_string()),
-                prefix: Some("2026/april".to_string()),
-                scan_mode: HealScanMode::Deep,
-                dry_run: true,
-                ..Default::default()
-            })
-            .await
-            .expect("heal start succeeds");
-
-        assert!(!status.healing);
-
-        let request = receiver.recv().expect("capture admin request");
-        assert_eq!(request.method, "POST");
-        assert_eq!(
-            request.target,
-            "/rustfs/admin/v3/heal/raw%20photos/2026%2Fapril"
-        );
-
-        let body: serde_json::Value =
-            serde_json::from_slice(&request.body).expect("heal start body is JSON");
-        assert_eq!(body["dryRun"], true);
-        assert_eq!(body["scanMode"], 2);
-        assert!(body.get("bucket").is_none());
-        assert!(body.get("prefix").is_none());
-    }
-
-    #[tokio::test]
-    async fn test_heal_stop_posts_force_stop_to_root_heal_endpoint() {
-        let (endpoint, receiver) = start_admin_test_server("");
-        let alias = Alias::new("test", &endpoint, "access", "secret");
-        let client = AdminClient::new(&alias).expect("admin client should build");
-
-        client.heal_stop().await.expect("heal stop succeeds");
-
-        let request = receiver.recv().expect("capture admin request");
-        assert_eq!(request.method, "POST");
-        assert_eq!(request.target, "/rustfs/admin/v3/heal/?forceStop=true");
-
-        let body: serde_json::Value =
-            serde_json::from_slice(&request.body).expect("heal stop body is JSON");
-        assert_eq!(body["scanMode"], 1);
-        assert_eq!(body["dryRun"], false);
-    }
-
     #[test]
     fn test_background_heal_status_response_maps_to_heal_status() {
         let status = HealStatus::from(BackgroundHealStatusResponse {
@@ -1179,6 +1132,70 @@ mod tests {
         let error = client.map_error(StatusCode::BAD_REQUEST, "err request body parse");
         assert!(matches!(error, Error::General(_)));
         assert_eq!(error.to_string(), "Bad request: err request body parse");
+    }
+
+    #[tokio::test]
+    async fn test_heal_status_uses_background_heal_status_endpoint() {
+        let (endpoint, receiver, handle) =
+            start_admin_test_server("200 OK", r#"{"bitrotStartTime":"2026-04-19T10:00:00Z"}"#);
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let status = client.heal_status().await.expect("heal status request");
+
+        assert!(status.healing);
+        assert_eq!(status.started.as_deref(), Some("2026-04-19T10:00:00Z"));
+
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.target, "/rustfs/admin/v3/background-heal/status");
+        assert!(request.body.is_empty());
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn test_heal_start_posts_to_bucket_prefix_route_with_options_body() {
+        let (endpoint, receiver, handle) = start_admin_test_server("200 OK", "");
+        let client = admin_client_for_endpoint(&endpoint);
+        let request = HealStartRequest {
+            bucket: Some("raw photos".to_string()),
+            prefix: Some("2026/april".to_string()),
+            scan_mode: HealScanMode::Deep,
+            remove: true,
+            recreate: true,
+            dry_run: true,
+        };
+
+        let status = client
+            .heal_start(request)
+            .await
+            .expect("heal start request");
+
+        assert!(!status.healing);
+        assert!(status.heal_id.is_empty());
+        assert!(status.started.is_none());
+
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(request.method, "POST");
+        assert_eq!(
+            request.target,
+            "/rustfs/admin/v3/heal/raw%20photos/2026%2Fapril"
+        );
+        assert_heal_options_body(&request.body, 2, true, true, true);
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn test_heal_stop_posts_force_stop_to_root_heal_route() {
+        let (endpoint, receiver, handle) = start_admin_test_server("200 OK", "");
+        let client = admin_client_for_endpoint(&endpoint);
+
+        client.heal_stop().await.expect("heal stop request");
+
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.target, "/rustfs/admin/v3/heal/?forceStop=true");
+        assert_heal_options_body(&request.body, 1, false, false, false);
+        handle.join().expect("server thread should finish");
     }
 
     #[test]
