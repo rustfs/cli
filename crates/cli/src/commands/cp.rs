@@ -834,6 +834,35 @@ mod tests {
     }
 
     #[test]
+    fn test_download_progress_skips_unknown_total_size() {
+        let output_config = OutputConfig::default();
+        let mut progress = None;
+
+        update_download_progress(&mut progress, &output_config, 1024, None);
+
+        assert!(progress.is_none());
+    }
+
+    #[test]
+    fn test_download_progress_respects_no_progress_config() {
+        let output_config = OutputConfig {
+            no_progress: true,
+            ..Default::default()
+        };
+        let mut progress = None;
+
+        update_download_progress(
+            &mut progress,
+            &output_config,
+            1024,
+            Some(DOWNLOAD_PROGRESS_THRESHOLD),
+        );
+
+        let progress = progress.expect("large download should create progress state");
+        assert!(!progress.is_visible());
+    }
+
+    #[test]
     fn test_parse_cp_path_prefers_existing_local_path_when_alias_missing() {
         let (alias_manager, temp_dir) = temp_alias_manager();
         let full = temp_dir.path().join("issue-2094-local").join("file.txt");
