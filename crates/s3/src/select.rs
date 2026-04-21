@@ -202,7 +202,8 @@ fn classify_aws_code_missing_metadata(text: &str) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_input_serialization, classify_aws_code};
+    use super::{build_input_serialization, build_output_serialization, classify_aws_code};
+    use aws_sdk_s3::types::{CompressionType, FileHeaderInfo, JsonType, QuoteFields};
     use rc_core::Error;
     use rc_core::{SelectCompression, SelectInputFormat, SelectOptions, SelectOutputFormat};
 
@@ -266,5 +267,65 @@ mod tests {
         };
 
         build_input_serialization(&options).expect("parquet without whole-object compression");
+    }
+
+    #[test]
+    fn csv_input_serialization_uses_csv_defaults_and_compression() {
+        let options = SelectOptions {
+            expression: "SELECT * FROM S3Object".to_string(),
+            input_format: SelectInputFormat::Csv,
+            output_format: SelectOutputFormat::Csv,
+            compression: SelectCompression::Bzip2,
+        };
+
+        let input = build_input_serialization(&options).expect("csv input serialization");
+        let csv = input.csv().expect("csv input is configured");
+
+        assert_eq!(input.compression_type(), Some(&CompressionType::Bzip2));
+        assert_eq!(csv.file_header_info(), Some(&FileHeaderInfo::None));
+        assert!(input.json().is_none());
+        assert!(input.parquet().is_none());
+    }
+
+    #[test]
+    fn json_input_serialization_uses_lines_mode() {
+        let options = SelectOptions {
+            expression: "SELECT * FROM S3Object".to_string(),
+            input_format: SelectInputFormat::Json,
+            output_format: SelectOutputFormat::Json,
+            compression: SelectCompression::Gzip,
+        };
+
+        let input = build_input_serialization(&options).expect("json input serialization");
+        let json = input.json().expect("json input is configured");
+
+        assert_eq!(input.compression_type(), Some(&CompressionType::Gzip));
+        assert_eq!(json.r#type(), Some(&JsonType::Lines));
+        assert!(input.csv().is_none());
+        assert!(input.parquet().is_none());
+    }
+
+    #[test]
+    fn output_serialization_selects_csv_or_json_shape() {
+        let csv_options = SelectOptions {
+            expression: "SELECT * FROM S3Object".to_string(),
+            input_format: SelectInputFormat::Csv,
+            output_format: SelectOutputFormat::Csv,
+            compression: SelectCompression::None,
+        };
+        let csv_output = build_output_serialization(&csv_options);
+        let csv = csv_output.csv().expect("csv output is configured");
+        assert_eq!(csv.quote_fields(), Some(&QuoteFields::Asneeded));
+        assert!(csv_output.json().is_none());
+
+        let json_options = SelectOptions {
+            expression: "SELECT * FROM S3Object".to_string(),
+            input_format: SelectInputFormat::Json,
+            output_format: SelectOutputFormat::Json,
+            compression: SelectCompression::None,
+        };
+        let json_output = build_output_serialization(&json_options);
+        assert!(json_output.json().is_some());
+        assert!(json_output.csv().is_none());
     }
 }
