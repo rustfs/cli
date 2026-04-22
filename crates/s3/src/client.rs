@@ -83,6 +83,29 @@ async fn build_reqwest_client(insecure: bool, ca_bundle: Option<&str>) -> Result
     Ok(client)
 }
 
+fn force_path_style_for_alias(alias: &Alias) -> bool {
+    match alias.bucket_lookup.as_str() {
+        "path" => true,
+        "dns" => false,
+        "auto" => !is_aliyun_oss_service_endpoint(&alias.endpoint),
+        _ => true,
+    }
+}
+
+fn is_aliyun_oss_service_endpoint(endpoint: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(endpoint.trim_end_matches('/')) else {
+        return false;
+    };
+
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+
+    host.strip_suffix(".aliyuncs.com")
+        .and_then(|host| host.split('.').next())
+        .is_some_and(|first_label| first_label.starts_with("oss-"))
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct ReplicationConfigurationXml {
@@ -696,7 +719,7 @@ impl S3Client {
 
         // Build S3 client with path-style addressing for compatibility
         let s3_config = aws_sdk_s3::config::Builder::from(&config)
-            .force_path_style(alias.bucket_lookup == "path" || alias.bucket_lookup == "auto")
+            .force_path_style(force_path_style_for_alias(&alias))
             // Improve compatibility with S3-compatible backends by only sending request
             // checksums when the operation explicitly requires them.
             .request_checksum_calculation(
@@ -2760,6 +2783,55 @@ mod tests {
         let info = ObjectInfo::file("test.txt", 1024);
         assert_eq!(info.key, "test.txt");
         assert_eq!(info.size_bytes, Some(1024));
+    }
+
+    #[test]
+    fn auto_bucket_lookup_uses_dns_for_aliyun_oss_service_endpoint() {
+        let alias = Alias::new(
+            "aliyun",
+            "https://oss-cn-hangzhou.aliyuncs.com",
+            "access-key",
+            "secret-key",
+        );
+
+        assert!(!force_path_style_for_alias(&alias));
+    }
+
+    #[test]
+    fn auto_bucket_lookup_uses_dns_for_aliyun_internal_service_endpoint() {
+        let alias = Alias::new(
+            "aliyun",
+            "https://oss-cn-hangzhou-internal.aliyuncs.com",
+            "access-key",
+            "secret-key",
+        );
+
+        assert!(!force_path_style_for_alias(&alias));
+    }
+
+    #[test]
+    fn auto_bucket_lookup_keeps_path_style_for_custom_endpoint() {
+        let alias = Alias::new("local", "http://localhost:9000", "access-key", "secret-key");
+
+        assert!(force_path_style_for_alias(&alias));
+    }
+
+    #[test]
+    fn explicit_bucket_lookup_overrides_auto_detection() {
+        let mut path_alias = Alias::new(
+            "aliyun",
+            "https://oss-cn-hangzhou.aliyuncs.com",
+            "access-key",
+            "secret-key",
+        );
+        path_alias.bucket_lookup = "path".to_string();
+
+        let mut dns_alias =
+            Alias::new("local", "http://localhost:9000", "access-key", "secret-key");
+        dns_alias.bucket_lookup = "dns".to_string();
+
+        assert!(force_path_style_for_alias(&path_alias));
+        assert!(!force_path_style_for_alias(&dns_alias));
     }
 
     #[test]
