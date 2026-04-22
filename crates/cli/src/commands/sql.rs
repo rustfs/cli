@@ -153,6 +153,7 @@ fn exit_code_from_error(error: &rc_core::Error) -> ExitCode {
 mod tests {
     use super::*;
     use crate::output::OutputConfig;
+    use rc_core::Error;
 
     #[tokio::test]
     async fn sql_empty_query_is_usage_error() {
@@ -178,5 +179,35 @@ mod tests {
         };
         let code = execute(args, OutputConfig::default()).await;
         assert_eq!(code, ExitCode::UsageError);
+    }
+
+    #[test]
+    fn sql_exit_code_from_backend_errors() {
+        let cases = [
+            (
+                Error::UnsupportedFeature("S3 Select is not supported".to_string()),
+                ExitCode::UnsupportedFeature,
+            ),
+            (
+                Error::NotFound("Object not found".to_string()),
+                ExitCode::NotFound,
+            ),
+            (
+                Error::Auth("Access denied".to_string()),
+                ExitCode::AuthError,
+            ),
+            (
+                Error::Network("Request timeout".to_string()),
+                ExitCode::NetworkError,
+            ),
+            (
+                Error::General("Query failed".to_string()),
+                ExitCode::GeneralError,
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(exit_code_from_error(&error), expected);
+        }
     }
 }
