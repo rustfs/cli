@@ -544,6 +544,58 @@ mod tests {
     }
 
     #[test]
+    fn cli_accepts_sql_select_options() {
+        let cli = Cli::try_parse_from([
+            "rc",
+            "sql",
+            "local/reports/data.jsonl",
+            "--query",
+            "SELECT * FROM S3Object",
+            "--input-format",
+            "json",
+            "--output-format",
+            "json",
+            "--compression",
+            "gzip",
+        ])
+        .expect("parse sql command");
+
+        match cli.command {
+            Commands::Sql(arg) => {
+                assert_eq!(arg.path, "local/reports/data.jsonl");
+                assert_eq!(arg.query, "SELECT * FROM S3Object");
+                assert!(matches!(arg.input_format, sql::InputFormatArg::Json));
+                assert!(matches!(arg.output_format, sql::OutputFormatArg::Json));
+                assert!(matches!(arg.compression, sql::CompressionArg::Gzip));
+            }
+            other => panic!("expected sql command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_sql_defaults() {
+        let cli = Cli::try_parse_from([
+            "rc",
+            "sql",
+            "local/reports/data.csv",
+            "--query",
+            "SELECT s._1 FROM S3Object s",
+        ])
+        .expect("parse sql command defaults");
+
+        match cli.command {
+            Commands::Sql(arg) => {
+                assert_eq!(arg.path, "local/reports/data.csv");
+                assert_eq!(arg.query, "SELECT s._1 FROM S3Object s");
+                assert!(matches!(arg.input_format, sql::InputFormatArg::Csv));
+                assert!(matches!(arg.output_format, sql::OutputFormatArg::Csv));
+                assert!(matches!(arg.compression, sql::CompressionArg::None));
+            }
+            other => panic!("expected sql command, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn cli_accepts_object_list_alias() {
         let cli = Cli::try_parse_from(["rc", "object", "ls", "local/my-bucket/logs/"])
             .expect("parse object ls alias");
