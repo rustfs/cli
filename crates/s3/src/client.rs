@@ -2817,6 +2817,25 @@ mod tests {
     }
 
     #[test]
+    fn auto_bucket_lookup_keeps_path_style_for_non_oss_aliyun_endpoint() {
+        let alias = Alias::new(
+            "aliyun",
+            "https://ecs-cn-hangzhou.aliyuncs.com",
+            "access-key",
+            "secret-key",
+        );
+
+        assert!(force_path_style_for_alias(&alias));
+    }
+
+    #[test]
+    fn auto_bucket_lookup_keeps_path_style_for_invalid_endpoint() {
+        let alias = Alias::new("broken", "not a valid endpoint", "access-key", "secret-key");
+
+        assert!(force_path_style_for_alias(&alias));
+    }
+
+    #[test]
     fn explicit_bucket_lookup_overrides_auto_detection() {
         let mut path_alias = Alias::new(
             "aliyun",
@@ -2832,6 +2851,19 @@ mod tests {
 
         assert!(force_path_style_for_alias(&path_alias));
         assert!(!force_path_style_for_alias(&dns_alias));
+    }
+
+    #[test]
+    fn unknown_bucket_lookup_keeps_path_style() {
+        let mut alias = Alias::new(
+            "aliyun",
+            "https://oss-cn-hangzhou.aliyuncs.com",
+            "access-key",
+            "secret-key",
+        );
+        alias.bucket_lookup = "unexpected".to_string();
+
+        assert!(force_path_style_for_alias(&alias));
     }
 
     #[test]
