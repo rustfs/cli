@@ -197,6 +197,9 @@ fn classify_aws_code_missing_metadata(text: &str) -> Error {
     if text.contains("NoSuchBucket") {
         return Error::NotFound("Bucket not found".to_string());
     }
+    if text.contains("AccessDenied") {
+        return Error::Auth("Access denied".to_string());
+    }
     Error::General(text.to_string())
 }
 
@@ -229,6 +232,12 @@ mod tests {
     fn classify_missing_code_maps_no_such_bucket_substring() {
         let e = classify_aws_code(None, "Service error: ... NoSuchBucket ...");
         assert!(matches!(e, Error::NotFound(msg) if msg.contains("Bucket")));
+    }
+
+    #[test]
+    fn classify_missing_code_maps_access_denied_substring() {
+        let e = classify_aws_code(None, "Service error: ... AccessDenied ...");
+        assert!(matches!(e, Error::Auth(msg) if msg.contains("Access denied")));
     }
 
     #[test]
