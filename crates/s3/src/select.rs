@@ -247,9 +247,21 @@ mod tests {
     }
 
     #[test]
+    fn classify_unknown_code_with_not_implemented_text_maps_unsupported_feature() {
+        let e = classify_aws_code(Some("SlowDown"), "backend replied with NotImplemented");
+        assert!(matches!(e, Error::UnsupportedFeature(msg) if msg.contains("does not support")));
+    }
+
+    #[test]
     fn classify_missing_code_unknown_maps_general() {
         let e = classify_aws_code(None, "Service error: query parsing failed");
         assert!(matches!(e, Error::General(_)));
+    }
+
+    #[test]
+    fn classify_missing_code_maps_not_implemented_substring() {
+        let e = classify_aws_code(None, "Service error: backend returned NotImplemented");
+        assert!(matches!(e, Error::UnsupportedFeature(msg) if msg.contains("does not support")));
     }
 
     #[test]
