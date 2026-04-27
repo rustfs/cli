@@ -404,6 +404,43 @@ jobs:
           echo "📦 Release assets:"
           ls -la
 
+      - name: Upload release assets to Aliyun OSS
+        env:
+          OSS_ACCESS_KEY_ID: ${{ secrets.ALICLOUDOSS_KEY_ID }}
+          OSS_ACCESS_KEY_SECRET: ${{ secrets.ALICLOUDOSS_KEY_SECRET }}
+          OSS_REGION: cn-beijing
+          OSS_ENDPOINT: https://oss-cn-beijing.aliyuncs.com
+          RELEASE_VERSION: ${{ needs.build-check.outputs.version }}
+        shell: bash
+        run: |
+          if [[ -z "$OSS_ACCESS_KEY_ID" ]]; then
+            echo "⚠️ OSS credentials not available, skipping release asset OSS upload"
+            exit 0
+          fi
+
+          OSSUTIL_VERSION="2.1.1"
+          OSSUTIL_ZIP="ossutil-${OSSUTIL_VERSION}-linux-amd64.zip"
+          OSSUTIL_DIR="ossutil-${OSSUTIL_VERSION}-linux-amd64"
+
+          curl -sL -o "$OSSUTIL_ZIP" "https://gosspublic.alicdn.com/ossutil/v2/${OSSUTIL_VERSION}/${OSSUTIL_ZIP}"
+          unzip -q "$OSSUTIL_ZIP"
+          mv "${OSSUTIL_DIR}/ossutil" ./ossutil
+          rm -rf "$OSSUTIL_DIR" "$OSSUTIL_ZIP"
+          chmod +x ./ossutil
+
+          OSS_PATH="oss://rustfs-artifacts/artifacts/rustfs-cli/release/${RELEASE_VERSION}/"
+
+          echo "📤 Uploading release assets to $OSS_PATH..."
+          for file in release-assets/*; do
+            if [[ -f "$file" ]]; then
+              echo "Uploading: $file"
+              ./ossutil cp "$file" "$OSS_PATH" --force
+              echo "✅ Uploaded: $(basename "$file")"
+            fi
+          done
+
+          echo "✅ Release asset OSS upload completed successfully"
+
       - name: Upload to GitHub Release (release event)
         if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
