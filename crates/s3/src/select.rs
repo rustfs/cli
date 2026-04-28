@@ -235,6 +235,12 @@ mod tests {
     }
 
     #[test]
+    fn classify_missing_code_maps_no_such_key_substring() {
+        let e = classify_aws_code(None, "Service error: ... NoSuchKey ...");
+        assert!(matches!(e, Error::NotFound(msg) if msg.contains("Object")));
+    }
+
+    #[test]
     fn classify_missing_code_maps_access_denied_substring() {
         let e = classify_aws_code(None, "Service error: ... AccessDenied ...");
         assert!(matches!(e, Error::Auth(msg) if msg.contains("Access denied")));
