@@ -253,6 +253,18 @@ mod tests {
     }
 
     #[test]
+    fn classify_empty_code_maps_no_such_bucket_substring() {
+        let e = classify_aws_code(Some(""), "Service error: ... NoSuchBucket ...");
+        assert!(matches!(e, Error::NotFound(msg) if msg.contains("Bucket")));
+    }
+
+    #[test]
+    fn classify_empty_code_maps_not_implemented_substring() {
+        let e = classify_aws_code(Some(""), "Service error: backend returned NotImplemented");
+        assert!(matches!(e, Error::UnsupportedFeature(msg) if msg.contains("does not support")));
+    }
+
+    #[test]
     fn classify_maps_invalid_argument() {
         let e = classify_aws_code(Some("InvalidArgument"), "bad expr");
         assert!(matches!(e, Error::General(_)));
