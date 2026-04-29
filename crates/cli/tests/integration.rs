@@ -2742,6 +2742,122 @@ mod version_operations {
     }
 
     #[test]
+    fn test_ls_versions_lists_multiple_object_versions() {
+        let (config_dir, bucket_name) = match setup_with_alias("lsversions") {
+            Some(v) => v,
+            None => {
+                eprintln!("Skipping: S3 test config not available");
+                return;
+            }
+        };
+
+        let enable_output = run_rc(
+            &[
+                "version",
+                "enable",
+                &format!("test/{}", bucket_name),
+                "--json",
+            ],
+            config_dir.path(),
+        );
+        if !enable_output.status.success() {
+            eprintln!(
+                "Enable versioning not supported: {}",
+                String::from_utf8_lossy(&enable_output.stderr)
+            );
+            cleanup_bucket(config_dir.path(), &bucket_name);
+            return;
+        }
+
+        let temp_file = tempfile::NamedTempFile::new().expect("Failed to create temp file");
+        let object_key = "multi-version.txt";
+
+        std::fs::write(temp_file.path(), "first version").expect("Failed to write first version");
+        let first_upload_output = run_rc(
+            &[
+                "cp",
+                temp_file
+                    .path()
+                    .to_str()
+                    .expect("Temp file path should be UTF-8"),
+                &format!("test/{}/{}", bucket_name, object_key),
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            first_upload_output.status.success(),
+            "Failed to upload first version: {}",
+            String::from_utf8_lossy(&first_upload_output.stderr)
+        );
+
+        std::thread::sleep(Duration::from_secs(1));
+        std::fs::write(temp_file.path(), "second version with more bytes")
+            .expect("Failed to write second version");
+        let second_upload_output = run_rc(
+            &[
+                "cp",
+                temp_file
+                    .path()
+                    .to_str()
+                    .expect("Temp file path should be UTF-8"),
+                &format!("test/{}/{}", bucket_name, object_key),
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            second_upload_output.status.success(),
+            "Failed to upload second version: {}",
+            String::from_utf8_lossy(&second_upload_output.stderr)
+        );
+
+        let list_output = run_rc(
+            &[
+                "ls",
+                &format!("test/{}/", bucket_name),
+                "--versions",
+                "--json",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            list_output.status.success(),
+            "Failed to list versions through ls: {}",
+            String::from_utf8_lossy(&list_output.stderr)
+        );
+
+        let stdout = String::from_utf8_lossy(&list_output.stdout);
+        let payload: serde_json::Value =
+            serde_json::from_str(&stdout).expect("Invalid JSON ls version output");
+        let items = payload["items"]
+            .as_array()
+            .expect("ls version output should expose an items array");
+        let matching_versions: Vec<&serde_json::Value> = items
+            .iter()
+            .filter(|entry| entry["key"].as_str() == Some(object_key))
+            .collect();
+
+        assert_eq!(
+            matching_versions.len(),
+            2,
+            "Expected ls --versions to return both object versions"
+        );
+        assert!(
+            matching_versions
+                .iter()
+                .any(|entry| entry["is_latest"].as_bool() == Some(true)),
+            "Expected one listed version to be marked as latest"
+        );
+        assert!(
+            matching_versions
+                .iter()
+                .all(|entry| entry["version_id"].as_str().is_some()),
+            "Expected every listed version to carry a version_id"
+        );
+
+        cleanup_bucket(config_dir.path(), &bucket_name);
+    }
+
+    #[test]
     fn test_rm_recursive_purge_permanently_deletes_versioned_prefix() {
         let (config_dir, bucket_name) = match setup_with_alias("rmpurgeprefix") {
             Some(v) => v,

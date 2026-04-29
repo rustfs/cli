@@ -52,6 +52,28 @@ struct Summary {
     total_size_human: String,
 }
 
+#[derive(Debug, Serialize)]
+struct LsVersionOutput {
+    items: Vec<LsVersionInfo>,
+    truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    continuation_token: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct LsVersionInfo {
+    key: String,
+    version_id: String,
+    is_latest: bool,
+    is_delete_marker: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_modified: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size_bytes: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size_human: Option<String>,
+}
+
 /// Execute the ls command
 pub async fn execute(args: LsArgs, output_config: OutputConfig) -> ExitCode {
     let formatter = Formatter::new(output_config);
@@ -104,8 +126,83 @@ pub async fn execute(args: LsArgs, output_config: OutputConfig) -> ExitCode {
     let bucket = bucket.unwrap();
     let path = RemotePath::new(&alias_name, &bucket, prefix.unwrap_or_default());
 
+    if args.versions {
+        return list_object_versions(&client, &path, args.summarize, &formatter).await;
+    }
+
     // List objects
     list_objects(&client, &path, &args, &formatter).await
+}
+
+async fn list_object_versions(
+    client: &S3Client,
+    path: &RemotePath,
+    summarize: bool,
+    formatter: &Formatter,
+) -> ExitCode {
+    match client.list_object_versions(path, Some(1000)).await {
+        Ok(versions) => {
+            let total_size: i64 = versions.iter().filter_map(|v| v.size_bytes).sum();
+
+            if formatter.is_json() {
+                let items = versions
+                    .into_iter()
+                    .map(|v| LsVersionInfo {
+                        key: v.key,
+                        version_id: v.version_id,
+                        is_latest: v.is_latest,
+                        is_delete_marker: v.is_delete_marker,
+                        last_modified: v.last_modified.map(|t| t.to_string()),
+                        size_bytes: v.size_bytes,
+                        size_human: v
+                            .size_bytes
+                            .map(|s| humansize::format_size(s as u64, humansize::BINARY)),
+                    })
+                    .collect();
+                formatter.json(&LsVersionOutput {
+                    items,
+                    truncated: false,
+                    continuation_token: None,
+                });
+            } else {
+                for version in &versions {
+                    let marker = if version.is_delete_marker {
+                        " [DELETE]"
+                    } else {
+                        ""
+                    };
+                    let latest = if version.is_latest { "*" } else { " " };
+                    let size = version
+                        .size_bytes
+                        .map(|s| humansize::format_size(s as u64, humansize::BINARY))
+                        .unwrap_or_default();
+
+                    formatter.println(&format!(
+                        "{latest} {:<40} {:>10} {:>12}{marker}",
+                        version.key,
+                        version.version_id.chars().take(10).collect::<String>(),
+                        size
+                    ));
+                }
+
+                if summarize {
+                    let total_size_human =
+                        humansize::format_size(total_size as u64, humansize::BINARY);
+                    formatter.println(&format!(
+                        "\nTotal: {} version(s), {}",
+                        formatter.style_size(&versions.len().to_string()),
+                        formatter.style_size(&total_size_human)
+                    ));
+                }
+            }
+
+            ExitCode::Success
+        }
+        Err(e) => {
+            formatter.error(&format!("Failed to list versions: {e}"));
+            ExitCode::GeneralError
+        }
+    }
 }
 
 async fn list_buckets(client: &S3Client, formatter: &Formatter, summarize: bool) -> ExitCode {
