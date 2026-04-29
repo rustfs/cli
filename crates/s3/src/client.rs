@@ -761,7 +761,7 @@ impl S3Client {
         }
 
         let response = builder.send().await.map_err(|e| {
-            let err_str = e.to_string();
+            let err_str = Self::format_sdk_error(&e);
             if err_str.contains("NotFound") || err_str.contains("NoSuchBucket") {
                 Error::NotFound(format!("Bucket not found: {}", path.bucket))
             } else {
@@ -3542,6 +3542,117 @@ mod tests {
         match result {
             Err(Error::Network(message)) => assert!(message.contains("InternalError")),
             other => panic!("Expected Network for delete failure, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_object_versions_page_preserves_markers_and_delete_markers() {
+        let response = http::Response::builder()
+            .status(200)
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListVersionsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>bucket</Name>
+  <Prefix>logs/</Prefix>
+  <KeyMarker></KeyMarker>
+  <VersionIdMarker></VersionIdMarker>
+  <NextKeyMarker>logs/c.txt</NextKeyMarker>
+  <NextVersionIdMarker>v3</NextVersionIdMarker>
+  <MaxKeys>25</MaxKeys>
+  <IsTruncated>true</IsTruncated>
+  <Version>
+    <Key>logs/a.txt</Key>
+    <VersionId>v1</VersionId>
+    <IsLatest>true</IsLatest>
+    <LastModified>2026-04-29T11:22:33.000Z</LastModified>
+    <ETag>"etag-a"</ETag>
+    <Size>12</Size>
+    <StorageClass>STANDARD</StorageClass>
+  </Version>
+  <DeleteMarker>
+    <Key>logs/b.txt</Key>
+    <VersionId>v2</VersionId>
+    <IsLatest>false</IsLatest>
+    <LastModified>2026-04-28T10:20:30.000Z</LastModified>
+    <Owner>
+      <ID>owner</ID>
+    </Owner>
+  </DeleteMarker>
+</ListVersionsResult>"#,
+            ))
+            .expect("build list object versions response");
+        let (client, request_receiver) = test_s3_client(Some(response));
+        let path = RemotePath::new("test", "bucket", "logs/");
+
+        let result = client
+            .list_object_versions_page(&path, Some(25))
+            .await
+            .expect("list object versions page");
+
+        let request = request_receiver.expect_request();
+        let uri = request.uri().to_string();
+        assert!(
+            uri.starts_with("https://example.com/bucket/?"),
+            "unexpected URI: {uri}"
+        );
+        assert!(
+            uri.contains("versions"),
+            "expected versions subresource: {uri}"
+        );
+        assert!(
+            uri.contains("prefix=logs%2F"),
+            "expected prefix query: {uri}"
+        );
+        assert!(
+            uri.contains("max-keys=25"),
+            "expected max-keys query: {uri}"
+        );
+
+        assert!(result.truncated);
+        assert_eq!(result.continuation_token.as_deref(), Some("logs/c.txt"));
+        assert_eq!(result.version_id_marker.as_deref(), Some("v3"));
+        assert_eq!(result.items.len(), 2);
+
+        let version = &result.items[0];
+        assert_eq!(version.key, "logs/a.txt");
+        assert_eq!(version.version_id, "v1");
+        assert!(version.is_latest);
+        assert!(!version.is_delete_marker);
+        assert_eq!(version.size_bytes, Some(12));
+        assert_eq!(version.etag.as_deref(), Some("etag-a"));
+
+        let delete_marker = &result.items[1];
+        assert_eq!(delete_marker.key, "logs/b.txt");
+        assert_eq!(delete_marker.version_id, "v2");
+        assert!(!delete_marker.is_latest);
+        assert!(delete_marker.is_delete_marker);
+        assert_eq!(delete_marker.size_bytes, None);
+        assert_eq!(delete_marker.etag, None);
+    }
+
+    #[tokio::test]
+    async fn list_object_versions_page_maps_missing_bucket_to_not_found() {
+        let response = http::Response::builder()
+            .status(404)
+            .header("x-amz-error-code", "NoSuchBucket")
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error>
+  <Code>NoSuchBucket</Code>
+  <Message>The specified bucket does not exist.</Message>
+</Error>"#,
+            ))
+            .expect("build missing bucket response");
+        let (client, _request_receiver) = test_s3_client(Some(response));
+        let path = RemotePath::new("test", "missing-bucket", "");
+
+        let result = client.list_object_versions_page(&path, Some(1000)).await;
+
+        match result {
+            Err(Error::NotFound(message)) => {
+                assert_eq!(message, "Bucket not found: missing-bucket")
+            }
+            other => panic!("Expected NotFound for missing bucket, got: {other:?}"),
         }
     }
 
