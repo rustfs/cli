@@ -63,6 +63,8 @@ struct LsVersionOutput {
     continuation_token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     version_id_marker: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<VersionSummary>,
 }
 
 #[derive(Debug, Serialize)]
@@ -77,6 +79,13 @@ struct LsVersionInfo {
     size_bytes: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     size_human: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct VersionSummary {
+    total_versions: usize,
+    total_size_bytes: i64,
+    total_size_human: String,
 }
 
 /// Execute the ls command
@@ -151,7 +160,7 @@ async fn list_object_versions(
             let total_size: i64 = versions.iter().filter_map(|v| v.size_bytes).sum();
 
             if formatter.is_json() {
-                formatter.json(&ls_version_output(result));
+                formatter.json(&ls_version_output(result, summarize));
             } else {
                 for version in &versions {
                     let marker = if version.is_delete_marker {
@@ -193,7 +202,9 @@ async fn list_object_versions(
     }
 }
 
-fn ls_version_output(result: ObjectVersionListResult) -> LsVersionOutput {
+fn ls_version_output(result: ObjectVersionListResult, summarize: bool) -> LsVersionOutput {
+    let total_versions = result.items.len();
+    let total_size_bytes: i64 = result.items.iter().filter_map(|v| v.size_bytes).sum();
     let items = result
         .items
         .into_iter()
@@ -215,6 +226,11 @@ fn ls_version_output(result: ObjectVersionListResult) -> LsVersionOutput {
         truncated: result.truncated,
         continuation_token: result.continuation_token,
         version_id_marker: result.version_id_marker,
+        summary: summarize.then(|| VersionSummary {
+            total_versions,
+            total_size_bytes,
+            total_size_human: humansize::format_size(total_size_bytes as u64, humansize::BINARY),
+        }),
     }
 }
 
@@ -621,26 +637,67 @@ mod tests {
 
     #[test]
     fn test_ls_version_output_preserves_pagination_metadata() {
-        let output = ls_version_output(ObjectVersionListResult {
-            items: vec![ObjectVersion {
-                key: "logs/a.txt".to_string(),
-                version_id: "v1".to_string(),
-                is_latest: true,
-                is_delete_marker: false,
-                last_modified: None,
-                size_bytes: Some(12),
-                etag: None,
-            }],
-            truncated: true,
-            continuation_token: Some("logs/b.txt".to_string()),
-            version_id_marker: Some("v2".to_string()),
-        });
+        let output = ls_version_output(
+            ObjectVersionListResult {
+                items: vec![ObjectVersion {
+                    key: "logs/a.txt".to_string(),
+                    version_id: "v1".to_string(),
+                    is_latest: true,
+                    is_delete_marker: false,
+                    last_modified: None,
+                    size_bytes: Some(12),
+                    etag: None,
+                }],
+                truncated: true,
+                continuation_token: Some("logs/b.txt".to_string()),
+                version_id_marker: Some("v2".to_string()),
+            },
+            false,
+        );
 
         let json = serde_json::to_value(output).unwrap();
         assert_eq!(json["truncated"], true);
         assert_eq!(json["continuation_token"], "logs/b.txt");
         assert_eq!(json["version_id_marker"], "v2");
         assert_eq!(json["items"][0]["key"], "logs/a.txt");
+        assert!(json.get("summary").is_none());
+    }
+
+    #[test]
+    fn test_ls_version_output_adds_summary_when_requested() {
+        let output = ls_version_output(
+            ObjectVersionListResult {
+                items: vec![
+                    ObjectVersion {
+                        key: "logs/a.txt".to_string(),
+                        version_id: "v1".to_string(),
+                        is_latest: false,
+                        is_delete_marker: false,
+                        last_modified: None,
+                        size_bytes: Some(12),
+                        etag: None,
+                    },
+                    ObjectVersion {
+                        key: "logs/a.txt".to_string(),
+                        version_id: "v2".to_string(),
+                        is_latest: true,
+                        is_delete_marker: true,
+                        last_modified: None,
+                        size_bytes: None,
+                        etag: None,
+                    },
+                ],
+                truncated: false,
+                continuation_token: None,
+                version_id_marker: None,
+            },
+            true,
+        );
+
+        let json = serde_json::to_value(output).unwrap();
+        assert_eq!(json["summary"]["total_versions"], 2);
+        assert_eq!(json["summary"]["total_size_bytes"], 12);
+        assert_eq!(json["summary"]["total_size_human"], "12 B");
     }
 
     #[test]

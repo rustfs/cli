@@ -2858,6 +2858,115 @@ mod version_operations {
     }
 
     #[test]
+    fn test_ls_versions_json_summary_reports_totals() {
+        let (config_dir, bucket_name) = match setup_with_alias("lsversionssummary") {
+            Some(v) => v,
+            None => {
+                eprintln!("Skipping: S3 test config not available");
+                return;
+            }
+        };
+
+        let enable_output = run_rc(
+            &[
+                "version",
+                "enable",
+                &format!("test/{}", bucket_name),
+                "--json",
+            ],
+            config_dir.path(),
+        );
+        if !enable_output.status.success() {
+            eprintln!(
+                "Enable versioning not supported: {}",
+                String::from_utf8_lossy(&enable_output.stderr)
+            );
+            cleanup_bucket(config_dir.path(), &bucket_name);
+            return;
+        }
+
+        let temp_file = tempfile::NamedTempFile::new().expect("Failed to create temp file");
+        let object_key = "summary-version.txt";
+
+        std::fs::write(temp_file.path(), "first version").expect("Failed to write first version");
+        let first_upload_output = run_rc(
+            &[
+                "cp",
+                temp_file
+                    .path()
+                    .to_str()
+                    .expect("Temp file path should be UTF-8"),
+                &format!("test/{}/{}", bucket_name, object_key),
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            first_upload_output.status.success(),
+            "Failed to upload first version: {}",
+            String::from_utf8_lossy(&first_upload_output.stderr)
+        );
+
+        std::thread::sleep(Duration::from_secs(1));
+        std::fs::write(temp_file.path(), "second version with more bytes")
+            .expect("Failed to write second version");
+        let second_upload_output = run_rc(
+            &[
+                "cp",
+                temp_file
+                    .path()
+                    .to_str()
+                    .expect("Temp file path should be UTF-8"),
+                &format!("test/{}/{}", bucket_name, object_key),
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            second_upload_output.status.success(),
+            "Failed to upload second version: {}",
+            String::from_utf8_lossy(&second_upload_output.stderr)
+        );
+
+        let list_output = run_rc(
+            &[
+                "ls",
+                &format!("test/{}/", bucket_name),
+                "--versions",
+                "--summarize",
+                "--json",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            list_output.status.success(),
+            "Failed to list versions through ls --summarize: {}",
+            String::from_utf8_lossy(&list_output.stderr)
+        );
+
+        let stdout = String::from_utf8_lossy(&list_output.stdout);
+        let payload: serde_json::Value =
+            serde_json::from_str(&stdout).expect("Invalid JSON ls version output");
+        let items = payload["items"]
+            .as_array()
+            .expect("ls version output should expose an items array");
+        let total_size_bytes: i64 = items
+            .iter()
+            .filter_map(|entry| entry["size_bytes"].as_i64())
+            .sum();
+
+        assert_eq!(payload["summary"]["total_versions"], 2);
+        assert_eq!(payload["summary"]["total_size_bytes"], total_size_bytes);
+        assert_eq!(
+            payload["summary"]["total_size_human"],
+            serde_json::Value::String(humansize::format_size(
+                total_size_bytes as u64,
+                humansize::BINARY
+            ))
+        );
+
+        cleanup_bucket(config_dir.path(), &bucket_name);
+    }
+
+    #[test]
     fn test_rm_recursive_purge_permanently_deletes_versioned_prefix() {
         let (config_dir, bucket_name) = match setup_with_alias("rmpurgeprefix") {
             Some(v) => v,
