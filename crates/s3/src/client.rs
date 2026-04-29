@@ -22,8 +22,8 @@ use jiff::Timestamp;
 use quick_xml::de::from_str as from_xml_str;
 use rc_core::{
     Alias, BucketNotification, Capabilities, CorsRule, Error, LifecycleRule, ListOptions,
-    ListResult, NotificationTarget, ObjectInfo, ObjectStore, ObjectVersion, RemotePath,
-    ReplicationConfiguration, Result, SelectOptions,
+    ListResult, NotificationTarget, ObjectInfo, ObjectStore, ObjectVersion,
+    ObjectVersionListResult, RemotePath, ReplicationConfiguration, Result, SelectOptions,
 };
 use reqwest::Method;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
@@ -742,6 +742,75 @@ impl S3Client {
     /// Get the underlying aws-sdk-s3 client
     pub fn inner(&self) -> &aws_sdk_s3::Client {
         &self.inner
+    }
+
+    /// List a single page of object versions and return pagination metadata.
+    pub async fn list_object_versions_page(
+        &self,
+        path: &RemotePath,
+        max_keys: Option<i32>,
+    ) -> Result<ObjectVersionListResult> {
+        let mut builder = self.inner.list_object_versions().bucket(&path.bucket);
+
+        if !path.key.is_empty() {
+            builder = builder.prefix(&path.key);
+        }
+
+        if let Some(max) = max_keys {
+            builder = builder.max_keys(max);
+        }
+
+        let response = builder.send().await.map_err(|e| {
+            let err_str = e.to_string();
+            if err_str.contains("NotFound") || err_str.contains("NoSuchBucket") {
+                Error::NotFound(format!("Bucket not found: {}", path.bucket))
+            } else {
+                Error::General(format!("list_object_versions: {e}"))
+            }
+        })?;
+
+        let mut items = Vec::new();
+
+        for v in response.versions() {
+            items.push(ObjectVersion {
+                key: v.key().unwrap_or_default().to_string(),
+                version_id: v.version_id().unwrap_or("null").to_string(),
+                is_latest: v.is_latest().unwrap_or(false),
+                is_delete_marker: false,
+                last_modified: v
+                    .last_modified()
+                    .and_then(|dt| Timestamp::from_second(dt.secs()).ok()),
+                size_bytes: v.size(),
+                etag: v.e_tag().map(|s| s.trim_matches('"').to_string()),
+            });
+        }
+
+        for m in response.delete_markers() {
+            items.push(ObjectVersion {
+                key: m.key().unwrap_or_default().to_string(),
+                version_id: m.version_id().unwrap_or("null").to_string(),
+                is_latest: m.is_latest().unwrap_or(false),
+                is_delete_marker: true,
+                last_modified: m
+                    .last_modified()
+                    .and_then(|dt| Timestamp::from_second(dt.secs()).ok()),
+                size_bytes: None,
+                etag: None,
+            });
+        }
+
+        items.sort_by(|a, b| {
+            a.key
+                .cmp(&b.key)
+                .then_with(|| b.last_modified.cmp(&a.last_modified))
+        });
+
+        Ok(ObjectVersionListResult {
+            items,
+            truncated: response.is_truncated().unwrap_or(false),
+            continuation_token: response.next_key_marker().map(ToString::to_string),
+            version_id_marker: response.next_version_id_marker().map(ToString::to_string),
+        })
     }
 
     /// Download object content and report downloaded bytes after each received chunk.
@@ -1930,61 +1999,7 @@ impl ObjectStore for S3Client {
         path: &RemotePath,
         max_keys: Option<i32>,
     ) -> Result<Vec<ObjectVersion>> {
-        let mut builder = self.inner.list_object_versions().bucket(&path.bucket);
-
-        if !path.key.is_empty() {
-            builder = builder.prefix(&path.key);
-        }
-
-        if let Some(max) = max_keys {
-            builder = builder.max_keys(max);
-        }
-
-        let response = builder
-            .send()
-            .await
-            .map_err(|e| Error::General(format!("list_object_versions: {e}")))?;
-
-        let mut versions = Vec::new();
-
-        // Add regular versions
-        for v in response.versions() {
-            versions.push(ObjectVersion {
-                key: v.key().unwrap_or_default().to_string(),
-                version_id: v.version_id().unwrap_or("null").to_string(),
-                is_latest: v.is_latest().unwrap_or(false),
-                is_delete_marker: false,
-                last_modified: v
-                    .last_modified()
-                    .and_then(|dt| Timestamp::from_second(dt.secs()).ok()),
-                size_bytes: v.size(),
-                etag: v.e_tag().map(|s| s.trim_matches('"').to_string()),
-            });
-        }
-
-        // Add delete markers
-        for m in response.delete_markers() {
-            versions.push(ObjectVersion {
-                key: m.key().unwrap_or_default().to_string(),
-                version_id: m.version_id().unwrap_or("null").to_string(),
-                is_latest: m.is_latest().unwrap_or(false),
-                is_delete_marker: true,
-                last_modified: m
-                    .last_modified()
-                    .and_then(|dt| Timestamp::from_second(dt.secs()).ok()),
-                size_bytes: None,
-                etag: None,
-            });
-        }
-
-        // Sort by key and then by last_modified (descending)
-        versions.sort_by(|a, b| {
-            a.key
-                .cmp(&b.key)
-                .then_with(|| b.last_modified.cmp(&a.last_modified))
-        });
-
-        Ok(versions)
+        Ok(self.list_object_versions_page(path, max_keys).await?.items)
     }
 
     async fn get_object_tags(

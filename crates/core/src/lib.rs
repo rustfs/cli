@@ -38,5 +38,5 @@ pub use retry::{RetryBuilder, is_retryable_error, retry_with_backoff};
 pub use select::{SelectCompression, SelectInputFormat, SelectOptions, SelectOutputFormat};
 pub use traits::{
     BucketNotification, Capabilities, ListOptions, ListResult, NotificationTarget, ObjectInfo,
-    ObjectStore, ObjectVersion,
+    ObjectStore, ObjectVersion, ObjectVersionListResult,
 };

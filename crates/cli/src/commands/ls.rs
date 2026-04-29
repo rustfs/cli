@@ -3,7 +3,10 @@
 //! Lists buckets when given an alias only, or lists objects when given a bucket path.
 
 use clap::Args;
-use rc_core::{AliasManager, ListOptions, ObjectInfo, ObjectStore as _, RemotePath};
+use rc_core::{
+    AliasManager, Error, ListOptions, ObjectInfo, ObjectStore as _, ObjectVersionListResult,
+    RemotePath,
+};
 use rc_s3::S3Client;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -58,6 +61,8 @@ struct LsVersionOutput {
     truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     continuation_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version_id_marker: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -140,30 +145,13 @@ async fn list_object_versions(
     summarize: bool,
     formatter: &Formatter,
 ) -> ExitCode {
-    match client.list_object_versions(path, Some(1000)).await {
-        Ok(versions) => {
+    match client.list_object_versions_page(path, Some(1000)).await {
+        Ok(result) => {
+            let versions = result.items.clone();
             let total_size: i64 = versions.iter().filter_map(|v| v.size_bytes).sum();
 
             if formatter.is_json() {
-                let items = versions
-                    .into_iter()
-                    .map(|v| LsVersionInfo {
-                        key: v.key,
-                        version_id: v.version_id,
-                        is_latest: v.is_latest,
-                        is_delete_marker: v.is_delete_marker,
-                        last_modified: v.last_modified.map(|t| t.to_string()),
-                        size_bytes: v.size_bytes,
-                        size_human: v
-                            .size_bytes
-                            .map(|s| humansize::format_size(s as u64, humansize::BINARY)),
-                    })
-                    .collect();
-                formatter.json(&LsVersionOutput {
-                    items,
-                    truncated: false,
-                    continuation_token: None,
-                });
+                formatter.json(&ls_version_output(result));
             } else {
                 for version in &versions {
                     let marker = if version.is_delete_marker {
@@ -200,7 +188,46 @@ async fn list_object_versions(
         }
         Err(e) => {
             formatter.error(&format!("Failed to list versions: {e}"));
-            ExitCode::GeneralError
+            exit_code_from_version_listing_error(&e)
+        }
+    }
+}
+
+fn ls_version_output(result: ObjectVersionListResult) -> LsVersionOutput {
+    let items = result
+        .items
+        .into_iter()
+        .map(|v| LsVersionInfo {
+            key: v.key,
+            version_id: v.version_id,
+            is_latest: v.is_latest,
+            is_delete_marker: v.is_delete_marker,
+            last_modified: v.last_modified.map(|t| t.to_string()),
+            size_bytes: v.size_bytes,
+            size_human: v
+                .size_bytes
+                .map(|s| humansize::format_size(s as u64, humansize::BINARY)),
+        })
+        .collect();
+
+    LsVersionOutput {
+        items,
+        truncated: result.truncated,
+        continuation_token: result.continuation_token,
+        version_id_marker: result.version_id_marker,
+    }
+}
+
+fn exit_code_from_version_listing_error(error: &Error) -> ExitCode {
+    match error {
+        Error::NotFound(_) => ExitCode::NotFound,
+        _ => {
+            let error_text = error.to_string();
+            if error_text.contains("NotFound") || error_text.contains("NoSuchBucket") {
+                ExitCode::NotFound
+            } else {
+                ExitCode::GeneralError
+            }
         }
     }
 }
@@ -530,6 +557,7 @@ fn parse_ls_path(path: &str) -> Result<(String, Option<String>, Option<String>),
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rc_core::ObjectVersion;
 
     #[test]
     fn test_parse_ls_path_alias_only() {
@@ -589,5 +617,53 @@ mod tests {
         let bucket = "demo".to_string();
         assert_eq!(alias_listing_mode(Some(&bucket), false), None);
         assert_eq!(alias_listing_mode(Some(&bucket), true), None);
+    }
+
+    #[test]
+    fn test_ls_version_output_preserves_pagination_metadata() {
+        let output = ls_version_output(ObjectVersionListResult {
+            items: vec![ObjectVersion {
+                key: "logs/a.txt".to_string(),
+                version_id: "v1".to_string(),
+                is_latest: true,
+                is_delete_marker: false,
+                last_modified: None,
+                size_bytes: Some(12),
+                etag: None,
+            }],
+            truncated: true,
+            continuation_token: Some("logs/b.txt".to_string()),
+            version_id_marker: Some("v2".to_string()),
+        });
+
+        let json = serde_json::to_value(output).unwrap();
+        assert_eq!(json["truncated"], true);
+        assert_eq!(json["continuation_token"], "logs/b.txt");
+        assert_eq!(json["version_id_marker"], "v2");
+        assert_eq!(json["items"][0]["key"], "logs/a.txt");
+    }
+
+    #[test]
+    fn test_version_listing_not_found_errors_use_not_found_exit_code() {
+        assert_eq!(
+            exit_code_from_version_listing_error(&Error::NotFound("missing".to_string())),
+            ExitCode::NotFound
+        );
+        assert_eq!(
+            exit_code_from_version_listing_error(&Error::General(
+                "list_object_versions: Service error: NoSuchBucket".to_string()
+            )),
+            ExitCode::NotFound
+        );
+    }
+
+    #[test]
+    fn test_version_listing_other_errors_use_general_exit_code() {
+        assert_eq!(
+            exit_code_from_version_listing_error(&Error::General(
+                "list_object_versions: timeout".to_string()
+            )),
+            ExitCode::GeneralError
+        );
     }
 }

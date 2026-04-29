@@ -45,6 +45,24 @@ pub struct ObjectVersion {
     pub etag: Option<String>,
 }
 
+/// Result of an object version list operation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObjectVersionListResult {
+    /// Listed object versions and delete markers
+    pub items: Vec<ObjectVersion>,
+
+    /// Whether the result is truncated (more items available)
+    pub truncated: bool,
+
+    /// Continuation key marker for pagination
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continuation_token: Option<String>,
+
+    /// Continuation version marker for pagination
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version_id_marker: Option<String>,
+}
+
 /// Metadata for an object or bucket
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObjectInfo {
