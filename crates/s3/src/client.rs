@@ -1736,9 +1736,11 @@ impl ObjectStore for S3Client {
             .send()
             .await
             .map_err(|e| {
-                let err_str = e.to_string();
+                let err_str = Self::format_sdk_error(&e);
                 if err_str.contains("NotFound") || err_str.contains("NoSuchBucket") {
                     Error::NotFound(format!("Bucket not found: {bucket}"))
+                } else if err_str.contains("BucketNotEmpty") {
+                    Error::Conflict(err_str)
                 } else {
                     Error::Network(err_str)
                 }
@@ -3525,6 +3527,54 @@ mod tests {
         match result {
             Err(Error::Network(message)) => assert!(message.contains("InternalError")),
             other => panic!("Expected Network for delete failure, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_bucket_maps_bucket_not_empty_to_conflict() {
+        let response = http::Response::builder()
+            .status(409)
+            .header("x-amz-error-code", "BucketNotEmpty")
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error>
+  <Code>BucketNotEmpty</Code>
+  <Message>The bucket you tried to delete is not empty.</Message>
+</Error>"#,
+            ))
+            .expect("build delete bucket response");
+        let (client, _request_receiver) = test_s3_client(Some(response));
+
+        let result = client.delete_bucket("bucket").await;
+
+        match result {
+            Err(Error::Conflict(message)) => assert!(message.contains("BucketNotEmpty")),
+            other => panic!("Expected Conflict for non-empty bucket, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_bucket_maps_missing_bucket_to_not_found() {
+        let response = http::Response::builder()
+            .status(404)
+            .header("x-amz-error-code", "NoSuchBucket")
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error>
+  <Code>NoSuchBucket</Code>
+  <Message>The specified bucket does not exist.</Message>
+</Error>"#,
+            ))
+            .expect("build missing bucket response");
+        let (client, _request_receiver) = test_s3_client(Some(response));
+
+        let result = client.delete_bucket("missing-bucket").await;
+
+        match result {
+            Err(Error::NotFound(message)) => {
+                assert_eq!(message, "Bucket not found: missing-bucket")
+            }
+            other => panic!("Expected NotFound for missing bucket, got: {other:?}"),
         }
     }
 

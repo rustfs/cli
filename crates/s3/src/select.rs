@@ -259,6 +259,12 @@ mod tests {
     }
 
     #[test]
+    fn classify_empty_code_maps_no_such_key_substring() {
+        let e = classify_aws_code(Some(""), "Service error: ... NoSuchKey ...");
+        assert!(matches!(e, Error::NotFound(msg) if msg.contains("Object")));
+    }
+
+    #[test]
     fn classify_empty_code_maps_not_implemented_substring() {
         let e = classify_aws_code(Some(""), "Service error: backend returned NotImplemented");
         assert!(matches!(e, Error::UnsupportedFeature(msg) if msg.contains("does not support")));
