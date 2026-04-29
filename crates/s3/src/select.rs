@@ -253,6 +253,12 @@ mod tests {
     }
 
     #[test]
+    fn classify_empty_code_maps_no_such_key_substring() {
+        let e = classify_aws_code(Some(""), "Service error: ... NoSuchKey ...");
+        assert!(matches!(e, Error::NotFound(msg) if msg.contains("Object")));
+    }
+
+    #[test]
     fn classify_maps_invalid_argument() {
         let e = classify_aws_code(Some("InvalidArgument"), "bad expr");
         assert!(matches!(e, Error::General(_)));
