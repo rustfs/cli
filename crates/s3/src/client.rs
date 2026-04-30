@@ -3594,6 +3594,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_bucket_maps_other_failures_to_network() {
+        let response = http::Response::builder()
+            .status(500)
+            .header("x-amz-error-code", "InternalError")
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error>
+  <Code>InternalError</Code>
+  <Message>Something went wrong.</Message>
+</Error>"#,
+            ))
+            .expect("build delete bucket response");
+        let (client, _request_receiver) = test_s3_client(Some(response));
+
+        let result = client.delete_bucket("bucket").await;
+
+        match result {
+            Err(Error::Network(message)) => assert!(message.contains("InternalError")),
+            other => panic!("Expected Network for delete bucket failure, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn delete_objects_with_force_delete_sets_rustfs_header() {
         let response = http::Response::builder()
             .status(200)
