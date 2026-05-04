@@ -3705,6 +3705,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_bucket_maps_not_found_code_to_not_found() {
+        let response = http::Response::builder()
+            .status(404)
+            .header("x-amz-error-code", "NotFound")
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error>
+  <Code>NotFound</Code>
+  <Message>The specified bucket does not exist.</Message>
+</Error>"#,
+            ))
+            .expect("build not found bucket response");
+        let (client, _request_receiver) = test_s3_client(Some(response));
+
+        let result = client.delete_bucket("missing-bucket").await;
+
+        match result {
+            Err(Error::NotFound(message)) => {
+                assert_eq!(message, "Bucket not found: missing-bucket")
+            }
+            other => panic!("Expected NotFound for NotFound delete bucket error, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn delete_bucket_maps_other_failures_to_network() {
         let response = http::Response::builder()
             .status(500)
