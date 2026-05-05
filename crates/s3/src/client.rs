@@ -3657,6 +3657,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_object_versions_page_maps_not_found_code_to_not_found() {
+        let response = http::Response::builder()
+            .status(404)
+            .header("x-amz-error-code", "NotFound")
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error>
+  <Code>NotFound</Code>
+  <Message>The specified bucket does not exist.</Message>
+</Error>"#,
+            ))
+            .expect("build not found bucket response");
+        let (client, _request_receiver) = test_s3_client(Some(response));
+        let path = RemotePath::new("test", "missing-bucket", "");
+
+        let result = client.list_object_versions_page(&path, Some(1000)).await;
+
+        match result {
+            Err(Error::NotFound(message)) => {
+                assert_eq!(message, "Bucket not found: missing-bucket")
+            }
+            other => panic!("Expected NotFound for NotFound list versions error, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn delete_bucket_maps_bucket_not_empty_to_conflict() {
         let response = http::Response::builder()
             .status(409)
