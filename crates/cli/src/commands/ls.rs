@@ -196,8 +196,9 @@ async fn list_object_versions(
             ExitCode::Success
         }
         Err(e) => {
-            formatter.error(&format!("Failed to list versions: {e}"));
-            exit_code_from_version_listing_error(&e)
+            let exit_code = exit_code_from_version_listing_error(&e);
+            formatter.error_with_code(exit_code, &format!("Failed to list versions: {e}"));
+            exit_code
         }
     }
 }
