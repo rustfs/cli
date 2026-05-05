@@ -765,7 +765,7 @@ impl S3Client {
             if err_str.contains("NotFound") || err_str.contains("NoSuchBucket") {
                 Error::NotFound(format!("Bucket not found: {}", path.bucket))
             } else {
-                Error::General(format!("list_object_versions: {e}"))
+                Error::Network(err_str)
             }
         })?;
 
@@ -3679,6 +3679,30 @@ mod tests {
                 assert_eq!(message, "Bucket not found: missing-bucket")
             }
             other => panic!("Expected NotFound for NotFound list versions error, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_object_versions_page_maps_other_failures_to_network() {
+        let response = http::Response::builder()
+            .status(500)
+            .header("x-amz-error-code", "InternalError")
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error>
+  <Code>InternalError</Code>
+  <Message>Something went wrong.</Message>
+</Error>"#,
+            ))
+            .expect("build internal error response");
+        let (client, _request_receiver) = test_s3_client(Some(response));
+        let path = RemotePath::new("test", "bucket", "");
+
+        let result = client.list_object_versions_page(&path, Some(1000)).await;
+
+        match result {
+            Err(Error::Network(message)) => assert!(message.contains("InternalError")),
+            other => panic!("Expected Network for list versions failure, got: {other:?}"),
         }
     }
 

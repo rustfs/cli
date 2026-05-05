@@ -237,6 +237,7 @@ fn ls_version_output(result: ObjectVersionListResult, summarize: bool) -> LsVers
 fn exit_code_from_version_listing_error(error: &Error) -> ExitCode {
     match error {
         Error::NotFound(_) => ExitCode::NotFound,
+        Error::Network(_) => ExitCode::NetworkError,
         _ => {
             let error_text = error.to_string();
             if error_text.contains("NotFound") || error_text.contains("NoSuchBucket") {
@@ -721,6 +722,14 @@ mod tests {
                 "list_object_versions: timeout".to_string()
             )),
             ExitCode::GeneralError
+        );
+    }
+
+    #[test]
+    fn test_version_listing_network_errors_use_network_exit_code() {
+        assert_eq!(
+            exit_code_from_version_listing_error(&Error::Network("timeout".to_string())),
+            ExitCode::NetworkError
         );
     }
 }
