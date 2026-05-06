@@ -33,9 +33,9 @@ tracing.workspace = true
 dirs.workspace = true
 jiff.workspace = true
 url.workspace = true
+urlencoding.workspace = true
 humansize.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
 mockall.workspace = true
-
