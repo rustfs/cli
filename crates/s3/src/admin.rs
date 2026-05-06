@@ -11,7 +11,8 @@ use aws_sigv4::http_request::{
 use aws_sigv4::sign::v4;
 use rc_core::admin::{
     AdminApi, BucketQuota, ClusterInfo, CreateServiceAccountRequest, Group, GroupStatus,
-    HealScanMode, HealStartRequest, HealStatus, Policy, PolicyEntity, PolicyInfo, ServiceAccount,
+    HealScanMode, HealStartRequest, HealStatus, Policy, PolicyEntity, PolicyInfo, PoolStatus,
+    PoolTarget, RebalanceStartResult, RebalanceStatus, ServiceAccount,
     ServiceAccountCreateResponse, UpdateGroupMembersRequest, User, UserStatus,
 };
 use rc_core::{Alias, Error, Result};
@@ -442,6 +443,14 @@ fn rustfs_heal_body(request: &HealStartRequest) -> Result<Vec<u8>> {
     serde_json::to_vec(&RustfsHealOptions::from(request)).map_err(Error::Json)
 }
 
+fn pool_target_query(target: &PoolTarget) -> Vec<(&str, &str)> {
+    let mut query = vec![("pool", target.pool.as_str())];
+    if target.by_id {
+        query.push(("by-id", "true"));
+    }
+    query
+}
+
 /// Request body for setting bucket quota
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -482,6 +491,43 @@ impl AdminApi for AdminClient {
             Some(&body),
         )
         .await
+    }
+
+    async fn list_pools(&self) -> Result<Vec<PoolStatus>> {
+        self.request(Method::GET, "/pools/list", None, None).await
+    }
+
+    async fn pool_status(&self, target: PoolTarget) -> Result<PoolStatus> {
+        let query = pool_target_query(&target);
+        self.request(Method::GET, "/pools/status", Some(&query), None)
+            .await
+    }
+
+    async fn decommission_start(&self, target: PoolTarget) -> Result<()> {
+        let query = pool_target_query(&target);
+        self.request_no_response(Method::POST, "/pools/decommission", Some(&query), None)
+            .await
+    }
+
+    async fn decommission_cancel(&self, target: PoolTarget) -> Result<()> {
+        let query = pool_target_query(&target);
+        self.request_no_response(Method::POST, "/pools/cancel", Some(&query), None)
+            .await
+    }
+
+    async fn rebalance_start(&self) -> Result<RebalanceStartResult> {
+        self.request(Method::POST, "/rebalance/start", None, None)
+            .await
+    }
+
+    async fn rebalance_status(&self) -> Result<RebalanceStatus> {
+        self.request(Method::GET, "/rebalance/status", None, None)
+            .await
+    }
+
+    async fn rebalance_stop(&self) -> Result<()> {
+        self.request_no_response(Method::POST, "/rebalance/stop", None, None)
+            .await
     }
 
     // ==================== User Operations ====================
@@ -1195,6 +1241,78 @@ mod tests {
         assert_eq!(request.method, "POST");
         assert_eq!(request.target, "/rustfs/admin/v3/heal/?forceStop=true");
         assert_heal_options_body(&request.body, 1, false, false, false);
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn test_pool_status_uses_pool_status_route_with_by_id_query() {
+        let (endpoint, receiver, handle) = start_admin_test_server(
+            "200 OK",
+            r#"{"id":1,"cmdline":"/data/pool1/disk{1...4}","lastUpdate":"2026-05-06T00:00:00Z","decommissionInfo":null}"#,
+        );
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let status = client
+            .pool_status(PoolTarget {
+                pool: "1".to_string(),
+                by_id: true,
+            })
+            .await
+            .expect("pool status request");
+
+        assert_eq!(status.id, 1);
+        assert_eq!(status.cmd_line, "/data/pool1/disk{1...4}");
+
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(request.method, "GET");
+        assert_eq!(
+            request.target,
+            "/rustfs/admin/v3/pools/status?pool=1&by-id=true"
+        );
+        assert!(request.body.is_empty());
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn test_decommission_start_posts_pool_query() {
+        let (endpoint, receiver, handle) = start_admin_test_server("200 OK", "");
+        let client = admin_client_for_endpoint(&endpoint);
+
+        client
+            .decommission_start(PoolTarget {
+                pool: "/data/pool1/disk{1...4}".to_string(),
+                by_id: false,
+            })
+            .await
+            .expect("decommission start request");
+
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(request.method, "POST");
+        assert_eq!(
+            request.target,
+            "/rustfs/admin/v3/pools/decommission?pool=%2Fdata%2Fpool1%2Fdisk%7B1...4%7D"
+        );
+        assert!(request.body.is_empty());
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn test_rebalance_start_posts_rebalance_start_route() {
+        let (endpoint, receiver, handle) =
+            start_admin_test_server("200 OK", r#"{"id":"rebalance-123"}"#);
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let result = client
+            .rebalance_start()
+            .await
+            .expect("rebalance start request");
+
+        assert_eq!(result.id, "rebalance-123");
+
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.target, "/rustfs/admin/v3/rebalance/start");
+        assert!(request.body.is_empty());
         handle.join().expect("server thread should finish");
     }
 

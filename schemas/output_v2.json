@@ -298,6 +298,208 @@
         }
       }
     },
+    "poolDecommissionInfo": {
+      "type": "object",
+      "properties": {
+        "startTime": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Decommission start timestamp"
+        },
+        "startSize": {
+          "type": "integer",
+          "description": "Free bytes when decommission started"
+        },
+        "totalSize": {
+          "type": "integer",
+          "description": "Total pool size in bytes"
+        },
+        "currentSize": {
+          "type": "integer",
+          "description": "Current free bytes in the pool"
+        },
+        "complete": {
+          "type": "boolean",
+          "description": "Whether decommission completed"
+        },
+        "failed": {
+          "type": "boolean",
+          "description": "Whether decommission failed"
+        },
+        "canceled": {
+          "type": "boolean",
+          "description": "Whether decommission was canceled"
+        },
+        "objectsDecommissioned": {
+          "type": "integer",
+          "description": "Objects successfully moved off the pool"
+        },
+        "objectsDecommissionedFailed": {
+          "type": "integer",
+          "description": "Objects that failed to move off the pool"
+        },
+        "bytesDecommissioned": {
+          "type": "integer",
+          "description": "Bytes successfully moved off the pool"
+        },
+        "bytesDecommissionedFailed": {
+          "type": "integer",
+          "description": "Bytes that failed to move off the pool"
+        }
+      }
+    },
+    "poolStatus": {
+      "type": "object",
+      "required": [
+        "id",
+        "cmdline",
+        "lastUpdate",
+        "decommissionInfo"
+      ],
+      "properties": {
+        "id": {
+          "type": "integer",
+          "description": "Zero-based pool ID"
+        },
+        "cmdline": {
+          "type": "string",
+          "description": "Pool command line used by the server process"
+        },
+        "lastUpdate": {
+          "type": "string",
+          "description": "Last pool metadata update timestamp"
+        },
+        "decommissionInfo": {
+          "oneOf": [
+            {
+              "$ref": "#/definitions/poolDecommissionInfo"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Decommission state and progress for this pool"
+        }
+      }
+    },
+    "rebalancePoolProgress": {
+      "type": "object",
+      "required": [
+        "objects",
+        "versions",
+        "bytes",
+        "remainingBuckets",
+        "bucket",
+        "object",
+        "elapsed",
+        "eta"
+      ],
+      "properties": {
+        "objects": {
+          "type": "integer",
+          "description": "Objects moved"
+        },
+        "versions": {
+          "type": "integer",
+          "description": "Object versions moved"
+        },
+        "bytes": {
+          "type": "integer",
+          "description": "Bytes moved"
+        },
+        "remainingBuckets": {
+          "type": "integer",
+          "description": "Buckets remaining"
+        },
+        "bucket": {
+          "type": "string",
+          "description": "Current bucket"
+        },
+        "object": {
+          "type": "string",
+          "description": "Current object"
+        },
+        "elapsed": {
+          "type": "integer",
+          "description": "Elapsed seconds"
+        },
+        "eta": {
+          "type": "integer",
+          "description": "Estimated seconds remaining"
+        }
+      }
+    },
+    "rebalancePoolStatus": {
+      "type": "object",
+      "required": [
+        "id",
+        "status",
+        "used",
+        "lastError",
+        "progress"
+      ],
+      "properties": {
+        "id": {
+          "type": "integer",
+          "description": "Zero-based pool ID"
+        },
+        "status": {
+          "type": "string",
+          "description": "Pool rebalance status"
+        },
+        "used": {
+          "type": "number",
+          "description": "Used capacity ratio in the range 0.0..=1.0"
+        },
+        "lastError": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Last rebalance error for this pool"
+        },
+        "progress": {
+          "oneOf": [
+            {
+              "$ref": "#/definitions/rebalancePoolProgress"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Rebalance progress for this pool"
+        }
+      }
+    },
+    "rebalanceStatus": {
+      "type": "object",
+      "required": [
+        "id",
+        "pools",
+        "stoppedAt"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Rebalance operation ID"
+        },
+        "pools": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/rebalancePoolStatus"
+          }
+        },
+        "stoppedAt": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Timestamp when rebalance was stopped"
+        }
+      }
+    },
     "errorResponse": {
       "type": "object",
       "required": [
@@ -469,6 +671,78 @@
         },
         "status": {
           "$ref": "#/definitions/healStatus"
+        }
+      }
+    },
+    {
+      "title": "admin pool list",
+      "description": "Server pool list output",
+      "type": "object",
+      "required": [
+        "pools"
+      ],
+      "properties": {
+        "pools": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/poolStatus"
+          }
+        }
+      }
+    },
+    {
+      "title": "admin pool status",
+      "description": "Server pool status output",
+      "$ref": "#/definitions/poolStatus"
+    },
+    {
+      "title": "admin decommission operation",
+      "description": "Decommission start/cancel output",
+      "type": "object",
+      "required": [
+        "success",
+        "message",
+        "pool"
+      ],
+      "properties": {
+        "success": {
+          "type": "boolean"
+        },
+        "message": {
+          "type": "string"
+        },
+        "pool": {
+          "type": "string"
+        }
+      }
+    },
+    {
+      "title": "admin rebalance status",
+      "description": "Rebalance status output",
+      "$ref": "#/definitions/rebalanceStatus"
+    },
+    {
+      "title": "admin rebalance operation",
+      "description": "Rebalance start/stop output",
+      "type": "object",
+      "required": [
+        "success",
+        "message",
+        "target"
+      ],
+      "properties": {
+        "success": {
+          "type": "boolean"
+        },
+        "message": {
+          "type": "string"
+        },
+        "target": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string",
+          "description": "Rebalance operation ID returned by start"
         }
       }
     },

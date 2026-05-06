@@ -154,7 +154,17 @@ fn top_level_command_help_contract() {
         HelpCase {
             args: &["admin"],
             usage: "Usage: rc admin [OPTIONS] <COMMAND>",
-            expected_tokens: &["info", "heal", "user", "policy", "group", "service-account"],
+            expected_tokens: &[
+                "info",
+                "heal",
+                "pool",
+                "decommission",
+                "rebalance",
+                "user",
+                "policy",
+                "group",
+                "service-account",
+            ],
         },
         HelpCase {
             args: &["bucket"],
@@ -435,6 +445,46 @@ fn nested_subcommand_help_contract() {
         HelpCase {
             args: &["admin", "heal", "stop"],
             usage: "Usage: rc admin heal stop [OPTIONS] <ALIAS>",
+            expected_tokens: &[],
+        },
+        HelpCase {
+            args: &["admin", "pool", "list"],
+            usage: "Usage: rc admin pool list [OPTIONS] <ALIAS>",
+            expected_tokens: &[],
+        },
+        HelpCase {
+            args: &["admin", "pool", "status"],
+            usage: "Usage: rc admin pool status [OPTIONS] <ALIAS> [POOL]",
+            expected_tokens: &["--by-id"],
+        },
+        HelpCase {
+            args: &["admin", "decommission", "start"],
+            usage: "Usage: rc admin decommission start [OPTIONS] <ALIAS> <POOL>",
+            expected_tokens: &["--by-id"],
+        },
+        HelpCase {
+            args: &["admin", "decommission", "status"],
+            usage: "Usage: rc admin decommission status [OPTIONS] <ALIAS> [POOL]",
+            expected_tokens: &["--by-id"],
+        },
+        HelpCase {
+            args: &["admin", "decommission", "cancel"],
+            usage: "Usage: rc admin decommission cancel [OPTIONS] <ALIAS> <POOL>",
+            expected_tokens: &["--by-id"],
+        },
+        HelpCase {
+            args: &["admin", "rebalance", "start"],
+            usage: "Usage: rc admin rebalance start [OPTIONS] <ALIAS>",
+            expected_tokens: &[],
+        },
+        HelpCase {
+            args: &["admin", "rebalance", "status"],
+            usage: "Usage: rc admin rebalance status [OPTIONS] <ALIAS>",
+            expected_tokens: &[],
+        },
+        HelpCase {
+            args: &["admin", "rebalance", "stop"],
+            usage: "Usage: rc admin rebalance stop [OPTIONS] <ALIAS>",
             expected_tokens: &[],
         },
         HelpCase {

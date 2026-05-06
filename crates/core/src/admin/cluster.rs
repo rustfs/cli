@@ -566,6 +566,170 @@ pub struct HealStatus {
     pub last_update: Option<String>,
 }
 
+/// Request targeting a storage pool by command line or numeric ID.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PoolTarget {
+    /// Pool command line, or zero-based pool ID when `by_id` is true.
+    pub pool: String,
+
+    /// Interpret `pool` as a zero-based pool ID.
+    #[serde(default)]
+    pub by_id: bool,
+}
+
+/// Status of a server pool.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PoolStatus {
+    /// Zero-based pool ID.
+    #[serde(default)]
+    pub id: usize,
+
+    /// Pool command line used by the server process.
+    #[serde(default, rename = "cmdline")]
+    pub cmd_line: String,
+
+    /// Last pool metadata update timestamp.
+    #[serde(default, rename = "lastUpdate")]
+    pub last_update: String,
+
+    /// Decommission status and progress for this pool.
+    #[serde(default, rename = "decommissionInfo")]
+    pub decommission: Option<PoolDecommissionInfo>,
+}
+
+/// Decommission state and progress for a server pool.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PoolDecommissionInfo {
+    /// Decommission start timestamp.
+    #[serde(default, rename = "startTime")]
+    pub start_time: Option<String>,
+
+    /// Free bytes when decommission started.
+    #[serde(default, rename = "startSize")]
+    pub start_size: u64,
+
+    /// Total pool size in bytes.
+    #[serde(default, rename = "totalSize")]
+    pub total_size: u64,
+
+    /// Current free size in bytes.
+    #[serde(default, rename = "currentSize")]
+    pub current_size: u64,
+
+    /// Whether decommission completed.
+    #[serde(default)]
+    pub complete: bool,
+
+    /// Whether decommission failed.
+    #[serde(default)]
+    pub failed: bool,
+
+    /// Whether decommission was canceled.
+    #[serde(default)]
+    pub canceled: bool,
+
+    /// Number of successfully decommissioned objects.
+    #[serde(default, rename = "objectsDecommissioned")]
+    pub objects_decommissioned: u64,
+
+    /// Number of objects that failed to decommission.
+    #[serde(default, rename = "objectsDecommissionedFailed")]
+    pub objects_decommissioned_failed: u64,
+
+    /// Bytes successfully moved off the pool.
+    #[serde(default, rename = "bytesDecommissioned")]
+    pub bytes_decommissioned: u64,
+
+    /// Bytes that failed to move off the pool.
+    #[serde(default, rename = "bytesDecommissionedFailed")]
+    pub bytes_decommissioned_failed: u64,
+}
+
+/// Response from starting a rebalance operation.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RebalanceStartResult {
+    /// Rebalance operation ID.
+    #[serde(default)]
+    pub id: String,
+}
+
+/// Cluster-wide rebalance status.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RebalanceStatus {
+    /// Rebalance operation ID.
+    #[serde(default)]
+    pub id: String,
+
+    /// Per-pool rebalance status.
+    #[serde(default)]
+    pub pools: Vec<RebalancePoolStatus>,
+
+    /// Timestamp when rebalance was stopped.
+    #[serde(default, rename = "stoppedAt")]
+    pub stopped_at: Option<String>,
+}
+
+/// Rebalance status for a single pool.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RebalancePoolStatus {
+    /// Zero-based pool ID.
+    #[serde(default)]
+    pub id: usize,
+
+    /// Rebalance status for this pool.
+    #[serde(default)]
+    pub status: String,
+
+    /// Used capacity ratio in the range 0.0..=1.0.
+    #[serde(default)]
+    pub used: f64,
+
+    /// Last rebalance error, if any.
+    #[serde(default, rename = "lastError")]
+    pub last_error: Option<String>,
+
+    /// Rebalance progress, if this pool is active.
+    #[serde(default)]
+    pub progress: Option<RebalancePoolProgress>,
+}
+
+/// Rebalance progress for a single pool.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RebalancePoolProgress {
+    /// Number of objects moved.
+    #[serde(default, rename = "objects")]
+    pub num_objects: u64,
+
+    /// Number of object versions moved.
+    #[serde(default, rename = "versions")]
+    pub num_versions: u64,
+
+    /// Number of bytes moved.
+    #[serde(default)]
+    pub bytes: u64,
+
+    /// Number of buckets remaining.
+    #[serde(default, rename = "remainingBuckets")]
+    pub remaining_buckets: usize,
+
+    /// Current bucket.
+    #[serde(default)]
+    pub bucket: String,
+
+    /// Current object.
+    #[serde(default)]
+    pub object: String,
+
+    /// Elapsed seconds.
+    #[serde(default)]
+    pub elapsed: u64,
+
+    /// Estimated seconds remaining.
+    #[serde(default)]
+    pub eta: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -686,6 +850,36 @@ mod tests {
         assert!(status.heal_id.is_empty());
         assert!(!status.healing);
         assert_eq!(status.items_scanned, 0);
+    }
+
+    #[test]
+    fn test_pool_status_deserialization() {
+        let json = r#"{"id":1,"cmdline":"/data/pool1/disk{1...4}","lastUpdate":"2026-05-06T00:00:00Z","decommissionInfo":{"startTime":"2026-05-06T00:00:01Z","startSize":100,"totalSize":1000,"currentSize":600,"complete":false,"failed":false,"canceled":false,"objectsDecommissioned":2,"objectsDecommissionedFailed":1,"bytesDecommissioned":128,"bytesDecommissionedFailed":64}}"#;
+
+        let status: PoolStatus = serde_json::from_str(json).unwrap();
+
+        assert_eq!(status.id, 1);
+        assert_eq!(status.cmd_line, "/data/pool1/disk{1...4}");
+        let info = status.decommission.expect("decommission info exists");
+        assert_eq!(info.objects_decommissioned, 2);
+        assert_eq!(info.bytes_decommissioned_failed, 64);
+    }
+
+    #[test]
+    fn test_rebalance_status_deserialization() {
+        let json = r#"{"id":"rebalance-1","pools":[{"id":0,"status":"Started","used":0.5,"lastError":null,"progress":{"objects":3,"versions":4,"bytes":1024,"remainingBuckets":2,"bucket":"bucket","object":"object","elapsed":10,"eta":20}}],"stoppedAt":null}"#;
+
+        let status: RebalanceStatus = serde_json::from_str(json).unwrap();
+
+        assert_eq!(status.id, "rebalance-1");
+        assert_eq!(status.pools.len(), 1);
+        assert_eq!(status.pools[0].used, 0.5);
+        let progress = status.pools[0]
+            .progress
+            .as_ref()
+            .expect("progress should exist");
+        assert_eq!(progress.num_objects, 3);
+        assert_eq!(progress.remaining_buckets, 2);
     }
 
     #[test]

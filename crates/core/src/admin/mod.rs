@@ -10,7 +10,8 @@ mod types;
 pub use cluster::{
     BackendInfo, BackendType, BucketsInfo, ClusterInfo, DiskInfo, HealDriveInfo, HealDriveInfos,
     HealResultItem, HealScanMode, HealStartRequest, HealStatus, HealingDiskInfo, MemStats,
-    ObjectsInfo, ServerInfo, UsageInfo,
+    ObjectsInfo, PoolDecommissionInfo, PoolStatus, PoolTarget, RebalancePoolProgress,
+    RebalancePoolStatus, RebalanceStartResult, RebalanceStatus, ServerInfo, UsageInfo,
 };
 pub use tier::{
     TierAliyun, TierAzure, TierConfig, TierCreds, TierGCS, TierHuaweicloud, TierMinIO, TierR2,
@@ -46,6 +47,27 @@ pub trait AdminApi: Send + Sync {
 
     /// Stop a running heal operation
     async fn heal_stop(&self) -> Result<()>;
+
+    /// List storage pools
+    async fn list_pools(&self) -> Result<Vec<PoolStatus>>;
+
+    /// Get storage pool status
+    async fn pool_status(&self, target: PoolTarget) -> Result<PoolStatus>;
+
+    /// Start decommissioning one or more storage pools
+    async fn decommission_start(&self, target: PoolTarget) -> Result<()>;
+
+    /// Cancel decommissioning a storage pool
+    async fn decommission_cancel(&self, target: PoolTarget) -> Result<()>;
+
+    /// Start a rebalance operation
+    async fn rebalance_start(&self) -> Result<RebalanceStartResult>;
+
+    /// Get rebalance status
+    async fn rebalance_status(&self) -> Result<RebalanceStatus>;
+
+    /// Stop a running rebalance operation
+    async fn rebalance_stop(&self) -> Result<()>;
 
     // ==================== User Operations ====================
 

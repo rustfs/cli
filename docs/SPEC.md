@@ -228,6 +228,85 @@ rc admin heal stop <ALIAS>
 
 **Exit Codes:** 0, 2 (invalid input), 4 (auth error), 5 (alias not found)
 
+#### admin pool
+
+List server pools and inspect pool status. This is the CLI entry point for
+post-expansion verification: RustFS expansion is performed by starting the
+deployment with additional pools, then using these commands to verify that the
+new pool is visible.
+
+```
+rc admin pool list <ALIAS>
+rc admin pool status <ALIAS> [POOL] [OPTIONS]
+```
+
+**Arguments:**
+| Argument | Description |
+|----------|-------------|
+| ALIAS | Alias name of the server |
+| POOL | Pool command line, or zero-based pool ID with `--by-id` |
+
+**Options (status):**
+| Option | Default | Description |
+|--------|---------|-------------|
+| --by-id | false | Interpret `POOL` as a zero-based pool ID |
+
+**Output (--json):**
+- `admin pool list`: See `schemas/output_v2.json#admin-pool-list`
+- `admin pool status`: See `schemas/output_v2.json#admin-pool-status`
+
+**Exit Codes:** 0, 4 (auth error), 5 (alias not found)
+
+#### admin decommission
+
+Manage server pool decommissioning.
+
+```
+rc admin decommission start <ALIAS> <POOL> [OPTIONS]
+rc admin decommission status <ALIAS> [POOL] [OPTIONS]
+rc admin decommission cancel <ALIAS> <POOL> [OPTIONS]
+```
+
+Alias: `rc admin decom`
+
+**Arguments:**
+| Argument | Description |
+|----------|-------------|
+| ALIAS | Alias name of the server |
+| POOL | Pool command line, comma-separated pool command lines for `start`, or zero-based pool ID with `--by-id` |
+
+**Options:**
+| Option | Default | Description |
+|--------|---------|-------------|
+| --by-id | false | Interpret `POOL` as zero-based pool ID values |
+
+**Output (--json):**
+- `admin decommission status`: See `schemas/output_v2.json#admin-pool-status` or `schemas/output_v2.json#admin-pool-list`
+- `admin decommission start/cancel`: See `schemas/output_v2.json#admin-decommission-operation`
+
+**Exit Codes:** 0, 4 (auth error), 5 (alias not found)
+
+#### admin rebalance
+
+Manage data rebalancing after server pool expansion.
+
+```
+rc admin rebalance start <ALIAS>
+rc admin rebalance status <ALIAS>
+rc admin rebalance stop <ALIAS>
+```
+
+**Arguments:**
+| Argument | Description |
+|----------|-------------|
+| ALIAS | Alias name of the server |
+
+**Output (--json):**
+- `admin rebalance status`: See `schemas/output_v2.json#admin-rebalance-status`
+- `admin rebalance start/stop`: See `schemas/output_v2.json#admin-rebalance-operation`
+
+**Exit Codes:** 0, 4 (auth error), 5 (alias not found)
+
 ---
 
 ### ls - List Objects

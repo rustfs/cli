@@ -244,9 +244,22 @@ rc admin heal start local --bucket mybucket --scan-mode deep
 rc admin heal start local --dry-run
 rc admin heal stop local
 
+# Pool expansion and decommission workflows
+rc admin pool list local
+rc admin pool status local 1 --by-id
+rc admin decommission start local '/data/pool1/disk{1...4}'
+rc admin decommission status local '/data/pool1/disk{1...4}'
+rc admin decommission cancel local 1 --by-id
+
+# Rebalance data after adding server pools
+rc admin rebalance start local
+rc admin rebalance status local
+rc admin rebalance stop local
+
 # JSON output
 rc admin info cluster local --json
 rc admin heal status local --json
+rc admin rebalance status local --json
 ```
 
 ## Command Overview
@@ -290,6 +303,9 @@ rc admin heal status local --json
 | `admin service-account` | Manage service accounts (create, remove, list, info)                                  |
 | `admin info`            | Display cluster information (cluster, server, disk)                                   |
 | `admin heal`            | Manage cluster healing operations (status, start, stop)                               |
+| `admin pool`            | List pools and inspect expansion/decommission status                                  |
+| `admin decommission`    | Manage server pool decommissioning (start, status, cancel)                            |
+| `admin rebalance`       | Manage post-expansion rebalancing (start, status, stop)                               |
 
 ### ILM Subcommands
 

@@ -3,10 +3,13 @@
 //! This module provides commands for managing users, policies, groups,
 //! service accounts, and cluster operations on RustFS/MinIO-compatible servers.
 
+mod decommission;
 mod group;
 mod heal;
 mod info;
 mod policy;
+mod pool;
+mod rebalance;
 mod service_account;
 mod user;
 
@@ -27,6 +30,18 @@ pub enum AdminCommands {
     /// Manage cluster healing operations
     #[command(subcommand)]
     Heal(heal::HealCommands),
+
+    /// Manage server pools and expansion status
+    #[command(subcommand)]
+    Pool(pool::PoolCommands),
+
+    /// Manage server pool decommissioning
+    #[command(alias = "decom", subcommand)]
+    Decommission(decommission::DecommissionCommands),
+
+    /// Manage post-expansion rebalancing
+    #[command(subcommand)]
+    Rebalance(rebalance::RebalanceCommands),
 
     /// Manage IAM users
     #[command(subcommand)]
@@ -52,6 +67,13 @@ pub async fn execute(cmd: AdminCommands, output_config: OutputConfig) -> ExitCod
     match cmd {
         AdminCommands::Info(info_cmd) => info::execute(info_cmd, &formatter).await,
         AdminCommands::Heal(heal_cmd) => heal::execute(heal_cmd, &formatter).await,
+        AdminCommands::Pool(pool_cmd) => pool::execute(pool_cmd, &formatter).await,
+        AdminCommands::Decommission(decommission_cmd) => {
+            decommission::execute(decommission_cmd, &formatter).await
+        }
+        AdminCommands::Rebalance(rebalance_cmd) => {
+            rebalance::execute(rebalance_cmd, &formatter).await
+        }
         AdminCommands::User(user_cmd) => user::execute(user_cmd, &formatter).await,
         AdminCommands::Policy(policy_cmd) => policy::execute(policy_cmd, &formatter).await,
         AdminCommands::Group(group_cmd) => group::execute(group_cmd, &formatter).await,
@@ -153,6 +175,60 @@ mod tests {
                 assert!(args.remove);
                 assert!(args.recreate);
                 assert!(args.dry_run);
+            }
+            _ => panic!("Unexpected command parsing result"),
+        }
+    }
+
+    #[test]
+    fn test_parse_admin_pool_status_by_id() {
+        let cli = TestCli::parse_from(["rc", "pool", "status", "local", "1", "--by-id"]);
+
+        match cli.command {
+            AdminCommands::Pool(pool::PoolCommands::Status(args)) => {
+                assert_eq!(args.alias, "local");
+                assert_eq!(args.pool.as_deref(), Some("1"));
+                assert!(args.by_id);
+            }
+            _ => panic!("Unexpected command parsing result"),
+        }
+    }
+
+    #[test]
+    fn test_parse_admin_decommission_start_by_id() {
+        let cli = TestCli::parse_from(["rc", "decommission", "start", "local", "1", "--by-id"]);
+
+        match cli.command {
+            AdminCommands::Decommission(decommission::DecommissionCommands::Start(args)) => {
+                assert_eq!(args.alias, "local");
+                assert_eq!(args.pool, "1");
+                assert!(args.by_id);
+            }
+            _ => panic!("Unexpected command parsing result"),
+        }
+    }
+
+    #[test]
+    fn test_parse_admin_decommission_alias() {
+        let cli = TestCli::parse_from(["rc", "decom", "cancel", "local", "1", "--by-id"]);
+
+        match cli.command {
+            AdminCommands::Decommission(decommission::DecommissionCommands::Cancel(args)) => {
+                assert_eq!(args.alias, "local");
+                assert_eq!(args.pool, "1");
+                assert!(args.by_id);
+            }
+            _ => panic!("Unexpected command parsing result"),
+        }
+    }
+
+    #[test]
+    fn test_parse_admin_rebalance_start() {
+        let cli = TestCli::parse_from(["rc", "rebalance", "start", "local"]);
+
+        match cli.command {
+            AdminCommands::Rebalance(rebalance::RebalanceCommands::Start(args)) => {
+                assert_eq!(args.alias, "local");
             }
             _ => panic!("Unexpected command parsing result"),
         }
