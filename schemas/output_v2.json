@@ -302,9 +302,13 @@
       "type": "object",
       "properties": {
         "startTime": {
-          "type": [
-            "string",
-            "null"
+          "oneOf": [
+            {
+              "$ref": "#/definitions/timestamp"
+            },
+            {
+              "type": "null"
+            }
           ],
           "description": "Decommission start timestamp"
         },
@@ -368,7 +372,7 @@
           "description": "Pool command line used by the server process"
         },
         "lastUpdate": {
-          "type": "string",
+          "$ref": "#/definitions/timestamp",
           "description": "Last pool metadata update timestamp"
         },
         "decommissionInfo": {
@@ -492,9 +496,13 @@
           }
         },
         "stoppedAt": {
-          "type": [
-            "string",
-            "null"
+          "oneOf": [
+            {
+              "$ref": "#/definitions/timestamp"
+            },
+            {
+              "type": "null"
+            }
           ],
           "description": "Timestamp when rebalance was stopped"
         }

@@ -253,7 +253,8 @@ rc admin pool status <ALIAS> [POOL] [OPTIONS]
 
 **Output (--json):**
 - `admin pool list`: See `schemas/output_v2.json#admin-pool-list`
-- `admin pool status`: See `schemas/output_v2.json#admin-pool-status`
+- `admin pool status <ALIAS> <POOL>`: See `schemas/output_v2.json#admin-pool-status`
+- `admin pool status <ALIAS>`: See `schemas/output_v2.json#admin-pool-list`
 
 **Exit Codes:** 0, 4 (auth error), 5 (alias not found)
 
