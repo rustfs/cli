@@ -258,18 +258,42 @@ fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::output::OutputConfig;
 
     #[test]
     fn test_format_duration() {
         assert_eq!(format_duration(0), "0s");
+        assert_eq!(format_duration(59), "59s");
+        assert_eq!(format_duration(60), "1m 0s");
         assert_eq!(format_duration(65), "1m 5s");
+        assert_eq!(format_duration(3600), "1h 0m 0s");
         assert_eq!(format_duration(3661), "1h 1m 1s");
     }
 
     #[test]
     fn test_format_bytes() {
         assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(1536), "1.50 KiB");
         assert_eq!(format_bytes(1024), "1.00 KiB");
         assert_eq!(format_bytes(1024 * 1024), "1.00 MiB");
+        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.00 GiB");
+        assert_eq!(format_bytes(1024 * 1024 * 1024 * 1024), "1.00 TiB");
+    }
+
+    #[test]
+    fn test_style_status_variants_without_color() {
+        let formatter = Formatter::new(OutputConfig {
+            no_color: true,
+            ..Default::default()
+        });
+
+        assert_eq!(style_status("Started", &formatter), "Started");
+        assert_eq!(style_status("running", &formatter), "running");
+        assert_eq!(style_status("Stopped", &formatter), "Stopped");
+        assert_eq!(style_status("stopped", &formatter), "stopped");
+        assert_eq!(style_status("Completed", &formatter), "Completed");
+        assert_eq!(style_status("complete", &formatter), "complete");
+        assert_eq!(style_status("idle", &formatter), "idle");
+        assert_eq!(style_status("Queued", &formatter), "Queued");
     }
 }

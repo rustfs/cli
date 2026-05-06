@@ -224,6 +224,10 @@ mod tests {
     fn test_decommission_state() {
         assert_eq!(decommission_state(None), "not started");
         assert_eq!(
+            decommission_state(Some(&PoolDecommissionInfo::default())),
+            "not started"
+        );
+        assert_eq!(
             decommission_state(Some(&PoolDecommissionInfo {
                 start_time: Some("2026-05-06T00:00:00Z".to_string()),
                 ..Default::default()
@@ -237,12 +241,29 @@ mod tests {
             })),
             "complete"
         );
+        assert_eq!(
+            decommission_state(Some(&PoolDecommissionInfo {
+                failed: true,
+                ..Default::default()
+            })),
+            "failed"
+        );
+        assert_eq!(
+            decommission_state(Some(&PoolDecommissionInfo {
+                canceled: true,
+                ..Default::default()
+            })),
+            "canceled"
+        );
     }
 
     #[test]
     fn test_format_bytes() {
         assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(1536), "1.50 KiB");
         assert_eq!(format_bytes(1024), "1.00 KiB");
         assert_eq!(format_bytes(1024 * 1024), "1.00 MiB");
+        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.00 GiB");
+        assert_eq!(format_bytes(1024 * 1024 * 1024 * 1024), "1.00 TiB");
     }
 }

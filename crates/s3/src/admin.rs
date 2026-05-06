@@ -1274,6 +1274,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_pool_status_uses_command_line_query_without_by_id() {
+        let (endpoint, receiver, handle) = start_admin_test_server(
+            "200 OK",
+            r#"{"id":2,"cmdline":"/data/pool2/disk{1...4}","lastUpdate":"2026-05-06T00:00:00Z","decommissionInfo":null}"#,
+        );
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let status = client
+            .pool_status(PoolTarget {
+                pool: "/data/pool2/disk{1...4}".to_string(),
+                by_id: false,
+            })
+            .await
+            .expect("pool status request");
+
+        assert_eq!(status.id, 2);
+        assert_eq!(status.cmd_line, "/data/pool2/disk{1...4}");
+
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(request.method, "GET");
+        assert_eq!(
+            request.target,
+            "/rustfs/admin/v3/pools/status?pool=%2Fdata%2Fpool2%2Fdisk%7B1...4%7D"
+        );
+        assert!(request.body.is_empty());
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
     async fn test_list_pools_uses_pool_list_route() {
         let (endpoint, receiver, handle) = start_admin_test_server(
             "200 OK",
