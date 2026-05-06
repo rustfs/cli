@@ -195,6 +195,29 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_admin_pool_list_and_status_without_pool() {
+        let cli = TestCli::parse_from(["rc", "pool", "list", "local"]);
+
+        match cli.command {
+            AdminCommands::Pool(pool::PoolCommands::List(args)) => {
+                assert_eq!(args.alias, "local");
+            }
+            _ => panic!("Unexpected command parsing result"),
+        }
+
+        let cli = TestCli::parse_from(["rc", "pool", "status", "local"]);
+
+        match cli.command {
+            AdminCommands::Pool(pool::PoolCommands::Status(args)) => {
+                assert_eq!(args.alias, "local");
+                assert!(args.pool.is_none());
+                assert!(!args.by_id);
+            }
+            _ => panic!("Unexpected command parsing result"),
+        }
+    }
+
+    #[test]
     fn test_parse_admin_decommission_start_by_id() {
         let cli = TestCli::parse_from(["rc", "decommission", "start", "local", "1", "--by-id"]);
 
@@ -202,6 +225,31 @@ mod tests {
             AdminCommands::Decommission(decommission::DecommissionCommands::Start(args)) => {
                 assert_eq!(args.alias, "local");
                 assert_eq!(args.pool, "1");
+                assert!(args.by_id);
+            }
+            _ => panic!("Unexpected command parsing result"),
+        }
+    }
+
+    #[test]
+    fn test_parse_admin_decommission_status_variants() {
+        let cli = TestCli::parse_from(["rc", "decommission", "status", "local"]);
+
+        match cli.command {
+            AdminCommands::Decommission(decommission::DecommissionCommands::Status(args)) => {
+                assert_eq!(args.alias, "local");
+                assert!(args.pool.is_none());
+                assert!(!args.by_id);
+            }
+            _ => panic!("Unexpected command parsing result"),
+        }
+
+        let cli = TestCli::parse_from(["rc", "decommission", "status", "local", "1", "--by-id"]);
+
+        match cli.command {
+            AdminCommands::Decommission(decommission::DecommissionCommands::Status(args)) => {
+                assert_eq!(args.alias, "local");
+                assert_eq!(args.pool.as_deref(), Some("1"));
                 assert!(args.by_id);
             }
             _ => panic!("Unexpected command parsing result"),
@@ -228,6 +276,27 @@ mod tests {
 
         match cli.command {
             AdminCommands::Rebalance(rebalance::RebalanceCommands::Start(args)) => {
+                assert_eq!(args.alias, "local");
+            }
+            _ => panic!("Unexpected command parsing result"),
+        }
+    }
+
+    #[test]
+    fn test_parse_admin_rebalance_status_and_stop() {
+        let cli = TestCli::parse_from(["rc", "rebalance", "status", "local"]);
+
+        match cli.command {
+            AdminCommands::Rebalance(rebalance::RebalanceCommands::Status(args)) => {
+                assert_eq!(args.alias, "local");
+            }
+            _ => panic!("Unexpected command parsing result"),
+        }
+
+        let cli = TestCli::parse_from(["rc", "rebalance", "stop", "local"]);
+
+        match cli.command {
+            AdminCommands::Rebalance(rebalance::RebalanceCommands::Stop(args)) => {
                 assert_eq!(args.alias, "local");
             }
             _ => panic!("Unexpected command parsing result"),
