@@ -1274,6 +1274,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_list_pools_uses_pool_list_route() {
+        let (endpoint, receiver, handle) = start_admin_test_server(
+            "200 OK",
+            r#"[{"id":0,"cmdline":"/data/pool0/disk{1...4}","lastUpdate":"2026-05-06T00:00:00Z","decommissionInfo":null}]"#,
+        );
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let pools = client.list_pools().await.expect("list pools request");
+
+        assert_eq!(pools.len(), 1);
+        assert_eq!(pools[0].id, 0);
+        assert_eq!(pools[0].cmd_line, "/data/pool0/disk{1...4}");
+
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.target, "/rustfs/admin/v3/pools/list");
+        assert!(request.body.is_empty());
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
     async fn test_decommission_start_posts_pool_query() {
         let (endpoint, receiver, handle) = start_admin_test_server("200 OK", "");
         let client = admin_client_for_endpoint(&endpoint);
@@ -1297,6 +1318,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_decommission_cancel_posts_pool_cancel_route_with_by_id_query() {
+        let (endpoint, receiver, handle) = start_admin_test_server("200 OK", "");
+        let client = admin_client_for_endpoint(&endpoint);
+
+        client
+            .decommission_cancel(PoolTarget {
+                pool: "1".to_string(),
+                by_id: true,
+            })
+            .await
+            .expect("decommission cancel request");
+
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(request.method, "POST");
+        assert_eq!(
+            request.target,
+            "/rustfs/admin/v3/pools/cancel?pool=1&by-id=true"
+        );
+        assert!(request.body.is_empty());
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
     async fn test_rebalance_start_posts_rebalance_start_route() {
         let (endpoint, receiver, handle) =
             start_admin_test_server("200 OK", r#"{"id":"rebalance-123"}"#);
@@ -1312,6 +1356,46 @@ mod tests {
         let request = receiver.recv().expect("captured request");
         assert_eq!(request.method, "POST");
         assert_eq!(request.target, "/rustfs/admin/v3/rebalance/start");
+        assert!(request.body.is_empty());
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn test_rebalance_status_gets_rebalance_status_route() {
+        let (endpoint, receiver, handle) = start_admin_test_server(
+            "200 OK",
+            r#"{"id":"rebalance-123","pools":[],"stoppedAt":"2026-05-06T00:00:00Z"}"#,
+        );
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let status = client
+            .rebalance_status()
+            .await
+            .expect("rebalance status request");
+
+        assert_eq!(status.id, "rebalance-123");
+        assert_eq!(status.stopped_at.as_deref(), Some("2026-05-06T00:00:00Z"));
+
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.target, "/rustfs/admin/v3/rebalance/status");
+        assert!(request.body.is_empty());
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn test_rebalance_stop_posts_rebalance_stop_route() {
+        let (endpoint, receiver, handle) = start_admin_test_server("200 OK", "");
+        let client = admin_client_for_endpoint(&endpoint);
+
+        client
+            .rebalance_stop()
+            .await
+            .expect("rebalance stop request");
+
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.target, "/rustfs/admin/v3/rebalance/stop");
         assert!(request.body.is_empty());
         handle.join().expect("server thread should finish");
     }
