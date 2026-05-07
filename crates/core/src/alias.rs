@@ -124,6 +124,20 @@ pub struct Alias {
     pub timeout: Option<TimeoutConfig>,
 }
 
+/// Validate that an alias endpoint is a usable HTTP(S) URL.
+pub fn validate_alias_endpoint(value: &str) -> Result<()> {
+    if value.contains('{') || value.contains('}') {
+        return Err(Error::Config(
+            "Endpoint must be a single S3 service URL; RustFS volume expansion patterns are not supported".into(),
+        ));
+    }
+
+    let url = Url::parse(value)
+        .map_err(|e| Error::Config(format!("Endpoint must be a valid URL: {e}")))?;
+
+    validate_http_endpoint_url(&url, "Endpoint")
+}
+
 fn default_region() -> String {
     "us-east-1".to_string()
 }
@@ -237,15 +251,7 @@ fn parse_env_alias(name: &str, value: &str) -> Result<Alias> {
     let mut url = Url::parse(value)
         .map_err(|e| Error::Config(format!("{var_name} must be a valid URL: {e}")))?;
 
-    if !matches!(url.scheme(), "http" | "https") {
-        return Err(Error::Config(format!(
-            "{var_name} must use an http or https URL"
-        )));
-    }
-
-    if url.host_str().is_none() {
-        return Err(Error::Config(format!("{var_name} must include a host")));
-    }
+    validate_http_endpoint_url(&url, &var_name)?;
 
     let access_key = url.username();
     let Some(secret_key) = url.password() else {
@@ -272,6 +278,20 @@ fn parse_env_alias(name: &str, value: &str) -> Result<Alias> {
 
     let endpoint = url.as_str().trim_end_matches('/').to_string();
     Ok(Alias::new(name, endpoint, access_key, secret_key))
+}
+
+fn validate_http_endpoint_url(url: &Url, label: &str) -> Result<()> {
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(Error::Config(format!(
+            "{label} must use an http or https URL"
+        )));
+    }
+
+    if url.host_str().is_none() {
+        return Err(Error::Config(format!("{label} must include a host")));
+    }
+
+    Ok(())
 }
 
 fn decode_env_alias_credential(value: &str, var_name: &str, field: &str) -> Result<String> {
@@ -476,6 +496,51 @@ mod tests {
         assert_eq!(alias.secret_key, "SECRET_KEY");
         assert_eq!(alias.region, "us-east-1");
         assert_eq!(alias.bucket_lookup, "auto");
+    }
+
+    #[test]
+    fn test_validate_alias_endpoint_rejects_volume_expansion_endpoint() {
+        let result = validate_alias_endpoint("http://rustfs-node{1...32}:9000");
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("RustFS volume expansion patterns are not supported")
+        );
+    }
+
+    #[test]
+    fn test_validate_alias_endpoint_rejects_missing_scheme() {
+        let result = validate_alias_endpoint("localhost:9000");
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Endpoint must use an http or https URL")
+        );
+    }
+
+    #[test]
+    fn test_validate_alias_endpoint_rejects_non_http_scheme() {
+        let result = validate_alias_endpoint("ftp://localhost:9000");
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Endpoint must use an http or https URL")
+        );
+    }
+
+    #[test]
+    fn test_validate_alias_endpoint_accepts_http_url_with_host() {
+        validate_alias_endpoint("http://localhost:9000").unwrap();
+        validate_alias_endpoint("https://s3.amazonaws.com").unwrap();
     }
 
     #[test]
