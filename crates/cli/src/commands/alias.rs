@@ -135,7 +135,7 @@ async fn execute_set(args: SetArgs, manager: &AliasManager, formatter: &Formatte
     }
 
     if let Err(e) = validate_alias_endpoint(&args.endpoint) {
-        formatter.error(&e.to_string());
+        formatter.error(&alias_endpoint_error_message(e));
         return ExitCode::UsageError;
     }
 
@@ -255,6 +255,13 @@ async fn execute_remove(
     }
 }
 
+fn alias_endpoint_error_message(error: rc_core::Error) -> String {
+    match error {
+        rc_core::Error::Config(message) => message,
+        other => format!("Invalid endpoint: {other}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,5 +318,14 @@ mod tests {
 
         assert_eq!(exit_code, ExitCode::UsageError);
         assert!(manager.get("rustfs").is_err());
+    }
+
+    #[test]
+    fn test_alias_endpoint_error_message_omits_config_prefix() {
+        let message = alias_endpoint_error_message(rc_core::Error::Config(
+            "Endpoint must include a host".to_string(),
+        ));
+
+        assert_eq!(message, "Endpoint must include a host");
     }
 }

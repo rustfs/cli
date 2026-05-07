@@ -135,6 +135,12 @@ pub fn validate_alias_endpoint(value: &str) -> Result<()> {
     let url = Url::parse(value)
         .map_err(|e| Error::Config(format!("Endpoint must be a valid URL: {e}")))?;
 
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(Error::Config(
+            "Endpoint must not include credentials; pass access key and secret key as separate arguments".into(),
+        ));
+    }
+
     validate_http_endpoint_url(&url, "Endpoint")
 }
 
@@ -534,6 +540,19 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("Endpoint must use an http or https URL")
+        );
+    }
+
+    #[test]
+    fn test_validate_alias_endpoint_rejects_embedded_credentials() {
+        let result = validate_alias_endpoint("http://access:secret@localhost:9000");
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Endpoint must not include credentials")
         );
     }
 
