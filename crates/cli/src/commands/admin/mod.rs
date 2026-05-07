@@ -4,6 +4,7 @@
 //! service accounts, and cluster operations on RustFS/MinIO-compatible servers.
 
 mod decommission;
+mod expand;
 mod group;
 mod heal;
 mod info;
@@ -34,6 +35,10 @@ pub enum AdminCommands {
     /// Manage server pools and expansion status
     #[command(subcommand)]
     Pool(pool::PoolCommands),
+
+    /// Manage post-expansion data rebalancing
+    #[command(alias = "scale", subcommand)]
+    Expand(expand::ExpandCommands),
 
     /// Manage server pool decommissioning
     #[command(alias = "decom", subcommand)]
@@ -68,6 +73,7 @@ pub async fn execute(cmd: AdminCommands, output_config: OutputConfig) -> ExitCod
         AdminCommands::Info(info_cmd) => info::execute(info_cmd, &formatter).await,
         AdminCommands::Heal(heal_cmd) => heal::execute(heal_cmd, &formatter).await,
         AdminCommands::Pool(pool_cmd) => pool::execute(pool_cmd, &formatter).await,
+        AdminCommands::Expand(expand_cmd) => expand::execute(expand_cmd, &formatter).await,
         AdminCommands::Decommission(decommission_cmd) => {
             decommission::execute(decommission_cmd, &formatter).await
         }
@@ -212,6 +218,48 @@ mod tests {
                 assert_eq!(args.alias, "local");
                 assert!(args.pool.is_none());
                 assert!(!args.by_id);
+            }
+            _ => panic!("Unexpected command parsing result"),
+        }
+    }
+
+    #[test]
+    fn test_parse_admin_expand_commands() {
+        let cli = TestCli::parse_from(["rc", "expand", "start", "local"]);
+
+        match cli.command {
+            AdminCommands::Expand(expand::ExpandCommands::Start(args)) => {
+                assert_eq!(args.alias, "local");
+            }
+            _ => panic!("Unexpected command parsing result"),
+        }
+
+        let cli = TestCli::parse_from(["rc", "expand", "status", "local"]);
+
+        match cli.command {
+            AdminCommands::Expand(expand::ExpandCommands::Status(args)) => {
+                assert_eq!(args.alias, "local");
+            }
+            _ => panic!("Unexpected command parsing result"),
+        }
+
+        let cli = TestCli::parse_from(["rc", "expand", "stop", "local"]);
+
+        match cli.command {
+            AdminCommands::Expand(expand::ExpandCommands::Stop(args)) => {
+                assert_eq!(args.alias, "local");
+            }
+            _ => panic!("Unexpected command parsing result"),
+        }
+    }
+
+    #[test]
+    fn test_parse_admin_expand_alias() {
+        let cli = TestCli::parse_from(["rc", "scale", "status", "local"]);
+
+        match cli.command {
+            AdminCommands::Expand(expand::ExpandCommands::Status(args)) => {
+                assert_eq!(args.alias, "local");
             }
             _ => panic!("Unexpected command parsing result"),
         }

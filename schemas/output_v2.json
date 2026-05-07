@@ -755,6 +755,36 @@
       }
     },
     {
+      "title": "admin expand status",
+      "description": "Post-expansion rebalance status output",
+      "$ref": "#/definitions/rebalanceStatus"
+    },
+    {
+      "title": "admin expand operation",
+      "description": "Post-expansion rebalance start/stop output",
+      "type": "object",
+      "required": [
+        "success",
+        "message",
+        "target"
+      ],
+      "properties": {
+        "success": {
+          "type": "boolean"
+        },
+        "message": {
+          "type": "string"
+        },
+        "target": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string",
+          "description": "Rebalance operation ID returned by start"
+        }
+      }
+    },
+    {
       "title": "error",
       "description": "Error response",
       "$ref": "#/definitions/errorResponse"

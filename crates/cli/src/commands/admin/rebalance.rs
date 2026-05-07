@@ -59,6 +59,21 @@ pub async fn execute(cmd: RebalanceCommands, formatter: &Formatter) -> ExitCode 
 }
 
 async fn execute_start(args: StartArgs, formatter: &Formatter) -> ExitCode {
+    execute_start_with_messages(
+        args,
+        formatter,
+        "Rebalance started successfully",
+        "Failed to start rebalance",
+    )
+    .await
+}
+
+pub(super) async fn execute_start_with_messages(
+    args: StartArgs,
+    formatter: &Formatter,
+    success_message: &str,
+    failure_prefix: &str,
+) -> ExitCode {
     let client = match get_admin_client(&args.alias, formatter) {
         Ok(c) => c,
         Err(code) => return code,
@@ -69,12 +84,12 @@ async fn execute_start(args: StartArgs, formatter: &Formatter) -> ExitCode {
             if formatter.is_json() {
                 formatter.json(&RebalanceOperationOutput {
                     success: true,
-                    message: "Rebalance started successfully".to_string(),
+                    message: success_message.to_string(),
                     target: args.alias,
                     id: Some(result.id),
                 });
             } else {
-                formatter.success("Rebalance started successfully.");
+                formatter.success(&format!("{success_message}."));
                 if !result.id.is_empty() {
                     formatter.println(&format!("  ID: {}", result.id));
                 }
@@ -82,13 +97,13 @@ async fn execute_start(args: StartArgs, formatter: &Formatter) -> ExitCode {
             ExitCode::Success
         }
         Err(e) => {
-            formatter.error(&format!("Failed to start rebalance: {e}"));
+            formatter.error(&format!("{failure_prefix}: {e}"));
             ExitCode::GeneralError
         }
     }
 }
 
-async fn execute_status(args: StatusArgs, formatter: &Formatter) -> ExitCode {
+pub(super) async fn execute_status(args: StatusArgs, formatter: &Formatter) -> ExitCode {
     let client = match get_admin_client(&args.alias, formatter) {
         Ok(c) => c,
         Err(code) => return code,
@@ -111,6 +126,21 @@ async fn execute_status(args: StatusArgs, formatter: &Formatter) -> ExitCode {
 }
 
 async fn execute_stop(args: StopArgs, formatter: &Formatter) -> ExitCode {
+    execute_stop_with_messages(
+        args,
+        formatter,
+        "Rebalance stopped successfully",
+        "Failed to stop rebalance",
+    )
+    .await
+}
+
+pub(super) async fn execute_stop_with_messages(
+    args: StopArgs,
+    formatter: &Formatter,
+    success_message: &str,
+    failure_prefix: &str,
+) -> ExitCode {
     let client = match get_admin_client(&args.alias, formatter) {
         Ok(c) => c,
         Err(code) => return code,
@@ -121,17 +151,17 @@ async fn execute_stop(args: StopArgs, formatter: &Formatter) -> ExitCode {
             if formatter.is_json() {
                 formatter.json(&RebalanceOperationOutput {
                     success: true,
-                    message: "Rebalance stopped successfully".to_string(),
+                    message: success_message.to_string(),
                     target: args.alias,
                     id: None,
                 });
             } else {
-                formatter.success("Rebalance stopped successfully.");
+                formatter.success(&format!("{success_message}."));
             }
             ExitCode::Success
         }
         Err(e) => {
-            formatter.error(&format!("Failed to stop rebalance: {e}"));
+            formatter.error(&format!("{failure_prefix}: {e}"));
             ExitCode::GeneralError
         }
     }

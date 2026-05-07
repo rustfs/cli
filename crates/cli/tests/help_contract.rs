@@ -158,6 +158,7 @@ fn top_level_command_help_contract() {
                 "info",
                 "heal",
                 "pool",
+                "expand",
                 "decommission",
                 "rebalance",
                 "user",
@@ -456,6 +457,32 @@ fn nested_subcommand_help_contract() {
             args: &["admin", "pool", "status"],
             usage: "Usage: rc admin pool status [OPTIONS] <ALIAS> [POOL]",
             expected_tokens: &["--by-id"],
+        },
+        HelpCase {
+            args: &["admin", "expand"],
+            usage: "Usage: rc admin expand [OPTIONS] <COMMAND>",
+            expected_tokens: &[
+                "start",
+                "status",
+                "stop",
+                "Examples:",
+                "rc admin expand start local",
+            ],
+        },
+        HelpCase {
+            args: &["admin", "expand", "start"],
+            usage: "Usage: rc admin expand start [OPTIONS] <ALIAS>",
+            expected_tokens: &[],
+        },
+        HelpCase {
+            args: &["admin", "expand", "status"],
+            usage: "Usage: rc admin expand status [OPTIONS] <ALIAS>",
+            expected_tokens: &[],
+        },
+        HelpCase {
+            args: &["admin", "expand", "stop"],
+            usage: "Usage: rc admin expand stop [OPTIONS] <ALIAS>",
+            expected_tokens: &[],
         },
         HelpCase {
             args: &["admin", "decommission", "start"],
