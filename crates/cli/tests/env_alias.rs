@@ -1,5 +1,6 @@
 #![cfg(not(windows))]
 
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -21,6 +22,13 @@ fn rc_binary() -> PathBuf {
     }
 
     workspace_root.join("target/release/rc")
+}
+
+fn unused_local_endpoint() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind local endpoint");
+    let address = listener.local_addr().expect("local endpoint address");
+    drop(listener);
+    format!("http://{address}")
 }
 
 #[test]
@@ -52,4 +60,37 @@ fn alias_list_includes_rc_host_alias_without_credentials() {
         payload["aliases"][0]["endpoint"],
         "https://rustfs.local:9000"
     );
+}
+
+#[test]
+fn ls_resolves_rc_host_alias_from_environment() {
+    let config_dir = tempfile::tempdir().expect("create config dir");
+    let endpoint = unused_local_endpoint();
+    let (_, endpoint_authority) = endpoint.split_once("://").expect("endpoint has scheme");
+    let env_alias = format!("http://ACCESS_KEY:SECRET_KEY@{endpoint_authority}");
+
+    let output = Command::new(rc_binary())
+        .args(["--json", "ls", "myalias"])
+        .env("RC_CONFIG_DIR", config_dir.path())
+        .env("RC_HOST_myalias", env_alias)
+        .output()
+        .expect("run rc command");
+
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
+    let payload: serde_json::Value = serde_json::from_str(&stderr).expect("JSON error output");
+    assert!(
+        payload["error"]
+            .as_str()
+            .expect("error message")
+            .contains("Failed to list buckets"),
+        "payload: {payload}"
+    );
+    assert_eq!(payload["details"]["type"], "network_error");
 }
