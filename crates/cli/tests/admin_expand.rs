@@ -1,12 +1,12 @@
 #![cfg(not(windows))]
 
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug)]
 struct CapturedAdminRequest {
@@ -65,11 +65,26 @@ fn start_admin_test_server(
     response_body: &'static str,
 ) -> (String, Receiver<CapturedAdminRequest>, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind admin test server");
+    listener
+        .set_nonblocking(true)
+        .expect("set admin test server nonblocking");
     let endpoint = format!("http://{}", listener.local_addr().expect("server address"));
     let (sender, receiver) = mpsc::channel();
 
     let handle = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept admin request");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        panic!("timed out waiting for admin request");
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("accept admin request: {error}"),
+            }
+        };
         let request = read_admin_request(&mut stream);
         sender.send(request).expect("send captured request");
 
