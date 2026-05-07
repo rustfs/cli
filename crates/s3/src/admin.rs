@@ -1347,6 +1347,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_decommission_start_posts_by_id_multi_pool_query() {
+        let (endpoint, receiver, handle) = start_admin_test_server("200 OK", "");
+        let client = admin_client_for_endpoint(&endpoint);
+
+        client
+            .decommission_start(PoolTarget {
+                pool: "1,2".to_string(),
+                by_id: true,
+            })
+            .await
+            .expect("decommission start request");
+
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(request.method, "POST");
+        assert_eq!(
+            request.target,
+            "/rustfs/admin/v3/pools/decommission?pool=1%2C2&by-id=true"
+        );
+        assert!(request.body.is_empty());
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
     async fn test_decommission_cancel_posts_pool_cancel_route_with_by_id_query() {
         let (endpoint, receiver, handle) = start_admin_test_server("200 OK", "");
         let client = admin_client_for_endpoint(&endpoint);
