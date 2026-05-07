@@ -125,30 +125,28 @@ pub async fn execute(cmd: AliasCommands, output_config: OutputConfig) -> ExitCod
 async fn execute_set(args: SetArgs, manager: &AliasManager, formatter: &Formatter) -> ExitCode {
     // Validate inputs
     if args.name.is_empty() {
-        formatter.error("Alias name cannot be empty");
-        return ExitCode::UsageError;
+        return formatter.fail(ExitCode::UsageError, "Alias name cannot be empty");
     }
 
     if args.endpoint.is_empty() {
-        formatter.error("Endpoint URL cannot be empty");
-        return ExitCode::UsageError;
+        return formatter.fail(ExitCode::UsageError, "Endpoint URL cannot be empty");
     }
 
     if let Err(e) = validate_alias_endpoint(&args.endpoint) {
-        formatter.error_with_code(ExitCode::UsageError, &alias_endpoint_error_message(e));
-        return ExitCode::UsageError;
+        return formatter.fail(ExitCode::UsageError, &alias_endpoint_error_message(e));
     }
 
     // Validate signature version
     if args.signature != "v4" && args.signature != "v2" {
-        formatter.error("Signature must be 'v4' or 'v2'");
-        return ExitCode::UsageError;
+        return formatter.fail(ExitCode::UsageError, "Signature must be 'v4' or 'v2'");
     }
 
     // Validate bucket lookup
     if args.bucket_lookup != "auto" && args.bucket_lookup != "path" && args.bucket_lookup != "dns" {
-        formatter.error("Bucket lookup must be 'auto', 'path', or 'dns'");
-        return ExitCode::UsageError;
+        return formatter.fail(
+            ExitCode::UsageError,
+            "Bucket lookup must be 'auto', 'path', or 'dns'",
+        );
     }
 
     // Create alias

@@ -26,15 +26,27 @@ fn rc_binary() -> PathBuf {
     workspace_root.join("target/release/rc")
 }
 
+fn rc_command() -> Command {
+    let mut command = Command::new(rc_binary());
+
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("RC_HOST_") {
+            command.env_remove(key);
+        }
+    }
+
+    command
+}
+
 fn run_rc(args: &[&str]) -> Output {
-    Command::new(rc_binary())
+    rc_command()
         .args(args)
         .output()
         .expect("failed to execute rc")
 }
 
 fn run_rc_with_config(args: &[&str], config_dir: &Path) -> Output {
-    Command::new(rc_binary())
+    rc_command()
         .args(args)
         .env("RC_CONFIG_DIR", config_dir)
         .output()
