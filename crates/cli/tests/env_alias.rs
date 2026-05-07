@@ -111,7 +111,7 @@ fn alias_list_rejects_invalid_rc_host_percent_encoding_without_credentials() {
 
     assert_eq!(
         output.status.code(),
-        Some(1),
+        Some(2),
         "stdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
@@ -129,6 +129,7 @@ fn alias_list_rejects_invalid_rc_host_percent_encoding_without_credentials() {
             .contains("invalid percent-encoding in secret key"),
         "payload: {payload}"
     );
+    assert_eq!(payload["code"], 2);
     assert_eq!(payload["details"]["type"], "usage_error");
 }
 
@@ -148,7 +149,7 @@ fn alias_list_rejects_invalid_rc_host_scheme_without_credentials() {
 
     assert_eq!(
         output.status.code(),
-        Some(1),
+        Some(2),
         "stdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
@@ -166,5 +167,6 @@ fn alias_list_rejects_invalid_rc_host_scheme_without_credentials() {
             .contains("must use an http or https URL"),
         "payload: {payload}"
     );
+    assert_eq!(payload["code"], 2);
     assert_eq!(payload["details"]["type"], "usage_error");
 }

@@ -180,8 +180,9 @@ async fn execute_set(args: SetArgs, manager: &AliasManager, formatter: &Formatte
             ExitCode::Success
         }
         Err(e) => {
-            formatter.error(&e.to_string());
-            ExitCode::GeneralError
+            let code = exit_code_from_error(&e);
+            formatter.error_with_code(code, &e.to_string());
+            code
         }
     }
 }
@@ -218,8 +219,9 @@ async fn execute_list(args: ListArgs, manager: &AliasManager, formatter: &Format
             ExitCode::Success
         }
         Err(e) => {
-            formatter.error(&e.to_string());
-            ExitCode::GeneralError
+            let code = exit_code_from_error(&e);
+            formatter.error_with_code(code, &e.to_string());
+            code
         }
     }
 }
@@ -249,8 +251,9 @@ async fn execute_remove(
             ExitCode::NotFound
         }
         Err(e) => {
-            formatter.error(&e.to_string());
-            ExitCode::GeneralError
+            let code = exit_code_from_error(&e);
+            formatter.error_with_code(code, &e.to_string());
+            code
         }
     }
 }
@@ -260,6 +263,10 @@ fn alias_endpoint_error_message(error: rc_core::Error) -> String {
         rc_core::Error::Config(message) => message,
         other => format!("Invalid endpoint: {other}"),
     }
+}
+
+fn exit_code_from_error(error: &rc_core::Error) -> ExitCode {
+    ExitCode::from_i32(error.exit_code()).unwrap_or(ExitCode::GeneralError)
 }
 
 #[cfg(test)]
