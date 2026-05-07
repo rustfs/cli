@@ -301,6 +301,12 @@ fn validate_http_endpoint_url(url: &Url, label: &str) -> Result<()> {
 }
 
 fn decode_env_alias_credential(value: &str, var_name: &str, field: &str) -> Result<String> {
+    if has_invalid_percent_encoding(value) {
+        return Err(Error::Config(format!(
+            "{var_name} contains invalid percent-encoding in {field}"
+        )));
+    }
+
     urlencoding::decode(value)
         .map(|decoded| decoded.into_owned())
         .map_err(|e| {
@@ -308,6 +314,29 @@ fn decode_env_alias_credential(value: &str, var_name: &str, field: &str) -> Resu
                 "{var_name} contains invalid percent-encoding in {field}: {e}"
             ))
         })
+}
+
+fn has_invalid_percent_encoding(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            index += 1;
+            continue;
+        }
+
+        if index + 2 >= bytes.len()
+            || !bytes[index + 1].is_ascii_hexdigit()
+            || !bytes[index + 2].is_ascii_hexdigit()
+        {
+            return true;
+        }
+
+        index += 3;
+    }
+
+    false
 }
 
 fn merge_env_aliases(mut aliases: Vec<Alias>, env_aliases: Vec<Alias>) -> Vec<Alias> {
@@ -577,6 +606,16 @@ mod tests {
 
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), Error::Config(_)));
+    }
+
+    #[test]
+    fn test_parse_rc_host_alias_rejects_invalid_percent_encoding() {
+        let result = parse_env_alias("invalid", "https://ACCESS_KEY:SECRET%ZZ@rustfs.local");
+
+        assert!(result.is_err());
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("invalid percent-encoding in secret key"));
+        assert!(!error.contains("SECRET"));
     }
 
     #[test]

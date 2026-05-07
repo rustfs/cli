@@ -133,6 +133,8 @@ fn infer_error_metadata(message: &str) -> (&'static str, bool, Option<String>) {
     if normalized.contains("invalid")
         || normalized.contains("cannot be empty")
         || normalized.contains("must be")
+        || normalized.contains("must use")
+        || normalized.contains("must include")
         || normalized.contains("must specify")
         || normalized.contains("expected:")
         || normalized.contains("use -r/--recursive")
