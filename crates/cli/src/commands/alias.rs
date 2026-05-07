@@ -135,7 +135,7 @@ async fn execute_set(args: SetArgs, manager: &AliasManager, formatter: &Formatte
     }
 
     if let Err(e) = validate_alias_endpoint(&args.endpoint) {
-        formatter.error(&alias_endpoint_error_message(e));
+        formatter.error_with_code(ExitCode::UsageError, &alias_endpoint_error_message(e));
         return ExitCode::UsageError;
     }
 
