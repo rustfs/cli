@@ -107,12 +107,20 @@ fn rc_host_alias(endpoint: &str) -> String {
 }
 
 #[test]
-fn rebalance_start_dispatches_to_rebalance_start_json() {
+fn decommission_start_dispatches_by_id_pool_json() {
     let config_dir = tempfile::tempdir().expect("create config dir");
-    let (endpoint, receiver, handle) = start_admin_test_server(r#"{"id":"rebalance-123"}"#);
+    let (endpoint, receiver, handle) = start_admin_test_server("");
 
     let output = Command::new(rc_binary())
-        .args(["--json", "admin", "rebalance", "start", "myalias"])
+        .args([
+            "--json",
+            "admin",
+            "decommission",
+            "start",
+            "myalias",
+            "1,2",
+            "--by-id",
+        ])
         .env("RC_CONFIG_DIR", config_dir.path())
         .env("RC_HOST_myalias", rc_host_alias(&endpoint))
         .output()
@@ -127,28 +135,30 @@ fn rebalance_start_dispatches_to_rebalance_start_json() {
     let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
     let payload: serde_json::Value = serde_json::from_str(&stdout).expect("JSON output");
     assert_eq!(payload["success"], true);
-    assert_eq!(payload["message"], "Rebalance started successfully");
-    assert_eq!(payload["target"], "myalias");
-    assert_eq!(payload["id"], "rebalance-123");
+    assert_eq!(payload["message"], "Decommission started successfully");
+    assert_eq!(payload["pool"], "1,2");
 
     let request = receiver
         .recv_timeout(Duration::from_secs(5))
         .expect("captured admin request");
     assert_eq!(request.method, "POST");
-    assert_eq!(request.target, "/rustfs/admin/v3/rebalance/start");
+    assert_eq!(
+        request.target,
+        "/rustfs/admin/v3/pools/decommission?pool=1%2C2&by-id=true"
+    );
 
     handle.join().expect("admin test server finished");
 }
 
 #[test]
-fn rebalance_status_dispatches_to_rebalance_status_json() {
+fn decommission_status_without_pool_dispatches_to_pool_list_json() {
     let config_dir = tempfile::tempdir().expect("create config dir");
     let (endpoint, receiver, handle) = start_admin_test_server(
-        r#"{"id":"rebalance-123","pools":[],"stoppedAt":"2026-05-07T00:00:00Z"}"#,
+        r#"[{"id":0,"cmdline":"/data/pool0/disk{1...4}","lastUpdate":"2026-05-06T00:00:00Z","decommissionInfo":null}]"#,
     );
 
     let output = Command::new(rc_binary())
-        .args(["--json", "admin", "rebalance", "status", "myalias"])
+        .args(["--json", "admin", "decommission", "status", "myalias"])
         .env("RC_CONFIG_DIR", config_dir.path())
         .env("RC_HOST_myalias", rc_host_alias(&endpoint))
         .output()
@@ -162,26 +172,29 @@ fn rebalance_status_dispatches_to_rebalance_status_json() {
 
     let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
     let payload: serde_json::Value = serde_json::from_str(&stdout).expect("JSON output");
-    assert_eq!(payload["id"], "rebalance-123");
-    assert_eq!(payload["stoppedAt"], "2026-05-07T00:00:00Z");
-    assert_eq!(payload["pools"].as_array().expect("pools array").len(), 0);
+    let pools = payload["pools"].as_array().expect("pools array");
+    assert_eq!(pools.len(), 1);
+    assert_eq!(pools[0]["id"], 0);
+    assert_eq!(pools[0]["cmdline"], "/data/pool0/disk{1...4}");
 
     let request = receiver
         .recv_timeout(Duration::from_secs(5))
         .expect("captured admin request");
     assert_eq!(request.method, "GET");
-    assert_eq!(request.target, "/rustfs/admin/v3/rebalance/status");
+    assert_eq!(request.target, "/rustfs/admin/v3/pools/list");
 
     handle.join().expect("admin test server finished");
 }
 
 #[test]
-fn rebalance_stop_dispatches_to_rebalance_stop_json() {
+fn decom_cancel_dispatches_by_id_pool_json() {
     let config_dir = tempfile::tempdir().expect("create config dir");
     let (endpoint, receiver, handle) = start_admin_test_server("");
 
     let output = Command::new(rc_binary())
-        .args(["--json", "admin", "rebalance", "stop", "myalias"])
+        .args([
+            "--json", "admin", "decom", "cancel", "myalias", "1", "--by-id",
+        ])
         .env("RC_CONFIG_DIR", config_dir.path())
         .env("RC_HOST_myalias", rc_host_alias(&endpoint))
         .output()
@@ -196,15 +209,17 @@ fn rebalance_stop_dispatches_to_rebalance_stop_json() {
     let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
     let payload: serde_json::Value = serde_json::from_str(&stdout).expect("JSON output");
     assert_eq!(payload["success"], true);
-    assert_eq!(payload["message"], "Rebalance stopped successfully");
-    assert_eq!(payload["target"], "myalias");
-    assert!(payload.get("id").is_none());
+    assert_eq!(payload["message"], "Decommission canceled successfully");
+    assert_eq!(payload["pool"], "1");
 
     let request = receiver
         .recv_timeout(Duration::from_secs(5))
         .expect("captured admin request");
     assert_eq!(request.method, "POST");
-    assert_eq!(request.target, "/rustfs/admin/v3/rebalance/stop");
+    assert_eq!(
+        request.target,
+        "/rustfs/admin/v3/pools/cancel?pool=1&by-id=true"
+    );
 
     handle.join().expect("admin test server finished");
 }
