@@ -307,6 +307,28 @@ async fn delete_recursive(
             .collect());
     }
 
+    if args.purge {
+        let mut deleted = Vec::new();
+        let mut failed = Vec::new();
+        let mut first_error_code = None;
+
+        for key in keys_to_delete {
+            match delete_single(client, alias_name, bucket, &key, args, formatter).await {
+                Ok(paths) => deleted.extend(paths),
+                Err((code, paths)) => {
+                    first_error_code.get_or_insert(code);
+                    failed.extend(paths);
+                }
+            }
+        }
+
+        return if failed.is_empty() {
+            Ok(deleted)
+        } else {
+            Err((first_error_code.unwrap_or(ExitCode::GeneralError), failed))
+        };
+    }
+
     // Delete in batches (S3 allows up to 1000 per request)
     let mut deleted = Vec::new();
     let mut failed = Vec::new();

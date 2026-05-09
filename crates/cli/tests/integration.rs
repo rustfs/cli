@@ -439,7 +439,7 @@ mod bucket_operations {
         assert_eq!(rules.len(), 1, "Expected one CORS rule from stdin input");
         assert_eq!(rules[0]["id"].as_str(), Some("stdin-rule"));
         assert_eq!(
-            rules[0]["allowed_methods"].as_array().map(|methods| methods
+            rules[0]["allowedMethods"].as_array().map(|methods| methods
                 .iter()
                 .filter_map(|method| method.as_str())
                 .collect::<Vec<_>>()),
