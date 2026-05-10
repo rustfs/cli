@@ -619,6 +619,17 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_rc_host_alias_rejects_invalid_access_key_percent_encoding() {
+        let result = parse_env_alias("invalid", "https://ACCESS%ZZKEY:SECRET_KEY@rustfs.local");
+
+        assert!(result.is_err());
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("invalid percent-encoding in access key"));
+        assert!(!error.contains("ACCESS"));
+        assert!(!error.contains("SECRET_KEY"));
+    }
+
+    #[test]
     fn test_env_aliases_from_vars_filters_rc_host_prefix() {
         let aliases = env_aliases_from_vars(vec![
             (

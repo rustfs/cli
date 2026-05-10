@@ -134,6 +134,44 @@ fn alias_list_rejects_invalid_rc_host_percent_encoding_without_credentials() {
 }
 
 #[test]
+fn alias_list_rejects_invalid_rc_host_access_key_percent_encoding_without_credentials() {
+    let config_dir = tempfile::tempdir().expect("create config dir");
+
+    let output = Command::new(rc_binary())
+        .args(["alias", "list", "--json"])
+        .env("RC_CONFIG_DIR", config_dir.path())
+        .env(
+            "RC_HOST_badalias",
+            "https://ACCESS%ZZKEY:SECRET_KEY@rustfs.local:9000",
+        )
+        .output()
+        .expect("run rc command");
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
+    assert!(!stderr.contains("ACCESS"));
+    assert!(!stderr.contains("SECRET_KEY"));
+
+    let payload: serde_json::Value = serde_json::from_str(&stderr).expect("JSON error output");
+    assert!(
+        payload["error"]
+            .as_str()
+            .expect("error message")
+            .contains("invalid percent-encoding in access key"),
+        "payload: {payload}"
+    );
+    assert_eq!(payload["code"], 2);
+    assert_eq!(payload["details"]["type"], "usage_error");
+}
+
+#[test]
 fn alias_list_rejects_invalid_rc_host_scheme_without_credentials() {
     let config_dir = tempfile::tempdir().expect("create config dir");
 
