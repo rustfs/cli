@@ -149,3 +149,56 @@ fn alias_set_json_error_rejects_embedded_endpoint_credentials() {
         0
     );
 }
+
+#[test]
+fn alias_set_json_error_rejects_invalid_signature() {
+    let config_dir = tempfile::tempdir().expect("create temp config dir");
+
+    let output = run_rc_with_config(
+        &[
+            "alias",
+            "set",
+            "bad",
+            "http://localhost:9000",
+            "accesskey",
+            "secretkey",
+            "--signature",
+            "v5",
+            "--json",
+        ],
+        config_dir.path(),
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "usage JSON errors should be emitted on stderr"
+    );
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
+    let json: serde_json::Value = serde_json::from_str(&stderr).expect("stderr is valid JSON");
+    assert_eq!(json["error"], "Signature must be 'v4' or 'v2'");
+    assert_eq!(json["code"], 2);
+    assert_eq!(json["details"]["type"], "usage_error");
+    assert_eq!(json["details"]["retryable"], false);
+
+    let list_output = run_rc_with_config(&["alias", "list", "--json"], config_dir.path());
+    assert!(
+        list_output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&list_output.stderr)
+    );
+
+    let stdout = String::from_utf8(list_output.stdout).expect("stdout should be UTF-8");
+    let payload: serde_json::Value = serde_json::from_str(&stdout).expect("stdout is valid JSON");
+    assert_eq!(
+        payload["aliases"].as_array().expect("aliases array").len(),
+        0
+    );
+}
