@@ -619,6 +619,17 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_rc_host_alias_rejects_non_utf8_percent_encoded_secret_key() {
+        let result = parse_env_alias("invalid", "https://ACCESS_KEY:SECRET%FF@rustfs.local");
+
+        assert!(result.is_err());
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("invalid percent-encoding in secret key"));
+        assert!(!error.contains("ACCESS_KEY"));
+        assert!(!error.contains("SECRET"));
+    }
+
+    #[test]
     fn test_parse_rc_host_alias_rejects_invalid_access_key_percent_encoding() {
         let result = parse_env_alias("invalid", "https://ACCESS%ZZKEY:SECRET_KEY@rustfs.local");
 
