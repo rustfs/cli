@@ -226,6 +226,44 @@ fn alias_list_rejects_empty_rc_host_alias_name_as_usage_error() {
 }
 
 #[test]
+fn alias_list_rejects_rc_host_missing_secret_key_as_usage_error() {
+    let config_dir = tempfile::tempdir().expect("create config dir");
+
+    let output = rc_command()
+        .args(["alias", "list", "--json"])
+        .env("RC_CONFIG_DIR", config_dir.path())
+        .env("RC_HOST_badalias", "https://ACCESS_KEY@rustfs.local:9000")
+        .output()
+        .expect("run rc command");
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "usage JSON errors should be emitted on stderr"
+    );
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
+    assert!(!stderr.contains("ACCESS_KEY"));
+
+    let payload: serde_json::Value = serde_json::from_str(&stderr).expect("JSON error output");
+    assert!(
+        payload["error"]
+            .as_str()
+            .expect("error message")
+            .contains("must include access key and secret key credentials"),
+        "payload: {payload}"
+    );
+    assert_eq!(payload["code"], 2);
+    assert_eq!(payload["details"]["type"], "usage_error");
+}
+
+#[test]
 fn alias_list_rejects_invalid_rc_host_scheme_without_credentials() {
     let config_dir = tempfile::tempdir().expect("create config dir");
 
