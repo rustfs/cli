@@ -1,6 +1,6 @@
 #![cfg(not(windows))]
 
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::Command;
@@ -18,10 +18,7 @@ struct CapturedRequest {
 
 impl CapturedRequest {
     fn header(&self, name: &str) -> Option<&str> {
-        self.headers
-            .iter()
-            .find(|(key, _)| key == name)
-            .map(|(_, value)| value.as_str())
+        header_value(&self.headers, name)
     }
 }
 
@@ -60,10 +57,11 @@ impl TestServer {
                             let _ = stream.write_all(response.as_bytes());
                         }
                     }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(10));
                     }
-                    Err(_) => break,
+                    Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                    Err(error) => panic!("accept test request: {error}"),
                 }
             }
         });
@@ -127,39 +125,109 @@ fn read_request(stream: &mut TcpStream) -> Option<CapturedRequest> {
             Ok(0) => break,
             Ok(n) => {
                 buffer.extend_from_slice(&chunk[..n]);
-                if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+                if header_end_position(&buffer).is_some() {
                     break;
                 }
             }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
                 break;
             }
             Err(_) => return None,
         }
     }
 
-    let request = String::from_utf8_lossy(&buffer);
+    let header_end = header_end_position(&buffer)?;
+    let request = String::from_utf8_lossy(&buffer[..header_end]);
     let mut lines = request.split("\r\n");
     let request_line = lines.next()?;
     let mut parts = request_line.split_whitespace();
     let method = parts.next()?.to_string();
     let path = parts.next()?.to_string();
-    let headers = lines
+    let headers: Vec<(String, String)> = lines
         .take_while(|line| !line.is_empty())
         .filter_map(|line| line.split_once(':'))
         .map(|(key, value)| (key.to_ascii_lowercase(), value.trim().to_string()))
         .collect();
+
+    drain_request_body(stream, &mut buffer, header_end + 4, &headers)?;
 
     Some(CapturedRequest {
         method,
         path,
         headers,
     })
+}
+
+fn header_end_position(buffer: &[u8]) -> Option<usize> {
+    buffer.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+fn drain_request_body(
+    stream: &mut TcpStream,
+    buffer: &mut Vec<u8>,
+    body_start: usize,
+    headers: &[(String, String)],
+) -> Option<()> {
+    if let Some(content_length) =
+        header_value(headers, "content-length").and_then(|value| value.parse::<usize>().ok())
+    {
+        drain_content_length_body(stream, buffer, body_start, content_length)
+    } else if header_value(headers, "transfer-encoding")
+        .is_some_and(|value| value.eq_ignore_ascii_case("chunked"))
+    {
+        drain_chunked_body(stream, buffer, body_start)
+    } else {
+        Some(())
+    }
+}
+
+fn drain_content_length_body(
+    stream: &mut TcpStream,
+    buffer: &mut Vec<u8>,
+    body_start: usize,
+    content_length: usize,
+) -> Option<()> {
+    let mut body_read = buffer.len().saturating_sub(body_start);
+    let mut chunk = [0_u8; 1024];
+
+    while body_read < content_length {
+        let n = stream.read(&mut chunk).ok()?;
+        if n == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&chunk[..n]);
+        body_read += n;
+    }
+
+    Some(())
+}
+
+fn drain_chunked_body(
+    stream: &mut TcpStream,
+    buffer: &mut Vec<u8>,
+    body_start: usize,
+) -> Option<()> {
+    let mut chunk = [0_u8; 1024];
+
+    while !buffer[body_start..]
+        .windows(5)
+        .any(|window| window == b"0\r\n\r\n")
+    {
+        let n = stream.read(&mut chunk).ok()?;
+        if n == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&chunk[..n]);
+    }
+
+    Some(())
+}
+
+fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.as_str())
 }
 
 fn response_for(request: &CapturedRequest) -> String {
