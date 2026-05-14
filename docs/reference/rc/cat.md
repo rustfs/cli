@@ -15,8 +15,8 @@ rc [GLOBAL OPTIONS] cat [OPTIONS] <ALIAS/BUCKET/KEY>
 | Parameter | Description |
 | --- | --- |
 | `ALIAS/BUCKET/KEY` | Object path to read. |
-| `--offset` | Start reading at a byte offset. |
-| `--length` | Limit output to a byte length. |
+| `--enc-key` | Encrypt or decrypt with the given base64-encoded key. |
+| `--rewind` | Read object state at a specific time where supported. |
 | `--version-id` | Read a specific object version. |
 
 ## Examples
@@ -24,6 +24,7 @@ rc [GLOBAL OPTIONS] cat [OPTIONS] <ALIAS/BUCKET/KEY>
 ```bash
 rc cat local/reports/summary.txt
 rc object show local/reports/summary.txt --version-id VERSION_ID
+rc cat local/reports/summary.txt --rewind 2026-05-01T00:00:00Z
 ```
 
 ## Behavior

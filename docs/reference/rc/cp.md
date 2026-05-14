@@ -37,15 +37,15 @@ Upload a directory recursively:
 rc object copy ./reports/ local/reports/ --recursive
 ```
 
-Copy between buckets:
+Copy between buckets on the same alias:
 
 ```bash
-rc cp local/reports/summary.json backup/reports/summary.json
+rc cp local/reports/summary.json local/archive/summary.json
 ```
 
 ## Behavior
 
-The last path is the target. Sources can mix local and remote paths only where the command can infer a valid copy direction. Use trailing slashes consistently when copying directory-like prefixes.
+The last path is the target. Sources can mix local and remote paths only where the command can infer a valid copy direction. S3-to-S3 copies are limited to paths under the same alias in the current implementation; use `rc mirror` for remote-to-remote synchronization across aliases. Use trailing slashes consistently when copying directory-like prefixes.
 
 Global options shown in command syntax use the same meaning everywhere:
 

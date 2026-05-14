@@ -2,7 +2,7 @@
 
 ## Purpose
 
-`rc mirror` synchronizes objects from a source location to a target location.
+`rc mirror` synchronizes objects from one remote S3-compatible location to another remote S3-compatible location.
 
 ## Syntax
 
@@ -14,8 +14,8 @@ rc [GLOBAL OPTIONS] mirror [OPTIONS] <SOURCE> <TARGET>
 
 | Parameter | Description |
 | --- | --- |
-| `SOURCE` | Local or remote source directory, bucket, or prefix. |
-| `TARGET` | Local or remote destination directory, bucket, or prefix. |
+| `SOURCE` | Remote source bucket or prefix path, in `ALIAS/BUCKET[/PREFIX]` form. |
+| `TARGET` | Remote destination bucket or prefix path, in `ALIAS/BUCKET[/PREFIX]` form. |
 | `--overwrite` | Overwrite changed destination objects. |
 | `--remove` | Delete target objects that no longer exist in the source. |
 | `-n, --dry-run` | Show planned changes without applying them. |
@@ -24,14 +24,14 @@ rc [GLOBAL OPTIONS] mirror [OPTIONS] <SOURCE> <TARGET>
 ## Examples
 
 ```bash
-rc mirror ./site local/web/site --dry-run
-rc mirror ./site local/web/site --overwrite --remove
 rc mirror local/source backup/source --parallel 8
+rc mirror local/web/site backup/web/site --dry-run
+rc mirror local/web/site backup/web/site --overwrite --remove
 ```
 
 ## Behavior
 
-Mirror is intended for prefix-level synchronization. Use `--dry-run` first when combining `--overwrite` and `--remove`.
+Mirror is intended for remote prefix-level synchronization. Local filesystem paths are not supported by the current implementation. Use `--dry-run` first when combining `--overwrite` and `--remove`.
 
 Global options shown in command syntax use the same meaning everywhere:
 
