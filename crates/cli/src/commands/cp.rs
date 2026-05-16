@@ -203,8 +203,8 @@ async fn copy_local_to_s3(
     }
 }
 
-/// Multipart upload threshold: files at least this size use multipart upload (64 MiB)
-const MULTIPART_THRESHOLD: u64 = 64 * 1024 * 1024;
+/// Multipart upload threshold: files larger than this size use multipart upload.
+const MULTIPART_THRESHOLD: u64 = rc_s3::multipart::DEFAULT_PART_SIZE;
 /// Download progress threshold: avoid flicker for tiny downloads while surfacing meaningful waits.
 const DOWNLOAD_PROGRESS_THRESHOLD: u64 = 4 * 1024 * 1024;
 
@@ -277,12 +277,6 @@ async fn upload_file(
         return ExitCode::Success;
     }
 
-    // Determine content type
-    let guessed_type: Option<String> = mime_guess::from_path(src)
-        .first()
-        .map(|m| m.essence_str().to_string());
-    let content_type = args.content_type.as_deref().or(guessed_type.as_deref());
-
     // Get file size for progress bar decision
     let file_size = match std::fs::metadata(src) {
         Ok(m) => m.len(),
@@ -294,8 +288,18 @@ async fn upload_file(
         }
     };
 
+    // Determine content type
+    let guessed_type: Option<String> = mime_guess::from_path(src)
+        .first()
+        .map(|m| m.essence_str().to_string());
+    let content_type = select_upload_content_type(
+        args.content_type.as_deref(),
+        guessed_type.as_deref(),
+        file_size,
+    );
+
     // Show progress bar for large files
-    let progress = if file_size >= MULTIPART_THRESHOLD {
+    let progress = if file_size > MULTIPART_THRESHOLD {
         tracing::debug!(
             file_size,
             threshold = MULTIPART_THRESHOLD,
@@ -332,6 +336,18 @@ async fn upload_file(
                 &format!("Failed to upload {src_display}: {e}"),
             )
         }
+    }
+}
+
+fn select_upload_content_type<'a>(
+    explicit_type: Option<&'a str>,
+    guessed_type: Option<&'a str>,
+    file_size: u64,
+) -> Option<&'a str> {
+    if file_size > MULTIPART_THRESHOLD {
+        explicit_type
+    } else {
+        explicit_type.or(guessed_type)
     }
 }
 
@@ -860,6 +876,40 @@ mod tests {
 
         let progress = progress.expect("large download should create progress state");
         assert!(!progress.is_visible());
+    }
+
+    #[test]
+    fn test_select_upload_content_type_uses_guess_for_small_files() {
+        let selected =
+            select_upload_content_type(None, Some("text/plain"), MULTIPART_THRESHOLD - 1);
+
+        assert_eq!(selected, Some("text/plain"));
+    }
+
+    #[test]
+    fn test_select_upload_content_type_skips_guess_for_multipart_files() {
+        let selected =
+            select_upload_content_type(None, Some("text/plain"), MULTIPART_THRESHOLD + 1);
+
+        assert_eq!(selected, None);
+    }
+
+    #[test]
+    fn test_select_upload_content_type_uses_guess_at_multipart_boundary() {
+        let selected = select_upload_content_type(None, Some("text/plain"), MULTIPART_THRESHOLD);
+
+        assert_eq!(selected, Some("text/plain"));
+    }
+
+    #[test]
+    fn test_select_upload_content_type_keeps_explicit_type_for_multipart_files() {
+        let selected = select_upload_content_type(
+            Some("application/octet-stream"),
+            Some("text/plain"),
+            MULTIPART_THRESHOLD + 1,
+        );
+
+        assert_eq!(selected, Some("application/octet-stream"));
     }
 
     #[test]
