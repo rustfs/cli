@@ -14,6 +14,7 @@ const GLOBAL_OPTIONS: &[&str] = &[
     "--no-progress",
     "--quiet",
     "--debug",
+    "--header",
     "--help",
     "--version",
 ];

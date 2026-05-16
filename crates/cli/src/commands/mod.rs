@@ -7,6 +7,7 @@
 use std::io::{IsTerminal, stderr, stdout};
 
 use clap::{Parser, Subcommand, ValueEnum};
+use rc_core::{RequestHeader, set_global_request_headers};
 
 use crate::exit_code::ExitCode;
 use crate::output::OutputConfig;
@@ -74,8 +75,16 @@ pub struct Cli {
     #[arg(long, global = true, default_value = "false")]
     pub debug: bool,
 
+    /// Add an x-amz-* request header to signed S3 requests
+    #[arg(short = 'H', long = "header", global = true, value_parser = parse_request_header)]
+    pub request_headers: Vec<RequestHeader>,
+
     #[command(subcommand)]
     pub command: Commands,
+}
+
+fn parse_request_header(value: &str) -> Result<RequestHeader, String> {
+    RequestHeader::parse(value).map_err(|error| error.to_string())
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -247,6 +256,7 @@ pub enum Commands {
 
 /// Execute the CLI command and return an exit code
 pub async fn execute(cli: Cli) -> ExitCode {
+    set_global_request_headers(cli.request_headers.clone());
     let output_options = GlobalOutputOptions::from_cli(&cli);
 
     match cli.command {
@@ -441,6 +451,35 @@ mod tests {
 
         let resolved = options.resolve(OutputBehavior::HumanDefault);
         assert_eq!(resolved.json, !std::io::stdout().is_terminal());
+    }
+
+    #[test]
+    fn cli_accepts_global_custom_amz_header() {
+        let cli = Cli::try_parse_from([
+            "rc",
+            "-H",
+            "x-amz-bucket-encrypt-enabled:1",
+            "bucket",
+            "list",
+            "local/",
+        ])
+        .expect("parse custom header");
+
+        assert_eq!(cli.request_headers.len(), 1);
+        assert_eq!(cli.request_headers[0].name, "x-amz-bucket-encrypt-enabled");
+        assert_eq!(cli.request_headers[0].value, "1");
+    }
+
+    #[test]
+    fn cli_rejects_non_amz_custom_header() {
+        let error = Cli::try_parse_from(["rc", "-H", "authorization:secret", "ls", "local/"])
+            .expect_err("non amz header should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("Only x-amz-* custom request headers are supported")
+        );
     }
 
     #[test]

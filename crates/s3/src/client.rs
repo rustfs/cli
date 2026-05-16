@@ -9,21 +9,26 @@ use aws_sigv4::http_request::{
     SignableBody, SignableRequest, SignatureLocation, SigningSettings, sign,
 };
 use aws_sigv4::sign::v4;
+use aws_smithy_runtime_api::box_error::BoxError;
 use aws_smithy_runtime_api::client::http::{
     HttpClient, HttpConnector, HttpConnectorFuture, HttpConnectorSettings, SharedHttpConnector,
 };
+use aws_smithy_runtime_api::client::interceptors::Intercept;
+use aws_smithy_runtime_api::client::interceptors::context::BeforeTransmitInterceptorContextMut;
 use aws_smithy_runtime_api::client::orchestrator::HttpRequest;
 use aws_smithy_runtime_api::client::result::ConnectorError;
 use aws_smithy_runtime_api::client::runtime_components::RuntimeComponents;
 use aws_smithy_runtime_api::http::{Response, StatusCode};
 use aws_smithy_types::body::SdkBody;
+use aws_smithy_types::config_bag::ConfigBag;
 use bytes::Bytes;
 use jiff::Timestamp;
 use quick_xml::de::from_str as from_xml_str;
 use rc_core::{
     Alias, BucketNotification, Capabilities, CorsRule, Error, LifecycleRule, ListOptions,
     ListResult, NotificationTarget, ObjectInfo, ObjectStore, ObjectVersion,
-    ObjectVersionListResult, RemotePath, ReplicationConfiguration, Result, SelectOptions,
+    ObjectVersionListResult, RemotePath, ReplicationConfiguration, RequestHeader, Result,
+    SelectOptions, global_request_headers,
 };
 use reqwest::Method;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
@@ -671,8 +676,10 @@ impl HttpClient for ReqwestConnector {
 /// S3 client wrapper
 pub struct S3Client {
     inner: aws_sdk_s3::Client,
+    presign_inner: aws_sdk_s3::Client,
     xml_http_client: reqwest::Client,
     alias: Alias,
+    request_headers: Vec<RequestHeader>,
 }
 
 /// Request-level options for delete operations.
@@ -680,6 +687,33 @@ pub struct S3Client {
 pub struct DeleteRequestOptions {
     /// Ask RustFS to permanently delete data instead of creating delete markers.
     pub force_delete: bool,
+}
+
+#[derive(Debug, Clone)]
+struct CustomHeaderInterceptor {
+    headers: Vec<RequestHeader>,
+}
+
+impl Intercept for CustomHeaderInterceptor {
+    fn name(&self) -> &'static str {
+        "CustomHeaderInterceptor"
+    }
+
+    fn modify_before_signing(
+        &self,
+        context: &mut BeforeTransmitInterceptorContextMut<'_>,
+        _runtime_components: &RuntimeComponents,
+        _cfg: &mut ConfigBag,
+    ) -> std::result::Result<(), BoxError> {
+        let request = context.request_mut();
+        for header in &self.headers {
+            request
+                .headers_mut()
+                .try_insert(header.name.clone(), header.value.clone())
+                .map_err(|error| Box::new(error) as BoxError)?;
+        }
+        Ok(())
+    }
 }
 
 impl S3Client {
@@ -718,7 +752,8 @@ impl S3Client {
         let config = config_loader.load().await;
 
         // Build S3 client with path-style addressing for compatibility
-        let s3_config = aws_sdk_s3::config::Builder::from(&config)
+        let request_headers = global_request_headers();
+        let mut s3_config_builder = aws_sdk_s3::config::Builder::from(&config)
             .force_path_style(force_path_style_for_alias(&alias))
             // Improve compatibility with S3-compatible backends by only sending request
             // checksums when the operation explicitly requires them.
@@ -727,15 +762,27 @@ impl S3Client {
             )
             .response_checksum_validation(
                 aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired,
-            )
-            .build();
+            );
+
+        let presign_s3_config = s3_config_builder.clone().build();
+
+        if !request_headers.is_empty() {
+            s3_config_builder = s3_config_builder.interceptor(CustomHeaderInterceptor {
+                headers: request_headers.clone(),
+            });
+        }
+
+        let s3_config = s3_config_builder.build();
 
         let client = aws_sdk_s3::Client::from_conf(s3_config);
+        let presign_client = aws_sdk_s3::Client::from_conf(presign_s3_config);
 
         Ok(Self {
             inner: client,
+            presign_inner: presign_client,
             xml_http_client,
             alias,
+            request_headers,
         })
     }
 
@@ -1146,6 +1193,14 @@ impl S3Client {
                 HeaderValue::from_str(content_type)
                     .map_err(|e| Error::Auth(format!("Invalid content type header: {e}")))?,
             );
+        }
+
+        for header in &self.request_headers {
+            let name = HeaderName::from_bytes(header.name.as_bytes())
+                .map_err(|e| Error::Auth(format!("Invalid custom header name: {e}")))?;
+            let value = HeaderValue::from_str(&header.value)
+                .map_err(|e| Error::Auth(format!("Invalid custom header value: {e}")))?;
+            headers.insert(name, value);
         }
 
         let signed_headers = self
@@ -1924,7 +1979,7 @@ impl ObjectStore for S3Client {
             .map_err(|e| Error::General(format!("presign_get config: {e}")))?;
 
         let request = self
-            .inner
+            .presign_inner
             .get_object()
             .bucket(&path.bucket)
             .key(&path.key)
@@ -1946,7 +2001,11 @@ impl ObjectStore for S3Client {
             .build()
             .map_err(|e| Error::General(format!("presign_put config: {e}")))?;
 
-        let mut builder = self.inner.put_object().bucket(&path.bucket).key(&path.key);
+        let mut builder = self
+            .presign_inner
+            .put_object()
+            .bucket(&path.bucket)
+            .key(&path.key);
 
         if let Some(ct) = content_type {
             builder = builder.content_type(ct);
@@ -2768,6 +2827,14 @@ mod tests {
         endpoint: &str,
         response: Option<http::Response<SdkBody>>,
     ) -> (S3Client, CaptureRequestReceiver) {
+        test_s3_client_with_endpoint_and_headers(endpoint, response, Vec::new())
+    }
+
+    fn test_s3_client_with_endpoint_and_headers(
+        endpoint: &str,
+        response: Option<http::Response<SdkBody>>,
+        request_headers: Vec<RequestHeader>,
+    ) -> (S3Client, CaptureRequestReceiver) {
         let (http_client, request_receiver) = capture_request(response);
         let credentials = Credentials::new(
             "access-key",
@@ -2776,20 +2843,31 @@ mod tests {
             None,
             "rc-test-credentials",
         );
-        let config = aws_sdk_s3::config::Builder::new()
+        let mut config_builder = aws_sdk_s3::config::Builder::new()
             .credentials_provider(credentials)
             .endpoint_url(endpoint)
             .region(aws_sdk_s3::config::Region::new("us-east-1"))
             .force_path_style(true)
             .behavior_version_latest()
-            .http_client(http_client)
-            .build();
+            .http_client(http_client);
+
+        let presign_config = config_builder.clone().build();
+
+        if !request_headers.is_empty() {
+            config_builder = config_builder.interceptor(CustomHeaderInterceptor {
+                headers: request_headers.clone(),
+            });
+        }
+
+        let config = config_builder.build();
 
         let alias = Alias::new("test", endpoint, "access-key", "secret-key");
         let client = S3Client {
             inner: aws_sdk_s3::Client::from_conf(config),
+            presign_inner: aws_sdk_s3::Client::from_conf(presign_config),
             xml_http_client: reqwest::Client::new(),
             alias,
+            request_headers,
         };
 
         (client, request_receiver)
@@ -3467,6 +3545,54 @@ mod tests {
 
         let request = request_receiver.expect_request();
         assert_eq!(request.headers().get("x-rustfs-force-delete"), Some("true"));
+    }
+
+    #[tokio::test]
+    async fn custom_headers_are_added_before_sending_sdk_requests() {
+        let (client, request_receiver) = test_s3_client_with_endpoint_and_headers(
+            "https://example.com",
+            None,
+            vec![RequestHeader {
+                name: "x-amz-bucket-encrypt-enabled".to_string(),
+                value: "1".to_string(),
+            }],
+        );
+        let path = RemotePath::new("test", "bucket", "key.txt");
+
+        let _ = client.delete_object(&path).await;
+
+        let request = request_receiver.expect_request();
+        assert_eq!(
+            request.headers().get("x-amz-bucket-encrypt-enabled"),
+            Some("1")
+        );
+        assert!(
+            request
+                .headers()
+                .get("authorization")
+                .expect("authorization header")
+                .contains("x-amz-bucket-encrypt-enabled")
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_headers_are_not_required_by_presigned_urls() {
+        let (client, _request_receiver) = test_s3_client_with_endpoint_and_headers(
+            "https://example.com",
+            None,
+            vec![RequestHeader {
+                name: "x-amz-bucket-encrypt-enabled".to_string(),
+                value: "1".to_string(),
+            }],
+        );
+        let path = RemotePath::new("test", "bucket", "key.txt");
+
+        let url = client
+            .presign_get(&path, 3600)
+            .await
+            .expect("presign get should succeed");
+
+        assert!(!url.contains("x-amz-bucket-encrypt-enabled"));
     }
 
     #[tokio::test]

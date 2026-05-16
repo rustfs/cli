@@ -55,6 +55,7 @@ Global options shown in command syntax use the same meaning everywhere:
 | `--no-progress` | Disable progress bars. |
 | `-q, --quiet` | Suppress non-error output. |
 | `--debug` | Enable debug logging. |
+| `-H, --header NAME:VALUE` | Add an `x-amz-*` header to signed S3 requests. |
 
 ## Credentials
 

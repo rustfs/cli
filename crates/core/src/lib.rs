@@ -21,7 +21,10 @@ pub mod retry;
 pub mod select;
 pub mod traits;
 
-pub use alias::{Alias, AliasManager, validate_alias_endpoint};
+pub use alias::{
+    Alias, AliasManager, RequestHeader, global_request_headers, set_global_request_headers,
+    validate_alias_endpoint,
+};
 pub use config::{Config, ConfigManager};
 pub use cors::{CorsConfiguration, CorsRule};
 pub use error::{Error, Result};

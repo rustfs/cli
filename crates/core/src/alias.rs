@@ -4,6 +4,7 @@
 //! including connection details and credentials.
 
 use std::env;
+use std::sync::{OnceLock, RwLock};
 
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -12,6 +13,80 @@ use crate::config::ConfigManager;
 use crate::error::{Error, Result};
 
 const RC_HOST_PREFIX: &str = "RC_HOST_";
+const CUSTOM_HEADER_PREFIX: &str = "x-amz-";
+
+static GLOBAL_REQUEST_HEADERS: OnceLock<RwLock<Vec<RequestHeader>>> = OnceLock::new();
+
+/// Custom S3 request header applied to remote operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestHeader {
+    pub name: String,
+    pub value: String,
+}
+
+impl RequestHeader {
+    pub fn parse(value: &str) -> Result<Self> {
+        let (name, header_value) = value.split_once(':').ok_or_else(|| {
+            Error::Config(
+                "Header must use NAME:VALUE format, for example x-amz-meta-key:value".into(),
+            )
+        })?;
+
+        let name = name.trim().to_ascii_lowercase();
+        let header_value = header_value.trim().to_string();
+
+        if name.is_empty() {
+            return Err(Error::Config("Header name must not be empty".into()));
+        }
+
+        if header_value.is_empty() {
+            return Err(Error::Config("Header value must not be empty".into()));
+        }
+
+        if !name.starts_with(CUSTOM_HEADER_PREFIX) {
+            return Err(Error::Config(
+                "Only x-amz-* custom request headers are supported".into(),
+            ));
+        }
+
+        if !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+        {
+            return Err(Error::Config(format!("Invalid header name '{name}'")));
+        }
+
+        if !header_value.is_ascii() || header_value.bytes().any(|b| matches!(b, b'\r' | b'\n')) {
+            return Err(Error::Config(format!("Invalid value for header '{name}'")));
+        }
+
+        Ok(Self {
+            name,
+            value: header_value,
+        })
+    }
+}
+
+/// Set process-wide custom request headers for this CLI invocation.
+pub fn set_global_request_headers(headers: Vec<RequestHeader>) {
+    let storage = GLOBAL_REQUEST_HEADERS.get_or_init(|| RwLock::new(Vec::new()));
+    let mut guard = storage
+        .write()
+        .expect("global request header lock should not be poisoned");
+    *guard = headers;
+}
+
+/// Get process-wide custom request headers for this CLI invocation.
+pub fn global_request_headers() -> Vec<RequestHeader> {
+    let Some(storage) = GLOBAL_REQUEST_HEADERS.get() else {
+        return Vec::new();
+    };
+
+    storage
+        .read()
+        .expect("global request header lock should not be poisoned")
+        .clone()
+}
 
 /// Retry configuration for an alias
 #[derive(Debug, Clone, Serialize, Deserialize)]
