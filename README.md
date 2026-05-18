@@ -267,6 +267,8 @@ rc admin rebalance status local --json
 
 ## Command Overview
 
+For full command documentation, see the [`rc` command reference](docs/reference/rc/README.md).
+
 | Command       | Description                                                                  |
 |---------------|------------------------------------------------------------------------------|
 | `alias`       | Manage storage service aliases                                               |
