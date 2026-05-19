@@ -65,7 +65,7 @@ The following files require the Breaking Change process for modifications:
 
 | File | Description |
 |------|-------------|
-| `docs/SPEC.md` | CLI behavior contract |
+| `docs/reference/rc/` | CLI behavior contract |
 | `schemas/output_v1.json` | JSON output schema |
 | `crates/cli/src/exit_code.rs` | Exit code definitions |
 | `crates/core/src/config.rs` | Config schema_version related |
@@ -80,7 +80,7 @@ Modifying protected files requires:
 
 2. **Provide migration path**
    - Config migration: add `migrations/v{N}_to_v{N+1}.rs`
-   - Documentation update: update relevant SPEC.md sections
+   - Documentation update: update relevant command reference sections
 
 3. **PR marking**
    - Include `BREAKING` in PR title or description
@@ -367,7 +367,7 @@ Before submitting a PR, confirm all of the following:
 ### Phase 2+: Command Implementation
 - Follow command implementation template
 - Each command needs tests
-- Update SPEC.md (if needed)
+- Update the command reference (if needed)
 - Update Golden tests
 
 ### Git Commit Guidelines
