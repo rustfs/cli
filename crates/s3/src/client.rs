@@ -1683,7 +1683,7 @@ impl ObjectStore for S3Client {
             .list_buckets()
             .send()
             .await
-            .map_err(|e| Error::Network(e.to_string()))?;
+            .map_err(|e| Error::Network(Self::format_sdk_error(&e)))?;
 
         let buckets = response
             .buckets()
@@ -1848,7 +1848,7 @@ impl ObjectStore for S3Client {
             .bucket(bucket)
             .send()
             .await
-            .map_err(|e| Error::Network(e.to_string()))?;
+            .map_err(|e| Error::Network(Self::format_sdk_error(&e)))?;
 
         Ok(())
     }
@@ -3978,6 +3978,52 @@ mod tests {
         match result {
             Err(Error::Network(message)) => assert!(message.contains("InternalError")),
             other => panic!("Expected Network for list versions failure, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_buckets_preserves_service_error_code() {
+        let response = http::Response::builder()
+            .status(403)
+            .header("x-amz-error-code", "InvalidAccessKeyId")
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error>
+  <Code>InvalidAccessKeyId</Code>
+  <Message>The AWS access key Id you provided does not exist in our records.</Message>
+</Error>"#,
+            ))
+            .expect("build list buckets response");
+        let (client, _request_receiver) = test_s3_client(Some(response));
+
+        let result = client.list_buckets().await;
+
+        match result {
+            Err(Error::Network(message)) => assert!(message.contains("InvalidAccessKeyId")),
+            other => panic!("Expected Network for list buckets failure, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_bucket_preserves_service_error_code() {
+        let response = http::Response::builder()
+            .status(403)
+            .header("x-amz-error-code", "InvalidAccessKeyId")
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error>
+  <Code>InvalidAccessKeyId</Code>
+  <Message>The AWS access key Id you provided does not exist in our records.</Message>
+</Error>"#,
+            ))
+            .expect("build create bucket response");
+        let (client, _request_receiver) = test_s3_client(Some(response));
+
+        let result = client.create_bucket("bucket").await;
+
+        match result {
+            Err(Error::Network(message)) => assert!(message.contains("InvalidAccessKeyId")),
+            other => panic!("Expected Network for create bucket failure, got: {other:?}"),
         }
     }
 
