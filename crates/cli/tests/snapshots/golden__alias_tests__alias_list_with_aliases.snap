@@ -1,18 +1,23 @@
 ---
 source: crates/cli/tests/golden.rs
+assertion_line: 144
 expression: json
 ---
 {
   "aliases": [
     {
+      "auth_mode": "sigv4",
       "bucket_lookup": "auto",
       "endpoint": "http://localhost:9000",
+      "mtls": false,
       "name": "local",
       "region": "us-east-1"
     },
     {
+      "auth_mode": "sigv4",
       "bucket_lookup": "auto",
       "endpoint": "https://s3.amazonaws.com",
+      "mtls": false,
       "name": "s3",
       "region": "us-west-2"
     }
