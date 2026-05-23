@@ -164,11 +164,23 @@ pub struct Alias {
     /// S3 endpoint URL
     pub endpoint: String,
 
-    /// Access key ID
+    /// Access key ID. Empty when anonymous authentication is enabled.
     pub access_key: String,
 
-    /// Secret access key
+    /// Secret access key. Empty when anonymous authentication is enabled.
     pub secret_key: String,
+
+    /// Send requests without SigV4 authentication.
+    #[serde(default)]
+    pub anonymous: bool,
+
+    /// Path to PEM client certificate for mTLS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_cert: Option<String>,
+
+    /// Path to PEM client private key for mTLS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_key: Option<String>,
 
     /// AWS region
     #[serde(default = "default_region")]
@@ -244,6 +256,9 @@ impl Alias {
             endpoint: endpoint.into(),
             access_key: access_key.into(),
             secret_key: secret_key.into(),
+            anonymous: false,
+            client_cert: None,
+            client_key: None,
             region: default_region(),
             signature: default_signature(),
             bucket_lookup: default_bucket_lookup(),

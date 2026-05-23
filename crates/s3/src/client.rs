@@ -60,13 +60,23 @@ struct ReqwestConnector {
 }
 
 impl ReqwestConnector {
-    async fn new(insecure: bool, ca_bundle: Option<&str>) -> Result<Self> {
-        let client = build_reqwest_client(insecure, ca_bundle).await?;
+    async fn new(
+        insecure: bool,
+        ca_bundle: Option<&str>,
+        client_cert: Option<&str>,
+        client_key: Option<&str>,
+    ) -> Result<Self> {
+        let client = build_reqwest_client(insecure, ca_bundle, client_cert, client_key).await?;
         Ok(Self { client })
     }
 }
 
-async fn build_reqwest_client(insecure: bool, ca_bundle: Option<&str>) -> Result<reqwest::Client> {
+async fn build_reqwest_client(
+    insecure: bool,
+    ca_bundle: Option<&str>,
+    client_cert: Option<&str>,
+    client_key: Option<&str>,
+) -> Result<reqwest::Client> {
     // NOTE: When `insecure = true`, `danger_accept_invalid_certs` disables all TLS
     // certificate verification. Any CA bundle provided will still be added to the
     // trust store but is rendered ineffective for this connection.
@@ -80,6 +90,25 @@ async fn build_reqwest_client(insecure: bool, ca_bundle: Option<&str>) -> Result
         let cert = reqwest::Certificate::from_pem(&pem)
             .map_err(|e| Error::Network(format!("Invalid CA bundle '{bundle_path}': {e}")))?;
         builder = builder.add_root_certificate(cert);
+    }
+
+    if let (Some(cert_path), Some(key_path)) = (client_cert, client_key) {
+        let mut identity_pem = tokio::fs::read(cert_path).await.map_err(|e| {
+            Error::Network(format!(
+                "Failed to read client certificate '{cert_path}': {e}"
+            ))
+        })?;
+        let key_pem = tokio::fs::read(key_path)
+            .await
+            .map_err(|e| Error::Network(format!("Failed to read client key '{key_path}': {e}")))?;
+        identity_pem.extend_from_slice(
+            b"
+",
+        );
+        identity_pem.extend_from_slice(&key_pem);
+        let identity = reqwest::Identity::from_pem(&identity_pem)
+            .map_err(|e| Error::Network(format!("Invalid client certificate/key identity: {e}")))?;
+        builder = builder.use_rustls_tls().identity(identity);
     }
 
     let client = builder
@@ -724,31 +753,47 @@ impl S3Client {
         let access_key = alias.access_key.clone();
         let secret_key = alias.secret_key.clone();
 
-        // Build credentials provider
-        let credentials = aws_credential_types::Credentials::new(
-            access_key,
-            secret_key,
-            None, // session token
-            None, // expiry
-            "rc-static-credentials",
-        );
-
         // Build SDK config loader
         let mut config_loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
-            .credentials_provider(credentials)
             .region(aws_config::Region::new(region))
             .endpoint_url(&endpoint);
 
+        if alias.anonymous {
+            config_loader = config_loader.no_credentials();
+        } else {
+            let credentials = aws_credential_types::Credentials::new(
+                access_key,
+                secret_key,
+                None, // session token
+                None, // expiry
+                "rc-static-credentials",
+            );
+            config_loader = config_loader.credentials_provider(credentials);
+        }
+
         // When insecure mode is enabled or a custom CA bundle is provided, use the reqwest
         // connector which supports danger_accept_invalid_certs and custom root certificates.
-        if alias.insecure || alias.ca_bundle.is_some() {
-            let connector =
-                ReqwestConnector::new(alias.insecure, alias.ca_bundle.as_deref()).await?;
+        if alias.insecure
+            || alias.ca_bundle.is_some()
+            || (alias.client_cert.is_some() && alias.client_key.is_some())
+        {
+            let connector = ReqwestConnector::new(
+                alias.insecure,
+                alias.ca_bundle.as_deref(),
+                alias.client_cert.as_deref(),
+                alias.client_key.as_deref(),
+            )
+            .await?;
             config_loader = config_loader.http_client(connector);
         }
 
-        let xml_http_client =
-            build_reqwest_client(alias.insecure, alias.ca_bundle.as_deref()).await?;
+        let xml_http_client = build_reqwest_client(
+            alias.insecure,
+            alias.ca_bundle.as_deref(),
+            alias.client_cert.as_deref(),
+            alias.client_key.as_deref(),
+        )
+        .await?;
         let config = config_loader.load().await;
 
         // Build S3 client with path-style addressing for compatibility
@@ -1117,6 +1162,10 @@ impl S3Client {
         headers: &HeaderMap,
         body: &[u8],
     ) -> Result<HeaderMap> {
+        if self.alias.anonymous {
+            return Ok(headers.clone());
+        }
+
         let credentials = Credentials::new(
             &self.alias.access_key,
             &self.alias.secret_key,
@@ -3604,7 +3653,7 @@ mod tests {
     #[tokio::test]
     async fn reqwest_connector_insecure_without_ca_bundle_succeeds() {
         // When insecure is true and no CA bundle is provided, the connector should be created.
-        let connector = ReqwestConnector::new(true, None).await;
+        let connector = ReqwestConnector::new(true, None, None, None).await;
         assert!(
             connector.is_ok(),
             "Expected insecure connector creation to succeed"
@@ -3614,7 +3663,7 @@ mod tests {
     #[tokio::test]
     async fn reqwest_connector_invalid_ca_bundle_path_surfaces_error() {
         // Use an obviously invalid path (empty string) to trigger a read error.
-        let result = ReqwestConnector::new(false, Some("")).await;
+        let result = ReqwestConnector::new(false, Some(""), None, None).await;
         match result {
             Err(Error::Network(msg)) => {
                 assert!(

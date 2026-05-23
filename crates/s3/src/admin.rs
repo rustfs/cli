@@ -30,6 +30,7 @@ pub struct AdminClient {
     access_key: String,
     secret_key: String,
     region: String,
+    anonymous: bool,
 }
 
 impl AdminClient {
@@ -56,6 +57,25 @@ impl AdminClient {
             }
         }
 
+        if let (Some(cert_path), Some(key_path)) =
+            (alias.client_cert.as_deref(), alias.client_key.as_deref())
+        {
+            let mut identity_pem = std::fs::read(cert_path).map_err(|e| {
+                Error::Network(format!(
+                    "Failed to read client certificate '{cert_path}': {e}"
+                ))
+            })?;
+            let key_pem = std::fs::read(key_path).map_err(|e| {
+                Error::Network(format!("Failed to read client key '{key_path}': {e}"))
+            })?;
+            identity_pem.extend_from_slice(b"\n");
+            identity_pem.extend_from_slice(&key_pem);
+            let identity = reqwest::Identity::from_pem(&identity_pem).map_err(|e| {
+                Error::Network(format!("Invalid client certificate/key identity: {e}"))
+            })?;
+            builder = builder.use_rustls_tls().identity(identity);
+        }
+
         let http_client = builder
             .build()
             .map_err(|e| Error::Network(format!("Failed to create HTTP client: {e}")))?;
@@ -66,6 +86,7 @@ impl AdminClient {
             access_key: alias.access_key.clone(),
             secret_key: alias.secret_key.clone(),
             region: alias.region.clone(),
+            anonymous: alias.anonymous,
         })
     }
 
@@ -89,6 +110,10 @@ impl AdminClient {
         headers: &HeaderMap,
         body: &[u8],
     ) -> Result<HeaderMap> {
+        if self.anonymous {
+            return Ok(headers.clone());
+        }
+
         let credentials = Credentials::new(
             &self.access_key,
             &self.secret_key,

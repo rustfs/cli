@@ -32,11 +32,23 @@ pub struct SetArgs {
     /// S3 endpoint URL (e.g., `http://localhost:9000`, `https://s3.amazonaws.com`)
     pub endpoint: String,
 
-    /// Access key ID
-    pub access_key: String,
+    /// Access key ID (omit with --anonymous)
+    pub access_key: Option<String>,
 
-    /// Secret access key
-    pub secret_key: String,
+    /// Secret access key (omit with --anonymous)
+    pub secret_key: Option<String>,
+
+    /// Send requests without SigV4 credentials
+    #[arg(long, default_value = "false")]
+    pub anonymous: bool,
+
+    /// Path to PEM client certificate for mTLS
+    #[arg(long)]
+    pub client_cert: Option<String>,
+
+    /// Path to PEM client private key for mTLS
+    #[arg(long)]
+    pub client_key: Option<String>,
 
     /// AWS region (default: us-east-1)
     #[arg(long, default_value = "us-east-1")]
@@ -83,6 +95,8 @@ struct AliasInfo {
     endpoint: String,
     region: String,
     bucket_lookup: String,
+    auth_mode: String,
+    mtls: bool,
 }
 
 impl From<&Alias> for AliasInfo {
@@ -92,6 +106,13 @@ impl From<&Alias> for AliasInfo {
             endpoint: alias.endpoint.clone(),
             region: alias.region.clone(),
             bucket_lookup: alias.bucket_lookup.clone(),
+            auth_mode: if alias.anonymous {
+                "anonymous"
+            } else {
+                "sigv4"
+            }
+            .to_string(),
+            mtls: alias.client_cert.is_some() && alias.client_key.is_some(),
         }
     }
 }
@@ -136,6 +157,36 @@ async fn execute_set(args: SetArgs, manager: &AliasManager, formatter: &Formatte
         return formatter.fail(ExitCode::UsageError, &alias_endpoint_error_message(e));
     }
 
+    if args.client_cert.is_some() != args.client_key.is_some() {
+        return formatter.fail(
+            ExitCode::UsageError,
+            "--client-cert and --client-key must be supplied together",
+        );
+    }
+
+    let has_access_key = args
+        .access_key
+        .as_ref()
+        .is_some_and(|value| !value.is_empty());
+    let has_secret_key = args
+        .secret_key
+        .as_ref()
+        .is_some_and(|value| !value.is_empty());
+
+    if args.anonymous && (has_access_key || has_secret_key) {
+        return formatter.fail(
+            ExitCode::UsageError,
+            "Anonymous aliases must not include access key or secret key credentials",
+        );
+    }
+
+    if !args.anonymous && (!has_access_key || !has_secret_key) {
+        return formatter.fail(
+            ExitCode::UsageError,
+            "Access key and secret key are required unless --anonymous is set",
+        );
+    }
+
     // Validate signature version
     if args.signature != "v4" && args.signature != "v2" {
         return formatter.fail(ExitCode::UsageError, "Signature must be 'v4' or 'v2'");
@@ -153,9 +204,12 @@ async fn execute_set(args: SetArgs, manager: &AliasManager, formatter: &Formatte
     let mut alias = Alias::new(
         &args.name,
         &args.endpoint,
-        &args.access_key,
-        &args.secret_key,
+        args.access_key.as_deref().unwrap_or_default(),
+        args.secret_key.as_deref().unwrap_or_default(),
     );
+    alias.anonymous = args.anonymous;
+    alias.client_cert = args.client_cert;
+    alias.client_key = args.client_key;
     alias.region = args.region;
     alias.signature = args.signature;
     alias.bucket_lookup = args.bucket_lookup;
@@ -202,8 +256,20 @@ async fn execute_list(args: ListArgs, manager: &AliasManager, formatter: &Format
                     let styled_url = formatter.style_url(&alias.endpoint);
                     let styled_region = formatter.style_date(&alias.region);
                     let styled_lookup = formatter.style_date(&alias.bucket_lookup);
+                    let styled_auth = formatter.style_date(if alias.anonymous {
+                        "anonymous"
+                    } else {
+                        "sigv4"
+                    });
+                    let styled_mtls = formatter.style_date(
+                        if alias.client_cert.is_some() && alias.client_key.is_some() {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        },
+                    );
                     formatter.println(&format!(
-                        "{styled_name} {styled_url} (region: {styled_region}, lookup: {styled_lookup})"
+                        "{styled_name} {styled_url} (region: {styled_region}, lookup: {styled_lookup}, auth: {styled_auth}, mtls: {styled_mtls})"
                     ));
                 }
             } else {
@@ -277,8 +343,11 @@ mod tests {
         let args = SetArgs {
             name: "test".to_string(),
             endpoint: "http://localhost:9000".to_string(),
-            access_key: "accesskey".to_string(),
-            secret_key: "secretkey".to_string(),
+            access_key: Some("accesskey".to_string()),
+            secret_key: Some("secretkey".to_string()),
+            anonymous: false,
+            client_cert: None,
+            client_key: None,
             region: "us-east-1".to_string(),
             signature: "v4".to_string(),
             bucket_lookup: "auto".to_string(),
@@ -311,8 +380,11 @@ mod tests {
         let args = SetArgs {
             name: "rustfs".to_string(),
             endpoint: "http://rustfs-node{1...32}:9000".to_string(),
-            access_key: "accesskey".to_string(),
-            secret_key: "secretkey".to_string(),
+            access_key: Some("accesskey".to_string()),
+            secret_key: Some("secretkey".to_string()),
+            anonymous: false,
+            client_cert: None,
+            client_key: None,
             region: "us-east-1".to_string(),
             signature: "v4".to_string(),
             bucket_lookup: "auto".to_string(),

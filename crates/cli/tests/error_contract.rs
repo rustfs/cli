@@ -202,3 +202,114 @@ fn alias_set_json_error_rejects_invalid_signature() {
         0
     );
 }
+
+#[test]
+fn alias_set_anonymous_accepts_missing_credentials_and_lists_auth_mode() {
+    let config_dir = tempfile::tempdir().expect("create temp config dir");
+
+    let output = run_rc_with_config(
+        &[
+            "alias",
+            "set",
+            "public",
+            "https://public.example.com",
+            "--anonymous",
+            "--client-cert",
+            "/tmp/client.pem",
+            "--client-key",
+            "/tmp/client.key",
+            "--json",
+        ],
+        config_dir.path(),
+    );
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let list_output = run_rc_with_config(&["alias", "list", "--json"], config_dir.path());
+    assert!(
+        list_output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&list_output.stderr)
+    );
+
+    let stdout = String::from_utf8(list_output.stdout).expect("stdout should be UTF-8");
+    let payload: serde_json::Value = serde_json::from_str(&stdout).expect("stdout is valid JSON");
+    let alias = &payload["aliases"][0];
+    assert_eq!(alias["name"], "public");
+    assert_eq!(alias["auth_mode"], "anonymous");
+    assert_eq!(alias["mtls"], true);
+}
+
+#[test]
+fn alias_set_anonymous_rejects_supplied_credentials() {
+    let config_dir = tempfile::tempdir().expect("create temp config dir");
+
+    let output = run_rc_with_config(
+        &[
+            "alias",
+            "set",
+            "bad",
+            "https://public.example.com",
+            "accesskey",
+            "secretkey",
+            "--anonymous",
+            "--json",
+        ],
+        config_dir.path(),
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
+    let json: serde_json::Value = serde_json::from_str(&stderr).expect("stderr is valid JSON");
+    assert_eq!(
+        json["error"],
+        "Anonymous aliases must not include access key or secret key credentials"
+    );
+}
+
+#[test]
+fn alias_set_rejects_partial_client_identity() {
+    let config_dir = tempfile::tempdir().expect("create temp config dir");
+
+    let output = run_rc_with_config(
+        &[
+            "alias",
+            "set",
+            "bad",
+            "https://public.example.com",
+            "accesskey",
+            "secretkey",
+            "--client-cert",
+            "/tmp/client.pem",
+            "--json",
+        ],
+        config_dir.path(),
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
+    let json: serde_json::Value = serde_json::from_str(&stderr).expect("stderr is valid JSON");
+    assert_eq!(
+        json["error"],
+        "--client-cert and --client-key must be supplied together"
+    );
+}

@@ -399,8 +399,16 @@ fn nested_subcommand_help_contract() {
     let cases = [
         HelpCase {
             args: &["alias", "set"],
-            usage: "Usage: rc alias set [OPTIONS] <NAME> <ENDPOINT> <ACCESS_KEY> <SECRET_KEY>",
-            expected_tokens: &["--region", "--signature", "--bucket-lookup", "--insecure"],
+            usage: "Usage: rc alias set [OPTIONS] <NAME> <ENDPOINT> [ACCESS_KEY] [SECRET_KEY]",
+            expected_tokens: &[
+                "--anonymous",
+                "--client-cert",
+                "--client-key",
+                "--region",
+                "--signature",
+                "--bucket-lookup",
+                "--insecure",
+            ],
         },
         HelpCase {
             args: &["alias", "list"],
