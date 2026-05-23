@@ -101,10 +101,7 @@ async fn build_reqwest_client(
         let key_pem = tokio::fs::read(key_path)
             .await
             .map_err(|e| Error::Network(format!("Failed to read client key '{key_path}': {e}")))?;
-        identity_pem.extend_from_slice(
-            b"
-",
-        );
+        identity_pem.extend_from_slice(b"\n");
         identity_pem.extend_from_slice(&key_pem);
         let identity = reqwest::Identity::from_pem(&identity_pem)
             .map_err(|e| Error::Network(format!("Invalid client certificate/key identity: {e}")))?;
