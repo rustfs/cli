@@ -2958,6 +2958,9 @@ mod tests {
                 }
             };
             stream
+                .set_nonblocking(false)
+                .expect("configure blocking request stream");
+            stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .expect("set stream read timeout");
             let request = read_xml_request(&mut stream);
