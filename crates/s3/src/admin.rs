@@ -963,12 +963,14 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::sync::mpsc;
     use std::thread;
+    use std::time::Duration;
     use tempfile::tempdir;
 
     #[derive(Debug)]
     struct CapturedAdminRequest {
         method: String,
         target: String,
+        headers: String,
         body: Vec<u8>,
     }
 
@@ -1010,6 +1012,7 @@ mod tests {
         CapturedAdminRequest {
             method,
             target,
+            headers,
             body,
         }
     }
@@ -1047,6 +1050,12 @@ mod tests {
     fn admin_client_for_endpoint(endpoint: &str) -> AdminClient {
         let alias = Alias::new("test", endpoint, "access", "secret");
         AdminClient::new(&alias).expect("admin client should build")
+    }
+
+    fn anonymous_admin_client_for_endpoint(endpoint: &str) -> AdminClient {
+        let mut alias = Alias::new("test", endpoint, "", "");
+        alias.anonymous = true;
+        AdminClient::new(&alias).expect("anonymous admin client should build")
     }
 
     fn assert_heal_options_body(
@@ -1220,6 +1229,31 @@ mod tests {
         assert_eq!(request.method, "POST");
         assert_eq!(request.target, "/rustfs/admin/v3/background-heal/status");
         assert!(request.body.is_empty());
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn test_anonymous_admin_requests_skip_authorization_header() {
+        let (endpoint, receiver, handle) =
+            start_admin_test_server("200 OK", r#"{"bitrotStartTime":"2026-04-19T10:00:00Z"}"#);
+        let client = anonymous_admin_client_for_endpoint(&endpoint);
+
+        client
+            .heal_status()
+            .await
+            .expect("anonymous heal status request");
+
+        let request = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("captured request");
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.target, "/rustfs/admin/v3/background-heal/status");
+        assert!(
+            !request
+                .headers
+                .lines()
+                .any(|line| line.to_ascii_lowercase().starts_with("authorization:"))
+        );
         handle.join().expect("server thread should finish");
     }
 
