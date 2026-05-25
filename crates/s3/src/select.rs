@@ -2,7 +2,7 @@
 
 use aws_sdk_s3::types::{
     CompressionType, CsvInput, CsvOutput, ExpressionType, FileHeaderInfo, InputSerialization,
-    JsonInput, JsonOutput, JsonType, OutputSerialization, ParquetInput, QuoteFields,
+    JsonInput, JsonOutput, JsonType, OutputSerialization, ParquetInput, QuoteFields, ScanRange,
     SelectObjectContentEventStream,
 };
 use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
@@ -10,8 +10,9 @@ use aws_smithy_runtime_api::client::result::SdkError;
 use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use aws_smithy_types::event_stream::RawMessage;
 use rc_core::{
-    Error, RemotePath, Result, SelectCompression, SelectInputFormat, SelectOptions,
-    SelectOutputFormat,
+    Error, RemotePath, Result, SelectCompression, SelectCsvFileHeaderInfo, SelectInputFormat,
+    SelectJsonInputType, SelectOptions, SelectOutputFormat,
+    SelectQuoteFields as RcSelectQuoteFields,
 };
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
@@ -23,20 +24,31 @@ pub async fn select_object_content(
     writer: &mut (dyn AsyncWrite + Send + Unpin),
 ) -> Result<()> {
     let input = build_input_serialization(options)?;
-    let output = build_output_serialization(options);
+    let output = build_output_serialization(options)?;
 
     // aws-sdk-s3 `SelectObjectContent` does not expose object `VersionId`; the current object is used.
-    let resp = client
+    let mut request = client
         .select_object_content()
         .bucket(&path.bucket)
         .key(&path.key)
         .expression(&options.expression)
         .expression_type(ExpressionType::Sql)
         .input_serialization(input)
-        .output_serialization(output)
-        .send()
-        .await
-        .map_err(map_select_initial_error)?;
+        .output_serialization(output);
+    if let Some(scan_range) = build_scan_range(options)? {
+        request = request.scan_range(scan_range);
+    }
+    if let Some(algorithm) = options.sse_customer.algorithm.as_deref() {
+        request = request.sse_customer_algorithm(algorithm);
+    }
+    if let Some(key) = options.sse_customer.key.as_deref() {
+        request = request.sse_customer_key(key);
+    }
+    if let Some(key_md5) = options.sse_customer.key_md5.as_deref() {
+        request = request.sse_customer_key_md5(key_md5);
+    }
+
+    let resp = request.send().await.map_err(map_select_initial_error)?;
 
     let mut events = resp.payload;
     while let Some(ev) = events.recv().await.map_err(map_select_stream_error)? {
@@ -62,6 +74,87 @@ fn compression_type(c: SelectCompression) -> CompressionType {
     }
 }
 
+fn csv_file_header_info(info: SelectCsvFileHeaderInfo) -> FileHeaderInfo {
+    match info {
+        SelectCsvFileHeaderInfo::None => FileHeaderInfo::None,
+        SelectCsvFileHeaderInfo::Ignore => FileHeaderInfo::Ignore,
+        SelectCsvFileHeaderInfo::Use => FileHeaderInfo::Use,
+    }
+}
+
+fn json_input_type(input_type: SelectJsonInputType) -> JsonType {
+    match input_type {
+        SelectJsonInputType::Lines => JsonType::Lines,
+        SelectJsonInputType::Document => JsonType::Document,
+    }
+}
+
+fn quote_fields(quote_fields: RcSelectQuoteFields) -> QuoteFields {
+    match quote_fields {
+        RcSelectQuoteFields::Always => QuoteFields::Always,
+        RcSelectQuoteFields::AsNeeded => QuoteFields::Asneeded,
+    }
+}
+
+fn build_scan_range(options: &SelectOptions) -> Result<Option<ScanRange>> {
+    let scan_range = &options.scan_range;
+    if scan_range.start.is_none() && scan_range.end.is_none() {
+        return Ok(None);
+    }
+    if matches!(options.input_format, SelectInputFormat::Parquet) {
+        return Err(Error::General(
+            "ScanRange is not supported for Parquet input.".to_string(),
+        ));
+    }
+    if matches!(options.input_format, SelectInputFormat::Json)
+        && matches!(options.json_input.input_type, SelectJsonInputType::Document)
+    {
+        return Err(Error::General(
+            "ScanRange is not supported for JSON document input.".to_string(),
+        ));
+    }
+    if scan_range.start.is_some_and(|start| start < 0) || scan_range.end.is_some_and(|end| end < 0)
+    {
+        return Err(Error::General(
+            "ScanRange start and end must be non-negative.".to_string(),
+        ));
+    }
+    if let (Some(start), Some(end)) = (scan_range.start, scan_range.end)
+        && start > end
+    {
+        return Err(Error::General(
+            "ScanRange start must not be greater than end.".to_string(),
+        ));
+    }
+    Ok(Some(
+        ScanRange::builder()
+            .set_start(scan_range.start)
+            .set_end(scan_range.end)
+            .build(),
+    ))
+}
+
+fn validate_single_byte(name: &str, value: Option<&str>) -> Result<()> {
+    if let Some(value) = value
+        && value.len() != 1
+    {
+        return Err(Error::General(format!("{name} must be exactly one byte.")));
+    }
+    Ok(())
+}
+
+fn validate_record_delimiter(name: &str, value: Option<&str>) -> Result<()> {
+    if let Some(value) = value
+        && value.len() != 1
+        && value != "\r\n"
+    {
+        return Err(Error::General(format!(
+            "{name} must be exactly one byte or CRLF."
+        )));
+    }
+    Ok(())
+}
+
 fn build_input_serialization(options: &SelectOptions) -> Result<InputSerialization> {
     if matches!(options.input_format, SelectInputFormat::Parquet)
         && !matches!(options.compression, SelectCompression::None)
@@ -75,14 +168,43 @@ fn build_input_serialization(options: &SelectOptions) -> Result<InputSerializati
     let mut b = InputSerialization::builder().compression_type(compression);
     match options.input_format {
         SelectInputFormat::Csv => {
-            let csv = CsvInput::builder()
-                .file_header_info(FileHeaderInfo::None)
-                .build();
+            validate_single_byte(
+                "CSV input field delimiter",
+                options.csv_input.field_delimiter.as_deref(),
+            )?;
+            validate_single_byte(
+                "CSV input quote character",
+                options.csv_input.quote_character.as_deref(),
+            )?;
+            validate_single_byte(
+                "CSV input quote escape character",
+                options.csv_input.quote_escape_character.as_deref(),
+            )?;
+            validate_single_byte(
+                "CSV input comment character",
+                options.csv_input.comments.as_deref(),
+            )?;
+            let mut csv = CsvInput::builder()
+                .file_header_info(csv_file_header_info(options.csv_input.file_header_info));
+            if let Some(delimiter) = options.csv_input.field_delimiter.as_deref() {
+                csv = csv.field_delimiter(delimiter);
+            }
+            if let Some(quote) = options.csv_input.quote_character.as_deref() {
+                csv = csv.quote_character(quote);
+            }
+            if let Some(escape) = options.csv_input.quote_escape_character.as_deref() {
+                csv = csv.quote_escape_character(escape);
+            }
+            if let Some(comments) = options.csv_input.comments.as_deref() {
+                csv = csv.comments(comments);
+            }
+            let csv = csv.build();
             b = b.csv(csv);
         }
         SelectInputFormat::Json => {
-            // JSONL: one JSON object per line (S3 Select `Type=LINES`).
-            let json = JsonInput::builder().r#type(JsonType::Lines).build();
+            let json = JsonInput::builder()
+                .r#type(json_input_type(options.json_input.input_type))
+                .build();
             b = b.json(json);
         }
         SelectInputFormat::Parquet => {
@@ -93,21 +215,53 @@ fn build_input_serialization(options: &SelectOptions) -> Result<InputSerializati
     Ok(b.build())
 }
 
-fn build_output_serialization(options: &SelectOptions) -> OutputSerialization {
+fn build_output_serialization(options: &SelectOptions) -> Result<OutputSerialization> {
     let mut b = OutputSerialization::builder();
     match options.output_format {
         SelectOutputFormat::Csv => {
-            let csv = CsvOutput::builder()
-                .quote_fields(QuoteFields::Asneeded)
-                .build();
+            validate_single_byte(
+                "CSV output field delimiter",
+                options.csv_output.field_delimiter.as_deref(),
+            )?;
+            validate_record_delimiter(
+                "CSV output record delimiter",
+                options.csv_output.record_delimiter.as_deref(),
+            )?;
+            validate_single_byte(
+                "CSV output quote character",
+                options.csv_output.quote_character.as_deref(),
+            )?;
+            validate_single_byte(
+                "CSV output quote escape character",
+                options.csv_output.quote_escape_character.as_deref(),
+            )?;
+            let mut csv =
+                CsvOutput::builder().quote_fields(quote_fields(options.csv_output.quote_fields));
+            if let Some(delimiter) = options.csv_output.field_delimiter.as_deref() {
+                csv = csv.field_delimiter(delimiter);
+            }
+            if let Some(record_delimiter) = options.csv_output.record_delimiter.as_deref() {
+                csv = csv.record_delimiter(record_delimiter);
+            }
+            if let Some(quote) = options.csv_output.quote_character.as_deref() {
+                csv = csv.quote_character(quote);
+            }
+            if let Some(escape) = options.csv_output.quote_escape_character.as_deref() {
+                csv = csv.quote_escape_character(escape);
+            }
+            let csv = csv.build();
             b = b.csv(csv);
         }
         SelectOutputFormat::Json => {
-            let json = JsonOutput::builder().build();
+            let mut json = JsonOutput::builder();
+            if let Some(record_delimiter) = options.json_output.record_delimiter.as_deref() {
+                json = json.record_delimiter(record_delimiter);
+            }
+            let json = json.build();
             b = b.json(json);
         }
     }
-    b.build()
+    Ok(b.build())
 }
 
 fn resolve_http_service_error_code<'a, E: ProvideErrorMetadata + ?Sized>(
@@ -205,10 +359,16 @@ fn classify_aws_code_missing_metadata(text: &str) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_input_serialization, build_output_serialization, classify_aws_code};
+    use super::{
+        build_input_serialization, build_output_serialization, build_scan_range, classify_aws_code,
+    };
     use aws_sdk_s3::types::{CompressionType, FileHeaderInfo, JsonType, QuoteFields};
     use rc_core::Error;
-    use rc_core::{SelectCompression, SelectInputFormat, SelectOptions, SelectOutputFormat};
+    use rc_core::{
+        SelectCompression, SelectCsvInputOptions, SelectCsvOutputOptions, SelectInputFormat,
+        SelectJsonInputOptions, SelectJsonInputType, SelectOptions, SelectOutputFormat,
+        SelectScanRangeOptions,
+    };
 
     #[test]
     fn classify_maps_no_such_key() {
@@ -301,6 +461,7 @@ mod tests {
             input_format: SelectInputFormat::Parquet,
             output_format: SelectOutputFormat::Csv,
             compression: SelectCompression::Gzip,
+            ..SelectOptions::default()
         };
 
         let error = build_input_serialization(&options)
@@ -315,6 +476,7 @@ mod tests {
             input_format: SelectInputFormat::Parquet,
             output_format: SelectOutputFormat::Csv,
             compression: SelectCompression::None,
+            ..SelectOptions::default()
         };
 
         build_input_serialization(&options).expect("parquet without whole-object compression");
@@ -327,6 +489,7 @@ mod tests {
             input_format: SelectInputFormat::Csv,
             output_format: SelectOutputFormat::Csv,
             compression: SelectCompression::Bzip2,
+            ..SelectOptions::default()
         };
 
         let input = build_input_serialization(&options).expect("csv input serialization");
@@ -345,6 +508,7 @@ mod tests {
             input_format: SelectInputFormat::Json,
             output_format: SelectOutputFormat::Json,
             compression: SelectCompression::Gzip,
+            ..SelectOptions::default()
         };
 
         let input = build_input_serialization(&options).expect("json input serialization");
@@ -363,8 +527,9 @@ mod tests {
             input_format: SelectInputFormat::Csv,
             output_format: SelectOutputFormat::Csv,
             compression: SelectCompression::None,
+            ..SelectOptions::default()
         };
-        let csv_output = build_output_serialization(&csv_options);
+        let csv_output = build_output_serialization(&csv_options).expect("csv output");
         let csv = csv_output.csv().expect("csv output is configured");
         assert_eq!(csv.quote_fields(), Some(&QuoteFields::Asneeded));
         assert!(csv_output.json().is_none());
@@ -374,9 +539,93 @@ mod tests {
             input_format: SelectInputFormat::Json,
             output_format: SelectOutputFormat::Json,
             compression: SelectCompression::None,
+            ..SelectOptions::default()
         };
-        let json_output = build_output_serialization(&json_options);
+        let json_output = build_output_serialization(&json_options).expect("json output");
         assert!(json_output.json().is_some());
         assert!(json_output.csv().is_none());
+    }
+
+    #[test]
+    fn csv_input_rejects_multi_byte_delimiter() {
+        let options = SelectOptions {
+            expression: "SELECT * FROM S3Object".to_string(),
+            csv_input: SelectCsvInputOptions {
+                field_delimiter: Some("||".to_string()),
+                ..SelectCsvInputOptions::default()
+            },
+            ..SelectOptions::default()
+        };
+
+        let error = build_input_serialization(&options)
+            .expect_err("multi-byte CSV input delimiter should be rejected");
+        assert!(matches!(error, Error::General(msg) if msg.contains("field delimiter")));
+    }
+
+    #[test]
+    fn csv_output_record_delimiter_allows_crlf() {
+        let options = SelectOptions {
+            expression: "SELECT * FROM S3Object".to_string(),
+            csv_output: SelectCsvOutputOptions {
+                record_delimiter: Some("\r\n".to_string()),
+                ..SelectCsvOutputOptions::default()
+            },
+            ..SelectOptions::default()
+        };
+
+        let output = build_output_serialization(&options).expect("CRLF record delimiter");
+        let csv = output.csv().expect("csv output is configured");
+        assert_eq!(csv.record_delimiter(), Some("\r\n"));
+    }
+
+    #[test]
+    fn csv_output_rejects_multi_byte_record_delimiter() {
+        let options = SelectOptions {
+            expression: "SELECT * FROM S3Object".to_string(),
+            csv_output: SelectCsvOutputOptions {
+                record_delimiter: Some("||".to_string()),
+                ..SelectCsvOutputOptions::default()
+            },
+            ..SelectOptions::default()
+        };
+
+        let error = build_output_serialization(&options)
+            .expect_err("multi-byte CSV output record delimiter should be rejected");
+        assert!(matches!(error, Error::General(msg) if msg.contains("record delimiter")));
+    }
+
+    #[test]
+    fn scan_range_rejects_json_document() {
+        let options = SelectOptions {
+            expression: "SELECT * FROM S3Object".to_string(),
+            input_format: SelectInputFormat::Json,
+            json_input: SelectJsonInputOptions {
+                input_type: SelectJsonInputType::Document,
+            },
+            scan_range: SelectScanRangeOptions {
+                start: Some(0),
+                end: None,
+            },
+            ..SelectOptions::default()
+        };
+
+        let error =
+            build_scan_range(&options).expect_err("scan range should reject JSON document input");
+        assert!(matches!(error, Error::General(msg) if msg.contains("JSON document")));
+    }
+
+    #[test]
+    fn scan_range_rejects_start_after_end() {
+        let options = SelectOptions {
+            expression: "SELECT * FROM S3Object".to_string(),
+            scan_range: SelectScanRangeOptions {
+                start: Some(20),
+                end: Some(10),
+            },
+            ..SelectOptions::default()
+        };
+
+        let error = build_scan_range(&options).expect_err("start after end should be rejected");
+        assert!(matches!(error, Error::General(msg) if msg.contains("greater than end")));
     }
 }

@@ -38,7 +38,12 @@ pub use replication::{
     ReplicationRule, ReplicationRuleStatus,
 };
 pub use retry::{RetryBuilder, is_retryable_error, retry_with_backoff};
-pub use select::{SelectCompression, SelectInputFormat, SelectOptions, SelectOutputFormat};
+pub use select::{
+    SelectCompression, SelectCsvFileHeaderInfo, SelectCsvInputOptions, SelectCsvOutputOptions,
+    SelectInputFormat, SelectJsonInputOptions, SelectJsonInputType, SelectJsonOutputOptions,
+    SelectOptions, SelectOutputFormat, SelectQuoteFields, SelectScanRangeOptions,
+    SelectSseCustomerOptions,
+};
 pub use traits::{
     BucketNotification, Capabilities, ListOptions, ListResult, NotificationTarget, ObjectInfo,
     ObjectStore, ObjectVersion, ObjectVersionListResult,
