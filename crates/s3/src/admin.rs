@@ -1258,6 +1258,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_anonymous_admin_no_response_requests_skip_authorization_header() {
+        let (endpoint, receiver, handle) = start_admin_test_server("200 OK", "");
+        let client = anonymous_admin_client_for_endpoint(&endpoint);
+        let request = HealStartRequest {
+            bucket: Some("raw photos".to_string()),
+            prefix: Some("2026/april".to_string()),
+            scan_mode: HealScanMode::Deep,
+            remove: true,
+            recreate: true,
+            dry_run: true,
+        };
+
+        client
+            .heal_start(request)
+            .await
+            .expect("anonymous heal start request");
+
+        let request = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("captured request");
+        assert_eq!(request.method, "POST");
+        assert_eq!(
+            request.target,
+            "/rustfs/admin/v3/heal/raw%20photos/2026%2Fapril"
+        );
+        assert_heal_options_body(&request.body, 2, true, true, true);
+        assert!(
+            !request
+                .headers
+                .lines()
+                .any(|line| line.to_ascii_lowercase().starts_with("authorization:"))
+        );
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
     async fn test_heal_start_posts_to_bucket_prefix_route_with_options_body() {
         let (endpoint, receiver, handle) = start_admin_test_server("200 OK", "");
         let client = admin_client_for_endpoint(&endpoint);
