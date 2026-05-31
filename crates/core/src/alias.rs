@@ -387,6 +387,12 @@ fn validate_http_endpoint_url(url: &Url, label: &str) -> Result<()> {
         return Err(Error::Config(format!("{label} must include a host")));
     }
 
+    if !matches!(url.path(), "" | "/") || url.query().is_some() || url.fragment().is_some() {
+        return Err(Error::Config(format!(
+            "{label} must not include a non-root path, query, or fragment"
+        )));
+    }
+
     Ok(())
 }
 
@@ -673,6 +679,25 @@ mod tests {
                 .to_string()
                 .contains("Endpoint must not include credentials")
         );
+    }
+
+    #[test]
+    fn test_validate_alias_endpoint_rejects_path_query_and_fragment() {
+        for endpoint in [
+            "http://localhost:9000/api",
+            "http://localhost:9000?region=us-east-1",
+            "http://localhost:9000#alias",
+        ] {
+            let result = validate_alias_endpoint(endpoint);
+
+            assert!(result.is_err(), "endpoint should be rejected: {endpoint}");
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Endpoint must not include a non-root path, query, or fragment")
+            );
+        }
     }
 
     #[test]
