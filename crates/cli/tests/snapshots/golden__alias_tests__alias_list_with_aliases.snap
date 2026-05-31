@@ -6,7 +6,7 @@ expression: json
 {
   "aliases": [
     {
-      "auth_mode": "sigv4",
+      "auth_mode": "anonymous",
       "bucket_lookup": "auto",
       "endpoint": "http://localhost:9000",
       "mtls": false,
@@ -14,7 +14,7 @@ expression: json
       "region": "us-east-1"
     },
     {
-      "auth_mode": "sigv4",
+      "auth_mode": "anonymous",
       "bucket_lookup": "auto",
       "endpoint": "https://s3.amazonaws.com",
       "mtls": false,

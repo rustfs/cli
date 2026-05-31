@@ -8,7 +8,8 @@ use serde::Serialize;
 
 use crate::exit_code::ExitCode;
 use crate::output::{Formatter, OutputConfig};
-use rc_core::{Alias, AliasManager, validate_alias_endpoint};
+use rc_core::{Alias, AliasManager, Error, ObjectStore as _, validate_alias_endpoint};
+use rc_s3::S3Client;
 
 /// Alias subcommands for managing storage service connections
 #[derive(Subcommand, Debug)]
@@ -215,6 +216,12 @@ async fn execute_set(args: SetArgs, manager: &AliasManager, formatter: &Formatte
     alias.bucket_lookup = args.bucket_lookup;
     alias.insecure = args.insecure;
 
+    if let Err(e) = validate_alias_credentials(&alias).await {
+        let code = exit_code_from_error(&e);
+        formatter.error_with_code(code, &e.to_string());
+        return code;
+    }
+
     // Save alias
     match manager.set(alias) {
         Ok(()) => {
@@ -237,6 +244,46 @@ async fn execute_set(args: SetArgs, manager: &AliasManager, formatter: &Formatte
             code
         }
     }
+}
+
+async fn validate_alias_credentials(alias: &Alias) -> rc_core::Result<()> {
+    if alias.anonymous {
+        return Ok(());
+    }
+
+    let client = S3Client::new(alias.clone()).await?;
+    match client.list_buckets().await {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            let message = error.to_string();
+            if is_alias_auth_validation_failure(&message) {
+                Err(Error::Auth("Invalid access key or secret key".to_string()))
+            } else if is_alias_authorization_only_failure(&message) {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+fn is_alias_auth_validation_failure(message: &str) -> bool {
+    [
+        "InvalidAccessKeyId",
+        "SignatureDoesNotMatch",
+        "AuthorizationHeaderMalformed",
+        "InvalidToken",
+        "ExpiredToken",
+        "RequestTimeTooSkewed",
+    ]
+    .iter()
+    .any(|code| message.contains(code))
+}
+
+fn is_alias_authorization_only_failure(message: &str) -> bool {
+    ["AccessDenied", "AllAccessDisabled"]
+        .iter()
+        .any(|code| message.contains(code))
 }
 
 async fn execute_list(args: ListArgs, manager: &AliasManager, formatter: &Formatter) -> ExitCode {
@@ -336,6 +383,8 @@ fn exit_code_from_error(error: &rc_core::Error) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     #[test]
     fn test_set_args_defaults() {
@@ -377,24 +426,42 @@ mod tests {
             temp_dir.path().join("config.toml"),
         ));
         let formatter = Formatter::new(OutputConfig::default());
-        let args = SetArgs {
-            name: "rustfs".to_string(),
-            endpoint: "http://rustfs-node{1...32}:9000".to_string(),
-            access_key: Some("accesskey".to_string()),
-            secret_key: Some("secretkey".to_string()),
-            anonymous: false,
-            client_cert: None,
-            client_key: None,
-            region: "us-east-1".to_string(),
-            signature: "v4".to_string(),
-            bucket_lookup: "auto".to_string(),
-            insecure: false,
-        };
+        let args = set_args("http://rustfs-node{1...32}:9000");
 
         let exit_code = execute_set(args, &manager, &formatter).await;
 
         assert_eq!(exit_code, ExitCode::UsageError);
         assert!(manager.get("rustfs").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_execute_set_rejects_invalid_credentials() {
+        let endpoint = spawn_s3_error_server("InvalidAccessKeyId").await;
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let manager = AliasManager::with_config_manager(rc_core::ConfigManager::with_path(
+            temp_dir.path().join("config.toml"),
+        ));
+        let formatter = Formatter::new(OutputConfig::default());
+
+        let exit_code = execute_set(set_args(&endpoint), &manager, &formatter).await;
+
+        assert_eq!(exit_code, ExitCode::AuthError);
+        assert!(manager.get("rustfs").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_execute_set_allows_authenticated_access_denied() {
+        let endpoint = spawn_s3_error_server("AccessDenied").await;
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let manager = AliasManager::with_config_manager(rc_core::ConfigManager::with_path(
+            temp_dir.path().join("config.toml"),
+        ));
+        let formatter = Formatter::new(OutputConfig::default());
+
+        let exit_code = execute_set(set_args(&endpoint), &manager, &formatter).await;
+
+        assert_eq!(exit_code, ExitCode::Success);
+        assert!(manager.get("rustfs").is_ok());
     }
 
     #[test]
@@ -404,5 +471,43 @@ mod tests {
         ));
 
         assert_eq!(message, "Endpoint must include a host");
+    }
+
+    fn set_args(endpoint: &str) -> SetArgs {
+        SetArgs {
+            name: "rustfs".to_string(),
+            endpoint: endpoint.to_string(),
+            access_key: Some("accesskey".to_string()),
+            secret_key: Some("secretkey".to_string()),
+            anonymous: false,
+            client_cert: None,
+            client_key: None,
+            region: "us-east-1".to_string(),
+            signature: "v4".to_string(),
+            bucket_lookup: "auto".to_string(),
+            insecure: false,
+        }
+    }
+
+    async fn spawn_s3_error_server(code: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for _ in 0..3 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut request = [0_u8; 4096];
+                let _ = stream.read(&mut request).await;
+                let body = format!("<Error><Code>{code}</Code><Message>test</Message></Error>");
+                let response = format!(
+                    "HTTP/1.1 403 Forbidden\r\ncontent-type: application/xml\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        format!("http://{addr}")
     }
 }

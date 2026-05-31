@@ -70,8 +70,7 @@ mod alias_tests {
                 "set",
                 "test-alias",
                 "http://localhost:9000",
-                "accesskey",
-                "secretkey",
+                "--anonymous",
                 "--json",
             ])
             .env("RC_CONFIG_DIR", config_dir)
@@ -100,8 +99,7 @@ mod alias_tests {
                 "set",
                 "local",
                 "http://localhost:9000",
-                "accesskey",
-                "secretkey",
+                "--anonymous",
                 "--json",
             ])
             .env("RC_CONFIG_DIR", config_dir)
@@ -114,8 +112,7 @@ mod alias_tests {
                 "set",
                 "s3",
                 "https://s3.amazonaws.com",
-                "awskey",
-                "awssecret",
+                "--anonymous",
                 "--region",
                 "us-west-2",
                 "--json",
@@ -156,8 +153,7 @@ mod alias_tests {
                 "set",
                 "to-remove",
                 "http://localhost:9000",
-                "accesskey",
-                "secretkey",
+                "--anonymous",
                 "--json",
             ])
             .env("RC_CONFIG_DIR", config_dir)
