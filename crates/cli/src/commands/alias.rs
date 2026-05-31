@@ -271,10 +271,8 @@ fn is_alias_auth_validation_failure(message: &str) -> bool {
     [
         "InvalidAccessKeyId",
         "SignatureDoesNotMatch",
-        "AuthorizationHeaderMalformed",
         "InvalidToken",
         "ExpiredToken",
-        "RequestTimeTooSkewed",
     ]
     .iter()
     .any(|code| message.contains(code))
@@ -462,6 +460,16 @@ mod tests {
 
         assert_eq!(exit_code, ExitCode::Success);
         assert!(manager.get("rustfs").is_ok());
+    }
+
+    #[test]
+    fn test_alias_auth_validation_preserves_signing_configuration_errors() {
+        assert!(is_alias_auth_validation_failure("InvalidAccessKeyId"));
+        assert!(is_alias_auth_validation_failure("SignatureDoesNotMatch"));
+        assert!(!is_alias_auth_validation_failure(
+            "AuthorizationHeaderMalformed"
+        ));
+        assert!(!is_alias_auth_validation_failure("RequestTimeTooSkewed"));
     }
 
     #[test]
