@@ -2,7 +2,7 @@
 
 ## Purpose
 
-The `rc bucket` operation is the preferred noun-first entry point for bucket-oriented workflows. It groups bucket listing, creation, deletion, notification, CORS, versioning, quota, anonymous access, lifecycle, and replication operations under one command family.
+The `rc bucket` operation is the preferred noun-first entry point for bucket-oriented workflows. It groups bucket listing, creation, deletion, notification, CORS, encryption, versioning, quota, anonymous access, lifecycle, and replication operations under one command family.
 
 ## Syntax
 
@@ -13,6 +13,7 @@ rc bucket create [OPTIONS] <ALIAS/BUCKET>
 rc bucket remove [OPTIONS] <ALIAS/BUCKET>
 rc bucket event <add|list|remove> ...
 rc bucket cors <list|set|remove> ...
+rc bucket encryption <set|info|clear> ...
 rc bucket version <enable|suspend|info|list> ...
 rc bucket quota <set|info|clear> ...
 rc bucket anonymous <set|set-json|get|get-json|list|links> ...
@@ -29,6 +30,7 @@ rc bucket replication <add|update|list|status|remove|export|import> ...
 | `remove` | Remove a bucket. |
 | `event` | Manage bucket notification rules. |
 | `cors` | Manage bucket CORS rules. |
+| `encryption` | Manage bucket default encryption. |
 | `version` | Manage bucket versioning and object versions. |
 | `quota` | Manage bucket quota. |
 | `anonymous` | Manage anonymous bucket or prefix access. |
@@ -75,6 +77,12 @@ Set CORS from an XML or JSON file:
 rc bucket cors set local/archive cors.xml
 ```
 
+Inspect default bucket encryption:
+
+```bash
+rc bucket encryption info local/archive
+```
+
 Check replication status:
 
 ```bash
@@ -83,7 +91,7 @@ rc bucket replication status local/archive
 
 ## Behavior
 
-Prefer `rc bucket ...` for new scripts. Legacy commands such as `rc mb`, `rc rb`, `rc event`, `rc cors`, `rc version`, `rc anonymous`, `rc quota`, `rc ilm`, and `rc replicate` remain available and delegate to the same implementations.
+Prefer `rc bucket ...` for new scripts. Legacy commands such as `rc mb`, `rc rb`, `rc event`, `rc cors`, `rc version`, `rc anonymous`, `rc quota`, `rc ilm`, and `rc replicate` remain available and delegate to the same implementations. For encryption-specific behavior and examples, see [`rc encryption`](encryption.md).
 
 Global options shown in command syntax use the same meaning everywhere:
 

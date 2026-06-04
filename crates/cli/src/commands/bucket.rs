@@ -8,7 +8,7 @@ use clap::{Args, Subcommand};
 use crate::exit_code::ExitCode;
 use crate::output::OutputConfig;
 
-use super::{anonymous, cors, event, ilm, ls, mb, quota, rb, replicate, version};
+use super::{anonymous, cors, encryption, event, ilm, ls, mb, quota, rb, replicate, version};
 
 const BUCKET_AFTER_HELP: &str = "\
 Examples:
@@ -17,6 +17,7 @@ Examples:
   rc bucket remove local/my-bucket
   rc bucket event list local/my-bucket
   rc bucket cors list local/my-bucket
+  rc bucket encryption info local/my-bucket
   rc bucket replication status local/my-bucket";
 
 /// Manage bucket-oriented workflows
@@ -46,6 +47,9 @@ pub enum BucketCommands {
     /// Manage bucket CORS rules
     #[command(subcommand)]
     Cors(cors::CorsCommands),
+
+    /// Manage bucket default encryption
+    Encryption(encryption::EncryptionArgs),
 
     /// Manage bucket versioning
     #[command(subcommand)]
@@ -80,6 +84,7 @@ pub async fn execute(args: BucketArgs, output_config: OutputConfig) -> ExitCode 
         BucketCommands::Cors(cmd) => {
             cors::execute(cors::CorsArgs { command: cmd }, output_config).await
         }
+        BucketCommands::Encryption(args) => encryption::execute(args, output_config).await,
         BucketCommands::Version(cmd) => {
             version::execute(version::VersionArgs { command: cmd }, output_config).await
         }

@@ -3284,6 +3284,261 @@ mod alias_operations {
     }
 }
 
+mod encryption_operations {
+    use super::*;
+
+    fn upload_text_object(config_dir: &std::path::Path, bucket: &str, key: &str, content: &str) {
+        let temp_file = tempfile::NamedTempFile::new().expect("Failed to create temp file");
+        std::fs::write(temp_file.path(), content).expect("Failed to write");
+
+        let output = run_rc(
+            &[
+                "cp",
+                temp_file
+                    .path()
+                    .to_str()
+                    .expect("temp file path is valid utf-8"),
+                &format!("test/{}/{}", bucket, key),
+            ],
+            config_dir,
+        );
+        assert!(
+            output.status.success(),
+            "Failed to upload {}: {}",
+            key,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn test_bucket_encryption_set_info_clear() {
+        let (config_dir, bucket_name) = match setup_with_alias("encryption") {
+            Some(v) => v,
+            None => {
+                eprintln!("Skipping: S3 test config not available");
+                return;
+            }
+        };
+
+        let output = run_rc(
+            &[
+                "bucket",
+                "encryption",
+                "set",
+                &format!("test/{}", bucket_name),
+                "--mode",
+                "sse-s3",
+                "--json",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            output.status.success(),
+            "Failed to set bucket encryption: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let json: serde_json::Value = serde_json::from_str(&stdout).expect("Invalid JSON output");
+        assert_eq!(json["bucket"], bucket_name);
+        assert_eq!(json["status"], "Configured");
+        assert_eq!(json["mode"], "SSE-S3");
+
+        let output = run_rc(
+            &[
+                "bucket",
+                "encryption",
+                "info",
+                &format!("test/{}", bucket_name),
+                "--json",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            output.status.success(),
+            "Failed to get bucket encryption: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let json: serde_json::Value = serde_json::from_str(&stdout).expect("Invalid JSON output");
+        assert_eq!(json["bucket"], bucket_name);
+        assert_eq!(json["status"], "Configured");
+        assert_eq!(json["mode"], "SSE-S3");
+
+        let output = run_rc(
+            &[
+                "bucket",
+                "encryption",
+                "clear",
+                &format!("test/{}", bucket_name),
+                "--json",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            output.status.success(),
+            "Failed to clear bucket encryption: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let json: serde_json::Value = serde_json::from_str(&stdout).expect("Invalid JSON output");
+        assert_eq!(json["bucket"], bucket_name);
+        assert_eq!(json["status"], "Cleared");
+
+        let output = run_rc(
+            &[
+                "bucket",
+                "encryption",
+                "info",
+                &format!("test/{}", bucket_name),
+                "--json",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            output.status.success(),
+            "Failed to verify cleared bucket encryption: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let json: serde_json::Value = serde_json::from_str(&stdout).expect("Invalid JSON output");
+        assert_eq!(json["bucket"], bucket_name);
+        assert_eq!(json["status"], "Not configured");
+        assert!(
+            json.get("mode").is_none(),
+            "mode should be omitted after clear"
+        );
+
+        cleanup_bucket(config_dir.path(), &bucket_name);
+    }
+
+    #[test]
+    fn test_cp_enc_s3_upload() {
+        let (config_dir, bucket_name) = match setup_with_alias("cpencs3") {
+            Some(v) => v,
+            None => {
+                eprintln!("Skipping: S3 test config not available");
+                return;
+            }
+        };
+
+        let temp_file = tempfile::NamedTempFile::new().expect("Failed to create temp file");
+        std::fs::write(temp_file.path(), "encrypted cp payload").expect("Failed to write");
+
+        let target = format!("test/{}/cp-sse-s3.txt", bucket_name);
+        let output = run_rc(
+            &[
+                "cp",
+                temp_file
+                    .path()
+                    .to_str()
+                    .expect("temp file path is valid utf-8"),
+                &target,
+                "--enc-s3",
+                &target,
+                "--json",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            output.status.success(),
+            "Failed to upload via cp --enc-s3: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let output = run_rc(&["cat", &target], config_dir.path());
+        assert!(output.status.success(), "Failed to read cp --enc-s3 object");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(stdout, "encrypted cp payload");
+
+        cleanup_bucket(config_dir.path(), &bucket_name);
+    }
+
+    #[test]
+    fn test_mv_enc_s3_remote_copy() {
+        let (config_dir, bucket_name) = match setup_with_alias("mvencs3") {
+            Some(v) => v,
+            None => {
+                eprintln!("Skipping: S3 test config not available");
+                return;
+            }
+        };
+
+        upload_text_object(
+            config_dir.path(),
+            &bucket_name,
+            "source.txt",
+            "encrypted mv payload",
+        );
+
+        let source = format!("test/{}/source.txt", bucket_name);
+        let target = format!("test/{}/dest.txt", bucket_name);
+        let output = run_rc(
+            &["mv", &source, &target, "--enc-s3", &target, "--json"],
+            config_dir.path(),
+        );
+        assert!(
+            output.status.success(),
+            "Failed to move via mv --enc-s3: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let output = run_rc(
+            &["ls", &format!("test/{}/", bucket_name), "--json"],
+            config_dir.path(),
+        );
+        assert!(output.status.success(), "Failed to list moved objects");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !stdout.contains("source.txt"),
+            "source object should be removed"
+        );
+        assert!(
+            stdout.contains("dest.txt"),
+            "destination object should exist"
+        );
+
+        let output = run_rc(&["cat", &target], config_dir.path());
+        assert!(output.status.success(), "Failed to read mv --enc-s3 object");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(stdout, "encrypted mv payload");
+
+        cleanup_bucket(config_dir.path(), &bucket_name);
+    }
+
+    #[test]
+    fn test_pipe_enc_s3_upload() {
+        let (config_dir, bucket_name) = match setup_with_alias("pipeencs3") {
+            Some(v) => v,
+            None => {
+                eprintln!("Skipping: S3 test config not available");
+                return;
+            }
+        };
+
+        let target = format!("test/{}/piped-sse-s3.txt", bucket_name);
+        let output = run_rc_with_stdin(
+            &["pipe", &target, "--enc-s3", "--json"],
+            config_dir.path(),
+            "encrypted pipe payload",
+        );
+        assert!(
+            output.status.success(),
+            "Failed to upload via pipe --enc-s3: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let output = run_rc(&["cat", &target], config_dir.path());
+        assert!(
+            output.status.success(),
+            "Failed to read pipe --enc-s3 object"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(stdout, "encrypted pipe payload");
+
+        cleanup_bucket(config_dir.path(), &bucket_name);
+    }
+}
+
 mod option_behavior_operations {
     use super::*;
 

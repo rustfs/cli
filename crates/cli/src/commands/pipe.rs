@@ -3,7 +3,7 @@
 //! Reads from stdin and uploads to S3. Useful for piping output from other commands.
 
 use clap::Args;
-use rc_core::{AliasManager, ObjectStore as _, RemotePath};
+use rc_core::{AliasManager, ObjectEncryptionRequest, ObjectStore as _, RemotePath};
 use rc_s3::S3Client;
 use serde::Serialize;
 use std::io::Read;
@@ -24,6 +24,14 @@ pub struct PipeArgs {
     /// Storage class for the object
     #[arg(long)]
     pub storage_class: Option<String>,
+
+    /// Apply SSE-S3 to the upload target
+    #[arg(long = "enc-s3", default_value = "false")]
+    pub enc_s3: bool,
+
+    /// Apply SSE-KMS to the upload target
+    #[arg(long = "enc-kms")]
+    pub enc_kms: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -39,6 +47,19 @@ struct PipeOutput {
 /// Execute the pipe command
 pub async fn execute(args: PipeArgs, output_config: OutputConfig) -> ExitCode {
     let formatter = Formatter::new(output_config);
+    let encryption = match (args.enc_s3, args.enc_kms.as_deref()) {
+        (true, None) => Some(ObjectEncryptionRequest::SseS3),
+        (false, Some(key_id)) => Some(ObjectEncryptionRequest::SseKms {
+            key_id: key_id.to_string(),
+        }),
+        (false, None) => None,
+        (true, Some(_)) => {
+            return formatter.fail(
+                ExitCode::UsageError,
+                "--enc-s3 and --enc-kms cannot be used together",
+            );
+        }
+    };
 
     // Parse the target path
     let (alias_name, bucket, key) = match parse_pipe_path(&args.target) {
@@ -93,7 +114,12 @@ pub async fn execute(args: PipeArgs, output_config: OutputConfig) -> ExitCode {
 
     // Upload
     match client
-        .put_object(&target, buffer, Some(&args.content_type))
+        .put_object(
+            &target,
+            buffer,
+            Some(&args.content_type),
+            encryption.as_ref(),
+        )
         .await
     {
         Ok(info) => {
@@ -178,5 +204,19 @@ mod tests {
     #[test]
     fn test_parse_pipe_path_empty() {
         assert!(parse_pipe_path("").is_err());
+    }
+
+    #[tokio::test]
+    async fn pipe_conflicting_encryption_flags_return_usage_error() {
+        let args = PipeArgs {
+            target: "local/bucket/file.txt".to_string(),
+            content_type: "application/octet-stream".to_string(),
+            storage_class: None,
+            enc_s3: true,
+            enc_kms: Some("kms-key".to_string()),
+        };
+
+        let code = execute(args, OutputConfig::default()).await;
+        assert_eq!(code, ExitCode::UsageError);
     }
 }

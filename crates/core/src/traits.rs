@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWrite;
 
 use crate::cors::CorsRule;
+use crate::encryption::{BucketEncryption, ObjectEncryptionRequest};
 use crate::error::Result;
 use crate::lifecycle::LifecycleRule;
 use crate::path::RemotePath;
@@ -282,6 +283,7 @@ pub trait ObjectStore: Send + Sync {
         path: &RemotePath,
         data: Vec<u8>,
         content_type: Option<&str>,
+        encryption: Option<&ObjectEncryptionRequest>,
     ) -> Result<ObjectInfo>;
 
     /// Delete an object
@@ -291,7 +293,12 @@ pub trait ObjectStore: Send + Sync {
     async fn delete_objects(&self, bucket: &str, keys: Vec<String>) -> Result<Vec<String>>;
 
     /// Copy object within S3 (server-side copy)
-    async fn copy_object(&self, src: &RemotePath, dst: &RemotePath) -> Result<ObjectInfo>;
+    async fn copy_object(
+        &self,
+        src: &RemotePath,
+        dst: &RemotePath,
+        encryption: Option<&ObjectEncryptionRequest>,
+    ) -> Result<ObjectInfo>;
 
     /// Generate a presigned URL for an object
     async fn presign_get(&self, path: &RemotePath, expires_secs: u64) -> Result<String>;
@@ -311,6 +318,16 @@ pub trait ObjectStore: Send + Sync {
 
     /// Set bucket versioning status
     async fn set_versioning(&self, bucket: &str, enabled: bool) -> Result<()>;
+
+    /// Get bucket default encryption. Returns None when encryption is not configured.
+    async fn get_bucket_encryption(&self, bucket: &str) -> Result<Option<BucketEncryption>>;
+
+    /// Set bucket default encryption.
+    async fn set_bucket_encryption(&self, bucket: &str, encryption: BucketEncryption)
+    -> Result<()>;
+
+    /// Delete bucket default encryption.
+    async fn delete_bucket_encryption(&self, bucket: &str) -> Result<()>;
 
     /// List object versions
     async fn list_object_versions(

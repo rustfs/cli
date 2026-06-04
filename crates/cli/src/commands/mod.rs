@@ -21,6 +21,7 @@ mod completions;
 mod cors;
 pub mod cp;
 pub mod diff;
+mod encryption;
 mod event;
 mod find;
 mod head;

@@ -25,10 +25,10 @@ use bytes::Bytes;
 use jiff::Timestamp;
 use quick_xml::de::from_str as from_xml_str;
 use rc_core::{
-    Alias, BucketNotification, Capabilities, CorsRule, Error, LifecycleRule, ListOptions,
-    ListResult, NotificationTarget, ObjectInfo, ObjectStore, ObjectVersion,
-    ObjectVersionListResult, RemotePath, ReplicationConfiguration, RequestHeader, Result,
-    SelectOptions, global_request_headers,
+    Alias, BucketEncryption, BucketNotification, Capabilities, CorsRule, Error, LifecycleRule,
+    ListOptions, ListResult, NotificationTarget, ObjectEncryptionRequest, ObjectInfo, ObjectStore,
+    ObjectVersion, ObjectVersionListResult, RemotePath, ReplicationConfiguration, RequestHeader,
+    Result, SelectOptions, global_request_headers,
 };
 use reqwest::Method;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
@@ -360,6 +360,110 @@ fn sdk_cors_rule_to_core(rule: &aws_sdk_s3::types::CorsRule) -> CorsRule {
         allowed_headers: normalize_optional_strings(Some(rule.allowed_headers().to_vec())),
         expose_headers: normalize_optional_strings(Some(rule.expose_headers().to_vec())),
         max_age_seconds: rule.max_age_seconds(),
+    }
+}
+
+fn sdk_bucket_encryption_to_core(
+    value: &aws_sdk_s3::types::ServerSideEncryptionByDefault,
+) -> Result<BucketEncryption> {
+    match value.sse_algorithm() {
+        aws_sdk_s3::types::ServerSideEncryption::Aes256 => Ok(BucketEncryption::SseS3),
+        aws_sdk_s3::types::ServerSideEncryption::AwsKms => {
+            let key_id = value.kms_master_key_id().ok_or_else(|| {
+                Error::General("bucket encryption rule missing KMS key id".to_string())
+            })?;
+            Ok(BucketEncryption::SseKms {
+                key_id: key_id.to_string(),
+            })
+        }
+        other => Err(Error::General(format!(
+            "unsupported bucket encryption algorithm: {}",
+            other.as_str()
+        ))),
+    }
+}
+
+fn is_missing_bucket_encryption_error(error_text: &str) -> bool {
+    let normalized = error_text.to_ascii_lowercase();
+    normalized.contains("serversideencryptionconfigurationnotfounderror")
+        || normalized.contains("nosuchbucketencryption")
+        || normalized.contains("encryption configuration was not found")
+}
+
+fn is_missing_bucket_encryption_response(
+    error_code: Option<&str>,
+    status_code: Option<u16>,
+    error_text: &str,
+) -> bool {
+    let error_code = error_code.map(|code| code.to_ascii_lowercase());
+    if matches!(
+        error_code.as_deref(),
+        Some("serversideencryptionconfigurationnotfounderror" | "nosuchbucketencryption")
+    ) {
+        return true;
+    }
+
+    if !is_missing_bucket_encryption_error(error_text) {
+        return false;
+    }
+
+    status_code.is_none_or(|status| status == 404)
+}
+
+fn core_bucket_encryption_to_sdk(
+    value: &BucketEncryption,
+) -> aws_sdk_s3::types::ServerSideEncryptionConfiguration {
+    let encryption_by_default = match value {
+        BucketEncryption::SseS3 => aws_sdk_s3::types::ServerSideEncryptionByDefault::builder()
+            .sse_algorithm(aws_sdk_s3::types::ServerSideEncryption::Aes256)
+            .build()
+            .expect("sse-s3 bucket encryption configuration is valid"),
+        BucketEncryption::SseKms { key_id } => {
+            aws_sdk_s3::types::ServerSideEncryptionByDefault::builder()
+                .sse_algorithm(aws_sdk_s3::types::ServerSideEncryption::AwsKms)
+                .kms_master_key_id(key_id)
+                .build()
+                .expect("sse-kms bucket encryption configuration is valid")
+        }
+    };
+
+    let rule = aws_sdk_s3::types::ServerSideEncryptionRule::builder()
+        .apply_server_side_encryption_by_default(encryption_by_default)
+        .build();
+
+    aws_sdk_s3::types::ServerSideEncryptionConfiguration::builder()
+        .rules(rule)
+        .build()
+        .expect("bucket encryption configuration requires one rule")
+}
+
+fn apply_object_encryption_to_put_request(
+    request: aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder,
+    encryption: Option<&ObjectEncryptionRequest>,
+) -> aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder {
+    match encryption {
+        Some(ObjectEncryptionRequest::SseS3) => {
+            request.server_side_encryption(aws_sdk_s3::types::ServerSideEncryption::Aes256)
+        }
+        Some(ObjectEncryptionRequest::SseKms { key_id }) => request
+            .server_side_encryption(aws_sdk_s3::types::ServerSideEncryption::AwsKms)
+            .ssekms_key_id(key_id),
+        None => request,
+    }
+}
+
+fn apply_object_encryption_to_copy_request(
+    request: aws_sdk_s3::operation::copy_object::builders::CopyObjectFluentBuilder,
+    encryption: Option<&ObjectEncryptionRequest>,
+) -> aws_sdk_s3::operation::copy_object::builders::CopyObjectFluentBuilder {
+    match encryption {
+        Some(ObjectEncryptionRequest::SseS3) => {
+            request.server_side_encryption(aws_sdk_s3::types::ServerSideEncryption::Aes256)
+        }
+        Some(ObjectEncryptionRequest::SseKms { key_id }) => request
+            .server_side_encryption(aws_sdk_s3::types::ServerSideEncryption::AwsKms)
+            .ssekms_key_id(key_id),
+        None => request,
     }
 }
 
@@ -1478,18 +1582,21 @@ impl S3Client {
         file_path: &std::path::Path,
         content_type: Option<&str>,
         file_size: u64,
+        encryption: Option<&ObjectEncryptionRequest>,
     ) -> Result<ObjectInfo> {
         let data = tokio::fs::read(file_path)
             .await
             .map_err(|e| Error::General(format!("read file '{}': {e}", file_path.display())))?;
         let body = aws_sdk_s3::primitives::ByteStream::from(data);
 
-        let mut request = self
-            .inner
-            .put_object()
-            .bucket(&path.bucket)
-            .key(&path.key)
-            .body(body);
+        let mut request = apply_object_encryption_to_put_request(
+            self.inner
+                .put_object()
+                .bucket(&path.bucket)
+                .key(&path.key)
+                .body(body),
+            encryption,
+        );
 
         if let Some(ct) = content_type {
             request = request.content_type(ct);
@@ -1526,6 +1633,7 @@ impl S3Client {
         file_path: &std::path::Path,
         content_type: Option<&str>,
         file_size: u64,
+        encryption: Option<&ObjectEncryptionRequest>,
         on_progress: impl Fn(u64) + Send,
     ) -> Result<ObjectInfo> {
         use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
@@ -1542,6 +1650,15 @@ impl S3Client {
             .create_multipart_upload()
             .bucket(&path.bucket)
             .key(&path.key);
+
+        create_request = match encryption {
+            Some(ObjectEncryptionRequest::SseS3) => create_request
+                .server_side_encryption(aws_sdk_s3::types::ServerSideEncryption::Aes256),
+            Some(ObjectEncryptionRequest::SseKms { key_id }) => create_request
+                .server_side_encryption(aws_sdk_s3::types::ServerSideEncryption::AwsKms)
+                .ssekms_key_id(key_id),
+            None => create_request,
+        };
 
         if let Some(ct) = content_type {
             create_request = create_request.content_type(ct);
@@ -1671,6 +1788,7 @@ impl S3Client {
         path: &RemotePath,
         file_path: &std::path::Path,
         content_type: Option<&str>,
+        encryption: Option<&ObjectEncryptionRequest>,
         on_progress: impl Fn(u64) + Send,
     ) -> Result<ObjectInfo> {
         let metadata = tokio::fs::metadata(file_path).await.map_err(|e| {
@@ -1690,12 +1808,19 @@ impl S3Client {
                 file_path,
                 content_type,
                 file_size,
+                encryption,
                 on_progress,
             )
             .await
         } else {
-            self.put_object_single_part_from_path(path, file_path, content_type, file_size)
-                .await
+            self.put_object_single_part_from_path(
+                path,
+                file_path,
+                content_type,
+                file_size,
+                encryption,
+            )
+            .await
         }
     }
 }
@@ -1944,16 +2069,19 @@ impl ObjectStore for S3Client {
         path: &RemotePath,
         data: Vec<u8>,
         content_type: Option<&str>,
+        encryption: Option<&ObjectEncryptionRequest>,
     ) -> Result<ObjectInfo> {
         let size = data.len() as i64;
         let body = aws_sdk_s3::primitives::ByteStream::from(data);
 
-        let mut request = self
-            .inner
-            .put_object()
-            .bucket(&path.bucket)
-            .key(&path.key)
-            .body(body);
+        let mut request = apply_object_encryption_to_put_request(
+            self.inner
+                .put_object()
+                .bucket(&path.bucket)
+                .key(&path.key)
+                .body(body),
+            encryption,
+        );
 
         if let Some(ct) = content_type {
             request = request.content_type(ct);
@@ -1983,26 +2111,33 @@ impl ObjectStore for S3Client {
             .await
     }
 
-    async fn copy_object(&self, src: &RemotePath, dst: &RemotePath) -> Result<ObjectInfo> {
+    async fn copy_object(
+        &self,
+        src: &RemotePath,
+        dst: &RemotePath,
+        encryption: Option<&ObjectEncryptionRequest>,
+    ) -> Result<ObjectInfo> {
         // Build copy source: bucket/key
         let copy_source = format!("{}/{}", src.bucket, src.key);
 
-        let response = self
-            .inner
-            .copy_object()
-            .copy_source(&copy_source)
-            .bucket(&dst.bucket)
-            .key(&dst.key)
-            .send()
-            .await
-            .map_err(|e| {
-                let err_str = e.to_string();
-                if err_str.contains("NotFound") || err_str.contains("NoSuchKey") {
-                    Error::NotFound(src.to_string())
-                } else {
-                    Error::Network(err_str)
-                }
-            })?;
+        let response = apply_object_encryption_to_copy_request(
+            self.inner
+                .copy_object()
+                .copy_source(&copy_source)
+                .bucket(&dst.bucket)
+                .key(&dst.key),
+            encryption,
+        )
+        .send()
+        .await
+        .map_err(|e| {
+            let err_str = e.to_string();
+            if err_str.contains("NotFound") || err_str.contains("NoSuchKey") {
+                Error::NotFound(src.to_string())
+            } else {
+                Error::Network(err_str)
+            }
+        })?;
 
         // Get size from head_object since copy doesn't return it
         let info = self.head_object(dst).await?;
@@ -2099,6 +2234,97 @@ impl ObjectStore for S3Client {
             .map_err(|e| Error::General(format!("set_versioning: {e}")))?;
 
         Ok(())
+    }
+
+    async fn get_bucket_encryption(&self, bucket: &str) -> Result<Option<BucketEncryption>> {
+        let response = match self
+            .inner
+            .get_bucket_encryption()
+            .bucket(bucket)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                let error_text = Self::format_sdk_error(&error);
+                let missing_config =
+                    if let aws_sdk_s3::error::SdkError::ServiceError(service_err) = &error {
+                        is_missing_bucket_encryption_response(
+                            service_err.err().code(),
+                            Some(service_err.raw().status().as_u16()),
+                            &error_text,
+                        )
+                    } else {
+                        is_missing_bucket_encryption_response(None, None, &error_text)
+                    };
+                if missing_config {
+                    return Ok(None);
+                }
+                return Err(Error::General(format!(
+                    "get_bucket_encryption: {error_text}"
+                )));
+            }
+        };
+
+        let rule = response
+            .server_side_encryption_configuration()
+            .and_then(|config| config.rules().first())
+            .and_then(|rule| rule.apply_server_side_encryption_by_default())
+            .ok_or_else(|| {
+                Error::General("get_bucket_encryption: missing bucket encryption rule".to_string())
+            })?;
+
+        sdk_bucket_encryption_to_core(rule).map(Some)
+    }
+
+    async fn set_bucket_encryption(
+        &self,
+        bucket: &str,
+        encryption: BucketEncryption,
+    ) -> Result<()> {
+        let configuration = core_bucket_encryption_to_sdk(&encryption);
+
+        self.inner
+            .put_bucket_encryption()
+            .bucket(bucket)
+            .server_side_encryption_configuration(configuration)
+            .send()
+            .await
+            .map_err(|e| Error::General(format!("set_bucket_encryption: {e}")))?;
+
+        Ok(())
+    }
+
+    async fn delete_bucket_encryption(&self, bucket: &str) -> Result<()> {
+        match self
+            .inner
+            .delete_bucket_encryption()
+            .bucket(bucket)
+            .send()
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                let error_text = Self::format_sdk_error(&error);
+                let missing_config =
+                    if let aws_sdk_s3::error::SdkError::ServiceError(service_err) = &error {
+                        is_missing_bucket_encryption_response(
+                            service_err.err().code(),
+                            Some(service_err.raw().status().as_u16()),
+                            &error_text,
+                        )
+                    } else {
+                        is_missing_bucket_encryption_response(None, None, &error_text)
+                    };
+                if missing_config {
+                    Ok(())
+                } else {
+                    Err(Error::General(format!(
+                        "delete_bucket_encryption: {error_text}"
+                    )))
+                }
+            }
+        }
     }
 
     async fn list_object_versions(
@@ -3411,6 +3637,94 @@ mod tests {
     }
 
     #[test]
+    fn bucket_encryption_rule_maps_sse_s3() {
+        let value = aws_sdk_s3::types::ServerSideEncryptionByDefault::builder()
+            .sse_algorithm(aws_sdk_s3::types::ServerSideEncryption::Aes256)
+            .build()
+            .expect("build rule");
+
+        let encryption = sdk_bucket_encryption_to_core(&value).expect("map rule");
+        assert_eq!(encryption, BucketEncryption::SseS3);
+    }
+
+    #[test]
+    fn bucket_encryption_rule_maps_sse_kms() {
+        let value = aws_sdk_s3::types::ServerSideEncryptionByDefault::builder()
+            .sse_algorithm(aws_sdk_s3::types::ServerSideEncryption::AwsKms)
+            .kms_master_key_id("kms-key")
+            .build()
+            .expect("build rule");
+
+        let encryption = sdk_bucket_encryption_to_core(&value).expect("map rule");
+        assert_eq!(
+            encryption,
+            BucketEncryption::SseKms {
+                key_id: "kms-key".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn bucket_encryption_rule_missing_kms_key_errors() {
+        let value = aws_sdk_s3::types::ServerSideEncryptionByDefault::builder()
+            .sse_algorithm(aws_sdk_s3::types::ServerSideEncryption::AwsKms)
+            .build()
+            .expect("build rule");
+
+        match sdk_bucket_encryption_to_core(&value) {
+            Err(Error::General(message)) => {
+                assert!(message.contains("missing KMS key id"));
+            }
+            other => panic!("expected missing KMS key error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_bucket_encryption_errors_are_detected() {
+        assert!(is_missing_bucket_encryption_error(
+            "ServerSideEncryptionConfigurationNotFoundError"
+        ));
+        assert!(is_missing_bucket_encryption_error(
+            "The server-side encryption configuration was not found"
+        ));
+        assert!(!is_missing_bucket_encryption_error("AccessDenied"));
+    }
+
+    #[test]
+    fn missing_bucket_encryption_response_detects_code_and_status() {
+        assert!(is_missing_bucket_encryption_response(
+            Some("ServerSideEncryptionConfigurationNotFoundError"),
+            Some(404),
+            "service error"
+        ));
+        assert!(is_missing_bucket_encryption_response(
+            Some("NoSuchBucketEncryption"),
+            Some(404),
+            "service error"
+        ));
+        assert!(is_missing_bucket_encryption_response(
+            None,
+            Some(404),
+            "The server-side encryption configuration was not found"
+        ));
+        assert!(is_missing_bucket_encryption_response(
+            None,
+            None,
+            "The server-side encryption configuration was not found"
+        ));
+        assert!(!is_missing_bucket_encryption_response(
+            Some("AccessDenied"),
+            Some(403),
+            "access denied"
+        ));
+        assert!(!is_missing_bucket_encryption_response(
+            None,
+            Some(500),
+            "The server-side encryption configuration was not found"
+        ));
+    }
+
+    #[test]
     fn sdk_cors_rule_to_core_drops_empty_optional_headers() {
         let sdk_rule = aws_sdk_s3::types::CorsRule::builder()
             .allowed_origins("https://app.example.com")
@@ -3482,6 +3796,162 @@ mod tests {
         assert!(body.contains("<AllowedHeader>Authorization</AllowedHeader>"));
         assert!(body.contains("<ExposeHeader>ETag</ExposeHeader>"));
         assert!(body.contains("<MaxAgeSeconds>600</MaxAgeSeconds>"));
+    }
+
+    #[tokio::test]
+    async fn get_bucket_encryption_sends_expected_request_shape() {
+        let response = http::Response::builder()
+            .status(200)
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<ServerSideEncryptionConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Rule>
+    <ApplyServerSideEncryptionByDefault>
+      <SSEAlgorithm>AES256</SSEAlgorithm>
+    </ApplyServerSideEncryptionByDefault>
+  </Rule>
+</ServerSideEncryptionConfiguration>"#,
+            ))
+            .expect("build get bucket encryption response");
+        let (client, request_receiver) = test_s3_client(Some(response));
+
+        let encryption = client
+            .get_bucket_encryption("bucket")
+            .await
+            .expect("get bucket encryption");
+
+        assert_eq!(encryption, Some(BucketEncryption::SseS3));
+
+        let request = request_receiver.expect_request();
+        assert_eq!(request.method(), http::Method::GET);
+        assert!(
+            request.uri().to_string().contains("?encryption"),
+            "expected bucket encryption subresource in URI: {}",
+            request.uri()
+        );
+    }
+
+    #[tokio::test]
+    async fn get_bucket_encryption_missing_configuration_returns_none() {
+        let response = http::Response::builder()
+            .status(404)
+            .header(
+                "x-amz-error-code",
+                "ServerSideEncryptionConfigurationNotFoundError",
+            )
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error>
+  <Code>ServerSideEncryptionConfigurationNotFoundError</Code>
+  <Message>The server-side encryption configuration was not found</Message>
+</Error>"#,
+            ))
+            .expect("build missing bucket encryption response");
+        let (client, _) = test_s3_client(Some(response));
+
+        let encryption = client
+            .get_bucket_encryption("bucket")
+            .await
+            .expect("missing bucket encryption should map to None");
+
+        assert_eq!(encryption, None);
+    }
+
+    #[tokio::test]
+    async fn get_bucket_encryption_missing_rule_errors() {
+        let response = http::Response::builder()
+            .status(200)
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<ServerSideEncryptionConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Rule />
+</ServerSideEncryptionConfiguration>"#,
+            ))
+            .expect("build malformed bucket encryption response");
+        let (client, _) = test_s3_client(Some(response));
+
+        match client.get_bucket_encryption("bucket").await {
+            Err(Error::General(message)) => {
+                assert!(message.contains("missing bucket encryption rule"))
+            }
+            other => panic!("expected missing rule error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_bucket_encryption_sends_expected_request_shape() {
+        let response = http::Response::builder()
+            .status(200)
+            .body(SdkBody::from(""))
+            .expect("build put bucket encryption response");
+        let (client, request_receiver) = test_s3_client(Some(response));
+
+        client
+            .set_bucket_encryption(
+                "bucket",
+                BucketEncryption::SseKms {
+                    key_id: "kms-key".to_string(),
+                },
+            )
+            .await
+            .expect("set bucket encryption");
+
+        let request = request_receiver.expect_request();
+        assert_eq!(request.method(), http::Method::PUT);
+        assert!(
+            request.uri().to_string().contains("?encryption"),
+            "expected bucket encryption subresource in URI: {}",
+            request.uri()
+        );
+
+        let body = request.body().bytes().expect("request body bytes");
+        let body = std::str::from_utf8(body).expect("request body is utf8");
+        assert!(body.contains("<ServerSideEncryptionConfiguration"));
+        assert!(body.contains("<SSEAlgorithm>aws:kms</SSEAlgorithm>"));
+        assert!(body.contains("<KMSMasterKeyID>kms-key</KMSMasterKeyID>"));
+    }
+
+    #[tokio::test]
+    async fn delete_bucket_encryption_missing_configuration_is_successful() {
+        let response = http::Response::builder()
+            .status(404)
+            .header("x-amz-error-code", "NoSuchBucketEncryption")
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error>
+  <Code>NoSuchBucketEncryption</Code>
+  <Message>The server-side encryption configuration was not found</Message>
+</Error>"#,
+            ))
+            .expect("build missing bucket encryption delete response");
+        let (client, _) = test_s3_client(Some(response));
+
+        client
+            .delete_bucket_encryption("bucket")
+            .await
+            .expect("missing bucket encryption should be treated as successful delete");
+    }
+
+    #[tokio::test]
+    async fn delete_bucket_encryption_sends_expected_request_shape() {
+        let response = http::Response::builder()
+            .status(204)
+            .body(SdkBody::from(""))
+            .expect("build delete bucket encryption response");
+        let (client, request_receiver) = test_s3_client(Some(response));
+
+        client
+            .delete_bucket_encryption("bucket")
+            .await
+            .expect("delete bucket encryption");
+
+        let request = request_receiver.expect_request();
+        assert_eq!(request.method(), http::Method::DELETE);
+        assert!(
+            request.uri().to_string().contains("?encryption"),
+            "expected bucket encryption subresource in URI: {}",
+            request.uri()
+        );
     }
 
     #[test]
@@ -3804,6 +4274,68 @@ mod tests {
 
         let request = request_receiver.expect_request();
         assert!(request.headers().get("x-rustfs-force-delete").is_none());
+    }
+
+    #[tokio::test]
+    async fn put_object_applies_sse_s3_headers() {
+        let (client, request_receiver) = test_s3_client(None);
+        let path = RemotePath::new("test", "bucket", "file.txt");
+
+        client
+            .put_object(
+                &path,
+                b"payload".to_vec(),
+                Some("text/plain"),
+                Some(&ObjectEncryptionRequest::SseS3),
+            )
+            .await
+            .expect("put object");
+
+        let request = request_receiver.expect_request();
+        assert_eq!(
+            request.headers().get("x-amz-server-side-encryption"),
+            Some("AES256")
+        );
+    }
+
+    #[tokio::test]
+    async fn copy_object_applies_sse_kms_headers() {
+        let response = http::Response::builder()
+            .status(500)
+            .header("x-amz-error-code", "InternalError")
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error>
+  <Code>InternalError</Code>
+  <Message>Something went wrong.</Message>
+</Error>"#,
+            ))
+            .expect("build copy object response");
+        let (client, request_receiver) = test_s3_client(Some(response));
+        let src = RemotePath::new("test", "bucket", "src.txt");
+        let dst = RemotePath::new("test", "bucket", "dst.txt");
+
+        let _ = client
+            .copy_object(
+                &src,
+                &dst,
+                Some(&ObjectEncryptionRequest::SseKms {
+                    key_id: "kms-key".to_string(),
+                }),
+            )
+            .await;
+
+        let request = request_receiver.expect_request();
+        assert_eq!(
+            request.headers().get("x-amz-server-side-encryption"),
+            Some("aws:kms")
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("x-amz-server-side-encryption-aws-kms-key-id"),
+            Some("kms-key")
+        );
     }
 
     #[tokio::test]

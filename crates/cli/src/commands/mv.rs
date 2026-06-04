@@ -31,6 +31,14 @@ pub struct MvArgs {
     /// Only show what would be moved (dry run)
     #[arg(long)]
     pub dry_run: bool,
+
+    /// Apply SSE-S3 to the remote destination path
+    #[arg(long = "enc-s3")]
+    pub enc_s3: Vec<String>,
+
+    /// Apply SSE-KMS to the remote destination path as <TARGET>=<KMS_KEY_ID>
+    #[arg(long = "enc-kms")]
+    pub enc_kms: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -124,6 +132,8 @@ async fn move_local_to_s3(
         dry_run: args.dry_run,
         storage_class: None,
         content_type: None,
+        enc_s3: args.enc_s3.clone(),
+        enc_kms: args.enc_kms.clone(),
     };
 
     let cp_result = cp::execute(
@@ -178,6 +188,8 @@ async fn move_s3_to_local(
         dry_run: args.dry_run,
         storage_class: None,
         content_type: None,
+        enc_s3: args.enc_s3.clone(),
+        enc_kms: args.enc_kms.clone(),
     };
 
     let cp_result = cp::execute(
@@ -235,6 +247,16 @@ async fn move_s3_to_s3(
     args: &MvArgs,
     formatter: &Formatter,
 ) -> ExitCode {
+    let target = ParsedPath::Remote(dst.clone());
+    let encryption = match crate::commands::cp::parse_destination_encryption(
+        &args.enc_s3,
+        &args.enc_kms,
+        &target,
+    ) {
+        Ok(encryption) => encryption,
+        Err(error) => return formatter.fail(ExitCode::UsageError, &error),
+    };
+
     // For S3-to-S3, we need same alias for server-side copy
     if src.alias != dst.alias {
         formatter.error("Cross-alias S3-to-S3 move not yet supported.");
@@ -321,7 +343,10 @@ async fn move_s3_to_s3(
                 let src_obj_display = src_obj.to_string();
                 let dst_obj_display = dst_obj.to_string();
 
-                match client.copy_object(&src_obj, &dst_obj).await {
+                match client
+                    .copy_object(&src_obj, &dst_obj, encryption.as_ref())
+                    .await
+                {
                     Ok(_) => match client.delete_object(&src_obj).await {
                         Ok(()) => {
                             moved_count += 1;
@@ -402,7 +427,7 @@ async fn move_s3_to_s3(
         }
     } else {
         // Copy
-        match client.copy_object(src, dst).await {
+        match client.copy_object(src, dst, encryption.as_ref()).await {
             Ok(info) => {
                 // Delete source
                 if let Err(e) = client.delete_object(src).await {
@@ -535,10 +560,28 @@ mod tests {
             recursive: false,
             continue_on_error: false,
             dry_run: false,
+            enc_s3: Vec::new(),
+            enc_kms: Vec::new(),
         };
         assert!(!args.recursive);
         assert!(!args.dry_run);
         assert!(!args.continue_on_error);
+    }
+
+    #[test]
+    fn test_mv_args_store_encryption_flags() {
+        let args = MvArgs {
+            source: "src".to_string(),
+            target: "dst".to_string(),
+            recursive: false,
+            continue_on_error: false,
+            dry_run: false,
+            enc_s3: vec!["local/bucket/dst.txt".to_string()],
+            enc_kms: vec!["local/bucket/dst.txt=kms-key".to_string()],
+        };
+
+        assert_eq!(args.enc_s3.len(), 1);
+        assert_eq!(args.enc_kms.len(), 1);
     }
 
     #[test]

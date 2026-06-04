@@ -17,17 +17,22 @@ rc [GLOBAL OPTIONS] pipe [OPTIONS] <ALIAS/BUCKET/KEY>
 | `ALIAS/BUCKET/KEY` | Destination object path. |
 | `--content-type` | Object content type. Defaults to `application/octet-stream`. |
 | `--storage-class` | Storage class for the uploaded object. |
+| `--enc-s3` | Apply `SSE-S3` to the upload target. |
+| `--enc-kms <KMS_KEY_ID>` | Apply `SSE-KMS` to the upload target. |
 
 ## Examples
 
 ```bash
 tar -czf - ./logs | rc pipe local/backups/logs.tar.gz --content-type application/gzip
 printf 'hello\n' | rc pipe local/tmp/hello.txt --content-type text/plain
+printf 'hello\n' | rc pipe local/archive/hello.txt --enc-s3
 ```
 
 ## Behavior
 
 The command reads from stdin until EOF and uploads that stream as the destination object.
+
+`--enc-s3` and `--enc-kms` are mutually exclusive. The current implementation supports `SSE-S3` and `SSE-KMS`. For shared encryption rules across commands, see [`rc encryption`](encryption.md).
 
 Global options shown in command syntax use the same meaning everywhere:
 

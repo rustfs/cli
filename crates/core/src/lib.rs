@@ -13,6 +13,7 @@ pub mod admin;
 pub mod alias;
 pub mod config;
 pub mod cors;
+pub mod encryption;
 pub mod error;
 pub mod lifecycle;
 pub mod path;
@@ -27,6 +28,7 @@ pub use alias::{
 };
 pub use config::{Config, ConfigManager};
 pub use cors::{CorsConfiguration, CorsRule};
+pub use encryption::{BucketEncryption, ObjectEncryptionRequest};
 pub use error::{Error, Result};
 pub use lifecycle::{
     LifecycleConfiguration, LifecycleExpiration, LifecycleRule, LifecycleRuleStatus,

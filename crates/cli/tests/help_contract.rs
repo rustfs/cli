@@ -176,6 +176,8 @@ fn top_level_command_help_contract() {
                 "create",
                 "remove",
                 "event",
+                "cors",
+                "encryption",
                 "version",
                 "quota",
                 "anonymous",
@@ -184,6 +186,32 @@ fn top_level_command_help_contract() {
                 "Examples:",
                 "rc bucket list local/",
             ],
+        },
+        HelpCase {
+            args: &["bucket", "encryption"],
+            usage: "Usage: rc bucket encryption [OPTIONS] <COMMAND>",
+            expected_tokens: &["set", "info", "clear", "Examples:"],
+        },
+        HelpCase {
+            args: &["bucket", "encryption", "set"],
+            usage: "Usage: rc bucket encryption set [OPTIONS] --mode <MODE> <PATH>",
+            expected_tokens: &[
+                "--mode",
+                "--key-id",
+                "Examples:",
+                "rc bucket encryption set local/my-bucket --mode sse-s3",
+                "rc bucket encryption set local/my-bucket --mode sse-kms --key-id alias/my-key",
+            ],
+        },
+        HelpCase {
+            args: &["bucket", "encryption", "info"],
+            usage: "Usage: rc bucket encryption info [OPTIONS] <PATH>",
+            expected_tokens: &["Examples:", "rc bucket encryption info local/my-bucket"],
+        },
+        HelpCase {
+            args: &["bucket", "encryption", "clear"],
+            usage: "Usage: rc bucket encryption clear [OPTIONS] <PATH>",
+            expected_tokens: &["Examples:", "rc bucket encryption clear local/my-bucket"],
         },
         HelpCase {
             args: &["object"],
@@ -266,6 +294,8 @@ fn top_level_command_help_contract() {
                 "--dry-run",
                 "--storage-class",
                 "--content-type",
+                "--enc-s3",
+                "--enc-kms",
                 "Examples:",
                 "rc object copy ./report.json local/my-bucket/reports/",
             ],
@@ -273,7 +303,13 @@ fn top_level_command_help_contract() {
         HelpCase {
             args: &["mv"],
             usage: "Usage: rc mv [OPTIONS] <SOURCE> <TARGET>",
-            expected_tokens: &["--recursive", "--continue-on-error", "--dry-run"],
+            expected_tokens: &[
+                "--recursive",
+                "--continue-on-error",
+                "--dry-run",
+                "--enc-s3",
+                "--enc-kms",
+            ],
         },
         HelpCase {
             args: &["rm"],
@@ -293,7 +329,7 @@ fn top_level_command_help_contract() {
         HelpCase {
             args: &["pipe"],
             usage: "Usage: rc pipe [OPTIONS] <TARGET>",
-            expected_tokens: &["--content-type", "--storage-class"],
+            expected_tokens: &["--content-type", "--storage-class", "--enc-s3", "--enc-kms"],
         },
         HelpCase {
             args: &["find"],

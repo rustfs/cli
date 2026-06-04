@@ -231,6 +231,80 @@ fn alias_set_json_error_rejects_invalid_signature() {
 }
 
 #[test]
+fn bucket_encryption_set_json_error_requires_key_id_for_sse_kms() {
+    let output = run_rc(&[
+        "bucket",
+        "encryption",
+        "set",
+        "local/my-bucket",
+        "--mode",
+        "sse-kms",
+        "--json",
+    ]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "usage JSON errors should be emitted on stderr"
+    );
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
+    let json: serde_json::Value = serde_json::from_str(&stderr).expect("stderr is valid JSON");
+    assert_eq!(json["error"], "--key-id is required with --mode sse-kms");
+    assert_eq!(json["code"], 2);
+    assert_eq!(json["details"]["type"], "usage_error");
+    assert_eq!(json["details"]["retryable"], false);
+    assert_eq!(
+        json["details"]["suggestion"],
+        "Run the command with --help to review the expected arguments and flags."
+    );
+}
+
+#[test]
+fn bucket_encryption_set_json_error_rejects_key_id_for_sse_s3() {
+    let output = run_rc(&[
+        "bucket",
+        "encryption",
+        "set",
+        "local/my-bucket",
+        "--mode",
+        "sse-s3",
+        "--key-id",
+        "alias/my-key",
+        "--json",
+    ]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "usage JSON errors should be emitted on stderr"
+    );
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
+    let json: serde_json::Value = serde_json::from_str(&stderr).expect("stderr is valid JSON");
+    assert_eq!(json["error"], "--key-id is only valid with --mode sse-kms");
+    assert_eq!(json["code"], 2);
+    assert_eq!(json["details"]["type"], "usage_error");
+    assert_eq!(json["details"]["retryable"], false);
+    assert_eq!(
+        json["details"]["suggestion"],
+        "Run the command with --help to review the expected arguments and flags."
+    );
+}
+
+#[test]
 #[cfg(not(windows))]
 fn alias_set_json_error_rejects_invalid_credentials_without_saving_alias() {
     let config_dir = tempfile::tempdir().expect("create temp config dir");

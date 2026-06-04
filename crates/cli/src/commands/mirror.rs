@@ -102,7 +102,7 @@ impl MirrorCopyTarget for S3Client {
         data: Vec<u8>,
         content_type: Option<&str>,
     ) -> rc_core::Result<rc_core::ObjectInfo> {
-        rc_core::ObjectStore::put_object(self, path, data, content_type).await
+        rc_core::ObjectStore::put_object(self, path, data, content_type, None).await
     }
 }
 

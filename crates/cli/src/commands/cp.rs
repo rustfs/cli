@@ -3,7 +3,9 @@
 //! Copies objects between local filesystem and S3, or between S3 locations.
 
 use clap::Args;
-use rc_core::{AliasManager, ObjectStore as _, ParsedPath, RemotePath, parse_path};
+use rc_core::{
+    AliasManager, ObjectEncryptionRequest, ObjectStore as _, ParsedPath, RemotePath, parse_path,
+};
 use rc_s3::S3Client;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -57,6 +59,14 @@ pub struct CpArgs {
     /// Content type for uploaded files
     #[arg(long)]
     pub content_type: Option<String>,
+
+    /// Apply SSE-S3 to the remote destination path
+    #[arg(long = "enc-s3")]
+    pub enc_s3: Vec<String>,
+
+    /// Apply SSE-KMS to the remote destination path as <TARGET>=<KMS_KEY_ID>
+    #[arg(long = "enc-kms")]
+    pub enc_kms: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -146,6 +156,14 @@ async fn copy_local_to_s3(
     args: &CpArgs,
     formatter: &Formatter,
 ) -> ExitCode {
+    let target = ParsedPath::Remote(dst.clone());
+    let encryption = match parse_destination_encryption(&args.enc_s3, &args.enc_kms, &target) {
+        Ok(encryption) => encryption,
+        Err(error) => {
+            return formatter.fail(ExitCode::UsageError, &error);
+        }
+    };
+
     // Check if source exists
     if !src.exists() {
         return formatter.fail_with_suggestion(
@@ -196,10 +214,10 @@ async fn copy_local_to_s3(
 
     if src.is_file() {
         // Single file upload
-        upload_file(&client, src, dst, args, formatter).await
+        upload_file(&client, src, dst, args, formatter, encryption.as_ref()).await
     } else {
         // Directory upload
-        upload_directory(&client, src, dst, args, formatter).await
+        upload_directory(&client, src, dst, args, formatter, encryption.as_ref()).await
     }
 }
 
@@ -256,6 +274,7 @@ async fn upload_file(
     dst: &RemotePath,
     args: &CpArgs,
     formatter: &Formatter,
+    encryption: Option<&ObjectEncryptionRequest>,
 ) -> ExitCode {
     // Determine destination key
     let dst_key = if dst.key.is_empty() || dst.key.ends_with('/') {
@@ -313,7 +332,7 @@ async fn upload_file(
 
     // Upload
     match client
-        .put_object_from_path(&target, src, content_type, |bytes_sent| {
+        .put_object_from_path(&target, src, content_type, encryption, |bytes_sent| {
             if let Some(ref pb) = progress {
                 pb.set_position(bytes_sent);
             }
@@ -357,6 +376,7 @@ async fn upload_directory(
     dst: &RemotePath,
     args: &CpArgs,
     formatter: &Formatter,
+    encryption: Option<&ObjectEncryptionRequest>,
 ) -> ExitCode {
     use std::fs;
 
@@ -402,7 +422,7 @@ async fn upload_directory(
 
         let target = RemotePath::new(&dst.alias, &dst.bucket, &dst_key);
 
-        let result = upload_file(client, &file_path, &target, args, formatter).await;
+        let result = upload_file(client, &file_path, &target, args, formatter, encryption).await;
 
         if result == ExitCode::Success {
             success_count += 1;
@@ -665,6 +685,14 @@ async fn copy_s3_to_s3(
     args: &CpArgs,
     formatter: &Formatter,
 ) -> ExitCode {
+    let target = ParsedPath::Remote(dst.clone());
+    let encryption = match parse_destination_encryption(&args.enc_s3, &args.enc_kms, &target) {
+        Ok(encryption) => encryption,
+        Err(error) => {
+            return formatter.fail(ExitCode::UsageError, &error);
+        }
+    };
+
     // For S3-to-S3, we need to handle same or different aliases
     let alias_manager = match AliasManager::new() {
         Ok(am) => am,
@@ -714,7 +742,7 @@ async fn copy_s3_to_s3(
         return ExitCode::Success;
     }
 
-    match client.copy_object(src, dst).await {
+    match client.copy_object(src, dst, encryption.as_ref()).await {
         Ok(info) => {
             if formatter.is_json() {
                 let output = CpOutput {
@@ -745,6 +773,53 @@ async fn copy_s3_to_s3(
                 formatter.fail(ExitCode::NetworkError, &format!("Failed to copy: {e}"))
             }
         }
+    }
+}
+
+fn parse_kms_target(value: &str) -> Result<(String, String), String> {
+    let (target, key_id) = value
+        .split_once('=')
+        .ok_or_else(|| "Expected <TARGET>=<KMS_KEY_ID> for --enc-kms".to_string())?;
+
+    if target.is_empty() || key_id.is_empty() {
+        return Err("Expected <TARGET>=<KMS_KEY_ID> for --enc-kms".to_string());
+    }
+
+    Ok((target.to_string(), key_id.to_string()))
+}
+
+pub(crate) fn parse_destination_encryption(
+    enc_s3: &[String],
+    enc_kms: &[String],
+    target: &ParsedPath,
+) -> Result<Option<ObjectEncryptionRequest>, String> {
+    if enc_s3.is_empty() && enc_kms.is_empty() {
+        return Ok(None);
+    }
+
+    let remote = match target {
+        ParsedPath::Remote(remote) => remote,
+        ParsedPath::Local(_) => {
+            return Err("Destination encryption flags must reference a remote destination".into());
+        }
+    };
+
+    let target_display = remote.to_string();
+    let s3_matches = enc_s3.iter().any(|value| value == &target_display);
+    let kms_match = enc_kms
+        .iter()
+        .map(|value| parse_kms_target(value))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .find(|(candidate, _)| candidate == &target_display);
+
+    match (s3_matches, kms_match) {
+        (true, Some(_)) => Err(format!(
+            "--enc-s3 and --enc-kms cannot target the same destination: {target_display}"
+        )),
+        (true, None) => Ok(Some(ObjectEncryptionRequest::SseS3)),
+        (false, Some((_, key_id))) => Ok(Some(ObjectEncryptionRequest::SseKms { key_id })),
+        (false, None) => Ok(None),
     }
 }
 
@@ -959,10 +1034,43 @@ mod tests {
             dry_run: false,
             storage_class: None,
             content_type: None,
+            enc_s3: Vec::new(),
+            enc_kms: Vec::new(),
         };
         assert!(args.overwrite);
         assert!(!args.recursive);
         assert!(!args.dry_run);
+    }
+
+    #[test]
+    fn parse_enc_kms_target_requires_equals_separator() {
+        let error = parse_kms_target("local/bucket/file.txt").expect_err("missing key separator");
+        assert!(error.contains("Expected <TARGET>=<KMS_KEY_ID>"));
+    }
+
+    #[test]
+    fn destination_encryption_rejects_local_targets() {
+        let error = parse_destination_encryption(
+            &[String::from("./local.txt")],
+            &[],
+            &ParsedPath::Local(std::path::PathBuf::from("./local.txt")),
+        )
+        .expect_err("local target should be rejected");
+
+        assert!(error.contains("must reference a remote destination"));
+    }
+
+    #[test]
+    fn destination_encryption_detects_conflicting_flags_for_same_target() {
+        let target = ParsedPath::Remote(RemotePath::new("local", "bucket", "file.txt"));
+        let error = parse_destination_encryption(
+            &[String::from("local/bucket/file.txt")],
+            &[String::from("local/bucket/file.txt=kms-key")],
+            &target,
+        )
+        .expect_err("same target conflict should fail");
+
+        assert!(error.contains("cannot target the same destination"));
     }
 
     #[test]
