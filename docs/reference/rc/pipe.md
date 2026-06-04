@@ -26,13 +26,14 @@ rc [GLOBAL OPTIONS] pipe [OPTIONS] <ALIAS/BUCKET/KEY>
 tar -czf - ./logs | rc pipe local/backups/logs.tar.gz --content-type application/gzip
 printf 'hello\n' | rc pipe local/tmp/hello.txt --content-type text/plain
 printf 'hello\n' | rc pipe local/archive/hello.txt --enc-s3
+tar -czf - ./logs | rc pipe local/backups/logs.tar.gz --enc-kms alias/backup-key
 ```
 
 ## Behavior
 
 The command reads from stdin until EOF and uploads that stream as the destination object.
 
-`--enc-s3` and `--enc-kms` are mutually exclusive. The current implementation supports `SSE-S3` and `SSE-KMS`. For shared encryption rules across commands, see [`rc encryption`](encryption.md).
+`--enc-s3` and `--enc-kms` are mutually exclusive. When either flag is set, that object write uses the requested mode even if the bucket default encryption is different. The current implementation supports `SSE-S3` and `SSE-KMS` only. For shared encryption rules across commands, see [Encryption workflows](encryption.md).
 
 Global options shown in command syntax use the same meaning everywhere:
 

@@ -83,6 +83,12 @@ Inspect default bucket encryption:
 rc bucket encryption info local/archive
 ```
 
+Set a bucket default to `SSE-KMS`:
+
+```bash
+rc bucket encryption set local/archive --mode sse-kms --key-id alias/archive-key
+```
+
 Check replication status:
 
 ```bash
@@ -91,7 +97,9 @@ rc bucket replication status local/archive
 
 ## Behavior
 
-Prefer `rc bucket ...` for new scripts. Legacy commands such as `rc mb`, `rc rb`, `rc event`, `rc cors`, `rc version`, `rc anonymous`, `rc quota`, `rc ilm`, and `rc replicate` remain available and delegate to the same implementations. For encryption-specific behavior and examples, see [`rc encryption`](encryption.md).
+Prefer `rc bucket ...` for new scripts. Legacy commands such as `rc mb`, `rc rb`, `rc event`, `rc cors`, `rc version`, `rc anonymous`, `rc quota`, `rc ilm`, and `rc replicate` remain available and delegate to the same implementations.
+
+`rc bucket encryption set`, `info`, and `clear` manage only the bucket default for future writes. They do not rewrite, decrypt, or re-encrypt existing objects in the bucket. For object-level encryption flags and more detailed examples, see [Encryption workflows](encryption.md).
 
 Global options shown in command syntax use the same meaning everywhere:
 

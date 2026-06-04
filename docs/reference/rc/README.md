@@ -12,7 +12,7 @@ For installation and quick-start usage, see the [project README](../../../README
 | Bucket workflows | [`rc bucket`](bucket.md) | `rc ls`, `rc mb`, `rc rb`, `rc event`, `rc cors`, `rc version`, `rc anonymous`, `rc quota`, `rc ilm`, `rc replicate` |
 | Object workflows | [`rc object`](object.md) | `rc ls`, `rc cp`, `rc mv`, `rc rm`, `rc cat`, `rc head`, `rc stat`, `rc find`, `rc tree`, `rc share` |
 | Administrative workflows | [`rc admin`](admin.md) | none |
-| Encryption workflows | [`rc encryption`](encryption.md) | none |
+| Encryption guide | [`Encryption workflows`](encryption.md) | `rc bucket encryption`, `rc cp --enc-*`, `rc mv --enc-*`, `rc pipe --enc-*` |
 | Streaming upload | [`rc pipe`](pipe.md) | none |
 | Difference reports | [`rc diff`](diff.md) | none |
 | Mirroring | [`rc mirror`](mirror.md) | none |
