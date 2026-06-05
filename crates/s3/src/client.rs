@@ -368,14 +368,9 @@ fn sdk_bucket_encryption_to_core(
 ) -> Result<BucketEncryption> {
     match value.sse_algorithm() {
         aws_sdk_s3::types::ServerSideEncryption::Aes256 => Ok(BucketEncryption::SseS3),
-        aws_sdk_s3::types::ServerSideEncryption::AwsKms => {
-            let key_id = value.kms_master_key_id().ok_or_else(|| {
-                Error::General("bucket encryption rule missing KMS key id".to_string())
-            })?;
-            Ok(BucketEncryption::SseKms {
-                key_id: key_id.to_string(),
-            })
-        }
+        aws_sdk_s3::types::ServerSideEncryption::AwsKms => Ok(BucketEncryption::SseKms {
+            key_id: value.kms_master_key_id().map(ToString::to_string),
+        }),
         other => Err(Error::General(format!(
             "unsupported bucket encryption algorithm: {}",
             other.as_str()
@@ -419,9 +414,12 @@ fn core_bucket_encryption_to_sdk(
             .build()
             .expect("sse-s3 bucket encryption configuration is valid"),
         BucketEncryption::SseKms { key_id } => {
-            aws_sdk_s3::types::ServerSideEncryptionByDefault::builder()
-                .sse_algorithm(aws_sdk_s3::types::ServerSideEncryption::AwsKms)
-                .kms_master_key_id(key_id)
+            let mut builder = aws_sdk_s3::types::ServerSideEncryptionByDefault::builder()
+                .sse_algorithm(aws_sdk_s3::types::ServerSideEncryption::AwsKms);
+            if let Some(key_id) = key_id {
+                builder = builder.kms_master_key_id(key_id);
+            }
+            builder
                 .build()
                 .expect("sse-kms bucket encryption configuration is valid")
         }
@@ -3659,24 +3657,20 @@ mod tests {
         assert_eq!(
             encryption,
             BucketEncryption::SseKms {
-                key_id: "kms-key".to_string(),
+                key_id: Some("kms-key".to_string()),
             }
         );
     }
 
     #[test]
-    fn bucket_encryption_rule_missing_kms_key_errors() {
+    fn bucket_encryption_rule_without_kms_key_maps_to_default_kms() {
         let value = aws_sdk_s3::types::ServerSideEncryptionByDefault::builder()
             .sse_algorithm(aws_sdk_s3::types::ServerSideEncryption::AwsKms)
             .build()
             .expect("build rule");
 
-        match sdk_bucket_encryption_to_core(&value) {
-            Err(Error::General(message)) => {
-                assert!(message.contains("missing KMS key id"));
-            }
-            other => panic!("expected missing KMS key error, got {other:?}"),
-        }
+        let encryption = sdk_bucket_encryption_to_core(&value).expect("map default kms rule");
+        assert_eq!(encryption, BucketEncryption::SseKms { key_id: None });
     }
 
     #[test]
@@ -3890,7 +3884,7 @@ mod tests {
             .set_bucket_encryption(
                 "bucket",
                 BucketEncryption::SseKms {
-                    key_id: "kms-key".to_string(),
+                    key_id: Some("kms-key".to_string()),
                 },
             )
             .await

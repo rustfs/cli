@@ -8,8 +8,11 @@ use serde::{Deserialize, Serialize};
 pub enum BucketEncryption {
     /// Use S3-managed keys.
     SseS3,
-    /// Use KMS-managed keys with the provided key id.
-    SseKms { key_id: String },
+    /// Use KMS-managed keys with an optional explicit key id.
+    SseKms {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        key_id: Option<String>,
+    },
 }
 
 /// Object write encryption request.
@@ -36,10 +39,17 @@ mod tests {
     #[test]
     fn bucket_encryption_serializes_sse_kms_key_id() {
         let json = serde_json::to_value(&BucketEncryption::SseKms {
-            key_id: "kms-key".to_string(),
+            key_id: Some("kms-key".to_string()),
         })
         .expect("serialize sse-kms");
         assert_eq!(json, json!({ "sse-kms": { "key_id": "kms-key" } }));
+    }
+
+    #[test]
+    fn bucket_encryption_serializes_sse_kms_without_key_id() {
+        let json = serde_json::to_value(&BucketEncryption::SseKms { key_id: None })
+            .expect("serialize sse-kms without key");
+        assert_eq!(json, json!({ "sse-kms": {} }));
     }
 
     #[test]
@@ -57,9 +67,16 @@ mod tests {
         assert_eq!(
             value,
             BucketEncryption::SseKms {
-                key_id: "kms-key".to_string(),
+                key_id: Some("kms-key".to_string()),
             }
         );
+    }
+
+    #[test]
+    fn bucket_encryption_round_trips_sse_kms_without_key_id() {
+        let value: BucketEncryption = serde_json::from_value(json!({ "sse-kms": {} }))
+            .expect("deserialize sse-kms without key");
+        assert_eq!(value, BucketEncryption::SseKms { key_id: None });
     }
 
     #[test]

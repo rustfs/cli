@@ -36,7 +36,7 @@ pub struct MvArgs {
     #[arg(long = "enc-s3")]
     pub enc_s3: Vec<String>,
 
-    /// Apply SSE-KMS to the remote destination path as <TARGET>=<KMS_KEY_ID>
+    /// Apply SSE-KMS to the remote destination path as TARGET=KMS_KEY_ID
     #[arg(long = "enc-kms")]
     pub enc_kms: Vec<String>,
 }

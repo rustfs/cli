@@ -305,6 +305,44 @@ fn bucket_encryption_set_json_error_rejects_key_id_for_sse_s3() {
 }
 
 #[test]
+fn cp_json_error_rejects_unmatched_encryption_target() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let source = temp_dir.path().join("source.txt");
+    std::fs::write(&source, b"source").expect("write source file");
+
+    let output = run_rc(&[
+        "cp",
+        source.to_str().expect("source path is valid utf-8"),
+        "local/archive/report.json",
+        "--enc-s3",
+        "local/archive/typo.json",
+        "--json",
+    ]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "usage JSON errors should be emitted on stderr"
+    );
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
+    let json: serde_json::Value = serde_json::from_str(&stderr).expect("stderr is valid JSON");
+    assert_eq!(
+        json["error"],
+        "--enc-s3 target must exactly match the remote destination: local/archive/report.json"
+    );
+    assert_eq!(json["code"], 2);
+    assert_eq!(json["details"]["type"], "usage_error");
+    assert_eq!(json["details"]["retryable"], false);
+}
+
+#[test]
 #[cfg(not(windows))]
 fn alias_set_json_error_rejects_invalid_credentials_without_saving_alias() {
     let config_dir = tempfile::tempdir().expect("create temp config dir");

@@ -64,7 +64,7 @@ pub struct CpArgs {
     #[arg(long = "enc-s3")]
     pub enc_s3: Vec<String>,
 
-    /// Apply SSE-KMS to the remote destination path as <TARGET>=<KMS_KEY_ID>
+    /// Apply SSE-KMS to the remote destination path as TARGET=KMS_KEY_ID
     #[arg(long = "enc-kms")]
     pub enc_kms: Vec<String>,
 }
@@ -779,10 +779,10 @@ async fn copy_s3_to_s3(
 fn parse_kms_target(value: &str) -> Result<(String, String), String> {
     let (target, key_id) = value
         .split_once('=')
-        .ok_or_else(|| "Expected <TARGET>=<KMS_KEY_ID> for --enc-kms".to_string())?;
+        .ok_or_else(|| "Expected TARGET=KMS_KEY_ID for --enc-kms".to_string())?;
 
     if target.is_empty() || key_id.is_empty() {
-        return Err("Expected <TARGET>=<KMS_KEY_ID> for --enc-kms".to_string());
+        return Err("Expected TARGET=KMS_KEY_ID for --enc-kms".to_string());
     }
 
     Ok((target.to_string(), key_id.to_string()))
@@ -806,19 +806,34 @@ pub(crate) fn parse_destination_encryption(
 
     let target_display = remote.to_string();
     let s3_matches = enc_s3.iter().any(|value| value == &target_display);
-    let kms_match = enc_kms
+    let kms_targets = enc_kms
         .iter()
         .map(|value| parse_kms_target(value))
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+    let kms_match = kms_targets
+        .iter()
         .find(|(candidate, _)| candidate == &target_display);
+
+    if !enc_s3.is_empty() && !s3_matches {
+        return Err(format!(
+            "--enc-s3 target must exactly match the remote destination: {target_display}"
+        ));
+    }
+
+    if !enc_kms.is_empty() && kms_match.is_none() {
+        return Err(format!(
+            "--enc-kms target must exactly match the remote destination: {target_display}"
+        ));
+    }
 
     match (s3_matches, kms_match) {
         (true, Some(_)) => Err(format!(
             "--enc-s3 and --enc-kms cannot target the same destination: {target_display}"
         )),
         (true, None) => Ok(Some(ObjectEncryptionRequest::SseS3)),
-        (false, Some((_, key_id))) => Ok(Some(ObjectEncryptionRequest::SseKms { key_id })),
+        (false, Some((_, key_id))) => Ok(Some(ObjectEncryptionRequest::SseKms {
+            key_id: key_id.clone(),
+        })),
         (false, None) => Ok(None),
     }
 }
@@ -1045,7 +1060,7 @@ mod tests {
     #[test]
     fn parse_enc_kms_target_requires_equals_separator() {
         let error = parse_kms_target("local/bucket/file.txt").expect_err("missing key separator");
-        assert!(error.contains("Expected <TARGET>=<KMS_KEY_ID>"));
+        assert!(error.contains("Expected TARGET=KMS_KEY_ID"));
     }
 
     #[test]
@@ -1071,6 +1086,29 @@ mod tests {
         .expect_err("same target conflict should fail");
 
         assert!(error.contains("cannot target the same destination"));
+    }
+
+    #[test]
+    fn destination_encryption_rejects_unmatched_s3_target() {
+        let target = ParsedPath::Remote(RemotePath::new("local", "bucket", "file.txt"));
+        let error =
+            parse_destination_encryption(&[String::from("local/bucket/typo.txt")], &[], &target)
+                .expect_err("unmatched s3 target should fail");
+
+        assert!(error.contains("must exactly match the remote destination"));
+    }
+
+    #[test]
+    fn destination_encryption_rejects_unmatched_kms_target() {
+        let target = ParsedPath::Remote(RemotePath::new("local", "bucket", "file.txt"));
+        let error = parse_destination_encryption(
+            &[],
+            &[String::from("local/bucket/typo.txt=kms-key")],
+            &target,
+        )
+        .expect_err("unmatched kms target should fail");
+
+        assert!(error.contains("must exactly match the remote destination"));
     }
 
     #[test]

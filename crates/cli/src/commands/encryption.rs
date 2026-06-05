@@ -171,7 +171,7 @@ fn validate_set_encryption_args(
             "--key-id is only valid with --mode sse-kms",
         )),
         (EncryptionMode::SseKms, Some(key_id)) => Ok(BucketEncryption::SseKms {
-            key_id: key_id.to_string(),
+            key_id: Some(key_id.to_string()),
         }),
         (EncryptionMode::SseKms, None) => Err(formatter.fail(
             ExitCode::UsageError,
@@ -351,7 +351,7 @@ fn output_for_encryption(
             bucket,
             status: "Configured".to_string(),
             mode: Some("SSE-KMS".to_string()),
-            kms_key_id: Some(key_id),
+            kms_key_id: key_id,
         },
         None => BucketEncryptionOutput {
             bucket,
