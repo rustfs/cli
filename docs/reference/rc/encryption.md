@@ -10,6 +10,7 @@ Bucket default encryption:
 
 ```bash
 rc bucket encryption set <ALIAS/BUCKET> --mode sse-s3
+rc bucket encryption set <ALIAS/BUCKET> --mode sse-kms
 rc bucket encryption set <ALIAS/BUCKET> --mode sse-kms --key-id <KMS_KEY_ID>
 rc bucket encryption info <ALIAS/BUCKET>
 rc bucket encryption clear <ALIAS/BUCKET>
@@ -33,7 +34,7 @@ rc pipe <ALIAS/BUCKET/KEY> --enc-kms <KMS_KEY_ID>
 | Mode | Meaning |
 | --- | --- |
 | `sse-s3` | Use S3-managed keys (`AES256`). |
-| `sse-kms` | Use KMS-managed keys with the provided key identifier. |
+| `sse-kms` | Use KMS-managed keys with either the server default key or a provided key identifier. |
 
 ## Bucket Parameters
 
@@ -41,7 +42,7 @@ rc pipe <ALIAS/BUCKET/KEY> --enc-kms <KMS_KEY_ID>
 | --- | --- |
 | `ALIAS/BUCKET` | Bucket whose default encryption is managed. Object paths are invalid here. |
 | `--mode` | Required for `set`. Accepts `sse-s3` or `sse-kms`. |
-| `--key-id` | Required with `--mode sse-kms`. Invalid with `--mode sse-s3`. |
+| `--key-id` | Optional with `--mode sse-kms`; when omitted, the server default KMS key is used. Invalid with `--mode sse-s3`. |
 
 ## Object Write Parameters
 
@@ -65,6 +66,7 @@ rc bucket encryption clear local/archive
 Configure bucket default encryption with KMS:
 
 ```bash
+rc bucket encryption set local/archive --mode sse-kms
 rc bucket encryption set local/archive --mode sse-kms --key-id alias/archive-key
 ```
 
