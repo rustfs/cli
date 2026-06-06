@@ -13,6 +13,7 @@ use crate::output::{Formatter, OutputConfig};
 const ENCRYPTION_AFTER_HELP: &str = "\
 Examples:
   rc bucket encryption set local/my-bucket --mode sse-s3
+  rc bucket encryption set local/my-bucket --mode sse-kms
   rc bucket encryption set local/my-bucket --mode sse-kms --key-id alias/my-key
   rc bucket encryption info local/my-bucket
   rc bucket encryption clear local/my-bucket";
@@ -20,6 +21,7 @@ Examples:
 const SET_AFTER_HELP: &str = "\
 Examples:
   rc bucket encryption set local/my-bucket --mode sse-s3
+  rc bucket encryption set local/my-bucket --mode sse-kms
   rc bucket encryption set local/my-bucket --mode sse-kms --key-id alias/my-key";
 
 const INFO_AFTER_HELP: &str = "\
@@ -66,7 +68,7 @@ pub struct SetEncryptionArgs {
     #[arg(long)]
     pub mode: EncryptionMode,
 
-    /// KMS key id for sse-kms mode
+    /// Optional KMS key id for sse-kms mode
     #[arg(long)]
     pub key_id: Option<String>,
 }
@@ -170,13 +172,9 @@ fn validate_set_encryption_args(
             ExitCode::UsageError,
             "--key-id is only valid with --mode sse-kms",
         )),
-        (EncryptionMode::SseKms, Some(key_id)) => Ok(BucketEncryption::SseKms {
-            key_id: Some(key_id.to_string()),
+        (EncryptionMode::SseKms, key_id) => Ok(BucketEncryption::SseKms {
+            key_id: key_id.map(ToString::to_string),
         }),
-        (EncryptionMode::SseKms, None) => Err(formatter.fail(
-            ExitCode::UsageError,
-            "--key-id is required with --mode sse-kms",
-        )),
     }
 }
 
@@ -375,18 +373,19 @@ mod tests {
         assert!(parse_bucket_path("local/bucket/object.txt").is_err());
     }
 
-    #[tokio::test]
-    async fn execute_set_kms_without_key_id_returns_usage_error() {
-        let args = EncryptionArgs {
-            command: EncryptionCommands::Set(SetEncryptionArgs {
-                path: "local/my-bucket".to_string(),
-                mode: EncryptionMode::SseKms,
-                key_id: None,
-            }),
+    #[test]
+    fn validate_set_kms_without_key_id_uses_default_kms_key() {
+        let args = SetEncryptionArgs {
+            path: "local/my-bucket".to_string(),
+            mode: EncryptionMode::SseKms,
+            key_id: None,
         };
+        let formatter = Formatter::new(OutputConfig::default());
 
-        let code = execute(args, OutputConfig::default()).await;
-        assert_eq!(code, ExitCode::UsageError);
+        let encryption = validate_set_encryption_args(&args, &formatter)
+            .expect("sse-kms without key id should use the server default KMS key");
+
+        assert_eq!(encryption, BucketEncryption::SseKms { key_id: None });
     }
 
     #[tokio::test]

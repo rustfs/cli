@@ -200,6 +200,7 @@ fn top_level_command_help_contract() {
                 "--key-id",
                 "Examples:",
                 "rc bucket encryption set local/my-bucket --mode sse-s3",
+                "rc bucket encryption set local/my-bucket --mode sse-kms",
                 "rc bucket encryption set local/my-bucket --mode sse-kms --key-id alias/my-key",
             ],
         },
