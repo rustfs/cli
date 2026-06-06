@@ -366,8 +366,8 @@ mod tests {
     use rc_core::Error;
     use rc_core::{
         SelectCompression, SelectCsvInputOptions, SelectCsvOutputOptions, SelectInputFormat,
-        SelectJsonInputOptions, SelectJsonInputType, SelectOptions, SelectOutputFormat,
-        SelectScanRangeOptions,
+        SelectJsonInputOptions, SelectJsonInputType, SelectJsonOutputOptions, SelectOptions,
+        SelectOutputFormat, SelectScanRangeOptions,
     };
 
     #[test]
@@ -592,6 +592,22 @@ mod tests {
         let error = build_output_serialization(&options)
             .expect_err("multi-byte CSV output record delimiter should be rejected");
         assert!(matches!(error, Error::General(msg) if msg.contains("record delimiter")));
+    }
+
+    #[test]
+    fn json_output_serialization_sets_record_delimiter() {
+        let options = SelectOptions {
+            expression: "SELECT * FROM S3Object".to_string(),
+            output_format: SelectOutputFormat::Json,
+            json_output: SelectJsonOutputOptions {
+                record_delimiter: Some("\n".to_string()),
+            },
+            ..SelectOptions::default()
+        };
+
+        let output = build_output_serialization(&options).expect("json output serialization");
+        let json = output.json().expect("json output is configured");
+        assert_eq!(json.record_delimiter(), Some("\n"));
     }
 
     #[test]
