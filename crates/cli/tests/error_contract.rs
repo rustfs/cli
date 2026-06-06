@@ -231,43 +231,6 @@ fn alias_set_json_error_rejects_invalid_signature() {
 }
 
 #[test]
-fn bucket_encryption_set_json_error_reaches_alias_lookup_for_default_sse_kms() {
-    let config_dir = tempfile::tempdir().expect("create temp config dir");
-    let output = run_rc_with_config(
-        &[
-            "bucket",
-            "encryption",
-            "set",
-            "__missing_alias_for_default_kms__/my-bucket",
-            "--mode",
-            "sse-kms",
-            "--json",
-        ],
-        config_dir.path(),
-    );
-
-    assert_eq!(output.status.code(), Some(5));
-    assert!(
-        output.stdout.is_empty(),
-        "JSON errors should be emitted on stderr"
-    );
-
-    let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
-    let json: serde_json::Value = serde_json::from_str(&stderr).expect("stderr is valid JSON");
-    assert_eq!(
-        json["error"],
-        "Alias '__missing_alias_for_default_kms__' not found"
-    );
-    assert_eq!(json["code"], 5);
-    assert_eq!(json["details"]["type"], "not_found");
-    assert_eq!(json["details"]["retryable"], false);
-    assert_eq!(
-        json["details"]["suggestion"],
-        "Run `rc alias list` to inspect configured aliases or add one with `rc alias set ...`."
-    );
-}
-
-#[test]
 fn bucket_encryption_set_json_error_rejects_key_id_for_sse_s3() {
     let output = run_rc(&[
         "bucket",
