@@ -89,11 +89,7 @@ struct ServerOutput {
 
 impl From<&ServerInfo> for ServerOutput {
     fn from(server: &ServerInfo) -> Self {
-        let online = server
-            .disks
-            .iter()
-            .filter(|d| d.state == "online" || d.state == "ok")
-            .count();
+        let online = count_online_disks(&server.disks);
         let offline = server.disks.iter().filter(|d| d.state == "offline").count();
 
         Self {
@@ -272,6 +268,90 @@ fn print_cluster_info(info: &ClusterInfo, formatter: &Formatter) {
             formatter.println(&format!("  EC Parity:     {}", parity));
         }
     }
+
+    if let Some(ref servers) = info.servers {
+        print_cluster_node_details(servers, formatter);
+        print_cluster_disk_details(servers, formatter);
+    }
+}
+
+fn print_cluster_node_details(servers: &[ServerInfo], formatter: &Formatter) {
+    if servers.is_empty() {
+        return;
+    }
+
+    formatter.println("");
+    formatter.println(&formatter.style_name("Nodes:"));
+
+    for server in servers {
+        let state_icon = if is_online_state(&server.state) {
+            formatter.style_size("●")
+        } else {
+            formatter.style_date("○")
+        };
+        let endpoint = value_or_unknown(&server.endpoint);
+        let version = value_or_unknown(&server.version);
+        let online_disks = count_online_disks(&server.disks);
+        let total_disks = server.disks.len();
+
+        formatter.println(&format!(
+            "  {} {}",
+            state_icon,
+            formatter.style_name(endpoint)
+        ));
+        formatter.println(&format!("     Uptime:  {}", format_duration(server.uptime)));
+        formatter.println(&format!("     Version: {}", formatter.style_date(version)));
+        if !server.network.is_empty() {
+            formatter.println(&format!(
+                "     Network: {}/{} OK",
+                count_online_networks(server),
+                server.network.len()
+            ));
+        }
+        formatter.println(&format!(
+            "     Drives:  {}/{} OK",
+            online_disks, total_disks
+        ));
+        if server.pool_number > 0 {
+            formatter.println(&format!("     Pool:    {}", server.pool_number));
+        }
+    }
+}
+
+fn print_cluster_disk_details(servers: &[ServerInfo], formatter: &Formatter) {
+    let disks: Vec<&DiskInfo> = servers.iter().flat_map(|server| &server.disks).collect();
+    if disks.is_empty() {
+        return;
+    }
+
+    formatter.println("");
+    formatter.println(&formatter.style_name("Disks:"));
+
+    for disk in disks {
+        let state_icon = if is_online_state(&disk.state) {
+            formatter.style_size("●")
+        } else {
+            formatter.style_date("○")
+        };
+        let path = value_or_unknown(&disk.drive_path);
+        let state = value_or_unknown(&disk.state);
+        let endpoint = value_or_unknown(&disk.endpoint);
+
+        formatter.println(&format!(
+            "  {} {} [{}] {}",
+            state_icon,
+            formatter.style_name(path),
+            state,
+            endpoint
+        ));
+        if disk.total_space > 0 {
+            formatter.println(&format!("     Capacity: {}", disk_capacity_summary(disk)));
+        }
+        formatter.println(&format!(
+            "     Location: pool:{} set:{} disk:{}",
+            disk.pool_index, disk.set_index, disk.disk_index
+        ));
+    }
 }
 
 async fn execute_server(args: ServerArgs, formatter: &Formatter) -> ExitCode {
@@ -300,7 +380,7 @@ async fn execute_server(args: ServerArgs, formatter: &Formatter) -> ExitCode {
                 formatter.println("");
 
                 for server in &servers {
-                    let state_icon = if server.state == "online" {
+                    let state_icon = if is_online_state(&server.state) {
                         formatter.style_size("●")
                     } else {
                         formatter.style_date("○")
@@ -365,7 +445,7 @@ async fn execute_disk(args: DiskArgs, formatter: &Formatter) -> ExitCode {
 
                 for disk in disks {
                     let state_icon = match disk.state.as_str() {
-                        "online" | "ok" => formatter.style_size("●"),
+                        state if is_online_state(state) => formatter.style_size("●"),
                         "offline" => formatter.style_date("○"),
                         _ => formatter.style_date("?"),
                     };
@@ -406,6 +486,48 @@ async fn execute_disk(args: DiskArgs, formatter: &Formatter) -> ExitCode {
             ExitCode::GeneralError
         }
     }
+}
+
+fn is_online_state(state: &str) -> bool {
+    state.eq_ignore_ascii_case("online") || state.eq_ignore_ascii_case("ok")
+}
+
+fn count_online_disks(disks: &[DiskInfo]) -> usize {
+    disks
+        .iter()
+        .filter(|disk| is_online_state(&disk.state))
+        .count()
+}
+
+fn count_online_networks(server: &ServerInfo) -> usize {
+    server
+        .network
+        .values()
+        .filter(|state| is_online_state(state))
+        .count()
+}
+
+fn value_or_unknown(value: &str) -> &str {
+    if value.is_empty() { "unknown" } else { value }
+}
+
+fn disk_capacity_summary(disk: &DiskInfo) -> String {
+    if disk.total_space == 0 {
+        return format!(
+            "{} / 0 B (0%, available: {})",
+            format_bytes(disk.used_space),
+            format_bytes(disk.available_space)
+        );
+    }
+
+    let usage_pct = (disk.used_space as f64 / disk.total_space as f64 * 100.0) as u8;
+    format!(
+        "{} / {} ({}%, available: {})",
+        format_bytes(disk.used_space),
+        format_bytes(disk.total_space),
+        usage_pct,
+        format_bytes(disk.available_space)
+    )
 }
 
 /// Format bytes into human-readable form
@@ -543,5 +665,40 @@ mod tests {
         assert_eq!(output.pool_index, 0);
         assert_eq!(output.set_index, 1);
         assert_eq!(output.disk_index, 2);
+    }
+
+    #[test]
+    fn test_count_online_disks_accepts_ok_state() {
+        let disks = vec![
+            DiskInfo {
+                state: "online".to_string(),
+                ..Default::default()
+            },
+            DiskInfo {
+                state: "ok".to_string(),
+                ..Default::default()
+            },
+            DiskInfo {
+                state: "offline".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        assert_eq!(count_online_disks(&disks), 2);
+    }
+
+    #[test]
+    fn test_disk_capacity_summary_includes_available_space() {
+        let disk = DiskInfo {
+            total_space: 1024 * 1024 * 1024,
+            used_space: 512 * 1024 * 1024,
+            available_space: 512 * 1024 * 1024,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            disk_capacity_summary(&disk),
+            "512.00 MiB / 1.00 GiB (50%, available: 512.00 MiB)"
+        );
     }
 }
