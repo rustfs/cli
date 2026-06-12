@@ -4,6 +4,7 @@
 
 use clap::Subcommand;
 use serde::Serialize;
+use std::collections::BTreeSet;
 
 use super::get_admin_client;
 use crate::exit_code::ExitCode;
@@ -59,6 +60,8 @@ struct ClusterOutput {
     mode: String,
     deployment_id: String,
     region: String,
+    rc_version: String,
+    rustfs_version: String,
     servers: usize,
     online_disks: usize,
     offline_disks: usize,
@@ -173,6 +176,8 @@ async fn execute_cluster(args: ClusterArgs, formatter: &Formatter) -> ExitCode {
                         .region
                         .clone()
                         .unwrap_or_else(|| "us-east-1".to_string()),
+                    rc_version: env!("CARGO_PKG_VERSION").to_string(),
+                    rustfs_version: cluster_rustfs_version(&info),
                     servers: info.servers.as_ref().map(|s| s.len()).unwrap_or(0),
                     online_disks: info.online_disks(),
                     offline_disks: info.offline_disks(),
@@ -212,6 +217,11 @@ fn print_cluster_info(info: &ClusterInfo, formatter: &Formatter) {
         formatter.style_name(deployment_id)
     ));
     formatter.println(&format!("  Region:        {}", region));
+    formatter.println(&format!("  RC Version:    {}", env!("CARGO_PKG_VERSION")));
+    formatter.println(&format!(
+        "  RustFS Version: {}",
+        cluster_rustfs_version(info)
+    ));
 
     // Server info
     let server_count = info.servers.as_ref().map(|s| s.len()).unwrap_or(0);
@@ -511,6 +521,26 @@ fn value_or_unknown(value: &str) -> &str {
     if value.is_empty() { "unknown" } else { value }
 }
 
+fn cluster_rustfs_version(info: &ClusterInfo) -> String {
+    let versions = info
+        .servers
+        .as_ref()
+        .map(|servers| {
+            servers
+                .iter()
+                .map(|server| server.version.trim())
+                .filter(|version| !version.is_empty())
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+
+    if versions.is_empty() {
+        "unknown".to_string()
+    } else {
+        versions.into_iter().collect::<Vec<_>>().join(", ")
+    }
+}
+
 fn disk_capacity_summary(disk: &DiskInfo) -> String {
     if disk.total_space == 0 {
         return format!(
@@ -578,6 +608,8 @@ mod tests {
             mode: "distributed".to_string(),
             deployment_id: "deploy-1".to_string(),
             region: "us-east-1".to_string(),
+            rc_version: "0.1.21".to_string(),
+            rustfs_version: "1.0.0".to_string(),
             servers: 4,
             online_disks: 8,
             offline_disks: 1,
@@ -589,6 +621,8 @@ mod tests {
 
         let value = serde_json::to_value(&output).expect("serialize cluster output");
         assert!(value.get("deploymentId").is_some());
+        assert!(value.get("rcVersion").is_some());
+        assert!(value.get("rustfsVersion").is_some());
         assert!(value.get("onlineDisks").is_some());
         assert!(value.get("usedCapacity").is_some());
     }
@@ -685,6 +719,38 @@ mod tests {
         ];
 
         assert_eq!(count_online_disks(&disks), 2);
+    }
+
+    #[test]
+    fn test_cluster_rustfs_version_deduplicates_versions() {
+        let info = ClusterInfo {
+            servers: Some(vec![
+                ServerInfo {
+                    version: "1.0.0".to_string(),
+                    ..Default::default()
+                },
+                ServerInfo {
+                    version: "1.1.0".to_string(),
+                    ..Default::default()
+                },
+                ServerInfo {
+                    version: "1.0.0".to_string(),
+                    ..Default::default()
+                },
+                ServerInfo {
+                    version: String::new(),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        };
+
+        assert_eq!(cluster_rustfs_version(&info), "1.0.0, 1.1.0");
+    }
+
+    #[test]
+    fn test_cluster_rustfs_version_defaults_to_unknown() {
+        assert_eq!(cluster_rustfs_version(&ClusterInfo::default()), "unknown");
     }
 
     #[test]
