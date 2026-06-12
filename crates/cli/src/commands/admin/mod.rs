@@ -3,6 +3,7 @@
 //! This module provides commands for managing users, policies, groups,
 //! service accounts, and cluster operations on RustFS/MinIO-compatible servers.
 
+mod access_key;
 mod decommission;
 mod expand;
 mod group;
@@ -63,6 +64,10 @@ pub enum AdminCommands {
     /// Manage service accounts
     #[command(name = "service-account", subcommand)]
     ServiceAccount(service_account::ServiceAccountCommands),
+
+    /// Inspect access key identities
+    #[command(name = "access-key", subcommand)]
+    AccessKey(access_key::AccessKeyCommands),
 }
 
 /// Execute an admin subcommand
@@ -84,6 +89,9 @@ pub async fn execute(cmd: AdminCommands, output_config: OutputConfig) -> ExitCod
         AdminCommands::Policy(policy_cmd) => policy::execute(policy_cmd, &formatter).await,
         AdminCommands::Group(group_cmd) => group::execute(group_cmd, &formatter).await,
         AdminCommands::ServiceAccount(sa_cmd) => service_account::execute(sa_cmd, &formatter).await,
+        AdminCommands::AccessKey(access_key_cmd) => {
+            access_key::execute(access_key_cmd, &formatter).await
+        }
     }
 }
 
@@ -149,6 +157,20 @@ mod tests {
                 assert_eq!(args.alias, "local");
                 assert!(args.offline);
                 assert!(args.healing);
+            }
+            _ => panic!("Unexpected command parsing result"),
+        }
+    }
+
+    #[test]
+    fn test_parse_admin_access_key_info() {
+        let cli =
+            TestCli::parse_from(["rc", "access-key", "info", "local", "AKIAIOSFODNN7EXAMPLE"]);
+
+        match cli.command {
+            AdminCommands::AccessKey(access_key::AccessKeyCommands::Info(args)) => {
+                assert_eq!(args.alias, "local");
+                assert_eq!(args.access_key, "AKIAIOSFODNN7EXAMPLE");
             }
             _ => panic!("Unexpected command parsing result"),
         }

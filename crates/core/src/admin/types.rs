@@ -236,6 +236,98 @@ impl ServiceAccount {
     }
 }
 
+/// Identity-specific LDAP access key details.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LdapAccessKeyInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+}
+
+impl LdapAccessKeyInfo {
+    pub fn is_empty(&self) -> bool {
+        self.username.is_none()
+    }
+}
+
+/// Identity-specific OpenID access key details.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenIdAccessKeyInfo {
+    #[serde(rename = "configName", skip_serializing_if = "Option::is_none")]
+    pub config_name: Option<String>,
+
+    #[serde(rename = "userID", skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+
+    #[serde(rename = "userIDClaim", skip_serializing_if = "Option::is_none")]
+    pub user_id_claim: Option<String>,
+
+    #[serde(rename = "displayName", skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+
+    #[serde(rename = "displayNameClaim", skip_serializing_if = "Option::is_none")]
+    pub display_name_claim: Option<String>,
+}
+
+impl OpenIdAccessKeyInfo {
+    pub fn is_empty(&self) -> bool {
+        self.config_name.is_none()
+            && self.user_id.is_none()
+            && self.user_id_claim.is_none()
+            && self.display_name.is_none()
+            && self.display_name_claim.is_none()
+    }
+}
+
+/// Common details shared by users, service accounts, and STS credentials.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AccessKeyDetails {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_user: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_status: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub implied_policy: Option<bool>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expiration: Option<String>,
+}
+
+/// General access key information returned by the RustFS Admin API.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AccessKeyInfo {
+    pub access_key: String,
+    pub user_type: String,
+    pub user_provider: String,
+
+    #[serde(flatten)]
+    pub info: AccessKeyDetails,
+
+    #[serde(default, skip_serializing_if = "LdapAccessKeyInfo::is_empty")]
+    pub ldap_specific_info: LdapAccessKeyInfo,
+
+    #[serde(
+        rename = "openIDSpecificInfo",
+        default,
+        skip_serializing_if = "OpenIdAccessKeyInfo::is_empty"
+    )]
+    pub open_id_specific_info: OpenIdAccessKeyInfo,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServiceAccountCreateResponse {
@@ -525,6 +617,53 @@ mod tests {
         assert_eq!(
             parsed.get("expiration").and_then(|v| v.as_str()),
             Some("2025-12-31T23:59:59Z")
+        );
+    }
+
+    #[test]
+    fn test_access_key_info_deserializes_openid_server_shape() {
+        let value = serde_json::json!({
+            "accessKey": "sts-openid",
+            "userType": "STS",
+            "userProvider": "openid",
+            "parentUser": "openid-parent",
+            "accountStatus": "on",
+            "openIDSpecificInfo": {
+                "configName": "dex",
+                "userID": "subject-123",
+                "userIDClaim": "sub",
+                "displayName": "RustFS User",
+                "displayNameClaim": "name"
+            }
+        });
+
+        let info: AccessKeyInfo =
+            serde_json::from_value(value).expect("deserialize access key info");
+
+        assert_eq!(info.access_key, "sts-openid");
+        assert_eq!(info.user_type, "STS");
+        assert_eq!(info.user_provider, "openid");
+        assert_eq!(info.info.parent_user.as_deref(), Some("openid-parent"));
+        assert_eq!(info.info.account_status.as_deref(), Some("on"));
+        assert_eq!(
+            info.open_id_specific_info.config_name.as_deref(),
+            Some("dex")
+        );
+        assert_eq!(
+            info.open_id_specific_info.user_id.as_deref(),
+            Some("subject-123")
+        );
+        assert_eq!(
+            info.open_id_specific_info.user_id_claim.as_deref(),
+            Some("sub")
+        );
+        assert_eq!(
+            info.open_id_specific_info.display_name.as_deref(),
+            Some("RustFS User")
+        );
+        assert_eq!(
+            info.open_id_specific_info.display_name_claim.as_deref(),
+            Some("name")
         );
     }
 

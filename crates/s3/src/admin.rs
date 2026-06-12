@@ -10,9 +10,9 @@ use aws_sigv4::http_request::{
 };
 use aws_sigv4::sign::v4;
 use rc_core::admin::{
-    AdminApi, BucketQuota, ClusterInfo, CreateServiceAccountRequest, Group, GroupStatus,
-    HealScanMode, HealStartRequest, HealStatus, Policy, PolicyEntity, PolicyInfo, PoolStatus,
-    PoolTarget, RebalanceStartResult, RebalanceStatus, ServiceAccount,
+    AccessKeyInfo, AdminApi, BucketQuota, ClusterInfo, CreateServiceAccountRequest, Group,
+    GroupStatus, HealScanMode, HealStartRequest, HealStatus, Policy, PolicyEntity, PolicyInfo,
+    PoolStatus, PoolTarget, RebalanceStartResult, RebalanceStatus, ServiceAccount,
     ServiceAccountCreateResponse, UpdateGroupMembersRequest, User, UserStatus,
 };
 use rc_core::{Alias, Error, Result};
@@ -856,6 +856,12 @@ impl AdminApi for AdminClient {
         .await
     }
 
+    async fn get_access_key_info(&self, access_key: &str) -> Result<AccessKeyInfo> {
+        let query = [("accessKey", access_key)];
+        self.request(Method::GET, "/info-access-key", Some(&query), None)
+            .await
+    }
+
     // ==================== Bucket Quota Operations ====================
 
     async fn set_bucket_quota(&self, bucket: &str, quota: u64) -> Result<BucketQuota> {
@@ -1228,6 +1234,37 @@ mod tests {
         let request = receiver.recv().expect("captured request");
         assert_eq!(request.method, "POST");
         assert_eq!(request.target, "/rustfs/admin/v3/background-heal/status");
+        assert!(request.body.is_empty());
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn test_get_access_key_info_uses_info_access_key_endpoint() {
+        let (endpoint, receiver, handle) = start_admin_test_server(
+            "200 OK",
+            r#"{"accessKey":"svc-ldap","userType":"Service Account","userProvider":"ldap","parentUser":"ldap-parent","accountStatus":"on","ldapSpecificInfo":{"username":"alice"}}"#,
+        );
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let info = client
+            .get_access_key_info("svc-ldap")
+            .await
+            .expect("access key info request");
+
+        assert_eq!(info.access_key, "svc-ldap");
+        assert_eq!(info.user_type, "Service Account");
+        assert_eq!(info.user_provider, "ldap");
+        assert_eq!(info.info.parent_user.as_deref(), Some("ldap-parent"));
+        assert_eq!(info.info.account_status.as_deref(), Some("on"));
+        assert_eq!(info.ldap_specific_info.username.as_deref(), Some("alice"));
+        assert!(info.open_id_specific_info.is_empty());
+
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(request.method, "GET");
+        assert_eq!(
+            request.target,
+            "/rustfs/admin/v3/info-access-key?accessKey=svc-ldap"
+        );
         assert!(request.body.is_empty());
         handle.join().expect("server thread should finish");
     }

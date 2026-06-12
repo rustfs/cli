@@ -166,6 +166,7 @@ fn top_level_command_help_contract() {
                 "policy",
                 "group",
                 "service-account",
+                "access-key",
             ],
         },
         HelpCase {
@@ -758,6 +759,11 @@ fn nested_subcommand_help_contract() {
         HelpCase {
             args: &["admin", "service-account", "rm"],
             usage: "Usage: rc admin service-account rm [OPTIONS] <ALIAS> <ACCESS_KEY>",
+            expected_tokens: &[],
+        },
+        HelpCase {
+            args: &["admin", "access-key", "info"],
+            usage: "Usage: rc admin access-key info [OPTIONS] <ALIAS> <ACCESS_KEY>",
             expected_tokens: &[],
         },
         HelpCase {

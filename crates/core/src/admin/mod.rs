@@ -18,8 +18,9 @@ pub use tier::{
     TierRustFS, TierS3, TierTencent, TierType,
 };
 pub use types::{
-    BucketQuota, CreateServiceAccountRequest, Group, GroupStatus, Policy, PolicyEntity, PolicyInfo,
-    ServiceAccount, ServiceAccountCreateResponse, ServiceAccountCredentials, SetPolicyRequest,
+    AccessKeyDetails, AccessKeyInfo, BucketQuota, CreateServiceAccountRequest, Group, GroupStatus,
+    LdapAccessKeyInfo, OpenIdAccessKeyInfo, Policy, PolicyEntity, PolicyInfo, ServiceAccount,
+    ServiceAccountCreateResponse, ServiceAccountCredentials, SetPolicyRequest,
     UpdateGroupMembersRequest, User, UserStatus,
 };
 
@@ -155,6 +156,9 @@ pub trait AdminApi: Send + Sync {
 
     /// Delete a service account
     async fn delete_service_account(&self, access_key: &str) -> Result<()>;
+
+    /// Get information for any access key type.
+    async fn get_access_key_info(&self, access_key: &str) -> Result<AccessKeyInfo>;
 
     // ==================== Bucket Quota Operations ====================
 
