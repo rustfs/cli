@@ -4,7 +4,7 @@
 //! including server information, disk status, and heal operations.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Server information representing a RustFS node
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -96,15 +96,15 @@ pub struct DiskInfo {
     pub available_space: u64,
 
     /// Pool index
-    #[serde(default)]
+    #[serde(default, alias = "pool_index")]
     pub pool_index: i32,
 
     /// Set index
-    #[serde(default)]
+    #[serde(default, alias = "set_index")]
     pub set_index: i32,
 
     /// Disk index within set
-    #[serde(default)]
+    #[serde(default, alias = "disk_index")]
     pub disk_index: i32,
 
     /// Healing info if disk is being healed
@@ -284,6 +284,43 @@ pub struct ObjectsInfo {
     pub error: Option<String>,
 }
 
+/// Pool erasure set metrics returned by cluster information.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PoolErasureSetInfo {
+    /// Erasure set ID within the pool.
+    #[serde(default)]
+    pub id: i32,
+
+    /// Raw used capacity in bytes.
+    #[serde(default, rename = "rawUsage")]
+    pub raw_usage: u64,
+
+    /// Raw total capacity in bytes.
+    #[serde(default, rename = "rawCapacity")]
+    pub raw_capacity: u64,
+
+    /// Object data usage in bytes.
+    #[serde(default)]
+    pub usage: u64,
+
+    /// Number of objects in the set.
+    #[serde(default, rename = "objectsCount")]
+    pub objects_count: u64,
+
+    /// Number of versions in the set.
+    #[serde(default, rename = "versionsCount")]
+    pub versions_count: u64,
+
+    /// Number of delete markers in the set.
+    #[serde(default, rename = "deleteMarkersCount")]
+    pub delete_markers_count: u64,
+
+    /// Number of healing disks in the set.
+    #[serde(default, rename = "healDisks")]
+    pub heal_disks: i32,
+}
+
 /// Complete cluster information response
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -323,6 +360,10 @@ pub struct ClusterInfo {
     /// Server information
     #[serde(default)]
     pub servers: Option<Vec<ServerInfo>>,
+
+    /// Pool metrics keyed by pool and erasure set index.
+    #[serde(default)]
+    pub pools: Option<BTreeMap<i32, BTreeMap<i32, PoolErasureSetInfo>>>,
 }
 
 impl ClusterInfo {
@@ -824,6 +865,17 @@ mod tests {
         assert!(!disk.healing);
         assert!(!disk.scanning);
         assert_eq!(disk.total_space, 0);
+    }
+
+    #[test]
+    fn test_disk_info_deserializes_snake_case_location_indexes() {
+        let json = r#"{"pool_index":1,"set_index":2,"disk_index":3}"#;
+
+        let disk: DiskInfo = serde_json::from_str(json).unwrap();
+
+        assert_eq!(disk.pool_index, 1);
+        assert_eq!(disk.set_index, 2);
+        assert_eq!(disk.disk_index, 3);
     }
 
     #[test]

@@ -44,6 +44,42 @@ fn pool_list_dispatches_to_pool_list_json() {
 }
 
 #[test]
+fn pool_status_without_target_dispatches_to_cluster_info_json() {
+    let config_dir = tempfile::tempdir().expect("create config dir");
+    let (endpoint, receiver, handle) = start_admin_test_server(
+        r#"{"pools":{"0":{"0":{"id":0,"rawUsage":10,"rawCapacity":100,"usage":4,"objectsCount":1,"versionsCount":1,"deleteMarkersCount":0,"healDisks":0}},"1":{"0":{"id":0,"rawUsage":20,"rawCapacity":200,"usage":8,"objectsCount":2,"versionsCount":2,"deleteMarkersCount":0,"healDisks":0}}}}"#,
+    );
+
+    let output = Command::new(rc_binary())
+        .args(["--json", "admin", "pool", "status", "myalias"])
+        .env("RC_CONFIG_DIR", config_dir.path())
+        .env("RC_HOST_myalias", rc_host_alias(&endpoint))
+        .output()
+        .expect("run rc command");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+    let payload: serde_json::Value = serde_json::from_str(&stdout).expect("JSON output");
+    let pools = payload["pools"].as_array().expect("pools array");
+    assert_eq!(pools.len(), 2);
+    assert_eq!(pools[0]["id"], 0);
+    assert_eq!(pools[1]["id"], 1);
+
+    let request = receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("captured admin request");
+    assert_eq!(request.method, "GET");
+    assert_eq!(request.target, "/rustfs/admin/v3/info");
+
+    handle.join().expect("admin test server finished");
+}
+
+#[test]
 fn pool_status_dispatches_by_id_pool_json() {
     let config_dir = tempfile::tempdir().expect("create config dir");
     let (endpoint, receiver, handle) = start_admin_test_server(

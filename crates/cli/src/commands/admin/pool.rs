@@ -6,7 +6,7 @@ use serde::Serialize;
 use super::get_admin_client;
 use crate::exit_code::ExitCode;
 use crate::output::Formatter;
-use rc_core::admin::{AdminApi, PoolDecommissionInfo, PoolStatus, PoolTarget};
+use rc_core::admin::{AdminApi, ClusterInfo, PoolDecommissionInfo, PoolStatus, PoolTarget};
 
 /// Pool subcommands
 #[derive(Subcommand, Debug)]
@@ -98,8 +98,9 @@ async fn execute_status(args: StatusArgs, formatter: &Formatter) -> ExitCode {
             }
         }
     } else {
-        match client.list_pools().await {
-            Ok(pools) => {
+        match client.cluster_info().await {
+            Ok(info) => {
+                let pools = pool_statuses_from_cluster_info(&info);
                 if formatter.is_json() {
                     formatter.json(&PoolListOutput { pools });
                 } else {
@@ -113,6 +114,60 @@ async fn execute_status(args: StatusArgs, formatter: &Formatter) -> ExitCode {
             }
         }
     }
+}
+
+fn pool_statuses_from_cluster_info(info: &ClusterInfo) -> Vec<PoolStatus> {
+    let mut pools: Vec<PoolStatus> = info
+        .pools
+        .as_ref()
+        .map(|pools| {
+            pools
+                .iter()
+                .filter_map(|(pool_id, sets)| {
+                    let id = usize::try_from(*pool_id).ok()?;
+                    let raw_capacity = sets.values().map(|set| set.raw_capacity).sum::<u64>();
+                    let raw_usage = sets.values().map(|set| set.raw_usage).sum::<u64>();
+
+                    Some(PoolStatus {
+                        id,
+                        cmd_line: format!("pool {pool_id}"),
+                        decommission: Some(PoolDecommissionInfo {
+                            total_size: raw_capacity,
+                            current_size: raw_capacity.saturating_sub(raw_usage),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if pools.is_empty() {
+        pools = info
+            .servers
+            .as_ref()
+            .map(|servers| {
+                let mut pool_ids = servers
+                    .iter()
+                    .flat_map(|server| &server.disks)
+                    .filter_map(|disk| usize::try_from(disk.pool_index).ok())
+                    .collect::<Vec<_>>();
+                pool_ids.sort_unstable();
+                pool_ids.dedup();
+                pool_ids
+                    .into_iter()
+                    .map(|id| PoolStatus {
+                        id,
+                        cmd_line: format!("pool {id}"),
+                        ..Default::default()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+
+    pools
 }
 
 pub(super) fn print_pool_list(pools: &[PoolStatus], formatter: &Formatter) {
