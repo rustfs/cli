@@ -11,8 +11,8 @@ pub use cluster::{
     BackendInfo, BackendType, BucketsInfo, ClusterInfo, DiskInfo, HealDriveInfo, HealDriveInfos,
     HealResultItem, HealScanMode, HealStartRequest, HealStatus, HealingDiskInfo, MemStats,
     ObjectsInfo, PoolDecommissionInfo, PoolErasureSetInfo, PoolStatus, PoolTarget,
-    RebalancePoolProgress, RebalancePoolStatus, RebalanceStartResult, RebalanceStatus, ServerInfo,
-    UsageInfo,
+    RebalanceCleanupWarnings, RebalancePoolProgress, RebalancePoolStatus, RebalanceStartResult,
+    RebalanceStatus, ServerInfo, UsageInfo,
 };
 pub use tier::{
     TierAliyun, TierAzure, TierConfig, TierCreds, TierGCS, TierHuaweicloud, TierMinIO, TierR2,

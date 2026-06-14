@@ -435,6 +435,54 @@
         }
       }
     },
+    "rebalanceCleanupWarnings": {
+      "type": "object",
+      "required": [
+        "count",
+        "lastMsg",
+        "lastBucket",
+        "lastObject",
+        "lastAt"
+      ],
+      "properties": {
+        "count": {
+          "type": "integer",
+          "description": "Cleanup warning count"
+        },
+        "lastMsg": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Last cleanup warning message"
+        },
+        "lastBucket": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Bucket from the last cleanup warning"
+        },
+        "lastObject": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Object from the last cleanup warning"
+        },
+        "lastAt": {
+          "oneOf": [
+            {
+              "$ref": "#/definitions/timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Timestamp of the last cleanup warning"
+        }
+      }
+    },
     "rebalancePoolStatus": {
       "type": "object",
       "required": [
@@ -442,6 +490,7 @@
         "status",
         "used",
         "lastError",
+        "cleanupWarnings",
         "progress"
       ],
       "properties": {
@@ -463,6 +512,9 @@
             "null"
           ],
           "description": "Last rebalance error for this pool"
+        },
+        "cleanupWarnings": {
+          "$ref": "#/definitions/rebalanceCleanupWarnings"
         },
         "progress": {
           "oneOf": [

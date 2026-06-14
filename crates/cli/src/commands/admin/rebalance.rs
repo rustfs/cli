@@ -6,7 +6,7 @@ use serde::Serialize;
 use super::get_admin_client;
 use crate::exit_code::ExitCode;
 use crate::output::Formatter;
-use rc_core::admin::{AdminApi, RebalancePoolStatus, RebalanceStatus};
+use rc_core::admin::{AdminApi, RebalanceCleanupWarnings, RebalancePoolStatus, RebalanceStatus};
 
 /// Rebalance subcommands
 #[derive(Subcommand, Debug)]
@@ -217,6 +217,14 @@ fn print_rebalance_pool(pool: &RebalancePoolStatus, formatter: &Formatter) {
         formatter.println(&format!("    Last error: {error}"));
     }
 
+    if pool.cleanup_warnings.count > 0 {
+        formatter.println(&format!(
+            "    {} {}",
+            formatter.theme().warning.apply_to("Cleanup warnings:"),
+            format_cleanup_warnings(&pool.cleanup_warnings)
+        ));
+    }
+
     if let Some(progress) = &pool.progress {
         formatter.println(&format!(
             "    Progress:   {} moved, {} objects, {} versions",
@@ -240,6 +248,41 @@ fn print_rebalance_pool(pool: &RebalancePoolStatus, formatter: &Formatter) {
             format_duration(progress.elapsed)
         ));
     }
+}
+
+fn format_cleanup_warnings(warnings: &RebalanceCleanupWarnings) -> String {
+    let mut details = vec![format!("{} warning(s)", warnings.count)];
+
+    if let Some(message) = warnings
+        .last_message
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        details.push(format!("last message: {message}"));
+    }
+    if let Some(bucket) = warnings
+        .last_bucket
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        details.push(format!("bucket: {bucket}"));
+    }
+    if let Some(object) = warnings
+        .last_object
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        details.push(format!("object: {object}"));
+    }
+    if let Some(at) = warnings
+        .last_at
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        details.push(format!("at: {at}"));
+    }
+
+    details.join(", ")
 }
 
 fn style_status(status: &str, formatter: &Formatter) -> String {
@@ -325,5 +368,21 @@ mod tests {
         assert_eq!(style_status("complete", &formatter), "complete");
         assert_eq!(style_status("idle", &formatter), "idle");
         assert_eq!(style_status("Queued", &formatter), "Queued");
+    }
+
+    #[test]
+    fn test_format_cleanup_warnings() {
+        let warnings = RebalanceCleanupWarnings {
+            count: 2,
+            last_message: Some("cleanup warning".to_string()),
+            last_bucket: Some("bucket-a".to_string()),
+            last_object: Some("object-a".to_string()),
+            last_at: Some("2026-06-12T00:00:00Z".to_string()),
+        };
+
+        assert_eq!(
+            format_cleanup_warnings(&warnings),
+            "2 warning(s), last message: cleanup warning, bucket: bucket-a, object: object-a, at: 2026-06-12T00:00:00Z"
+        );
     }
 }

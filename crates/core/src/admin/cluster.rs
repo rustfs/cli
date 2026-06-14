@@ -730,9 +730,37 @@ pub struct RebalancePoolStatus {
     #[serde(default, rename = "lastError")]
     pub last_error: Option<String>,
 
+    /// Cleanup warnings observed after this pool finishes rebalance.
+    #[serde(default, rename = "cleanupWarnings")]
+    pub cleanup_warnings: RebalanceCleanupWarnings,
+
     /// Rebalance progress, if this pool is active.
     #[serde(default)]
     pub progress: Option<RebalancePoolProgress>,
+}
+
+/// Cleanup warnings recorded for a rebalanced pool.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RebalanceCleanupWarnings {
+    /// Number of cleanup warnings observed.
+    #[serde(default)]
+    pub count: u64,
+
+    /// Last cleanup warning message.
+    #[serde(default, rename = "lastMsg")]
+    pub last_message: Option<String>,
+
+    /// Bucket associated with the last cleanup warning.
+    #[serde(default, rename = "lastBucket")]
+    pub last_bucket: Option<String>,
+
+    /// Object associated with the last cleanup warning.
+    #[serde(default, rename = "lastObject")]
+    pub last_object: Option<String>,
+
+    /// Timestamp of the last cleanup warning.
+    #[serde(default, rename = "lastAt")]
+    pub last_at: Option<String>,
 }
 
 /// Rebalance progress for a single pool.
@@ -919,19 +947,34 @@ mod tests {
 
     #[test]
     fn test_rebalance_status_deserialization() {
-        let json = r#"{"id":"rebalance-1","pools":[{"id":0,"status":"Started","used":0.5,"lastError":null,"progress":{"objects":3,"versions":4,"bytes":1024,"remainingBuckets":2,"bucket":"bucket","object":"object","elapsed":10,"eta":20}}],"stoppedAt":null}"#;
+        let json = r#"{"id":"rebalance-1","pools":[{"id":0,"status":"Started","used":0.5,"lastError":null,"cleanupWarnings":{"count":1,"lastMsg":"cleanup warning","lastBucket":"bucket","lastObject":"object","lastAt":"2026-06-12T00:00:00Z"},"progress":{"objects":3,"versions":4,"bytes":1024,"remainingBuckets":2,"bucket":"bucket","object":"object","elapsed":10,"eta":20}}],"stoppedAt":null}"#;
 
         let status: RebalanceStatus = serde_json::from_str(json).unwrap();
 
         assert_eq!(status.id, "rebalance-1");
         assert_eq!(status.pools.len(), 1);
         assert_eq!(status.pools[0].used, 0.5);
+        assert_eq!(status.pools[0].cleanup_warnings.count, 1);
+        assert_eq!(
+            status.pools[0].cleanup_warnings.last_message.as_deref(),
+            Some("cleanup warning")
+        );
         let progress = status.pools[0]
             .progress
             .as_ref()
             .expect("progress should exist");
         assert_eq!(progress.num_objects, 3);
         assert_eq!(progress.remaining_buckets, 2);
+    }
+
+    #[test]
+    fn test_rebalance_status_defaults_cleanup_warnings() {
+        let json = r#"{"id":"rebalance-1","pools":[{"id":0,"status":"Completed","used":0.5,"lastError":null,"progress":null}],"stoppedAt":null}"#;
+
+        let status: RebalanceStatus = serde_json::from_str(json).unwrap();
+
+        assert_eq!(status.pools[0].cleanup_warnings.count, 0);
+        assert_eq!(status.pools[0].cleanup_warnings.last_message, None);
     }
 
     #[test]

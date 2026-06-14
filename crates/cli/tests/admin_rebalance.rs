@@ -45,7 +45,7 @@ fn rebalance_start_dispatches_to_rebalance_start_json() {
 fn rebalance_status_dispatches_to_rebalance_status_json() {
     let config_dir = tempfile::tempdir().expect("create config dir");
     let (endpoint, receiver, handle) = start_admin_test_server(
-        r#"{"id":"rebalance-123","pools":[],"stoppedAt":"2026-05-07T00:00:00Z"}"#,
+        r#"{"id":"rebalance-123","pools":[{"id":0,"status":"Completed","used":0.5,"lastError":null,"cleanupWarnings":{"count":1,"lastMsg":"cleanup warning","lastBucket":"test-bucket","lastObject":"object-a","lastAt":"2026-06-12T00:00:00Z"},"progress":null}],"stoppedAt":"2026-05-07T00:00:00Z"}"#,
     );
 
     let output = Command::new(rc_binary())
@@ -65,7 +65,16 @@ fn rebalance_status_dispatches_to_rebalance_status_json() {
     let payload: serde_json::Value = serde_json::from_str(&stdout).expect("JSON output");
     assert_eq!(payload["id"], "rebalance-123");
     assert_eq!(payload["stoppedAt"], "2026-05-07T00:00:00Z");
-    assert_eq!(payload["pools"].as_array().expect("pools array").len(), 0);
+    assert_eq!(payload["pools"].as_array().expect("pools array").len(), 1);
+    assert_eq!(payload["pools"][0]["cleanupWarnings"]["count"], 1);
+    assert_eq!(
+        payload["pools"][0]["cleanupWarnings"]["lastMsg"],
+        "cleanup warning"
+    );
+    assert_eq!(
+        payload["pools"][0]["cleanupWarnings"]["lastBucket"],
+        "test-bucket"
+    );
 
     let request = receiver
         .recv_timeout(Duration::from_secs(5))
