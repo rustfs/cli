@@ -578,6 +578,22 @@ pub struct HealStatus {
     #[serde(default)]
     pub object: String,
 
+    /// Current scan mode reported by background healing
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_mode: Option<HealScanMode>,
+
+    /// Background heal scan cycle
+    #[serde(default)]
+    pub scan_cycle: u64,
+
+    /// Number of queued heal tasks
+    #[serde(default)]
+    pub heal_queue_length: u64,
+
+    /// Number of active heal tasks
+    #[serde(default)]
+    pub heal_active_tasks: u64,
+
     /// Number of items scanned
     #[serde(default)]
     pub items_scanned: u64,
@@ -929,6 +945,10 @@ mod tests {
         let status = HealStatus::default();
         assert!(status.heal_id.is_empty());
         assert!(!status.healing);
+        assert!(status.scan_mode.is_none());
+        assert_eq!(status.scan_cycle, 0);
+        assert_eq!(status.heal_queue_length, 0);
+        assert_eq!(status.heal_active_tasks, 0);
         assert_eq!(status.items_scanned, 0);
     }
 
