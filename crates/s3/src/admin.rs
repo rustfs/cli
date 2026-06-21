@@ -392,15 +392,40 @@ struct ServiceAccountInfo {
 struct BackgroundHealStatusResponse {
     #[serde(default)]
     bitrot_start_time: Option<String>,
+    #[serde(default)]
+    bitrot_start_cycle: u64,
+    #[serde(default)]
+    current_scan_mode: Option<u8>,
+    #[serde(default)]
+    heal_queue_length: u64,
+    #[serde(default)]
+    heal_active_tasks: u64,
 }
 
 impl From<BackgroundHealStatusResponse> for HealStatus {
     fn from(response: BackgroundHealStatusResponse) -> Self {
+        let scan_mode = background_heal_scan_mode(response.current_scan_mode);
+        let legacy_healing = scan_mode.is_none() && response.bitrot_start_time.is_some();
         Self {
-            healing: response.bitrot_start_time.is_some(),
+            healing: matches!(scan_mode, Some(HealScanMode::Deep))
+                || response.heal_queue_length > 0
+                || response.heal_active_tasks > 0
+                || legacy_healing,
             started: response.bitrot_start_time,
+            scan_mode,
+            scan_cycle: response.bitrot_start_cycle,
+            heal_queue_length: response.heal_queue_length,
+            heal_active_tasks: response.heal_active_tasks,
             ..Default::default()
         }
+    }
+}
+
+fn background_heal_scan_mode(scan_mode: Option<u8>) -> Option<HealScanMode> {
+    match scan_mode {
+        Some(1) => Some(HealScanMode::Normal),
+        Some(2) => Some(HealScanMode::Deep),
+        _ => None,
     }
 }
 
@@ -1198,16 +1223,58 @@ mod tests {
     fn test_background_heal_status_response_maps_to_heal_status() {
         let status = HealStatus::from(BackgroundHealStatusResponse {
             bitrot_start_time: Some("2026-04-19T10:00:00Z".to_string()),
+            bitrot_start_cycle: 42,
+            current_scan_mode: Some(2),
+            heal_queue_length: 3,
+            heal_active_tasks: 1,
         });
 
         assert!(status.healing);
         assert_eq!(status.started.as_deref(), Some("2026-04-19T10:00:00Z"));
+        assert_eq!(status.scan_mode, Some(HealScanMode::Deep));
+        assert_eq!(status.scan_cycle, 42);
+        assert_eq!(status.heal_queue_length, 3);
+        assert_eq!(status.heal_active_tasks, 1);
 
         let idle = HealStatus::from(BackgroundHealStatusResponse {
             bitrot_start_time: None,
+            bitrot_start_cycle: 0,
+            current_scan_mode: Some(1),
+            heal_queue_length: 0,
+            heal_active_tasks: 0,
         });
         assert!(!idle.healing);
+        assert_eq!(idle.scan_mode, Some(HealScanMode::Normal));
         assert!(idle.started.is_none());
+
+        let completed = HealStatus::from(BackgroundHealStatusResponse {
+            bitrot_start_time: Some("2026-04-19T10:00:00Z".to_string()),
+            bitrot_start_cycle: 42,
+            current_scan_mode: Some(1),
+            heal_queue_length: 0,
+            heal_active_tasks: 0,
+        });
+        assert!(!completed.healing);
+        assert_eq!(completed.scan_mode, Some(HealScanMode::Normal));
+        assert_eq!(completed.started.as_deref(), Some("2026-04-19T10:00:00Z"));
+
+        let legacy = HealStatus::from(BackgroundHealStatusResponse {
+            bitrot_start_time: Some("2026-04-19T10:00:00Z".to_string()),
+            bitrot_start_cycle: 0,
+            current_scan_mode: None,
+            heal_queue_length: 0,
+            heal_active_tasks: 0,
+        });
+        assert!(legacy.healing);
+
+        let active = HealStatus::from(BackgroundHealStatusResponse {
+            bitrot_start_time: None,
+            bitrot_start_cycle: 0,
+            current_scan_mode: None,
+            heal_queue_length: 0,
+            heal_active_tasks: 1,
+        });
+        assert!(active.healing);
     }
 
     #[test]
@@ -1222,14 +1289,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_heal_status_uses_background_heal_status_endpoint() {
-        let (endpoint, receiver, handle) =
-            start_admin_test_server("200 OK", r#"{"bitrotStartTime":"2026-04-19T10:00:00Z"}"#);
+        let (endpoint, receiver, handle) = start_admin_test_server(
+            "200 OK",
+            r#"{"bitrotStartTime":"2026-04-19T10:00:00Z","bitrotStartCycle":42,"currentScanMode":2,"healQueueLength":3,"healActiveTasks":1}"#,
+        );
         let client = admin_client_for_endpoint(&endpoint);
 
         let status = client.heal_status().await.expect("heal status request");
 
         assert!(status.healing);
         assert_eq!(status.started.as_deref(), Some("2026-04-19T10:00:00Z"));
+        assert_eq!(status.scan_mode, Some(HealScanMode::Deep));
+        assert_eq!(status.scan_cycle, 42);
+        assert_eq!(status.heal_queue_length, 3);
+        assert_eq!(status.heal_active_tasks, 1);
 
         let request = receiver.recv().expect("captured request");
         assert_eq!(request.method, "POST");

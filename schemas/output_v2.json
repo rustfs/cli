@@ -270,6 +270,26 @@
           "type": "string",
           "description": "Object prefix being healed"
         },
+        "scanMode": {
+          "type": "string",
+          "enum": [
+            "normal",
+            "deep"
+          ],
+          "description": "Current background heal scan mode"
+        },
+        "scanCycle": {
+          "type": "integer",
+          "description": "Background heal scan cycle"
+        },
+        "healQueueLength": {
+          "type": "integer",
+          "description": "Queued heal tasks"
+        },
+        "healActiveTasks": {
+          "type": "integer",
+          "description": "Active heal tasks"
+        },
         "itemsScanned": {
           "type": "integer",
           "description": "Items scanned"

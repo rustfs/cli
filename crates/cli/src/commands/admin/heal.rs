@@ -73,6 +73,11 @@ struct HealStatusOutput {
     healing: bool,
     bucket: String,
     object: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scan_mode: Option<HealScanMode>,
+    scan_cycle: u64,
+    heal_queue_length: u64,
+    heal_active_tasks: u64,
     items_scanned: u64,
     items_healed: u64,
     items_failed: u64,
@@ -91,6 +96,10 @@ impl From<&HealStatus> for HealStatusOutput {
             healing: status.healing,
             bucket: status.bucket.clone(),
             object: status.object.clone(),
+            scan_mode: status.scan_mode,
+            scan_cycle: status.scan_cycle,
+            heal_queue_length: status.heal_queue_length,
+            heal_active_tasks: status.heal_active_tasks,
             items_scanned: status.items_scanned,
             items_healed: status.items_healed,
             items_failed: status.items_failed,
@@ -107,6 +116,10 @@ fn has_heal_status_details(status: &HealStatus) -> bool {
         || !status.heal_id.is_empty()
         || !status.bucket.is_empty()
         || !status.object.is_empty()
+        || status.scan_mode.is_some()
+        || status.scan_cycle > 0
+        || status.heal_queue_length > 0
+        || status.heal_active_tasks > 0
         || status.items_scanned > 0
         || status.items_healed > 0
         || status.items_failed > 0
@@ -181,6 +194,19 @@ fn print_heal_status(status: &HealStatus, formatter: &Formatter) {
                 status.bucket, status.object
             ));
         }
+
+        if let Some(scan_mode) = status.scan_mode {
+            formatter.println(&format!("  Scan Mode:     {scan_mode}"));
+        }
+
+        if status.scan_cycle > 0 {
+            formatter.println(&format!("  Scan Cycle:    {}", status.scan_cycle));
+        }
+
+        formatter.println(&format!(
+            "  Tasks:         {} queued, {} active",
+            status.heal_queue_length, status.heal_active_tasks
+        ));
 
         formatter.println(&format!(
             "  Items:         {} scanned, {} healed, {} failed",
@@ -326,6 +352,10 @@ mod tests {
             healing: true,
             bucket: "test-bucket".to_string(),
             object: "test/object.txt".to_string(),
+            scan_mode: Some(HealScanMode::Deep),
+            scan_cycle: 42,
+            heal_queue_length: 3,
+            heal_active_tasks: 1,
             items_scanned: 1000,
             items_healed: 50,
             items_failed: 5,
@@ -348,6 +378,9 @@ mod tests {
             .as_object()
             .expect("status is object");
         assert!(status_value.get("healId").is_some());
+        assert!(status_value.get("scanMode").is_some());
+        assert!(status_value.get("healQueueLength").is_some());
+        assert!(status_value.get("healActiveTasks").is_some());
         assert!(status_value.get("itemsScanned").is_some());
     }
 
@@ -358,6 +391,10 @@ mod tests {
             healing: true,
             bucket: "test-bucket".to_string(),
             object: "test/object.txt".to_string(),
+            scan_mode: Some(HealScanMode::Deep),
+            scan_cycle: 42,
+            heal_queue_length: 3,
+            heal_active_tasks: 1,
             items_scanned: 1000,
             items_healed: 50,
             items_failed: 5,
@@ -371,6 +408,10 @@ mod tests {
         assert_eq!(output.heal_id, "heal-123");
         assert!(output.healing);
         assert_eq!(output.bucket, "test-bucket");
+        assert_eq!(output.scan_mode, Some(HealScanMode::Deep));
+        assert_eq!(output.scan_cycle, 42);
+        assert_eq!(output.heal_queue_length, 3);
+        assert_eq!(output.heal_active_tasks, 1);
         assert_eq!(output.items_scanned, 1000);
         assert_eq!(output.items_healed, 50);
     }
@@ -386,6 +427,11 @@ mod tests {
 
         assert!(has_heal_status_details(&HealStatus {
             started: Some("2024-01-01T10:00:00Z".to_string()),
+            ..Default::default()
+        }));
+
+        assert!(has_heal_status_details(&HealStatus {
+            heal_active_tasks: 1,
             ..Default::default()
         }));
     }
