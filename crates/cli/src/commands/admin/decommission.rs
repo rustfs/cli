@@ -19,6 +19,9 @@ pub enum DecommissionCommands {
 
     /// Cancel decommissioning a pool
     Cancel(CancelArgs),
+
+    /// Clear failed or canceled decommissioning metadata for a pool
+    Clear(ClearArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -60,6 +63,19 @@ pub struct CancelArgs {
     pub by_id: bool,
 }
 
+#[derive(clap::Args, Debug)]
+pub struct ClearArgs {
+    /// Alias name of the server
+    pub alias: String,
+
+    /// Pool command line, or zero-based pool ID with --by-id
+    pub pool: String,
+
+    /// Interpret POOL as a zero-based pool ID
+    #[arg(long)]
+    pub by_id: bool,
+}
+
 #[derive(Serialize)]
 struct DecommissionOperationOutput {
     success: bool,
@@ -78,6 +94,7 @@ pub async fn execute(cmd: DecommissionCommands, formatter: &Formatter) -> ExitCo
         DecommissionCommands::Start(args) => execute_start(args, formatter).await,
         DecommissionCommands::Status(args) => execute_status(args, formatter).await,
         DecommissionCommands::Cancel(args) => execute_cancel(args, formatter).await,
+        DecommissionCommands::Clear(args) => execute_clear(args, formatter).await,
     }
 }
 
@@ -187,6 +204,40 @@ async fn execute_cancel(args: CancelArgs, formatter: &Formatter) -> ExitCode {
         }
         Err(e) => {
             formatter.error(&format!("Failed to cancel decommission: {e}"));
+            ExitCode::GeneralError
+        }
+    }
+}
+
+async fn execute_clear(args: ClearArgs, formatter: &Formatter) -> ExitCode {
+    let client = match get_admin_client(&args.alias, formatter) {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+
+    let target = PoolTarget {
+        pool: args.pool,
+        by_id: args.by_id,
+    };
+
+    match client.decommission_clear(target.clone()).await {
+        Ok(()) => {
+            if formatter.is_json() {
+                formatter.json(&DecommissionOperationOutput {
+                    success: true,
+                    message: "Decommission cleared successfully".to_string(),
+                    pool: target.pool,
+                });
+            } else {
+                formatter.success(&format!(
+                    "Decommission cleared successfully for `{}`.",
+                    target.pool
+                ));
+            }
+            ExitCode::Success
+        }
+        Err(e) => {
+            formatter.error(&format!("Failed to clear decommission: {e}"));
             ExitCode::GeneralError
         }
     }

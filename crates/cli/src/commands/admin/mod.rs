@@ -341,6 +341,20 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_admin_decommission_clear_by_id() {
+        let cli = TestCli::parse_from(["rc", "decommission", "clear", "local", "3", "--by-id"]);
+
+        match cli.command {
+            AdminCommands::Decommission(decommission::DecommissionCommands::Clear(args)) => {
+                assert_eq!(args.alias, "local");
+                assert_eq!(args.pool, "3");
+                assert!(args.by_id);
+            }
+            _ => panic!("Unexpected command parsing result"),
+        }
+    }
+
+    #[test]
     fn test_parse_admin_rebalance_start() {
         let cli = TestCli::parse_from(["rc", "rebalance", "start", "local"]);
 

@@ -547,6 +547,11 @@ fn nested_subcommand_help_contract() {
             expected_tokens: &["--by-id"],
         },
         HelpCase {
+            args: &["admin", "decommission", "clear"],
+            usage: "Usage: rc admin decommission clear [OPTIONS] <ALIAS> <POOL>",
+            expected_tokens: &["--by-id"],
+        },
+        HelpCase {
             args: &["admin", "rebalance", "start"],
             usage: "Usage: rc admin rebalance start [OPTIONS] <ALIAS>",
             expected_tokens: &[],

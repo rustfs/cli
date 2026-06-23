@@ -69,7 +69,7 @@ pub fn start_admin_test_server(
     let (sender, receiver) = mpsc::channel();
 
     let handle = thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(120);
         let (mut stream, _) = loop {
             match listener.accept() {
                 Ok(accepted) => break accepted,

@@ -565,6 +565,12 @@ impl AdminApi for AdminClient {
             .await
     }
 
+    async fn decommission_clear(&self, target: PoolTarget) -> Result<()> {
+        let query = pool_target_query(&target);
+        self.request_no_response(Method::POST, "/pools/clear", Some(&query), None)
+            .await
+    }
+
     async fn rebalance_start(&self) -> Result<RebalanceStartResult> {
         self.request(Method::POST, "/rebalance/start", None, None)
             .await
@@ -1592,6 +1598,29 @@ mod tests {
         assert_eq!(
             request.target,
             "/rustfs/admin/v3/pools/cancel?pool=1&by-id=true"
+        );
+        assert!(request.body.is_empty());
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn test_decommission_clear_posts_pool_clear_route_with_by_id_query() {
+        let (endpoint, receiver, handle) = start_admin_test_server("200 OK", "");
+        let client = admin_client_for_endpoint(&endpoint);
+
+        client
+            .decommission_clear(PoolTarget {
+                pool: "3".to_string(),
+                by_id: true,
+            })
+            .await
+            .expect("decommission clear request");
+
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(request.method, "POST");
+        assert_eq!(
+            request.target,
+            "/rustfs/admin/v3/pools/clear?pool=3&by-id=true"
         );
         assert!(request.body.is_empty());
         handle.join().expect("server thread should finish");

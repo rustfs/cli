@@ -62,6 +62,9 @@ pub trait AdminApi: Send + Sync {
     /// Cancel decommissioning a storage pool
     async fn decommission_cancel(&self, target: PoolTarget) -> Result<()>;
 
+    /// Clear failed or canceled decommissioning metadata for a storage pool
+    async fn decommission_clear(&self, target: PoolTarget) -> Result<()>;
+
     /// Start a rebalance operation
     async fn rebalance_start(&self) -> Result<RebalanceStartResult>;
 
