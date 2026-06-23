@@ -11,7 +11,7 @@ use admin_support::{rc_binary, rc_host_alias, start_admin_test_server};
 fn pool_list_dispatches_to_pool_list_json() {
     let config_dir = tempfile::tempdir().expect("create config dir");
     let (endpoint, receiver, handle) = start_admin_test_server(
-        r#"[{"id":0,"cmdline":"/data/pool0/disk{1...4}","lastUpdate":"2026-05-10T00:00:00Z","decommissionInfo":null}]"#,
+        r#"[{"id":0,"cmdline":"/data/pool0/disk{1...4}","lastUpdate":"2026-05-10T00:00:00Z","status":"active","decommissionStatus":"none","rebalanceStatus":"completed","totalSize":100,"currentSize":80,"usedSize":20,"used":0.2,"decommissionInfo":null}]"#,
     );
 
     let output = Command::new(rc_binary())
@@ -33,6 +33,10 @@ fn pool_list_dispatches_to_pool_list_json() {
     assert_eq!(pools.len(), 1);
     assert_eq!(pools[0]["id"], 0);
     assert_eq!(pools[0]["cmdline"], "/data/pool0/disk{1...4}");
+    assert_eq!(pools[0]["status"], "active");
+    assert_eq!(pools[0]["decommissionStatus"], "none");
+    assert_eq!(pools[0]["rebalanceStatus"], "completed");
+    assert_eq!(pools[0]["usedSize"], 20);
 
     let request = receiver
         .recv_timeout(Duration::from_secs(5))
@@ -47,7 +51,7 @@ fn pool_list_dispatches_to_pool_list_json() {
 fn pool_status_without_target_dispatches_to_pool_list_json() {
     let config_dir = tempfile::tempdir().expect("create config dir");
     let (endpoint, receiver, handle) = start_admin_test_server(
-        r#"[{"id":0,"cmdline":"/data/pool0/disk{1...4}","lastUpdate":"2026-05-10T00:00:00Z","decommissionInfo":{"totalSize":100,"currentSize":90}}]"#,
+        r#"[{"id":0,"cmdline":"/data/pool0/disk{1...4}","lastUpdate":"2026-05-10T00:00:00Z","status":"decommissioning","decommissionStatus":"running","rebalanceStatus":"none","decommissionInfo":{"totalSize":100,"currentSize":90}}]"#,
     );
 
     let output = Command::new(rc_binary())
@@ -69,6 +73,9 @@ fn pool_status_without_target_dispatches_to_pool_list_json() {
     assert_eq!(pools.len(), 1);
     assert_eq!(pools[0]["id"], 0);
     assert_eq!(pools[0]["cmdline"], "/data/pool0/disk{1...4}");
+    assert_eq!(pools[0]["status"], "decommissioning");
+    assert_eq!(pools[0]["decommissionStatus"], "running");
+    assert_eq!(pools[0]["rebalanceStatus"], "none");
     assert_eq!(pools[0]["decommissionInfo"]["totalSize"], 100);
     assert_eq!(pools[0]["decommissionInfo"]["currentSize"], 90);
 
@@ -85,7 +92,7 @@ fn pool_status_without_target_dispatches_to_pool_list_json() {
 fn pool_status_dispatches_by_id_pool_json() {
     let config_dir = tempfile::tempdir().expect("create config dir");
     let (endpoint, receiver, handle) = start_admin_test_server(
-        r#"{"id":1,"cmdline":"/data/pool1/disk{1...4}","lastUpdate":"2026-05-10T00:00:00Z","decommissionInfo":null}"#,
+        r#"{"id":1,"cmdline":"/data/pool1/disk{1...4}","lastUpdate":"2026-05-10T00:00:00Z","status":"active","decommissionStatus":"none","rebalanceStatus":"failed","decommissionInfo":null}"#,
     );
 
     let output = Command::new(rc_binary())
@@ -107,6 +114,9 @@ fn pool_status_dispatches_by_id_pool_json() {
     let payload: serde_json::Value = serde_json::from_str(&stdout).expect("JSON output");
     assert_eq!(payload["id"], 1);
     assert_eq!(payload["cmdline"], "/data/pool1/disk{1...4}");
+    assert_eq!(payload["status"], "active");
+    assert_eq!(payload["decommissionStatus"], "none");
+    assert_eq!(payload["rebalanceStatus"], "failed");
 
     let request = receiver
         .recv_timeout(Duration::from_secs(5))

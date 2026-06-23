@@ -10,10 +10,11 @@ use aws_sigv4::http_request::{
 };
 use aws_sigv4::sign::v4;
 use rc_core::admin::{
-    AccessKeyInfo, AdminApi, BucketQuota, ClusterInfo, CreateServiceAccountRequest, Group,
-    GroupStatus, HealScanMode, HealStartRequest, HealStatus, Policy, PolicyEntity, PolicyInfo,
-    PoolStatus, PoolTarget, RebalanceStartResult, RebalanceStatus, ServiceAccount,
-    ServiceAccountCreateResponse, UpdateGroupMembersRequest, User, UserStatus,
+    AccessKeyInfo, AdminApi, BucketQuota, ClusterInfo, CreateServiceAccountRequest,
+    DecommissionPoolStatus, DecommissionStatus, Group, GroupStatus, HealScanMode, HealStartRequest,
+    HealStatus, Policy, PolicyEntity, PolicyInfo, PoolStatus, PoolTarget, RebalanceStartResult,
+    RebalanceStatus, ServiceAccount, ServiceAccountCreateResponse, UpdateGroupMembersRequest, User,
+    UserStatus,
 };
 use rc_core::{Alias, Error, Result};
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
@@ -569,6 +570,24 @@ impl AdminApi for AdminClient {
         let query = pool_target_query(&target);
         self.request_no_response(Method::POST, "/pools/clear", Some(&query), None)
             .await
+    }
+
+    async fn decommission_status(&self, target: Option<PoolTarget>) -> Result<DecommissionStatus> {
+        if let Some(target) = target {
+            let query = pool_target_query(&target);
+            let pool = self
+                .request::<DecommissionPoolStatus>(
+                    Method::GET,
+                    "/decommission/status",
+                    Some(&query),
+                    None,
+                )
+                .await?;
+            Ok(DecommissionStatus { pools: vec![pool] })
+        } else {
+            self.request(Method::GET, "/decommission/status", None, None)
+                .await
+        }
     }
 
     async fn rebalance_start(&self) -> Result<RebalanceStartResult> {
@@ -1530,6 +1549,60 @@ mod tests {
         let request = receiver.recv().expect("captured request");
         assert_eq!(request.method, "GET");
         assert_eq!(request.target, "/rustfs/admin/v3/pools/list");
+        assert!(request.body.is_empty());
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn test_decommission_status_uses_status_route() {
+        let (endpoint, receiver, handle) = start_admin_test_server(
+            "200 OK",
+            r#"{"pools":[{"id":0,"cmdline":"/data/pool0/disk{1...4}","status":"running","poolStatus":"decommissioning","decommissionInfo":null}]}"#,
+        );
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let status = client
+            .decommission_status(None)
+            .await
+            .expect("decommission status request");
+
+        assert_eq!(status.pools.len(), 1);
+        assert_eq!(status.pools[0].status, "running");
+        assert_eq!(status.pools[0].pool_status, "decommissioning");
+
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.target, "/rustfs/admin/v3/decommission/status");
+        assert!(request.body.is_empty());
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn test_decommission_status_uses_status_route_with_by_id_query() {
+        let (endpoint, receiver, handle) = start_admin_test_server(
+            "200 OK",
+            r#"{"id":1,"cmdline":"/data/pool1/disk{1...4}","status":"failed","poolStatus":"blocked","decommissionInfo":null}"#,
+        );
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let status = client
+            .decommission_status(Some(PoolTarget {
+                pool: "1".to_string(),
+                by_id: true,
+            }))
+            .await
+            .expect("decommission status request");
+
+        assert_eq!(status.pools.len(), 1);
+        assert_eq!(status.pools[0].id, 1);
+        assert_eq!(status.pools[0].status, "failed");
+
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(request.method, "GET");
+        assert_eq!(
+            request.target,
+            "/rustfs/admin/v3/decommission/status?pool=1&by-id=true"
+        );
         assert!(request.body.is_empty());
         handle.join().expect("server thread should finish");
     }

@@ -356,6 +356,40 @@
           "type": "boolean",
           "description": "Whether decommission was canceled"
         },
+        "queued": {
+          "type": "boolean",
+          "description": "Whether decommission is queued"
+        },
+        "queuedBuckets": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Buckets waiting to be decommissioned"
+        },
+        "decommissionedBuckets": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Buckets already decommissioned"
+        },
+        "bucket": {
+          "type": "string",
+          "description": "Current bucket"
+        },
+        "prefix": {
+          "type": "string",
+          "description": "Current prefix"
+        },
+        "object": {
+          "type": "string",
+          "description": "Current object"
+        },
+        "stage": {
+          "type": "string",
+          "description": "Current decommission stage"
+        },
         "objectsDecommissioned": {
           "type": "integer",
           "description": "Objects successfully moved off the pool"
@@ -371,6 +405,17 @@
         "bytesDecommissionedFailed": {
           "type": "integer",
           "description": "Bytes that failed to move off the pool"
+        },
+        "waitingReason": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Reason why decommission is waiting"
         }
       }
     },
@@ -380,6 +425,13 @@
         "id",
         "cmdline",
         "lastUpdate",
+        "status",
+        "decommissionStatus",
+        "rebalanceStatus",
+        "totalSize",
+        "currentSize",
+        "usedSize",
+        "used",
         "decommissionInfo"
       ],
       "properties": {
@@ -395,6 +447,34 @@
           "$ref": "#/definitions/timestamp",
           "description": "Last pool metadata update timestamp"
         },
+        "status": {
+          "type": "string",
+          "description": "Pool lifecycle status"
+        },
+        "decommissionStatus": {
+          "type": "string",
+          "description": "Decommission operation status for this pool"
+        },
+        "rebalanceStatus": {
+          "type": "string",
+          "description": "Rebalance operation status for this pool"
+        },
+        "totalSize": {
+          "type": "integer",
+          "description": "Total pool size in bytes"
+        },
+        "currentSize": {
+          "type": "integer",
+          "description": "Current free bytes in the pool"
+        },
+        "usedSize": {
+          "type": "integer",
+          "description": "Used pool size in bytes"
+        },
+        "used": {
+          "type": "number",
+          "description": "Used capacity ratio in the range 0.0..=1.0"
+        },
         "decommissionInfo": {
           "oneOf": [
             {
@@ -405,6 +485,59 @@
             }
           ],
           "description": "Decommission state and progress for this pool"
+        }
+      }
+    },
+    "decommissionPoolStatus": {
+      "type": "object",
+      "required": [
+        "id",
+        "cmdline",
+        "status",
+        "poolStatus",
+        "decommissionInfo"
+      ],
+      "properties": {
+        "id": {
+          "type": "integer",
+          "description": "Zero-based pool ID"
+        },
+        "cmdline": {
+          "type": "string",
+          "description": "Pool command line used by the server process"
+        },
+        "status": {
+          "type": "string",
+          "description": "Decommission operation status for this pool"
+        },
+        "poolStatus": {
+          "type": "string",
+          "description": "Pool lifecycle status"
+        },
+        "decommissionInfo": {
+          "oneOf": [
+            {
+              "$ref": "#/definitions/poolDecommissionInfo"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Decommission state and progress for this pool"
+        }
+      }
+    },
+    "decommissionStatus": {
+      "type": "object",
+      "required": [
+        "pools"
+      ],
+      "properties": {
+        "pools": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/decommissionPoolStatus"
+          }
         }
       }
     },
@@ -795,6 +928,11 @@
           "type": "string"
         }
       }
+    },
+    {
+      "title": "admin decommission status",
+      "description": "Decommission status output",
+      "$ref": "#/definitions/decommissionStatus"
     },
     {
       "title": "admin rebalance status",

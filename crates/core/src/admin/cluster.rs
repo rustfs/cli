@@ -650,7 +650,67 @@ pub struct PoolStatus {
     #[serde(default, rename = "lastUpdate")]
     pub last_update: String,
 
+    /// Pool lifecycle status.
+    #[serde(default)]
+    pub status: String,
+
+    /// Decommission operation status for this pool.
+    #[serde(default, rename = "decommissionStatus")]
+    pub decommission_status: String,
+
+    /// Rebalance operation status for this pool.
+    #[serde(default, rename = "rebalanceStatus")]
+    pub rebalance_status: String,
+
+    /// Total pool size in bytes.
+    #[serde(default, rename = "totalSize")]
+    pub total_size: u64,
+
+    /// Current free size in bytes.
+    #[serde(default, rename = "currentSize")]
+    pub current_size: u64,
+
+    /// Used pool size in bytes.
+    #[serde(default, rename = "usedSize")]
+    pub used_size: u64,
+
+    /// Used capacity ratio in the range 0.0..=1.0.
+    #[serde(default)]
+    pub used: f64,
+
     /// Decommission status and progress for this pool.
+    #[serde(default, rename = "decommissionInfo")]
+    pub decommission: Option<PoolDecommissionInfo>,
+}
+
+/// Decommission status response.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DecommissionStatus {
+    /// Per-pool decommission status.
+    #[serde(default)]
+    pub pools: Vec<DecommissionPoolStatus>,
+}
+
+/// Decommission operation status for a single pool.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DecommissionPoolStatus {
+    /// Zero-based pool ID.
+    #[serde(default)]
+    pub id: usize,
+
+    /// Pool command line used by the server process.
+    #[serde(default, rename = "cmdline")]
+    pub cmd_line: String,
+
+    /// Decommission operation status for this pool.
+    #[serde(default)]
+    pub status: String,
+
+    /// Pool lifecycle status.
+    #[serde(default, rename = "poolStatus")]
+    pub pool_status: String,
+
+    /// Decommission state and progress for this pool.
     #[serde(default, rename = "decommissionInfo")]
     pub decommission: Option<PoolDecommissionInfo>,
 }
@@ -686,6 +746,34 @@ pub struct PoolDecommissionInfo {
     #[serde(default)]
     pub canceled: bool,
 
+    /// Whether decommission is queued.
+    #[serde(default)]
+    pub queued: bool,
+
+    /// Buckets waiting to be decommissioned.
+    #[serde(default, rename = "queuedBuckets")]
+    pub queued_buckets: Vec<String>,
+
+    /// Buckets already decommissioned.
+    #[serde(default, rename = "decommissionedBuckets")]
+    pub decommissioned_buckets: Vec<String>,
+
+    /// Current bucket.
+    #[serde(default)]
+    pub bucket: String,
+
+    /// Current prefix.
+    #[serde(default)]
+    pub prefix: String,
+
+    /// Current object.
+    #[serde(default)]
+    pub object: String,
+
+    /// Current decommission stage.
+    #[serde(default)]
+    pub stage: String,
+
     /// Number of successfully decommissioned objects.
     #[serde(default, rename = "objectsDecommissioned")]
     pub objects_decommissioned: u64,
@@ -701,6 +789,10 @@ pub struct PoolDecommissionInfo {
     /// Bytes that failed to move off the pool.
     #[serde(default, rename = "bytesDecommissionedFailed")]
     pub bytes_decommissioned_failed: u64,
+
+    /// Reason why decommission is waiting.
+    #[serde(default, rename = "waitingReason")]
+    pub waiting_reason: Option<String>,
 }
 
 /// Response from starting a rebalance operation.
@@ -954,15 +1046,42 @@ mod tests {
 
     #[test]
     fn test_pool_status_deserialization() {
-        let json = r#"{"id":1,"cmdline":"/data/pool1/disk{1...4}","lastUpdate":"2026-05-06T00:00:00Z","decommissionInfo":{"startTime":"2026-05-06T00:00:01Z","startSize":100,"totalSize":1000,"currentSize":600,"complete":false,"failed":false,"canceled":false,"objectsDecommissioned":2,"objectsDecommissionedFailed":1,"bytesDecommissioned":128,"bytesDecommissionedFailed":64}}"#;
+        let json = r#"{"id":1,"cmdline":"/data/pool1/disk{1...4}","lastUpdate":"2026-05-06T00:00:00Z","status":"decommissioning","decommissionStatus":"running","rebalanceStatus":"none","totalSize":1000,"currentSize":600,"usedSize":400,"used":0.4,"decommissionInfo":{"startTime":"2026-05-06T00:00:01Z","startSize":100,"totalSize":1000,"currentSize":600,"complete":false,"failed":false,"canceled":false,"queued":true,"queuedBuckets":["bucket-a"],"decommissionedBuckets":["bucket-b"],"bucket":"bucket-a","prefix":"","object":"object.txt","stage":"migrate_object","objectsDecommissioned":2,"objectsDecommissionedFailed":1,"bytesDecommissioned":128,"bytesDecommissionedFailed":64,"waitingReason":"queued"}}"#;
 
         let status: PoolStatus = serde_json::from_str(json).unwrap();
 
         assert_eq!(status.id, 1);
         assert_eq!(status.cmd_line, "/data/pool1/disk{1...4}");
+        assert_eq!(status.status, "decommissioning");
+        assert_eq!(status.decommission_status, "running");
+        assert_eq!(status.rebalance_status, "none");
+        assert_eq!(status.used_size, 400);
         let info = status.decommission.expect("decommission info exists");
+        assert!(info.queued);
+        assert_eq!(info.queued_buckets, vec!["bucket-a"]);
+        assert_eq!(info.bucket, "bucket-a");
+        assert_eq!(info.object, "object.txt");
+        assert_eq!(info.waiting_reason.as_deref(), Some("queued"));
         assert_eq!(info.objects_decommissioned, 2);
         assert_eq!(info.bytes_decommissioned_failed, 64);
+    }
+
+    #[test]
+    fn test_decommission_status_deserialization() {
+        let json = r#"{"pools":[{"id":2,"cmdline":"/data/pool2/disk{1...4}","status":"failed","poolStatus":"blocked","decommissionInfo":{"failed":true,"totalSize":1000,"currentSize":900}}]}"#;
+
+        let status: DecommissionStatus = serde_json::from_str(json).unwrap();
+
+        assert_eq!(status.pools.len(), 1);
+        assert_eq!(status.pools[0].id, 2);
+        assert_eq!(status.pools[0].status, "failed");
+        assert_eq!(status.pools[0].pool_status, "blocked");
+        assert!(
+            status.pools[0]
+                .decommission
+                .as_ref()
+                .is_some_and(|info| info.failed)
+        );
     }
 
     #[test]

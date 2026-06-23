@@ -129,11 +129,17 @@ pub(super) fn print_pool_list(pools: &[PoolStatus], formatter: &Formatter) {
 
 pub(super) fn print_pool_status(pool: &PoolStatus, formatter: &Formatter) {
     let decommission = pool.decommission.as_ref();
-    let state = decommission_state(decommission);
+    let lifecycle_state = pool_lifecycle_state(pool);
+    let decommission_state = pool_decommission_state(pool);
+    let rebalance_state = status_or_default(&pool.rebalance_status, "none");
     let used = decommission
         .map(|info| info.total_size.saturating_sub(info.current_size))
+        .or_else(|| (pool.total_size > 0).then_some(pool.used_size))
         .unwrap_or_default();
-    let total = decommission.map(|info| info.total_size).unwrap_or_default();
+    let total = decommission
+        .map(|info| info.total_size)
+        .or_else(|| (pool.total_size > 0).then_some(pool.total_size))
+        .unwrap_or_default();
 
     formatter.println(&format!(
         "  Pool {}: {}",
@@ -141,8 +147,16 @@ pub(super) fn print_pool_status(pool: &PoolStatus, formatter: &Formatter) {
         formatter.style_url(&pool.cmd_line)
     ));
     formatter.println(&format!(
+        "    Status:       {}",
+        style_state(lifecycle_state, formatter)
+    ));
+    formatter.println(&format!(
         "    Decommission: {}",
-        style_state(state, formatter)
+        style_state(decommission_state, formatter)
+    ));
+    formatter.println(&format!(
+        "    Rebalance:    {}",
+        style_state(rebalance_state, formatter)
     ));
 
     if total > 0 {
@@ -169,9 +183,29 @@ pub(super) fn print_pool_status(pool: &PoolStatus, formatter: &Formatter) {
     }
 }
 
+fn pool_lifecycle_state(pool: &PoolStatus) -> &str {
+    if !pool.status.is_empty() {
+        return pool.status.as_str();
+    }
+
+    match decommission_state(pool.decommission.as_ref()) {
+        "complete" => "decommissioned",
+        "failed" | "canceled" => "blocked",
+        _ => "active",
+    }
+}
+
+fn pool_decommission_state(pool: &PoolStatus) -> &str {
+    if !pool.decommission_status.is_empty() {
+        return pool.decommission_status.as_str();
+    }
+
+    decommission_state(pool.decommission.as_ref())
+}
+
 fn decommission_state(decommission: Option<&PoolDecommissionInfo>) -> &'static str {
     let Some(info) = decommission else {
-        return "not started";
+        return "none";
     };
 
     if info.complete {
@@ -180,24 +214,32 @@ fn decommission_state(decommission: Option<&PoolDecommissionInfo>) -> &'static s
         "failed"
     } else if info.canceled {
         "canceled"
+    } else if info.queued {
+        "queued"
     } else if info.start_time.is_some() {
         "running"
     } else {
-        "not started"
+        "none"
     }
 }
 
-fn style_state(state: &str, formatter: &Formatter) -> String {
+pub(super) fn style_state(state: &str, formatter: &Formatter) -> String {
     match state {
-        "complete" => formatter.style_size(state),
-        "failed" => formatter.theme().error.apply_to(state).to_string(),
-        "canceled" => formatter.theme().warning.apply_to(state).to_string(),
-        "running" => formatter.style_name(state),
+        "active" | "complete" | "completed" | "decommissioned" => formatter.style_size(state),
+        "blocked" | "failed" => formatter.theme().error.apply_to(state).to_string(),
+        "canceled" | "queued" | "stopping" | "stopped" => {
+            formatter.theme().warning.apply_to(state).to_string()
+        }
+        "decommissioning" | "running" | "started" => formatter.style_name(state),
         _ => formatter.style_date(state),
     }
 }
 
-fn format_bytes(bytes: u64) -> String {
+fn status_or_default<'a>(status: &'a str, default: &'static str) -> &'a str {
+    if status.is_empty() { default } else { status }
+}
+
+pub(super) fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
     const GB: u64 = MB * 1024;
@@ -222,10 +264,17 @@ mod tests {
 
     #[test]
     fn test_decommission_state() {
-        assert_eq!(decommission_state(None), "not started");
+        assert_eq!(decommission_state(None), "none");
         assert_eq!(
             decommission_state(Some(&PoolDecommissionInfo::default())),
-            "not started"
+            "none"
+        );
+        assert_eq!(
+            decommission_state(Some(&PoolDecommissionInfo {
+                queued: true,
+                ..Default::default()
+            })),
+            "queued"
         );
         assert_eq!(
             decommission_state(Some(&PoolDecommissionInfo {

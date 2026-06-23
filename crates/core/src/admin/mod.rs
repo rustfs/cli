@@ -8,11 +8,11 @@ pub mod tier;
 mod types;
 
 pub use cluster::{
-    BackendInfo, BackendType, BucketsInfo, ClusterInfo, DiskInfo, HealDriveInfo, HealDriveInfos,
-    HealResultItem, HealScanMode, HealStartRequest, HealStatus, HealingDiskInfo, MemStats,
-    ObjectsInfo, PoolDecommissionInfo, PoolErasureSetInfo, PoolStatus, PoolTarget,
-    RebalanceCleanupWarnings, RebalancePoolProgress, RebalancePoolStatus, RebalanceStartResult,
-    RebalanceStatus, ServerInfo, UsageInfo,
+    BackendInfo, BackendType, BucketsInfo, ClusterInfo, DecommissionPoolStatus, DecommissionStatus,
+    DiskInfo, HealDriveInfo, HealDriveInfos, HealResultItem, HealScanMode, HealStartRequest,
+    HealStatus, HealingDiskInfo, MemStats, ObjectsInfo, PoolDecommissionInfo, PoolErasureSetInfo,
+    PoolStatus, PoolTarget, RebalanceCleanupWarnings, RebalancePoolProgress, RebalancePoolStatus,
+    RebalanceStartResult, RebalanceStatus, ServerInfo, UsageInfo,
 };
 pub use tier::{
     TierAliyun, TierAzure, TierConfig, TierCreds, TierGCS, TierHuaweicloud, TierMinIO, TierR2,
@@ -64,6 +64,9 @@ pub trait AdminApi: Send + Sync {
 
     /// Clear failed or canceled decommissioning metadata for a storage pool
     async fn decommission_clear(&self, target: PoolTarget) -> Result<()>;
+
+    /// Get decommissioning status
+    async fn decommission_status(&self, target: Option<PoolTarget>) -> Result<DecommissionStatus>;
 
     /// Start a rebalance operation
     async fn rebalance_start(&self) -> Result<RebalanceStartResult>;
