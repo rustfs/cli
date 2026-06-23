@@ -44,10 +44,10 @@ fn pool_list_dispatches_to_pool_list_json() {
 }
 
 #[test]
-fn pool_status_without_target_dispatches_to_cluster_info_json() {
+fn pool_status_without_target_dispatches_to_pool_list_json() {
     let config_dir = tempfile::tempdir().expect("create config dir");
     let (endpoint, receiver, handle) = start_admin_test_server(
-        r#"{"pools":{"0":{"0":{"id":0,"rawUsage":10,"rawCapacity":100,"usage":4,"objectsCount":1,"versionsCount":1,"deleteMarkersCount":0,"healDisks":0}},"1":{"0":{"id":0,"rawUsage":20,"rawCapacity":200,"usage":8,"objectsCount":2,"versionsCount":2,"deleteMarkersCount":0,"healDisks":0}}}}"#,
+        r#"[{"id":0,"cmdline":"/data/pool0/disk{1...4}","lastUpdate":"2026-05-10T00:00:00Z","decommissionInfo":{"totalSize":100,"currentSize":90}}]"#,
     );
 
     let output = Command::new(rc_binary())
@@ -66,15 +66,17 @@ fn pool_status_without_target_dispatches_to_cluster_info_json() {
     let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
     let payload: serde_json::Value = serde_json::from_str(&stdout).expect("JSON output");
     let pools = payload["pools"].as_array().expect("pools array");
-    assert_eq!(pools.len(), 2);
+    assert_eq!(pools.len(), 1);
     assert_eq!(pools[0]["id"], 0);
-    assert_eq!(pools[1]["id"], 1);
+    assert_eq!(pools[0]["cmdline"], "/data/pool0/disk{1...4}");
+    assert_eq!(pools[0]["decommissionInfo"]["totalSize"], 100);
+    assert_eq!(pools[0]["decommissionInfo"]["currentSize"], 90);
 
     let request = receiver
         .recv_timeout(Duration::from_secs(5))
         .expect("captured admin request");
     assert_eq!(request.method, "GET");
-    assert_eq!(request.target, "/rustfs/admin/v3/info");
+    assert_eq!(request.target, "/rustfs/admin/v3/pools/list");
 
     handle.join().expect("admin test server finished");
 }
