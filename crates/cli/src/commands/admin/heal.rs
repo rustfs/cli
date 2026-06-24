@@ -38,7 +38,7 @@ pub struct StartArgs {
     /// Alias name of the server
     pub alias: String,
 
-    /// Specific bucket to heal (default: all buckets)
+    /// Bucket to heal; omit to recursively heal all buckets
     #[arg(short, long)]
     pub bucket: Option<String>,
 

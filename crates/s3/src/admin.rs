@@ -447,8 +447,14 @@ struct RustfsHealOptions {
 
 impl From<&HealStartRequest> for RustfsHealOptions {
     fn from(request: &HealStartRequest) -> Self {
+        Self::from_request(request, false)
+    }
+}
+
+impl RustfsHealOptions {
+    fn from_request(request: &HealStartRequest, recursive: bool) -> Self {
         Self {
-            recursive: false,
+            recursive,
             dry_run: request.dry_run,
             remove: request.remove,
             recreate: request.recreate,
@@ -494,6 +500,18 @@ fn rustfs_heal_body(request: &HealStartRequest) -> Result<Vec<u8>> {
     serde_json::to_vec(&RustfsHealOptions::from(request)).map_err(Error::Json)
 }
 
+fn rustfs_heal_start_body(request: &HealStartRequest) -> Result<Vec<u8>> {
+    let recursive = request
+        .bucket
+        .as_deref()
+        .is_none_or(|bucket| bucket.is_empty())
+        && request
+            .prefix
+            .as_deref()
+            .is_none_or(|prefix| prefix.is_empty());
+    serde_json::to_vec(&RustfsHealOptions::from_request(request, recursive)).map_err(Error::Json)
+}
+
 fn pool_target_query(target: &PoolTarget) -> Vec<(&str, &str)> {
     let mut query = vec![("pool", target.pool.as_str())];
     if target.by_id {
@@ -527,7 +545,7 @@ impl AdminApi for AdminClient {
 
     async fn heal_start(&self, request: HealStartRequest) -> Result<HealStatus> {
         let path = rustfs_heal_path(&request)?;
-        let body = rustfs_heal_body(&request)?;
+        let body = rustfs_heal_start_body(&request)?;
         self.request_no_response(Method::POST, &path, None, Some(&body))
             .await?;
         Ok(HealStatus::default())
@@ -1116,6 +1134,7 @@ mod tests {
 
     fn assert_heal_options_body(
         body: &[u8],
+        recursive: bool,
         scan_mode: u8,
         remove: bool,
         recreate: bool,
@@ -1124,7 +1143,7 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_slice(body).expect("heal request body should be JSON");
 
-        assert_eq!(value["recursive"], false);
+        assert_eq!(value["recursive"], recursive);
         assert_eq!(value["dryRun"], dry_run);
         assert_eq!(value["remove"], remove);
         assert_eq!(value["recreate"], recreate);
@@ -1418,7 +1437,7 @@ mod tests {
             request.target,
             "/rustfs/admin/v3/heal/raw%20photos/2026%2Fapril"
         );
-        assert_heal_options_body(&request.body, 2, true, true, true);
+        assert_heal_options_body(&request.body, false, 2, true, true, true);
         assert!(
             !request
                 .headers
@@ -1456,7 +1475,35 @@ mod tests {
             request.target,
             "/rustfs/admin/v3/heal/raw%20photos/2026%2Fapril"
         );
-        assert_heal_options_body(&request.body, 2, true, true, true);
+        assert_heal_options_body(&request.body, false, 2, true, true, true);
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn test_heal_start_without_bucket_posts_recursive_root_route() {
+        let (endpoint, receiver, handle) = start_admin_test_server("200 OK", "");
+        let client = admin_client_for_endpoint(&endpoint);
+        let request = HealStartRequest {
+            scan_mode: HealScanMode::Deep,
+            remove: true,
+            recreate: true,
+            dry_run: true,
+            ..Default::default()
+        };
+
+        let status = client
+            .heal_start(request)
+            .await
+            .expect("recursive root heal start request");
+
+        assert!(!status.healing);
+        assert!(status.heal_id.is_empty());
+        assert!(status.started.is_none());
+
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.target, "/rustfs/admin/v3/heal/");
+        assert_heal_options_body(&request.body, true, 2, true, true, true);
         handle.join().expect("server thread should finish");
     }
 
@@ -1470,7 +1517,7 @@ mod tests {
         let request = receiver.recv().expect("captured request");
         assert_eq!(request.method, "POST");
         assert_eq!(request.target, "/rustfs/admin/v3/heal/?forceStop=true");
-        assert_heal_options_body(&request.body, 1, false, false, false);
+        assert_heal_options_body(&request.body, false, 1, false, false, false);
         handle.join().expect("server thread should finish");
     }
 
