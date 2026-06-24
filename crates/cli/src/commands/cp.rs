@@ -631,7 +631,11 @@ async fn download_prefix(
                     }
 
                     // Calculate relative path from prefix
-                    let relative_key = item.key.strip_prefix(&src.key).unwrap_or(&item.key);
+                    let relative_key = item
+                        .key
+                        .strip_prefix(&src.key)
+                        .unwrap_or(&item.key)
+                        .trim_start_matches('/');
                     let dst_path =
                         dst.join(relative_key.replace('/', std::path::MAIN_SEPARATOR_STR));
 
