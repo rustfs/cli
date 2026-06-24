@@ -14,6 +14,7 @@ use rc_core::{AliasManager, ObjectStore as _};
 use rc_s3::{AdminClient, S3Client};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
 
 use crate::exit_code::ExitCode;
 use crate::output::{Formatter, OutputConfig};
@@ -30,7 +31,12 @@ const REPLICATE_ADD_AFTER_HELP: &str = "\
 Examples:
   rc bucket replication add local/my-bucket --remote-bucket backup/archive
   rc replicate add local/my-bucket --remote-bucket backup/archive --prefix reports/
-  rc bucket replication add local/my-bucket --remote-bucket backup/archive --replicate delete,existing-objects --sync";
+  rc bucket replication add local/my-bucket --remote-bucket backup/archive --replicate delete,existing-objects --sync
+  rc bucket replication add local/my-bucket --remote-bucket backup/archive --insecure
+  rc bucket replication add local/my-bucket --remote-bucket backup/archive --ca-cert ./private-ca.pem";
+
+const CA_CERT_LOCAL_PATH_SUGGESTION: &str =
+    "--ca-cert is a local CLI path; the certificate content will be uploaded to RustFS";
 
 /// Manage bucket replication
 #[derive(Args, Debug)]
@@ -120,6 +126,17 @@ pub struct AddArgs {
     #[arg(long)]
     pub disable_proxy: bool,
 
+    /// Skip TLS certificate verification for this bucket replication target.
+    /// Intended for development or test environments.
+    #[arg(long)]
+    pub insecure: bool,
+
+    /// Read a local PEM CA certificate file and upload its content for this
+    /// bucket replication target. The path is resolved on the CLI machine,
+    /// not on the RustFS server.
+    #[arg(long, value_name = "FILE")]
+    pub ca_cert: Option<PathBuf>,
+
     /// Force operation even if capability detection fails
     #[arg(long)]
     pub force: bool,
@@ -165,6 +182,17 @@ pub struct UpdateArgs {
     /// Disable replication proxy
     #[arg(long)]
     pub disable_proxy: Option<bool>,
+
+    /// Skip TLS certificate verification for this bucket replication target.
+    /// Intended for development or test environments.
+    #[arg(long)]
+    pub insecure: bool,
+
+    /// Read a local PEM CA certificate file and upload its content for this
+    /// bucket replication target. The path is resolved on the CLI machine,
+    /// not on the RustFS server.
+    #[arg(long, value_name = "FILE")]
+    pub ca_cert: Option<PathBuf>,
 
     /// Enable or disable the rule
     #[arg(long)]
@@ -232,6 +260,12 @@ struct ReplicationExport {
     remote_targets: Vec<BucketTarget>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ReplicationTargetTlsSettings {
+    skip_tls_verify: Option<bool>,
+    ca_cert_pem: Option<String>,
+}
+
 // ==================== execute ====================
 
 /// Execute the replicate command
@@ -251,6 +285,18 @@ pub async fn execute(args: ReplicateArgs, output_config: OutputConfig) -> ExitCo
 
 async fn execute_add(args: AddArgs, output_config: OutputConfig) -> ExitCode {
     let formatter = Formatter::new(output_config);
+    let tls_settings =
+        match build_replication_target_tls_settings(args.insecure, args.ca_cert.as_deref()) {
+            Ok(settings) => settings,
+            Err(error) => {
+                let suggestion = if args.ca_cert.is_some() {
+                    CA_CERT_LOCAL_PATH_SUGGESTION
+                } else {
+                    "Retry the command with either --insecure or --ca-cert, but not both."
+                };
+                return formatter.fail_with_suggestion(ExitCode::UsageError, &error, suggestion);
+            }
+        };
 
     let (source_alias, source_bucket) = match parse_bucket_path(&args.path) {
         Ok(parts) => parts,
@@ -302,7 +348,7 @@ async fn execute_add(args: AddArgs, output_config: OutputConfig) -> ExitCode {
         .unwrap_or_else(|| DEFAULT_REPLICATION_STORAGE_CLASS.to_string());
 
     // Build BucketTarget
-    let target = BucketTarget {
+    let mut target = BucketTarget {
         source_bucket: source_bucket.clone(),
         endpoint: target_endpoint,
         credentials: Some(BucketTargetCredentials {
@@ -322,6 +368,7 @@ async fn execute_add(args: AddArgs, output_config: OutputConfig) -> ExitCode {
         disable_proxy: args.disable_proxy,
         ..Default::default()
     };
+    apply_replication_target_tls_settings(&mut target, &tls_settings);
 
     // Register remote target via admin API → get ARN
     let arn = match admin_client
@@ -413,6 +460,18 @@ async fn execute_add(args: AddArgs, output_config: OutputConfig) -> ExitCode {
 
 async fn execute_update(args: UpdateArgs, output_config: OutputConfig) -> ExitCode {
     let formatter = Formatter::new(output_config);
+    let tls_settings =
+        match build_replication_target_tls_settings(args.insecure, args.ca_cert.as_deref()) {
+            Ok(settings) => settings,
+            Err(error) => {
+                let suggestion = if args.ca_cert.is_some() {
+                    CA_CERT_LOCAL_PATH_SUGGESTION
+                } else {
+                    "Retry the command with either --insecure or --ca-cert, but not both."
+                };
+                return formatter.fail_with_suggestion(ExitCode::UsageError, &error, suggestion);
+            }
+        };
 
     let (source_alias, source_bucket) = match parse_bucket_path(&args.path) {
         Ok(parts) => parts,
@@ -484,7 +543,7 @@ async fn execute_update(args: UpdateArgs, output_config: OutputConfig) -> ExitCo
             }
         };
 
-        apply_target_updates(&mut target, &args);
+        apply_target_updates(&mut target, &args, &tls_settings);
 
         let updated_arn = match admin_client
             .set_remote_target(&source_bucket, target, true)
@@ -1164,9 +1223,15 @@ fn target_level_updates_requested(args: &UpdateArgs) -> bool {
         || args.sync.is_some()
         || args.healthcheck_seconds.is_some()
         || args.disable_proxy.is_some()
+        || args.insecure
+        || args.ca_cert.is_some()
 }
 
-fn apply_target_updates(target: &mut BucketTarget, args: &UpdateArgs) {
+fn apply_target_updates(
+    target: &mut BucketTarget,
+    args: &UpdateArgs,
+    tls_settings: &ReplicationTargetTlsSettings,
+) {
     if let Some(storage_class) = &args.storage_class {
         target.storage_class = storage_class.clone();
     }
@@ -1181,6 +1246,9 @@ fn apply_target_updates(target: &mut BucketTarget, args: &UpdateArgs) {
     }
     if let Some(disable_proxy) = args.disable_proxy {
         target.disable_proxy = disable_proxy;
+    }
+    if args.insecure || args.ca_cert.is_some() {
+        apply_replication_target_tls_settings(target, tls_settings);
     }
 }
 
@@ -1243,6 +1311,55 @@ fn format_replication_flags(rule: &ReplicationRule) -> String {
     }
 }
 
+fn build_replication_target_tls_settings(
+    insecure: bool,
+    ca_cert: Option<&Path>,
+) -> Result<ReplicationTargetTlsSettings, String> {
+    if insecure && ca_cert.is_some() {
+        return Err("--insecure and --ca-cert cannot be used together".to_string());
+    }
+
+    if insecure {
+        return Ok(ReplicationTargetTlsSettings {
+            skip_tls_verify: Some(true),
+            ca_cert_pem: None,
+        });
+    }
+
+    let Some(path) = ca_cert else {
+        return Ok(ReplicationTargetTlsSettings::default());
+    };
+
+    let pem = std::fs::read_to_string(path)
+        .map_err(|_| "--ca-cert must point to a readable local PEM certificate file".to_string())?;
+
+    if pem.trim().is_empty() {
+        return Err("--ca-cert file is empty".to_string());
+    }
+
+    if !looks_like_pem_certificate(&pem) {
+        return Err("--ca-cert must point to a readable local PEM certificate file".to_string());
+    }
+
+    Ok(ReplicationTargetTlsSettings {
+        skip_tls_verify: Some(false),
+        ca_cert_pem: Some(pem),
+    })
+}
+
+fn apply_replication_target_tls_settings(
+    target: &mut BucketTarget,
+    tls_settings: &ReplicationTargetTlsSettings,
+) {
+    target.skip_tls_verify = tls_settings.skip_tls_verify;
+    target.ca_cert_pem = tls_settings.ca_cert_pem.clone();
+}
+
+fn looks_like_pem_certificate(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.contains("-----BEGIN CERTIFICATE-----") && trimmed.contains("-----END CERTIFICATE-----")
+}
+
 fn remote_target_endpoint(endpoint: &str, insecure: bool) -> (String, bool) {
     let trimmed = endpoint.trim().trim_end_matches('/');
 
@@ -1265,6 +1382,7 @@ fn strip_endpoint_path(endpoint: &str) -> String {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use tempfile::NamedTempFile;
 
     #[test]
     fn test_parse_bucket_path_success() {
@@ -1320,6 +1438,67 @@ mod tests {
     fn test_default_replication_role_uses_destination_arn() {
         let arn = "arn:rustfs:replication:us-east-1:123:test";
         assert_eq!(default_replication_role(arn), arn);
+    }
+
+    #[test]
+    fn test_build_replication_target_tls_settings_accepts_insecure() {
+        let settings = build_replication_target_tls_settings(true, None).expect("tls settings");
+        assert_eq!(
+            settings,
+            ReplicationTargetTlsSettings {
+                skip_tls_verify: Some(true),
+                ca_cert_pem: None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_build_replication_target_tls_settings_rejects_mutually_exclusive_flags() {
+        let cert = NamedTempFile::new().expect("temp cert");
+        let error = build_replication_target_tls_settings(true, Some(cert.path())).unwrap_err();
+        assert_eq!(error, "--insecure and --ca-cert cannot be used together");
+    }
+
+    #[test]
+    fn test_build_replication_target_tls_settings_rejects_missing_file() {
+        let missing = std::env::temp_dir().join("replication-missing-ca.pem");
+        let error =
+            build_replication_target_tls_settings(false, Some(missing.as_path())).unwrap_err();
+        assert_eq!(
+            error,
+            "--ca-cert must point to a readable local PEM certificate file"
+        );
+    }
+
+    #[test]
+    fn test_build_replication_target_tls_settings_rejects_empty_file() {
+        let cert = NamedTempFile::new().expect("temp cert");
+        let error = build_replication_target_tls_settings(false, Some(cert.path())).unwrap_err();
+        assert_eq!(error, "--ca-cert file is empty");
+    }
+
+    #[test]
+    fn test_build_replication_target_tls_settings_rejects_non_pem_content() {
+        let cert = NamedTempFile::new().expect("temp cert");
+        std::fs::write(cert.path(), "not a pem").expect("write invalid cert");
+        let error = build_replication_target_tls_settings(false, Some(cert.path())).unwrap_err();
+        assert_eq!(
+            error,
+            "--ca-cert must point to a readable local PEM certificate file"
+        );
+    }
+
+    #[test]
+    fn test_build_replication_target_tls_settings_reads_pem_content() {
+        let cert = NamedTempFile::new().expect("temp cert");
+        let pem = "-----BEGIN CERTIFICATE-----\nabc\n-----END CERTIFICATE-----\n";
+        std::fs::write(cert.path(), pem).expect("write cert");
+
+        let settings =
+            build_replication_target_tls_settings(false, Some(cert.path())).expect("tls settings");
+
+        assert_eq!(settings.skip_tls_verify, Some(false));
+        assert_eq!(settings.ca_cert_pem.as_deref(), Some(pem));
     }
 
     #[test]
@@ -1431,6 +1610,61 @@ mod tests {
     }
 
     #[test]
+    fn test_target_level_updates_requested_includes_tls_flags() {
+        let args = UpdateArgs {
+            path: "local/bucket".to_string(),
+            id: "rule-1".to_string(),
+            replicate: None,
+            priority: None,
+            storage_class: None,
+            bandwidth: None,
+            sync: None,
+            prefix: None,
+            healthcheck_seconds: None,
+            disable_proxy: None,
+            insecure: true,
+            ca_cert: None,
+            status: None,
+            force: false,
+        };
+
+        assert!(target_level_updates_requested(&args));
+    }
+
+    #[test]
+    fn test_apply_target_updates_clears_existing_ca_when_switching_to_insecure() {
+        let mut target = BucketTarget {
+            skip_tls_verify: Some(false),
+            ca_cert_pem: Some(
+                "-----BEGIN CERTIFICATE-----\nold\n-----END CERTIFICATE-----\n".to_string(),
+            ),
+            ..Default::default()
+        };
+        let args = UpdateArgs {
+            path: "local/bucket".to_string(),
+            id: "rule-1".to_string(),
+            replicate: None,
+            priority: None,
+            storage_class: None,
+            bandwidth: None,
+            sync: None,
+            prefix: None,
+            healthcheck_seconds: None,
+            disable_proxy: None,
+            insecure: true,
+            ca_cert: None,
+            status: None,
+            force: false,
+        };
+        let tls_settings = build_replication_target_tls_settings(true, None).expect("tls settings");
+
+        apply_target_updates(&mut target, &args, &tls_settings);
+
+        assert_eq!(target.skip_tls_verify, Some(true));
+        assert_eq!(target.ca_cert_pem, None);
+    }
+
+    #[test]
     fn test_format_replication_flags_includes_delete_replication() {
         let rule = ReplicationRule {
             id: "rule-1".to_string(),
@@ -1502,6 +1736,8 @@ mod tests {
                 id: None,
                 healthcheck_seconds: 60,
                 disable_proxy: false,
+                insecure: false,
+                ca_cert: None,
                 force: false,
             }),
         };

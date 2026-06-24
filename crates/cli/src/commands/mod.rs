@@ -819,6 +819,35 @@ mod tests {
     }
 
     #[test]
+    fn cli_accepts_bucket_replication_add_tls_flags() {
+        let cli = Cli::try_parse_from([
+            "rc",
+            "bucket",
+            "replication",
+            "add",
+            "local/my-bucket",
+            "--remote-bucket",
+            "backup/archive",
+            "--insecure",
+        ])
+        .expect("parse bucket replication add with insecure");
+
+        match cli.command {
+            Commands::Bucket(args) => match args.command {
+                bucket::BucketCommands::Replication(replicate::ReplicateArgs {
+                    command: replicate::ReplicateCommands::Add(arg),
+                }) => {
+                    assert_eq!(arg.path, "local/my-bucket");
+                    assert_eq!(arg.remote_bucket, "backup/archive");
+                    assert!(arg.insecure);
+                }
+                other => panic!("expected bucket replication add command, got {:?}", other),
+            },
+            other => panic!("expected bucket command, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn cli_accepts_bucket_remove_subcommand() {
         let cli = Cli::try_parse_from(["rc", "bucket", "remove", "local/my-bucket"])
             .expect("parse bucket remove");

@@ -216,6 +216,20 @@ rc replicate add local/my-bucket \
   --priority 1 \
   --replicate delete,delete-marker,existing-objects
 
+# Allow self-signed or otherwise untrusted target certificates for this
+# replication target only.
+rc replicate add local/my-bucket \
+  --remote-bucket remote/target-bucket \
+  --replicate delete,delete-marker,existing-objects \
+  --insecure
+
+# Upload a local PEM CA bundle so RustFS can trust a private CA when it
+# connects to the remote replication target.
+rc replicate add local/my-bucket \
+  --remote-bucket remote/target-bucket \
+  --replicate delete,delete-marker,existing-objects \
+  --ca-cert ./private-ca.pem
+
 # List replication rules
 rc replicate list local/my-bucket
 

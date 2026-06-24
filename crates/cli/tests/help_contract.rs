@@ -596,10 +596,13 @@ fn nested_subcommand_help_contract() {
             usage: "Usage: rc bucket replication add [OPTIONS] --remote-bucket <TARGET_ALIAS/BUCKET> <PATH>",
             expected_tokens: &[
                 "--remote-bucket",
+                "--insecure",
+                "--ca-cert",
                 "--priority",
                 "--healthcheck-seconds",
                 "Examples:",
                 "rc bucket replication add local/my-bucket --remote-bucket backup/archive",
+                "The path is resolved on the CLI machine,",
             ],
         },
         HelpCase {

@@ -116,6 +116,16 @@ pub struct BucketTarget {
     #[serde(default)]
     pub secure: bool,
 
+    #[serde(
+        rename = "skipTlsVerify",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub skip_tls_verify: Option<bool>,
+
+    #[serde(rename = "caCertPem", default, skip_serializing_if = "Option::is_none")]
+    pub ca_cert_pem: Option<String>,
+
     #[serde(default)]
     pub path: String,
 
@@ -226,6 +236,7 @@ mod tests {
             }),
             target_bucket: "dest-bucket".to_string(),
             secure: false,
+            skip_tls_verify: Some(true),
             target_type: "replication".to_string(),
             region: "us-east-1".to_string(),
             replication_sync: true,
@@ -236,11 +247,13 @@ mod tests {
         assert!(json.contains("sourcebucket"));
         assert!(json.contains("targetbucket"));
         assert!(json.contains("replicationSync"));
+        assert!(json.contains("skipTlsVerify"));
 
         let decoded: BucketTarget = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.source_bucket, "my-bucket");
         assert_eq!(decoded.target_bucket, "dest-bucket");
         assert!(decoded.replication_sync);
+        assert_eq!(decoded.skip_tls_verify, Some(true));
     }
 
     #[test]
@@ -251,5 +264,25 @@ mod tests {
         assert_eq!(target.target_bucket, "dst");
         assert!(target.online);
         assert_eq!(target.target_type, "replication");
+    }
+
+    #[test]
+    fn test_bucket_target_serialization_includes_ca_cert_pem_content() {
+        let pem = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
+        let target = BucketTarget {
+            source_bucket: "my-bucket".to_string(),
+            endpoint: "remote:9000".to_string(),
+            target_bucket: "dest-bucket".to_string(),
+            secure: true,
+            skip_tls_verify: Some(false),
+            ca_cert_pem: Some(pem.to_string()),
+            target_type: "replication".to_string(),
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&target).unwrap();
+        assert!(json.contains("\"skipTlsVerify\":false"));
+        assert!(json.contains("caCertPem"));
+        assert!(!json.contains("ca.pem"));
     }
 }
