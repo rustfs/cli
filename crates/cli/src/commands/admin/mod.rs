@@ -209,6 +209,56 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_admin_heal_status_task_options() {
+        let cli = TestCli::parse_from([
+            "rc",
+            "heal",
+            "status",
+            "local",
+            "--bucket",
+            "mybucket",
+            "--prefix",
+            "logs/",
+            "--client-token",
+            "heal-token-123",
+        ]);
+
+        match cli.command {
+            AdminCommands::Heal(heal::HealCommands::Status(args)) => {
+                assert_eq!(args.alias, "local");
+                assert_eq!(args.bucket.as_deref(), Some("mybucket"));
+                assert_eq!(args.prefix.as_deref(), Some("logs/"));
+                assert_eq!(args.client_token.as_deref(), Some("heal-token-123"));
+            }
+            _ => panic!("Unexpected command parsing result"),
+        }
+    }
+
+    #[test]
+    fn test_parse_admin_heal_stop_task_options() {
+        let cli = TestCli::parse_from([
+            "rc",
+            "heal",
+            "stop",
+            "local",
+            "--bucket",
+            "mybucket",
+            "--client-token",
+            "heal-token-123",
+        ]);
+
+        match cli.command {
+            AdminCommands::Heal(heal::HealCommands::Stop(args)) => {
+                assert_eq!(args.alias, "local");
+                assert_eq!(args.bucket.as_deref(), Some("mybucket"));
+                assert_eq!(args.prefix.as_deref(), None);
+                assert_eq!(args.client_token.as_deref(), Some("heal-token-123"));
+            }
+            _ => panic!("Unexpected command parsing result"),
+        }
+    }
+
+    #[test]
     fn test_parse_admin_pool_status_by_id() {
         let cli = TestCli::parse_from(["rc", "pool", "status", "local", "1", "--by-id"]);
 

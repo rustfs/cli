@@ -12,9 +12,9 @@ use aws_sigv4::sign::v4;
 use rc_core::admin::{
     AccessKeyInfo, AdminApi, BucketQuota, ClusterInfo, CreateServiceAccountRequest,
     DecommissionPoolStatus, DecommissionStatus, Group, GroupStatus, HealScanMode, HealStartRequest,
-    HealStatus, Policy, PolicyEntity, PolicyInfo, PoolStatus, PoolTarget, RebalanceStartResult,
-    RebalanceStatus, ServiceAccount, ServiceAccountCreateResponse, UpdateGroupMembersRequest, User,
-    UserStatus,
+    HealStatus, HealTaskRequest, Policy, PolicyEntity, PolicyInfo, PoolStatus, PoolTarget,
+    RebalanceStartResult, RebalanceStatus, ServiceAccount, ServiceAccountCreateResponse,
+    UpdateGroupMembersRequest, User, UserStatus,
 };
 use rc_core::{Alias, Error, Result};
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
@@ -430,7 +430,7 @@ fn background_heal_scan_mode(scan_mode: Option<u8>) -> Option<HealScanMode> {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct RustfsHealOptions {
     recursive: bool,
     #[serde(rename = "dryRun")]
@@ -496,6 +496,28 @@ fn rustfs_heal_path(request: &HealStartRequest) -> Result<String> {
     }
 }
 
+fn rustfs_heal_task_path(request: &HealTaskRequest) -> Result<String> {
+    if request.bucket.is_empty() {
+        return Err(Error::InvalidPath(
+            "heal task status requires a bucket target".to_string(),
+        ));
+    }
+
+    let prefix = request
+        .prefix
+        .as_deref()
+        .filter(|prefix| !prefix.is_empty());
+
+    match prefix {
+        Some(prefix) => Ok(format!(
+            "/heal/{}/{}",
+            urlencoding::encode(&request.bucket),
+            urlencoding::encode(prefix)
+        )),
+        None => Ok(format!("/heal/{}", urlencoding::encode(&request.bucket))),
+    }
+}
+
 fn rustfs_heal_body(request: &HealStartRequest) -> Result<Vec<u8>> {
     serde_json::to_vec(&RustfsHealOptions::from(request)).map_err(Error::Json)
 }
@@ -518,6 +540,63 @@ fn pool_target_query(target: &PoolTarget) -> Vec<(&str, &str)> {
         query.push(("by-id", "true"));
     }
     query
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HealStartSuccessResponse {
+    #[serde(default)]
+    client_token: String,
+    #[serde(default, rename = "clientAddress")]
+    _client_address: String,
+    #[serde(default)]
+    start_time: Option<String>,
+}
+
+impl HealStartSuccessResponse {
+    fn into_status(self, request: &HealStartRequest) -> HealStatus {
+        HealStatus {
+            heal_id: self.client_token,
+            bucket: request.bucket.clone().unwrap_or_default(),
+            object: request.prefix.clone().unwrap_or_default(),
+            started: self.start_time,
+            ..Default::default()
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HealTaskStatusResponse {
+    #[serde(default)]
+    summary: String,
+    #[serde(default, rename = "detail")]
+    detail: String,
+    #[serde(default)]
+    start_time: Option<String>,
+    #[serde(default)]
+    settings: Option<RustfsHealOptions>,
+}
+
+impl HealTaskStatusResponse {
+    fn into_status(self, request: &HealTaskRequest) -> HealStatus {
+        let healing = matches!(self.summary.as_str(), "running");
+        let scan_mode = self.settings.map(|settings| {
+            background_heal_scan_mode(Some(settings.scan_mode)).unwrap_or(HealScanMode::Normal)
+        });
+
+        HealStatus {
+            heal_id: request.client_token.clone(),
+            healing,
+            summary: (!self.summary.is_empty()).then_some(self.summary),
+            detail: (!self.detail.is_empty()).then_some(self.detail),
+            bucket: request.bucket.clone(),
+            object: request.prefix.clone().unwrap_or_default(),
+            scan_mode,
+            started: self.start_time,
+            ..Default::default()
+        }
+    }
 }
 
 /// Request body for setting bucket quota
@@ -546,9 +625,18 @@ impl AdminApi for AdminClient {
     async fn heal_start(&self, request: HealStartRequest) -> Result<HealStatus> {
         let path = rustfs_heal_path(&request)?;
         let body = rustfs_heal_start_body(&request)?;
-        self.request_no_response(Method::POST, &path, None, Some(&body))
+        let response: HealStartSuccessResponse =
+            self.request(Method::POST, &path, None, Some(&body)).await?;
+        Ok(response.into_status(&request))
+    }
+
+    async fn heal_task_status(&self, request: HealTaskRequest) -> Result<HealStatus> {
+        let path = rustfs_heal_task_path(&request)?;
+        let query = [("clientToken", request.client_token.as_str())];
+        let response: HealTaskStatusResponse = self
+            .request(Method::POST, &path, Some(&query), None)
             .await?;
-        Ok(HealStatus::default())
+        Ok(response.into_status(&request))
     }
 
     async fn heal_stop(&self) -> Result<()> {
@@ -560,6 +648,18 @@ impl AdminApi for AdminClient {
             Some(&body),
         )
         .await
+    }
+
+    async fn heal_task_stop(&self, request: HealTaskRequest) -> Result<HealStatus> {
+        let path = rustfs_heal_task_path(&request)?;
+        let query = [
+            ("clientToken", request.client_token.as_str()),
+            ("forceStop", "true"),
+        ];
+        let response: HealTaskStatusResponse = self
+            .request(Method::POST, &path, Some(&query), None)
+            .await?;
+        Ok(response.into_status(&request))
     }
 
     async fn list_pools(&self) -> Result<Vec<PoolStatus>> {
@@ -1413,7 +1513,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_anonymous_admin_no_response_requests_skip_authorization_header() {
-        let (endpoint, receiver, handle) = start_admin_test_server("200 OK", "");
+        let (endpoint, receiver, handle) = start_admin_test_server(
+            "200 OK",
+            r#"{"clientToken":"token-anon","clientAddress":"","startTime":"2026-06-25T10:00:00Z"}"#,
+        );
         let client = anonymous_admin_client_for_endpoint(&endpoint);
         let request = HealStartRequest {
             bucket: Some("raw photos".to_string()),
@@ -1449,7 +1552,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_heal_start_posts_to_bucket_prefix_route_with_options_body() {
-        let (endpoint, receiver, handle) = start_admin_test_server("200 OK", "");
+        let (endpoint, receiver, handle) = start_admin_test_server(
+            "200 OK",
+            r#"{"clientToken":"heal-token-123","clientAddress":"127.0.0.1:9000","startTime":"2026-06-25T10:00:00Z"}"#,
+        );
         let client = admin_client_for_endpoint(&endpoint);
         let request = HealStartRequest {
             bucket: Some("raw photos".to_string()),
@@ -1466,8 +1572,10 @@ mod tests {
             .expect("heal start request");
 
         assert!(!status.healing);
-        assert!(status.heal_id.is_empty());
-        assert!(status.started.is_none());
+        assert_eq!(status.heal_id, "heal-token-123");
+        assert_eq!(status.bucket, "raw photos");
+        assert_eq!(status.object, "2026/april");
+        assert_eq!(status.started.as_deref(), Some("2026-06-25T10:00:00Z"));
 
         let request = receiver.recv().expect("captured request");
         assert_eq!(request.method, "POST");
@@ -1481,7 +1589,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_heal_start_without_bucket_posts_recursive_root_route() {
-        let (endpoint, receiver, handle) = start_admin_test_server("200 OK", "");
+        let (endpoint, receiver, handle) = start_admin_test_server(
+            "200 OK",
+            r#"{"clientToken":"root-token","clientAddress":"127.0.0.1:9000","startTime":"2026-06-25T10:00:00Z"}"#,
+        );
         let client = admin_client_for_endpoint(&endpoint);
         let request = HealStartRequest {
             scan_mode: HealScanMode::Deep,
@@ -1497,13 +1608,113 @@ mod tests {
             .expect("recursive root heal start request");
 
         assert!(!status.healing);
-        assert!(status.heal_id.is_empty());
-        assert!(status.started.is_none());
+        assert_eq!(status.heal_id, "root-token");
+        assert!(status.bucket.is_empty());
+        assert!(status.object.is_empty());
+        assert_eq!(status.started.as_deref(), Some("2026-06-25T10:00:00Z"));
 
         let request = receiver.recv().expect("captured request");
         assert_eq!(request.method, "POST");
         assert_eq!(request.target, "/rustfs/admin/v3/heal/");
         assert_heal_options_body(&request.body, true, 2, true, true, true);
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn test_heal_task_status_queries_bucket_route_with_client_token() {
+        let (endpoint, receiver, handle) = start_admin_test_server(
+            "200 OK",
+            r#"{"summary":"running","detail":"","startTime":"2026-06-25T10:00:00Z","settings":{"recursive":true,"dryRun":false,"remove":false,"recreate":true,"scanMode":2,"updateParity":false,"nolock":false},"items":[]}"#,
+        );
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let status = client
+            .heal_task_status(HealTaskRequest {
+                bucket: "raw photos".to_string(),
+                prefix: None,
+                client_token: "heal-token-123".to_string(),
+            })
+            .await
+            .expect("heal task status request");
+
+        assert_eq!(status.heal_id, "heal-token-123");
+        assert!(status.healing);
+        assert_eq!(status.bucket, "raw photos");
+        assert!(status.object.is_empty());
+        assert_eq!(status.scan_mode, Some(HealScanMode::Deep));
+        assert_eq!(status.started.as_deref(), Some("2026-06-25T10:00:00Z"));
+
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(request.method, "POST");
+        assert_eq!(
+            request.target,
+            "/rustfs/admin/v3/heal/raw%20photos?clientToken=heal-token-123"
+        );
+        assert!(request.body.is_empty());
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn test_heal_task_status_queries_prefix_route_with_client_token() {
+        let (endpoint, receiver, handle) = start_admin_test_server(
+            "200 OK",
+            r#"{"summary":"finished","detail":"","startTime":"2026-06-25T10:00:00Z","settings":{"recursive":false,"dryRun":false,"remove":false,"recreate":false,"scanMode":1,"updateParity":false,"nolock":false},"items":[]}"#,
+        );
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let status = client
+            .heal_task_status(HealTaskRequest {
+                bucket: "raw photos".to_string(),
+                prefix: Some("2026/april".to_string()),
+                client_token: "heal-token-123".to_string(),
+            })
+            .await
+            .expect("heal task status request");
+
+        assert_eq!(status.heal_id, "heal-token-123");
+        assert!(!status.healing);
+        assert_eq!(status.bucket, "raw photos");
+        assert_eq!(status.object, "2026/april");
+        assert_eq!(status.scan_mode, Some(HealScanMode::Normal));
+
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(request.method, "POST");
+        assert_eq!(
+            request.target,
+            "/rustfs/admin/v3/heal/raw%20photos/2026%2Fapril?clientToken=heal-token-123"
+        );
+        assert!(request.body.is_empty());
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn test_heal_task_stop_posts_force_stop_with_client_token() {
+        let (endpoint, receiver, handle) = start_admin_test_server(
+            "200 OK",
+            r#"{"summary":"stopped","detail":"heal task cancelled","startTime":"2026-06-25T10:00:00Z","settings":{"recursive":true,"dryRun":false,"remove":false,"recreate":true,"scanMode":2,"updateParity":false,"nolock":false},"items":[]}"#,
+        );
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let status = client
+            .heal_task_stop(HealTaskRequest {
+                bucket: "raw photos".to_string(),
+                prefix: None,
+                client_token: "heal-token-123".to_string(),
+            })
+            .await
+            .expect("heal task stop request");
+
+        assert_eq!(status.heal_id, "heal-token-123");
+        assert!(!status.healing);
+        assert_eq!(status.bucket, "raw photos");
+
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(request.method, "POST");
+        assert_eq!(
+            request.target,
+            "/rustfs/admin/v3/heal/raw%20photos?clientToken=heal-token-123&forceStop=true"
+        );
+        assert!(request.body.is_empty());
         handle.join().expect("server thread should finish");
     }
 

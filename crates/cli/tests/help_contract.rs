@@ -476,7 +476,7 @@ fn nested_subcommand_help_contract() {
         HelpCase {
             args: &["admin", "heal", "status"],
             usage: "Usage: rc admin heal status [OPTIONS] <ALIAS>",
-            expected_tokens: &[],
+            expected_tokens: &["--bucket", "--prefix", "--client-token"],
         },
         HelpCase {
             args: &["admin", "heal", "start"],
@@ -493,7 +493,7 @@ fn nested_subcommand_help_contract() {
         HelpCase {
             args: &["admin", "heal", "stop"],
             usage: "Usage: rc admin heal stop [OPTIONS] <ALIAS>",
-            expected_tokens: &[],
+            expected_tokens: &["--bucket", "--prefix", "--client-token"],
         },
         HelpCase {
             args: &["admin", "pool", "list"],

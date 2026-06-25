@@ -259,7 +259,9 @@ rc admin info disk local --offline
 # Heal operations
 rc admin heal status local
 rc admin heal start local --bucket mybucket --scan-mode deep
+rc admin heal status local --bucket mybucket --client-token <TOKEN_FROM_START>
 rc admin heal start local --dry-run
+rc admin heal stop local --bucket mybucket --client-token <TOKEN_FROM_START>
 rc admin heal stop local
 
 # Pool expansion and decommission workflows

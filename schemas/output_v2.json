@@ -262,6 +262,14 @@
           "type": "boolean",
           "description": "Whether a heal operation is active"
         },
+        "summary": {
+          "type": "string",
+          "description": "Token-scoped manual heal task summary"
+        },
+        "detail": {
+          "type": "string",
+          "description": "Token-scoped manual heal task detail"
+        },
         "bucket": {
           "type": "string",
           "description": "Bucket being healed"
@@ -881,6 +889,10 @@
         },
         "message": {
           "type": "string"
+        },
+        "clientToken": {
+          "type": "string",
+          "description": "Client token returned by a manual heal start request"
         },
         "status": {
           "$ref": "#/definitions/healStatus"

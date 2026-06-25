@@ -485,6 +485,21 @@ pub struct HealStartRequest {
     pub dry_run: bool,
 }
 
+/// Request to inspect or stop a token-scoped heal task
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HealTaskRequest {
+    /// Bucket being healed
+    pub bucket: String,
+
+    /// Object prefix being healed
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+
+    /// Client token returned by the heal start request
+    pub client_token: String,
+}
+
 /// Information about a single heal drive
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct HealDriveInfo {
@@ -569,6 +584,14 @@ pub struct HealStatus {
     /// Whether healing is in progress
     #[serde(default)]
     pub healing: bool,
+
+    /// Task summary for token-scoped manual heal status
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+
+    /// Task detail for token-scoped manual heal status
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 
     /// Current bucket being healed
     #[serde(default)]

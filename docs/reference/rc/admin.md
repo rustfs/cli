@@ -49,6 +49,24 @@ Start a deep heal for a prefix:
 rc admin heal start local --bucket logs --prefix 2026/ --scan-mode deep
 ```
 
+Check global background heal status:
+
+```bash
+rc admin heal status local
+```
+
+Check a manual bucket heal task using the client token returned by `start`:
+
+```bash
+rc admin heal status local --bucket logs --prefix 2026/ --client-token <TOKEN_FROM_START>
+```
+
+Stop a manual bucket heal task:
+
+```bash
+rc admin heal stop local --bucket logs --client-token <TOKEN_FROM_START>
+```
+
 Create a user and attach a policy:
 
 ```bash
@@ -65,6 +83,8 @@ rc admin service-account create local SA_ACCESS_KEY SA_SECRET_KEY --policy ./pol
 ## Behavior
 
 Admin operations use the configured alias to create an admin client. The credentials behind the alias must have permissions for the requested administrative API. The command accepts aliases with or without a trailing slash.
+
+`rc admin heal status <ALIAS>` reports aggregate background heal status. Manual bucket or prefix heals started with `rc admin heal start` are token-scoped tasks; the start output includes a client token, and subsequent task status or stop requests must pass that token with `--bucket`, optional `--prefix`, and `--client-token`.
 
 Global options shown in command syntax use the same meaning everywhere:
 

@@ -8,7 +8,7 @@ use serde::Serialize;
 use super::get_admin_client;
 use crate::exit_code::ExitCode;
 use crate::output::Formatter;
-use rc_core::admin::{AdminApi, HealScanMode, HealStartRequest, HealStatus};
+use rc_core::admin::{AdminApi, HealScanMode, HealStartRequest, HealStatus, HealTaskRequest};
 
 const HEAL_STOP_SUCCESS_MESSAGE: &str = "Heal operation stopped successfully";
 const HEAL_STOP_STILL_RUNNING_MESSAGE: &str =
@@ -31,6 +31,18 @@ pub enum HealCommands {
 pub struct StatusArgs {
     /// Alias name of the server
     pub alias: String,
+
+    /// Bucket for token-scoped manual heal task status
+    #[arg(short, long)]
+    pub bucket: Option<String>,
+
+    /// Object prefix for token-scoped manual heal task status
+    #[arg(short, long)]
+    pub prefix: Option<String>,
+
+    /// Client token returned by heal start
+    #[arg(long)]
+    pub client_token: Option<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -67,6 +79,18 @@ pub struct StartArgs {
 pub struct StopArgs {
     /// Alias name of the server
     pub alias: String,
+
+    /// Bucket for token-scoped manual heal task stop
+    #[arg(short, long)]
+    pub bucket: Option<String>,
+
+    /// Object prefix for token-scoped manual heal task stop
+    #[arg(short, long)]
+    pub prefix: Option<String>,
+
+    /// Client token returned by heal start
+    #[arg(long)]
+    pub client_token: Option<String>,
 }
 
 /// JSON output for heal status
@@ -75,6 +99,10 @@ pub struct StopArgs {
 struct HealStatusOutput {
     heal_id: String,
     healing: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
     bucket: String,
     object: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -98,6 +126,8 @@ impl From<&HealStatus> for HealStatusOutput {
         Self {
             heal_id: status.heal_id.clone(),
             healing: status.healing,
+            summary: status.summary.clone(),
+            detail: status.detail.clone(),
             bucket: status.bucket.clone(),
             object: status.object.clone(),
             scan_mode: status.scan_mode,
@@ -118,6 +148,8 @@ impl From<&HealStatus> for HealStatusOutput {
 fn has_heal_status_details(status: &HealStatus) -> bool {
     status.healing
         || !status.heal_id.is_empty()
+        || status.summary.is_some()
+        || status.detail.is_some()
         || !status.bucket.is_empty()
         || !status.object.is_empty()
         || status.scan_mode.is_some()
@@ -138,6 +170,8 @@ fn has_heal_status_details(status: &HealStatus) -> bool {
 struct HealOperationOutput {
     success: bool,
     message: String,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "clientToken")]
+    client_token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     status: Option<HealStatusOutput>,
 }
@@ -159,6 +193,7 @@ fn heal_stop_output(status: &HealStatus) -> (ExitCode, HealOperationOutput) {
         HealOperationOutput {
             success,
             message: message.to_string(),
+            client_token: None,
             status: has_heal_status_details(status).then(|| HealStatusOutput::from(status)),
         },
     )
@@ -179,7 +214,23 @@ async fn execute_status(args: StatusArgs, formatter: &Formatter) -> ExitCode {
         Err(code) => return code,
     };
 
-    match client.heal_status().await {
+    let task_request = match heal_task_request(
+        args.bucket.clone(),
+        args.prefix.clone(),
+        args.client_token.clone(),
+        formatter,
+    ) {
+        Ok(request) => request,
+        Err(code) => return code,
+    };
+
+    let result = if let Some(request) = task_request {
+        client.heal_task_status(request).await
+    } else {
+        client.heal_status().await
+    };
+
+    match result {
         Ok(status) => {
             if formatter.is_json() {
                 formatter.json(&HealStatusOutput::from(&status));
@@ -196,10 +247,13 @@ async fn execute_status(args: StatusArgs, formatter: &Formatter) -> ExitCode {
 }
 
 fn print_heal_status(status: &HealStatus, formatter: &Formatter) {
-    let healing_status = if status.healing {
-        formatter.style_size("In Progress")
-    } else {
-        formatter.style_date("Idle")
+    let healing_status = match status.summary.as_deref() {
+        Some("running") => formatter.style_size("In Progress"),
+        Some("finished") => formatter.style_size("Finished"),
+        Some("stopped") => formatter.style_date("Stopped"),
+        Some("notFound") => formatter.style_date("Not Found"),
+        _ if status.healing => formatter.style_size("In Progress"),
+        _ => formatter.style_date("Idle"),
     };
 
     formatter.println(&format!(
@@ -213,7 +267,14 @@ fn print_heal_status(status: &HealStatus, formatter: &Formatter) {
         formatter.println(&format!("  Heal ID:       {}", status.heal_id));
     }
 
-    if status.healing {
+    if let Some(ref summary) = status.summary {
+        formatter.println(&format!("  Summary:       {}", summary));
+    }
+    if let Some(ref detail) = status.detail {
+        formatter.println(&format!("  Detail:        {}", detail));
+    }
+
+    if status.healing || status.summary.is_some() {
         if !status.bucket.is_empty() {
             formatter.println(&format!(
                 "  Current:       {}/{}",
@@ -289,6 +350,7 @@ async fn execute_start(args: StartArgs, formatter: &Formatter) -> ExitCode {
                 let output = HealOperationOutput {
                     success: true,
                     message: "Heal operation started successfully".to_string(),
+                    client_token: (!status.heal_id.is_empty()).then(|| status.heal_id.clone()),
                     status: status_output,
                 };
                 formatter.json(&output);
@@ -298,9 +360,11 @@ async fn execute_start(args: StartArgs, formatter: &Formatter) -> ExitCode {
                 } else {
                     formatter.success("Heal operation started successfully.");
                 }
-                if has_heal_status_details(&status) {
-                    formatter.println("");
-                    print_heal_status(&status, formatter);
+                if !status.heal_id.is_empty() {
+                    formatter.println(&format!("  Client Token:  {}", status.heal_id));
+                }
+                if let Some(ref started) = status.started {
+                    formatter.println(&format!("  Started:       {}", started));
                 }
             }
             ExitCode::Success
@@ -317,6 +381,40 @@ async fn execute_stop(args: StopArgs, formatter: &Formatter) -> ExitCode {
         Ok(c) => c,
         Err(code) => return code,
     };
+
+    let task_request = match heal_task_request(
+        args.bucket.clone(),
+        args.prefix.clone(),
+        args.client_token.clone(),
+        formatter,
+    ) {
+        Ok(request) => request,
+        Err(code) => return code,
+    };
+
+    if let Some(request) = task_request {
+        return match client.heal_task_stop(request).await {
+            Ok(status) => {
+                let (exit_code, mut output) = heal_stop_output(&status);
+                output.client_token = (!status.heal_id.is_empty()).then(|| status.heal_id.clone());
+
+                if formatter.is_json() {
+                    formatter.json(&output);
+                } else if output.success {
+                    formatter.success(&format!("{}.", output.message));
+                } else {
+                    formatter.error(&format!("{}.", output.message));
+                    formatter.println("");
+                    print_heal_status(&status, formatter);
+                }
+                exit_code
+            }
+            Err(e) => {
+                formatter.error(&format!("Failed to stop heal operation: {e}"));
+                ExitCode::GeneralError
+            }
+        };
+    }
 
     match client.heal_stop().await {
         Ok(()) => {
@@ -345,6 +443,42 @@ async fn execute_stop(args: StopArgs, formatter: &Formatter) -> ExitCode {
         Err(e) => {
             formatter.error(&format!("Failed to stop heal operation: {e}"));
             ExitCode::GeneralError
+        }
+    }
+}
+
+fn heal_task_request(
+    bucket: Option<String>,
+    prefix: Option<String>,
+    client_token: Option<String>,
+    formatter: &Formatter,
+) -> Result<Option<HealTaskRequest>, ExitCode> {
+    if prefix.as_deref().is_some_and(|prefix| !prefix.is_empty())
+        && bucket.as_deref().is_none_or(|bucket| bucket.is_empty())
+    {
+        formatter.error("Heal task prefix requires --bucket.");
+        return Err(ExitCode::UsageError);
+    }
+
+    let has_target = bucket.as_deref().is_some_and(|bucket| !bucket.is_empty());
+    let has_token = client_token
+        .as_deref()
+        .is_some_and(|client_token| !client_token.is_empty());
+
+    match (has_target, has_token) {
+        (false, false) => Ok(None),
+        (true, true) => Ok(Some(HealTaskRequest {
+            bucket: bucket.expect("bucket is present"),
+            prefix,
+            client_token: client_token.expect("client token is present"),
+        })),
+        (true, false) => {
+            formatter.error("Heal task request requires --client-token when --bucket is set.");
+            Err(ExitCode::UsageError)
+        }
+        (false, true) => {
+            formatter.error("Heal task request requires --bucket when --client-token is set.");
+            Err(ExitCode::UsageError)
         }
     }
 }
@@ -399,15 +533,18 @@ mod tests {
             bytes_healed: 1024 * 1024 * 5,
             started: Some("2024-01-01T10:00:00Z".to_string()),
             last_update: Some("2024-01-01T10:30:00Z".to_string()),
+            ..Default::default()
         };
 
         let output = HealOperationOutput {
             success: true,
             message: "Heal operation started successfully".to_string(),
+            client_token: Some("heal-123".to_string()),
             status: Some(HealStatusOutput::from(&status)),
         };
 
         let value = serde_json::to_value(&output).expect("serialize heal operation output");
+        assert_eq!(value["clientToken"], "heal-123");
         let status_value = value
             .get("status")
             .expect("status field exists")
@@ -467,6 +604,7 @@ mod tests {
             bytes_healed: 1024 * 1024 * 5,
             started: Some("2024-01-01T10:00:00Z".to_string()),
             last_update: Some("2024-01-01T10:30:00Z".to_string()),
+            ..Default::default()
         };
 
         let output = HealStatusOutput::from(&status);
