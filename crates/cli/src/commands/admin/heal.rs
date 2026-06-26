@@ -313,7 +313,7 @@ fn print_heal_status(status: &HealStatus, formatter: &Formatter) {
             formatter.println(&format!("  Last Update:   {}", last_update));
         }
     } else {
-        formatter.println("  No heal operation currently running.");
+        formatter.println("  No active heal operation.");
     }
 }
 
@@ -584,6 +584,15 @@ mod tests {
         assert!(output.success);
         assert_eq!(output.message, HEAL_STOP_SUCCESS_MESSAGE);
         assert!(output.status.is_none());
+    }
+
+    #[test]
+    fn test_heal_task_request_rejects_token_without_bucket() {
+        let formatter = Formatter::default();
+
+        let result = heal_task_request(None, None, Some("root-token".to_string()), &formatter);
+
+        assert!(matches!(result, Err(ExitCode::UsageError)));
     }
 
     #[test]

@@ -401,24 +401,81 @@ struct BackgroundHealStatusResponse {
     heal_queue_length: u64,
     #[serde(default)]
     heal_active_tasks: u64,
+    #[serde(default)]
+    heal_operations: Option<BackgroundHealOperations>,
+    #[serde(default)]
+    progress: Option<HealProgressResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BackgroundHealOperations {
+    #[serde(default)]
+    queue_length: u64,
+    #[serde(default)]
+    active_tasks: u64,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct HealProgressResponse {
+    #[serde(default)]
+    objects_scanned: u64,
+    #[serde(default)]
+    objects_healed: u64,
+    #[serde(default)]
+    objects_failed: u64,
+    #[serde(default)]
+    bytes_scanned: u64,
+    #[serde(default)]
+    bytes_healed: u64,
+    #[serde(default)]
+    bytes_processed: u64,
+}
+
+impl HealProgressResponse {
+    fn apply_to_status(&self, status: &mut HealStatus) {
+        status.items_scanned = self.objects_scanned;
+        status.items_healed = self.objects_healed;
+        status.items_failed = self.objects_failed;
+        status.bytes_scanned = self.bytes_scanned.max(self.bytes_processed);
+        status.bytes_healed = self.bytes_healed;
+    }
 }
 
 impl From<BackgroundHealStatusResponse> for HealStatus {
     fn from(response: BackgroundHealStatusResponse) -> Self {
         let scan_mode = background_heal_scan_mode(response.current_scan_mode);
         let legacy_healing = scan_mode.is_none() && response.bitrot_start_time.is_some();
-        Self {
+        let queue_length = response
+            .heal_operations
+            .as_ref()
+            .map_or(response.heal_queue_length, |operations| {
+                response.heal_queue_length.max(operations.queue_length)
+            });
+        let active_tasks = response
+            .heal_operations
+            .as_ref()
+            .map_or(response.heal_active_tasks, |operations| {
+                response.heal_active_tasks.max(operations.active_tasks)
+            });
+
+        let mut status = Self {
             healing: matches!(scan_mode, Some(HealScanMode::Deep))
-                || response.heal_queue_length > 0
-                || response.heal_active_tasks > 0
+                || queue_length > 0
+                || active_tasks > 0
                 || legacy_healing,
             started: response.bitrot_start_time,
             scan_mode,
             scan_cycle: response.bitrot_start_cycle,
-            heal_queue_length: response.heal_queue_length,
-            heal_active_tasks: response.heal_active_tasks,
+            heal_queue_length: queue_length,
+            heal_active_tasks: active_tasks,
             ..Default::default()
+        };
+        if let Some(progress) = response.progress {
+            progress.apply_to_status(&mut status);
         }
+        status
     }
 }
 
@@ -576,6 +633,8 @@ struct HealTaskStatusResponse {
     start_time: Option<String>,
     #[serde(default)]
     settings: Option<RustfsHealOptions>,
+    #[serde(default)]
+    progress: Option<HealProgressResponse>,
 }
 
 impl HealTaskStatusResponse {
@@ -585,7 +644,7 @@ impl HealTaskStatusResponse {
             background_heal_scan_mode(Some(settings.scan_mode)).unwrap_or(HealScanMode::Normal)
         });
 
-        HealStatus {
+        let mut status = HealStatus {
             heal_id: request.client_token.clone(),
             healing,
             summary: (!self.summary.is_empty()).then_some(self.summary),
@@ -595,7 +654,11 @@ impl HealTaskStatusResponse {
             scan_mode,
             started: self.start_time,
             ..Default::default()
+        };
+        if let Some(progress) = self.progress {
+            progress.apply_to_status(&mut status);
         }
+        status
     }
 }
 
@@ -1371,6 +1434,8 @@ mod tests {
             current_scan_mode: Some(2),
             heal_queue_length: 3,
             heal_active_tasks: 1,
+            heal_operations: None,
+            progress: None,
         });
 
         assert!(status.healing);
@@ -1386,6 +1451,8 @@ mod tests {
             current_scan_mode: Some(1),
             heal_queue_length: 0,
             heal_active_tasks: 0,
+            heal_operations: None,
+            progress: None,
         });
         assert!(!idle.healing);
         assert_eq!(idle.scan_mode, Some(HealScanMode::Normal));
@@ -1397,6 +1464,8 @@ mod tests {
             current_scan_mode: Some(1),
             heal_queue_length: 0,
             heal_active_tasks: 0,
+            heal_operations: None,
+            progress: None,
         });
         assert!(!completed.healing);
         assert_eq!(completed.scan_mode, Some(HealScanMode::Normal));
@@ -1408,6 +1477,8 @@ mod tests {
             current_scan_mode: None,
             heal_queue_length: 0,
             heal_active_tasks: 0,
+            heal_operations: None,
+            progress: None,
         });
         assert!(legacy.healing);
 
@@ -1417,8 +1488,40 @@ mod tests {
             current_scan_mode: None,
             heal_queue_length: 0,
             heal_active_tasks: 1,
+            heal_operations: None,
+            progress: None,
         });
         assert!(active.healing);
+    }
+
+    #[test]
+    fn test_background_heal_status_response_maps_nested_heal_operations() {
+        let response: BackgroundHealStatusResponse = serde_json::from_str(
+            r#"{"healOperations":{"queueLength":4,"activeTasks":1,"queuedBySource":{"admin":4}}}"#,
+        )
+        .expect("background heal status response should deserialize");
+
+        let status = HealStatus::from(response);
+
+        assert!(status.healing);
+        assert_eq!(status.heal_queue_length, 4);
+        assert_eq!(status.heal_active_tasks, 1);
+    }
+
+    #[test]
+    fn test_background_heal_status_response_maps_progress() {
+        let response: BackgroundHealStatusResponse = serde_json::from_str(
+            r#"{"progress":{"objectsScanned":7,"objectsHealed":3,"objectsFailed":1,"bytesProcessed":4096,"bytesHealed":1024}}"#,
+        )
+        .expect("background heal status response should deserialize");
+
+        let status = HealStatus::from(response);
+
+        assert_eq!(status.items_scanned, 7);
+        assert_eq!(status.items_healed, 3);
+        assert_eq!(status.items_failed, 1);
+        assert_eq!(status.bytes_scanned, 4096);
+        assert_eq!(status.bytes_healed, 1024);
     }
 
     #[test]
@@ -1624,7 +1727,7 @@ mod tests {
     async fn test_heal_task_status_queries_bucket_route_with_client_token() {
         let (endpoint, receiver, handle) = start_admin_test_server(
             "200 OK",
-            r#"{"summary":"running","detail":"","startTime":"2026-06-25T10:00:00Z","settings":{"recursive":true,"dryRun":false,"remove":false,"recreate":true,"scanMode":2,"updateParity":false,"nolock":false},"items":[]}"#,
+            r#"{"summary":"running","detail":"","startTime":"2026-06-25T10:00:00Z","settings":{"recursive":true,"dryRun":false,"remove":false,"recreate":true,"scanMode":2,"updateParity":false,"nolock":false},"items":[],"progress":{"objectsScanned":11,"objectsHealed":5,"objectsFailed":2,"bytesScanned":8192,"bytesHealed":2048}}"#,
         );
         let client = admin_client_for_endpoint(&endpoint);
 
@@ -1643,6 +1746,11 @@ mod tests {
         assert!(status.object.is_empty());
         assert_eq!(status.scan_mode, Some(HealScanMode::Deep));
         assert_eq!(status.started.as_deref(), Some("2026-06-25T10:00:00Z"));
+        assert_eq!(status.items_scanned, 11);
+        assert_eq!(status.items_healed, 5);
+        assert_eq!(status.items_failed, 2);
+        assert_eq!(status.bytes_scanned, 8192);
+        assert_eq!(status.bytes_healed, 2048);
 
         let request = receiver.recv().expect("captured request");
         assert_eq!(request.method, "POST");
