@@ -273,6 +273,7 @@ rc admin expand stop local
 rc admin decommission start local '/data/pool1/disk{1...4}'
 rc admin decommission status local '/data/pool1/disk{1...4}'
 rc admin decommission cancel local 1 --by-id
+rc admin decommission clear local 1 --by-id
 
 # Rebalance data after adding server pools
 rc admin rebalance start local
@@ -331,7 +332,7 @@ For full command documentation, see the [`rc` command reference](docs/reference/
 | `admin heal`            | Manage cluster healing operations (status, start, stop)                               |
 | `admin pool`            | List pools and inspect expansion/decommission status                                  |
 | `admin expand`          | Manage post-expansion data rebalancing (start, status, stop)                          |
-| `admin decommission`    | Manage server pool decommissioning (start, status, cancel)                            |
+| `admin decommission`    | Manage server pool decommissioning (start, status, cancel, clear)                     |
 | `admin rebalance`       | Manage post-expansion rebalancing (start, status, stop)                               |
 
 ### ILM Subcommands
