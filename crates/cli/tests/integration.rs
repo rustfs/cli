@@ -1549,6 +1549,59 @@ mod recursive_operations {
         // Cleanup
         cleanup_bucket(config_dir.path(), &bucket_name);
     }
+
+    #[test]
+    fn test_recursive_download_prefix_keeps_paths_under_destination() {
+        let (config_dir, bucket_name) = match setup_with_alias("cpdownloadprefix") {
+            Some(v) => v,
+            None => {
+                eprintln!("Skipping: S3 test config not available");
+                return;
+            }
+        };
+
+        let source_key = "src/dir/a.txt";
+        let source_content = "download prefix content";
+        let temp_file = tempfile::NamedTempFile::new().expect("Failed to create temp file");
+        std::fs::write(temp_file.path(), source_content).expect("Failed to write source file");
+
+        let output = run_rc(
+            &[
+                "cp",
+                temp_file.path().to_str().unwrap(),
+                &format!("test/{}/{}", bucket_name, source_key),
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            output.status.success(),
+            "Failed to upload source object: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let download_dir = tempfile::tempdir().expect("Failed to create download dir");
+        let output = run_rc(
+            &[
+                "cp",
+                "--recursive",
+                &format!("test/{}/src/", bucket_name),
+                download_dir.path().to_str().unwrap(),
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            output.status.success(),
+            "Failed to download prefix: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let downloaded_path = download_dir.path().join("dir").join("a.txt");
+        let downloaded_content =
+            std::fs::read_to_string(&downloaded_path).expect("downloaded object should exist");
+        assert_eq!(downloaded_content, source_content);
+
+        cleanup_bucket(config_dir.path(), &bucket_name);
+    }
 }
 
 mod concurrent_operations {
