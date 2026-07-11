@@ -17,12 +17,12 @@ use rc_core::admin::{
     UpdateGroupMembersRequest, User, UserStatus,
 };
 use rc_core::{Alias, Error, Result};
-use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::{CONTENT_TYPE, HOST, HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Client, Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 /// Admin API client for RustFS/MinIO-compatible servers
 pub struct AdminClient {
@@ -40,7 +40,19 @@ impl AdminClient {
         let mut builder = Client::builder()
             .danger_accept_invalid_certs(alias.insecure)
             .tls_built_in_native_certs(true)
-            .tls_built_in_webpki_certs(true);
+            .tls_built_in_webpki_certs(true)
+            .redirect(reqwest::redirect::Policy::none());
+
+        if let Some(timeout) = &alias.timeout {
+            if timeout.connect_ms == 0 || timeout.read_ms == 0 {
+                return Err(Error::Config(
+                    "Alias timeout values must be greater than zero".to_string(),
+                ));
+            }
+            builder = builder
+                .connect_timeout(Duration::from_millis(timeout.connect_ms))
+                .read_timeout(Duration::from_millis(timeout.read_ms));
+        }
 
         if let Some(bundle_path) = alias.ca_bundle.as_deref() {
             let pem = std::fs::read(bundle_path).map_err(|e| {
@@ -101,6 +113,25 @@ impl AdminClient {
         let mut hasher = Sha256::new();
         hasher.update(body);
         hex::encode(hasher.finalize())
+    }
+
+    fn request_headers(&self, body: &[u8]) -> Result<HeaderMap> {
+        let mut headers = HeaderMap::new();
+        let content_hash = HeaderValue::from_str(&Self::sha256_hash(body))
+            .map_err(|e| Error::Auth(format!("Invalid content hash header: {e}")))?;
+        let host = HeaderValue::from_str(&self.get_host())
+            .map_err(|e| Error::Auth(format!("Invalid host header: {e}")))?;
+
+        headers.insert(
+            HeaderName::from_static("x-amz-content-sha256"),
+            content_hash,
+        );
+        headers.insert(HOST, host);
+        if !body.is_empty() {
+            headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        }
+
+        Ok(headers)
     }
 
     /// Sign a request using AWS SigV4
@@ -192,15 +223,7 @@ impl AdminClient {
         }
 
         let body_bytes = body.unwrap_or(&[]);
-        let content_hash = Self::sha256_hash(body_bytes);
-
-        let mut headers = HeaderMap::new();
-        headers.insert("x-amz-content-sha256", content_hash.parse().unwrap());
-        headers.insert("host", self.get_host().parse().unwrap());
-
-        if !body_bytes.is_empty() {
-            headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-        }
+        let headers = self.request_headers(body_bytes)?;
 
         let signed_headers = self
             .sign_request(&method, &url, &headers, body_bytes)
@@ -267,15 +290,7 @@ impl AdminClient {
         }
 
         let body_bytes = body.unwrap_or(&[]);
-        let content_hash = Self::sha256_hash(body_bytes);
-
-        let mut headers = HeaderMap::new();
-        headers.insert("x-amz-content-sha256", content_hash.parse().unwrap());
-        headers.insert("host", self.get_host().parse().unwrap());
-
-        if !body_bytes.is_empty() {
-            headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-        }
+        let headers = self.request_headers(body_bytes)?;
 
         let signed_headers = self
             .sign_request(&method, &url, &headers, body_bytes)

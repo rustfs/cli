@@ -22,6 +22,9 @@ use aws_smithy_runtime_api::http::{Response, StatusCode};
 use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::config_bag::ConfigBag;
 use bytes::Bytes;
+use futures::TryStreamExt as _;
+use http_body::Frame;
+use http_body_util::StreamBody;
 use jiff::Timestamp;
 use quick_xml::de::from_str as from_xml_str;
 use rc_core::{
@@ -35,8 +38,11 @@ use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWrite;
+use tokio::io::AsyncWriteExt;
 
 /// Keep single-part uploads small to avoid backend incompatibilities with
 /// streaming aws-chunked payloads.
@@ -44,6 +50,7 @@ const SINGLE_PUT_OBJECT_MAX_SIZE: u64 = crate::multipart::DEFAULT_PART_SIZE;
 const S3_SERVICE_NAME: &str = "s3";
 const S3_REPLICATION_XML_NAMESPACE: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 const RUSTFS_FORCE_DELETE_HEADER: &str = "x-rustfs-force-delete";
+static DOWNLOAD_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BucketPolicyErrorKind {
@@ -65,8 +72,10 @@ impl ReqwestConnector {
         ca_bundle: Option<&str>,
         client_cert: Option<&str>,
         client_key: Option<&str>,
+        timeout: Option<&rc_core::alias::TimeoutConfig>,
     ) -> Result<Self> {
-        let client = build_reqwest_client(insecure, ca_bundle, client_cert, client_key).await?;
+        let client =
+            build_reqwest_client(insecure, ca_bundle, client_cert, client_key, timeout).await?;
         Ok(Self { client })
     }
 }
@@ -76,11 +85,20 @@ async fn build_reqwest_client(
     ca_bundle: Option<&str>,
     client_cert: Option<&str>,
     client_key: Option<&str>,
+    timeout: Option<&rc_core::alias::TimeoutConfig>,
 ) -> Result<reqwest::Client> {
     // NOTE: When `insecure = true`, `danger_accept_invalid_certs` disables all TLS
     // certificate verification. Any CA bundle provided will still be added to the
     // trust store but is rendered ineffective for this connection.
-    let mut builder = reqwest::Client::builder().danger_accept_invalid_certs(insecure);
+    let mut builder = reqwest::Client::builder()
+        .danger_accept_invalid_certs(insecure)
+        .redirect(reqwest::redirect::Policy::none());
+
+    if let Some(timeout) = timeout {
+        builder = builder
+            .connect_timeout(Duration::from_millis(timeout.connect_ms))
+            .read_timeout(Duration::from_millis(timeout.read_ms));
+    }
 
     if let Some(bundle_path) = ca_bundle {
         // Use tokio::fs::read to avoid blocking the async runtime thread.
@@ -121,6 +139,46 @@ fn force_path_style_for_alias(alias: &Alias) -> bool {
         "auto" => !is_aliyun_oss_service_endpoint(&alias.endpoint),
         _ => true,
     }
+}
+
+fn sdk_retry_config(
+    config: &rc_core::alias::RetryConfig,
+) -> Result<aws_smithy_types::retry::RetryConfig> {
+    if config.max_attempts == 0 {
+        return Err(Error::Config(
+            "Alias retry.max_attempts must be greater than zero".to_string(),
+        ));
+    }
+    if config.initial_backoff_ms == 0
+        || config.max_backoff_ms == 0
+        || config.initial_backoff_ms > config.max_backoff_ms
+    {
+        return Err(Error::Config(
+            "Alias retry backoff values must be non-zero and initial_backoff_ms must not exceed max_backoff_ms"
+                .to_string(),
+        ));
+    }
+
+    Ok(aws_smithy_types::retry::RetryConfigBuilder::new()
+        .max_attempts(config.max_attempts)
+        .initial_backoff(Duration::from_millis(config.initial_backoff_ms))
+        .max_backoff(Duration::from_millis(config.max_backoff_ms))
+        .build())
+}
+
+fn sdk_timeout_config(
+    config: &rc_core::alias::TimeoutConfig,
+) -> Result<aws_smithy_types::timeout::TimeoutConfig> {
+    if config.connect_ms == 0 || config.read_ms == 0 {
+        return Err(Error::Config(
+            "Alias timeout values must be greater than zero".to_string(),
+        ));
+    }
+
+    Ok(aws_smithy_types::timeout::TimeoutConfig::builder()
+        .connect_timeout(Duration::from_millis(config.connect_ms))
+        .read_timeout(Duration::from_millis(config.read_ms))
+        .build())
 }
 
 fn is_aliyun_oss_service_endpoint(endpoint: &str) -> bool {
@@ -701,7 +759,7 @@ fn build_lifecycle_rule_filter(
 }
 
 impl HttpConnector for ReqwestConnector {
-    fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+    fn call(&self, mut request: HttpRequest) -> HttpConnectorFuture {
         let client = self.client.clone();
         HttpConnectorFuture::new(async move {
             // Extract request parts before consuming the request
@@ -709,19 +767,11 @@ impl HttpConnector for ReqwestConnector {
             let method_str = request.method().to_string();
             let headers = request.headers().clone();
 
-            // Try to get the body as buffered in-memory bytes.
-            // For streaming bodies (e.g., large file uploads), bytes() returns None and we
-            // return a clear error rather than silently sending an empty body, which would
-            // cause signature mismatches or server-side failures.
-            let body_bytes = match request.body().bytes() {
-                Some(b) => Bytes::copy_from_slice(b),
-                None => {
-                    return Err(ConnectorError::user(
-                        "Streaming request bodies are not supported in insecure/ca_bundle TLS mode; \
-                         use in-memory data for uploads with this connector"
-                            .into(),
-                    ));
-                }
+            let body = match request.body().bytes() {
+                Some(bytes) => reqwest::Body::from(Bytes::copy_from_slice(bytes)),
+                None => reqwest::Body::wrap_stream(http_body_util::BodyDataStream::new(
+                    request.take_body(),
+                )),
             };
 
             // Build reqwest method
@@ -750,7 +800,7 @@ impl HttpConnector for ReqwestConnector {
             }
 
             // Set body
-            *req.body_mut() = Some(reqwest::Body::from(body_bytes));
+            *req.body_mut() = Some(body);
 
             // Execute
             let resp = client
@@ -762,12 +812,8 @@ impl HttpConnector for ReqwestConnector {
             let status = StatusCode::try_from(resp.status().as_u16())
                 .map_err(|e| ConnectorError::other(Box::new(e), None))?;
             let resp_headers = resp.headers().clone();
-            let body = resp
-                .bytes()
-                .await
-                .map_err(|e| ConnectorError::io(Box::new(e)))?;
-
-            let mut sdk_response = Response::new(status, SdkBody::from(body));
+            let body = StreamBody::new(resp.bytes_stream().map_ok(Frame::data));
+            let mut sdk_response = Response::new(status, SdkBody::from_body_1_x(body));
             for (name, value) in &resp_headers {
                 match value.to_str() {
                     Ok(value_str) => {
@@ -870,6 +916,13 @@ impl S3Client {
             config_loader = config_loader.credentials_provider(credentials);
         }
 
+        if let Some(retry) = &alias.retry {
+            config_loader = config_loader.retry_config(sdk_retry_config(retry)?);
+        }
+        if let Some(timeout) = &alias.timeout {
+            config_loader = config_loader.timeout_config(sdk_timeout_config(timeout)?);
+        }
+
         // When insecure mode is enabled or a custom CA bundle is provided, use the reqwest
         // connector which supports danger_accept_invalid_certs and custom root certificates.
         if alias.insecure
@@ -881,6 +934,7 @@ impl S3Client {
                 alias.ca_bundle.as_deref(),
                 alias.client_cert.as_deref(),
                 alias.client_key.as_deref(),
+                alias.timeout.as_ref(),
             )
             .await?;
             config_loader = config_loader.http_client(connector);
@@ -891,6 +945,7 @@ impl S3Client {
             alias.ca_bundle.as_deref(),
             alias.client_cert.as_deref(),
             alias.client_key.as_deref(),
+            alias.timeout.as_ref(),
         )
         .await?;
         let config = config_loader.load().await;
@@ -941,6 +996,17 @@ impl S3Client {
         path: &RemotePath,
         max_keys: Option<i32>,
     ) -> Result<ObjectVersionListResult> {
+        self.list_object_versions_page_with_markers(path, max_keys, None, None)
+            .await
+    }
+
+    pub async fn list_object_versions_page_with_markers(
+        &self,
+        path: &RemotePath,
+        max_keys: Option<i32>,
+        key_marker: Option<&str>,
+        version_id_marker: Option<&str>,
+    ) -> Result<ObjectVersionListResult> {
         let mut builder = self.inner.list_object_versions().bucket(&path.bucket);
 
         if !path.key.is_empty() {
@@ -949,6 +1015,12 @@ impl S3Client {
 
         if let Some(max) = max_keys {
             builder = builder.max_keys(max);
+        }
+        if let Some(key_marker) = key_marker {
+            builder = builder.key_marker(key_marker);
+        }
+        if let Some(version_id_marker) = version_id_marker {
+            builder = builder.version_id_marker(version_id_marker);
         }
 
         let response = builder.send().await.map_err(|e| {
@@ -1029,11 +1101,8 @@ impl S3Client {
         let content_length = response
             .content_length()
             .and_then(|length| u64::try_from(length).ok());
-        let mut data = Vec::with_capacity(
-            content_length
-                .and_then(|length| usize::try_from(length).ok())
-                .unwrap_or_default(),
-        );
+        let initial_capacity = content_length.unwrap_or_default().min(8 * 1024 * 1024);
+        let mut data = Vec::with_capacity(usize::try_from(initial_capacity).unwrap_or_default());
         let mut body = response.body;
         let mut bytes_downloaded = 0u64;
 
@@ -1048,6 +1117,216 @@ impl S3Client {
         }
 
         Ok(data)
+    }
+
+    pub async fn download_object_to_path(
+        &self,
+        path: &RemotePath,
+        destination: &std::path::Path,
+        mut on_progress: impl FnMut(u64, Option<u64>) + Send,
+    ) -> Result<u64> {
+        let response = self
+            .inner
+            .get_object()
+            .bucket(&path.bucket)
+            .key(&path.key)
+            .send()
+            .await
+            .map_err(|error| {
+                let message = error.to_string();
+                if message.contains("NotFound") || message.contains("NoSuchKey") {
+                    Error::NotFound(path.to_string())
+                } else {
+                    Error::Network(message)
+                }
+            })?;
+        let content_length = response
+            .content_length()
+            .and_then(|length| u64::try_from(length).ok());
+        let parent = destination.parent().ok_or_else(|| {
+            Error::General(format!(
+                "download destination '{}' has no parent directory",
+                destination.display()
+            ))
+        })?;
+        let file_name = destination.file_name().ok_or_else(|| {
+            Error::General(format!(
+                "download destination '{}' has no file name",
+                destination.display()
+            ))
+        })?;
+        let sequence = DOWNLOAD_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temporary = parent.join(format!(
+            ".{}.rc-part-{}-{sequence}",
+            file_name.to_string_lossy(),
+            std::process::id()
+        ));
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .await
+            .map_err(|error| {
+                Error::General(format!(
+                    "create temporary download '{}': {error}",
+                    temporary.display()
+                ))
+            })?;
+        let mut body = response.body;
+        let mut bytes_downloaded = 0u64;
+
+        while let Some(chunk) = match body.try_next().await {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                drop(file);
+                let _ = tokio::fs::remove_file(&temporary).await;
+                return Err(Error::Network(error.to_string()));
+            }
+        } {
+            if let Err(error) = file.write_all(&chunk).await {
+                drop(file);
+                let _ = tokio::fs::remove_file(&temporary).await;
+                return Err(Error::General(format!(
+                    "write download destination '{}': {error}",
+                    destination.display()
+                )));
+            }
+            bytes_downloaded += chunk.len() as u64;
+            on_progress(bytes_downloaded, content_length);
+        }
+
+        if let Err(error) = file.flush().await {
+            drop(file);
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(Error::General(format!(
+                "flush download destination '{}': {error}",
+                destination.display()
+            )));
+        }
+
+        drop(file);
+        let rename_result = tokio::fs::rename(&temporary, destination).await;
+        #[cfg(windows)]
+        let rename_result = match rename_result {
+            Ok(()) => Ok(()),
+            Err(_) if tokio::fs::try_exists(destination).await.unwrap_or(false) => {
+                tokio::fs::remove_file(destination).await?;
+                tokio::fs::rename(&temporary, destination).await
+            }
+            Err(error) => Err(error),
+        };
+        if let Err(error) = rename_result {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(Error::General(format!(
+                "replace download destination '{}': {error}",
+                destination.display()
+            )));
+        }
+
+        Ok(bytes_downloaded)
+    }
+
+    pub async fn write_object_to<W>(
+        &self,
+        path: &RemotePath,
+        writer: &mut W,
+        max_bytes: Option<u64>,
+    ) -> Result<u64>
+    where
+        W: AsyncWrite + Unpin + Send,
+    {
+        if matches!(max_bytes, Some(0)) {
+            return Ok(0);
+        }
+
+        let mut request = self.inner.get_object().bucket(&path.bucket).key(&path.key);
+        if let Some(max_bytes) = max_bytes {
+            request = request.range(format!("bytes=0-{}", max_bytes - 1));
+        }
+        let response = request.send().await.map_err(|error| {
+            let message = error.to_string();
+            if message.contains("NotFound") || message.contains("NoSuchKey") {
+                Error::NotFound(path.to_string())
+            } else {
+                Error::Network(message)
+            }
+        })?;
+        let mut body = response.body;
+        let mut bytes_written = 0u64;
+
+        while let Some(chunk) = body
+            .try_next()
+            .await
+            .map_err(|error| Error::Network(error.to_string()))?
+        {
+            let remaining = max_bytes
+                .map(|limit| limit.saturating_sub(bytes_written))
+                .unwrap_or(chunk.len() as u64);
+            let write_len = chunk.len().min(remaining as usize);
+            writer.write_all(&chunk[..write_len]).await?;
+            bytes_written += write_len as u64;
+            if max_bytes.is_some_and(|limit| bytes_written >= limit) {
+                break;
+            }
+        }
+        writer.flush().await?;
+
+        Ok(bytes_written)
+    }
+
+    pub async fn put_object_if_absent(
+        &self,
+        path: &RemotePath,
+        data: Vec<u8>,
+        content_type: Option<&str>,
+    ) -> Result<ObjectInfo> {
+        let size = data.len() as i64;
+        let mut request = self
+            .inner
+            .put_object()
+            .bucket(&path.bucket)
+            .key(&path.key)
+            .if_none_match("*")
+            .body(aws_sdk_s3::primitives::ByteStream::from(data));
+        if let Some(content_type) = content_type {
+            request = request.content_type(content_type);
+        }
+
+        let response = request.send().await.map_err(|error| {
+            if let aws_sdk_s3::error::SdkError::ServiceError(service_error) = &error
+                && service_error.raw().status().as_u16() == 412
+            {
+                Error::Conflict(format!("Object already exists: {path}"))
+            } else {
+                Error::Network(Self::format_sdk_error(&error))
+            }
+        })?;
+        let mut info = ObjectInfo::file(&path.key, size);
+        info.etag = response
+            .e_tag()
+            .map(|etag| etag.trim_matches('"').to_string());
+        info.last_modified = Some(jiff::Timestamp::now());
+        Ok(info)
+    }
+
+    pub async fn delete_object_if_match(&self, path: &RemotePath, etag: &str) -> Result<()> {
+        self.inner
+            .delete_object()
+            .bucket(&path.bucket)
+            .key(&path.key)
+            .if_match(etag)
+            .send()
+            .await
+            .map_err(|error| {
+                if let aws_sdk_s3::error::SdkError::ServiceError(service_error) = &error
+                    && service_error.raw().status().as_u16() == 412
+                {
+                    Error::Conflict(format!("Object changed before deletion: {path}"))
+                } else {
+                    Error::Network(Self::format_sdk_error(&error))
+                }
+            })?;
+        Ok(())
     }
 
     /// Delete an object with RustFS-specific request options.
@@ -1640,6 +1919,10 @@ impl S3Client {
         let part_size = config.calculate_part_size(file_size);
         let part_buffer_size = usize::try_from(part_size)
             .map_err(|_| Error::General(format!("invalid part size: {part_size}")))?;
+        let mut file = tokio::fs::File::open(file_path)
+            .await
+            .map_err(|e| Error::General(format!("open file '{}': {e}", file_path.display())))?;
+        let mut chunk = vec![0u8; part_buffer_size];
 
         tracing::debug!(file_size, part_size, "Starting multipart upload");
 
@@ -1674,16 +1957,19 @@ impl S3Client {
 
         tracing::debug!(upload_id = %upload_id, "Multipart upload initiated");
 
-        let mut file = tokio::fs::File::open(file_path)
-            .await
-            .map_err(|e| Error::General(format!("open file '{}': {e}", file_path.display())))?;
         let mut completed_parts = Vec::new();
         let mut part_number: i32 = 1;
-        let mut chunk = vec![0u8; part_buffer_size];
         let mut bytes_uploaded: u64 = 0;
 
         loop {
-            let bytes_read = Self::read_next_part(&mut file, file_path, &mut chunk).await?;
+            let bytes_read = match Self::read_next_part(&mut file, file_path, &mut chunk).await {
+                Ok(bytes_read) => bytes_read,
+                Err(error) => {
+                    self.abort_multipart_upload_best_effort(path, &upload_id)
+                        .await;
+                    return Err(error);
+                }
+            };
             if bytes_read == 0 {
                 break;
             }
@@ -1844,15 +2130,33 @@ fn build_tagging(
         .map_err(|e| Error::General(format!("invalid tagging payload: {e}")))
 }
 
+fn validate_continuation_token(
+    truncated: bool,
+    current: Option<&str>,
+    next: Option<&str>,
+) -> Result<()> {
+    if truncated && (next.is_none() || next == current) {
+        return Err(Error::Network(
+            "S3 returned a truncated object listing without a new continuation token".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
 #[async_trait]
 impl ObjectStore for S3Client {
     async fn list_buckets(&self) -> Result<Vec<ObjectInfo>> {
-        let response = self
-            .inner
-            .list_buckets()
-            .send()
-            .await
-            .map_err(|e| Error::Network(Self::format_sdk_error(&e)))?;
+        let response = self.inner.list_buckets().send().await.map_err(|e| {
+            let message = Self::format_sdk_error(&e);
+            if let aws_sdk_s3::error::SdkError::ServiceError(service_error) = &e
+                && matches!(service_error.raw().status().as_u16(), 401 | 403)
+            {
+                Error::Auth(message)
+            } else {
+                Error::Network(message)
+            }
+        })?;
 
         let buckets = response
             .buckets()
@@ -1939,10 +2243,18 @@ impl ObjectStore for S3Client {
             items.push(info);
         }
 
+        let truncated = response.is_truncated().unwrap_or(false);
+        let continuation_token = response.next_continuation_token().map(ToString::to_string);
+        validate_continuation_token(
+            truncated,
+            options.continuation_token.as_deref(),
+            continuation_token.as_deref(),
+        )?;
+
         Ok(ListResult {
             items,
-            truncated: response.is_truncated().unwrap_or(false),
-            continuation_token: response.next_continuation_token().map(|s| s.to_string()),
+            truncated,
+            continuation_token,
         })
     }
 
@@ -3131,6 +3443,7 @@ mod tests {
             .endpoint_url(endpoint)
             .region(aws_sdk_s3::config::Region::new("us-east-1"))
             .force_path_style(true)
+            .retry_config(aws_smithy_types::retry::RetryConfig::disabled())
             .behavior_version_latest()
             .http_client(http_client);
 
@@ -4115,7 +4428,7 @@ mod tests {
     #[tokio::test]
     async fn reqwest_connector_insecure_without_ca_bundle_succeeds() {
         // When insecure is true and no CA bundle is provided, the connector should be created.
-        let connector = ReqwestConnector::new(true, None, None, None).await;
+        let connector = ReqwestConnector::new(true, None, None, None, None).await;
         assert!(
             connector.is_ok(),
             "Expected insecure connector creation to succeed"
@@ -4125,7 +4438,7 @@ mod tests {
     #[tokio::test]
     async fn reqwest_connector_invalid_ca_bundle_path_surfaces_error() {
         // Use an obviously invalid path (empty string) to trigger a read error.
-        let result = ReqwestConnector::new(false, Some(""), None, None).await;
+        let result = ReqwestConnector::new(false, Some(""), None, None, None).await;
         match result {
             Err(Error::Network(msg)) => {
                 assert!(
@@ -4168,6 +4481,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conditional_mirror_writes_and_deletes_set_precondition_headers() {
+        let put_response = http::Response::builder()
+            .status(200)
+            .body(SdkBody::from(""))
+            .expect("build put response");
+        let (put_client, put_request_receiver) = test_s3_client(Some(put_response));
+        let path = RemotePath::new("test", "bucket", "key.txt");
+
+        put_client
+            .put_object_if_absent(&path, b"data".to_vec(), None)
+            .await
+            .expect("conditional put");
+        let put_request = put_request_receiver.expect_request();
+        assert_eq!(put_request.headers().get("if-none-match"), Some("*"));
+
+        let delete_response = http::Response::builder()
+            .status(204)
+            .body(SdkBody::from(""))
+            .expect("build delete response");
+        let (delete_client, delete_request_receiver) = test_s3_client(Some(delete_response));
+        delete_client
+            .delete_object_if_match(&path, "etag-value")
+            .await
+            .expect("conditional delete");
+        let delete_request = delete_request_receiver.expect_request();
+        assert_eq!(delete_request.headers().get("if-match"), Some("etag-value"));
+    }
+
+    #[tokio::test]
     async fn custom_headers_are_added_before_sending_sdk_requests() {
         let (client, request_receiver) = test_s3_client_with_endpoint_and_headers(
             "https://example.com",
@@ -4193,6 +4535,29 @@ mod tests {
                 .expect("authorization header")
                 .contains("x-amz-bucket-encrypt-enabled")
         );
+    }
+
+    #[tokio::test]
+    async fn write_object_to_limits_download_with_range_header() {
+        let response = http::Response::builder()
+            .status(206)
+            .header("content-length", "3")
+            .header("content-range", "bytes 0-2/8")
+            .body(SdkBody::from("abc"))
+            .expect("build ranged get response");
+        let (client, request_receiver) = test_s3_client(Some(response));
+        let path = RemotePath::new("test", "bucket", "key.txt");
+        let mut output = Vec::new();
+
+        let written = client
+            .write_object_to(&path, &mut output, Some(3))
+            .await
+            .expect("stream ranged object");
+
+        let request = request_receiver.expect_request();
+        assert_eq!(request.headers().get("range"), Some("bytes=0-2"));
+        assert_eq!(written, 3);
+        assert_eq!(output, b"abc");
     }
 
     #[tokio::test]
@@ -4575,9 +4940,34 @@ mod tests {
         let result = client.list_buckets().await;
 
         match result {
-            Err(Error::Network(message)) => assert!(message.contains("InvalidAccessKeyId")),
-            other => panic!("Expected Network for list buckets failure, got: {other:?}"),
+            Err(Error::Auth(message)) => assert!(message.contains("InvalidAccessKeyId")),
+            other => panic!("Expected Auth for list buckets failure, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn truncated_listing_requires_a_new_continuation_token() {
+        assert!(validate_continuation_token(false, None, None).is_ok());
+        assert!(validate_continuation_token(true, None, Some("next")).is_ok());
+        assert!(validate_continuation_token(true, Some("current"), None).is_err());
+        assert!(validate_continuation_token(true, Some("current"), Some("current")).is_err());
+    }
+
+    #[test]
+    fn alias_retry_and_timeout_configs_are_validated() {
+        let retry = rc_core::alias::RetryConfig {
+            max_attempts: 0,
+            ..Default::default()
+        };
+        let timeout = rc_core::alias::TimeoutConfig {
+            connect_ms: 0,
+            ..Default::default()
+        };
+
+        assert!(sdk_retry_config(&retry).is_err());
+        assert!(sdk_timeout_config(&timeout).is_err());
+        assert!(sdk_retry_config(&Default::default()).is_ok());
+        assert!(sdk_timeout_config(&Default::default()).is_ok());
     }
 
     #[tokio::test]
