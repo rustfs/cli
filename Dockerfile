@@ -17,8 +17,11 @@ FROM alpine:3.23
 # - ca-certificates for HTTPS
 # - jq/yq-go for Kubernetes-oriented config processing workflows
 RUN apk add --no-cache ca-certificates jq yq-go
+RUN addgroup -S rc && adduser -S -G rc -h /home/rc rc
 
 COPY --from=builder /app/target/release/rc /usr/bin/rc
 COPY --from=builder /app/LICENSE-* /licenses/
+
+USER rc
 
 ENTRYPOINT ["rc"]

@@ -28,3 +28,17 @@ fn runtime_image_contains_jq_and_yq() {
         "runtime image must install jq and yq-go"
     );
 }
+
+#[test]
+fn runtime_image_uses_non_root_user() {
+    let dockerfile = include_str!("../../../Dockerfile");
+    let runtime_section = dockerfile
+        .split("FROM alpine:3.23")
+        .nth(1)
+        .expect("Dockerfile must contain runtime stage based on alpine:3.23");
+
+    assert!(
+        runtime_section.lines().any(|line| line.trim() == "USER rc"),
+        "runtime image must use the dedicated rc user"
+    );
+}

@@ -3,9 +3,7 @@ name: Build and Release
 on:
   push:
     tags:
-      - "*.*.*"
-  release:
-    types: [ published ]
+      - "v*.*.*"
   workflow_dispatch:
     inputs:
       tag:
@@ -15,6 +13,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
 
 jobs:
   # Build strategy check - determine build type and version
@@ -27,37 +28,52 @@ jobs:
       version: ${{ steps.check.outputs.version }}
       is_release: ${{ steps.check.outputs.is_release }}
       has_token: ${{ steps.check.outputs.has_token }}
+      source_ref: ${{ steps.check.outputs.source_ref }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           fetch-depth: 0
 
       - name: Determine build strategy
         id: check
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           version=""
           is_release=false
+          source_ref="${GITHUB_SHA}"
 
-          if [[ "${{ github.event_name }}" == "release" ]]; then
-            # Release event - get version from release tag
-            version="${{ github.event.release.tag_name }}"
-            is_release=true
-            echo "📦 Release build detected: $version"
-          elif [[ "${{ startsWith(github.ref, 'refs/tags/') }}" == "true" ]]; then
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
             # Tag push - get version from tag
             version="${GITHUB_REF#refs/tags/}"
+            source_ref="${GITHUB_REF}"
             is_release=true
             echo "🏷️ Tag build detected: $version"
-          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]] && [[ -n "${{ github.event.inputs.tag }}" ]]; then
+          elif [[ "$EVENT_NAME" == "workflow_dispatch" ]] && [[ -n "$INPUT_TAG" ]]; then
             # Manual trigger with tag input - treat as release
-            version="${{ github.event.inputs.tag }}"
+            version="$INPUT_TAG"
+            if [[ ! "$version" =~ ^v ]]; then
+              version="v${version}"
+            fi
+            source_ref="refs/tags/${version}"
             is_release=true
             echo "🏷️ Manual release build detected: $version"
           else
             # Manual trigger without tag or other
             version="dev-$(git rev-parse --short HEAD)"
             echo "🛠️ Development build detected: $version"
+          fi
+
+          if [[ "$is_release" == "true" ]]; then
+            git rev-parse --verify "${source_ref}^{commit}" >/dev/null
+            workspace_version=$(git show "${source_ref}:Cargo.toml" | awk -F'"' '/^version = "/ { print $2; exit }')
+            if [[ -z "$workspace_version" || "${version#v}" != "$workspace_version" ]]; then
+              echo "Release tag '$version' does not match workspace version '$workspace_version'"
+              exit 1
+            fi
           fi
 
           # Ensure version starts with 'v' for release builds
@@ -67,22 +83,49 @@ jobs:
           fi
 
           has_token="false"
-          if [ -n "${{ secrets.CARGO_REGISTRY_TOKEN }}" ]; then
+          if [[ -n "$CARGO_REGISTRY_TOKEN" ]]; then
             has_token="true"
           fi
 
           echo "version=$version" >> $GITHUB_OUTPUT
           echo "is_release=$is_release" >> $GITHUB_OUTPUT
           echo "has_token=$has_token" >> $GITHUB_OUTPUT
+          echo "source_ref=$source_ref" >> $GITHUB_OUTPUT
 
           echo "📊 Build Summary:"
           echo "  - Version: $version"
           echo "  - Is release: $is_release"
           echo "  - Publish crate: $has_token"
 
+  verify:
+    name: Release Verification
+    needs: build-check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ needs.build-check.outputs.source_ref }}
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          components: rustfmt, clippy
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Run tests
+        run: cargo test --workspace --locked
+      - name: Check dependency advisories
+        uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2
+        with:
+          command: check advisories
+
   build:
     name: Build (${{ matrix.os_name }}-${{ matrix.arch }})
-    needs: build-check
+    needs: [build-check, verify]
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
@@ -141,15 +184,17 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ needs.build-check.outputs.source_ref }}
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           targets: ${{ matrix.target }}
 
       - name: Setup Rust cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: ${{ matrix.target }}
 
@@ -163,16 +208,16 @@ jobs:
       # Install cross for cross-compilation
       - name: Install cross
         if: matrix.cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
+        run: cargo install cross --version 0.2.5 --locked
 
       # Build
       - name: Build (native)
         if: "!matrix.cross"
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Build (cross)
         if: matrix.cross
-        run: cross build --release --target ${{ matrix.target }}
+        run: cross build --release --locked --target ${{ matrix.target }}
 
       # Package and prepare artifacts
       - name: Prepare and package artifacts (Unix)
@@ -186,8 +231,9 @@ jobs:
           ARTIFACT_PREFIX="rustfs-cli-${{ matrix.os_name }}-${{ matrix.arch }}"
 
           # Create versioned archive
+          cp LICENSE-MIT LICENSE-APACHE target/${{ matrix.target }}/release/
           cd target/${{ matrix.target }}/release
-          tar -czvf "../../../artifacts/${ARTIFACT_PREFIX}-${VERSION}.tar.gz" ${{ matrix.artifact_name }}
+          tar -czvf "../../../artifacts/${ARTIFACT_PREFIX}-${VERSION}.tar.gz" ${{ matrix.artifact_name }} LICENSE-MIT LICENSE-APACHE
           cd ../../..
 
           # Create latest archive (copy of versioned)
@@ -216,7 +262,7 @@ jobs:
           # Create versioned archive
           $sourcePath = "target/${{ matrix.target }}/release/${{ matrix.artifact_name }}"
           $versionedZip = "artifacts/${ARTIFACT_PREFIX}-${env:VERSION}.zip"
-          Compress-Archive -Path $sourcePath -DestinationPath $versionedZip
+          Compress-Archive -Path $sourcePath, "LICENSE-MIT", "LICENSE-APACHE" -DestinationPath $versionedZip
 
           # Create latest archive (copy of versioned)
           $latestZip = "artifacts/${ARTIFACT_PREFIX}-latest.zip"
@@ -234,7 +280,7 @@ jobs:
 
       # Upload artifacts for later jobs
       - name: Upload artifacts
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: rustfs-cli-${{ matrix.os_name }}-${{ matrix.arch }}
           path: artifacts/*
@@ -255,21 +301,7 @@ jobs:
             exit 0
           fi
 
-          # Ensure aws CLI is available; k8s/docker build images may not ship it.
-          if ! command -v aws >/dev/null 2>&1; then
-            echo "ℹ️ aws CLI not found, installing AWS CLI v2 for Linux..."
-            ARCH="$(uname -m)"
-            case "$ARCH" in
-              x86_64) AWS_CLI_ARCH="x86_64" ;;
-              aarch64|arm64) AWS_CLI_ARCH="aarch64" ;;
-              *) echo "❌ Unsupported architecture for aws CLI install: $ARCH"; exit 1 ;;
-            esac
-            curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-${AWS_CLI_ARCH}.zip" -o awscliv2.zip
-            unzip -q awscliv2.zip
-            ./aws/install --update -i "${RUNNER_TEMP:-/tmp}/aws-cli" -b "${RUNNER_TEMP:-/tmp}/aws-bin"
-            export PATH="${RUNNER_TEMP:-/tmp}/aws-bin:$PATH"
-            rm -rf awscliv2.zip aws
-          fi
+          command -v aws >/dev/null 2>&1 || { echo "AWS CLI is required on the release runner"; exit 1; }
 
           export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
           export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
@@ -296,20 +328,22 @@ jobs:
   # Generate shell completions
   completions:
     name: Generate Shell Completions
-    needs: build-check
+    needs: [build-check, verify]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ needs.build-check.outputs.source_ref }}
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
 
       - name: Setup Rust cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Build
-        run: cargo build --release
+        run: cargo build --release --locked
 
       - name: Generate completions
         run: |
@@ -319,14 +353,13 @@ jobs:
           ./target/release/rc completions fish > completions/rc.fish
           ./target/release/rc completions powershell > completions/rc.ps1
           tar -czvf completions.tar.gz completions/
-        continue-on-error: true
 
       - name: Upload completions artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: completions
           path: completions.tar.gz
-          if-no-files-found: warn
+          if-no-files-found: error
 
   # Upload release assets to GitHub Release
   upload-release-assets:
@@ -338,18 +371,17 @@ jobs:
       contents: write
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           path: artifacts
           pattern: rustfs-cli-*
           merge-multiple: true
 
       - name: Download completions
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: completions
           path: artifacts
-        continue-on-error: true
 
       - name: Display structure of downloaded files
         run: |
@@ -400,21 +432,7 @@ jobs:
             exit 0
           fi
 
-          # Ensure aws CLI is available; k8s/docker build images may not ship it.
-          if ! command -v aws >/dev/null 2>&1; then
-            echo "ℹ️ aws CLI not found, installing AWS CLI v2 for Linux..."
-            ARCH="$(uname -m)"
-            case "$ARCH" in
-              x86_64) AWS_CLI_ARCH="x86_64" ;;
-              aarch64|arm64) AWS_CLI_ARCH="aarch64" ;;
-              *) echo "❌ Unsupported architecture for aws CLI install: $ARCH"; exit 1 ;;
-            esac
-            curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-${AWS_CLI_ARCH}.zip" -o awscliv2.zip
-            unzip -q awscliv2.zip
-            ./aws/install --update -i "${RUNNER_TEMP:-/tmp}/aws-cli" -b "${RUNNER_TEMP:-/tmp}/aws-bin"
-            export PATH="${RUNNER_TEMP:-/tmp}/aws-bin:$PATH"
-            rm -rf awscliv2.zip aws
-          fi
+          command -v aws >/dev/null 2>&1 || { echo "AWS CLI is required on the release runner"; exit 1; }
 
           export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
           export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
@@ -437,18 +455,8 @@ jobs:
 
           echo "✅ Release asset R2 upload completed successfully"
 
-      - name: Upload to GitHub Release (release event)
-        if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.event.release.tag_name }}
-          files: release-assets/*
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload to GitHub Release (tag push or manual)
-        if: github.event_name != 'release'
-        uses: softprops/action-gh-release@v2
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ needs.build-check.outputs.version }}
           name: Release ${{ needs.build-check.outputs.version }}
@@ -462,30 +470,31 @@ jobs:
   # Publish to crates.io
   publish-crates:
     name: Publish to crates.io
-    needs: [ build-check, build ]
+    needs: [build-check, verify, build]
     runs-on: ubuntu-latest
     if: needs.build-check.outputs.is_release == 'true' && needs.build-check.outputs.has_token == 'true'
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ needs.build-check.outputs.source_ref }}
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
 
       - name: Publish rc-core
-        run: cargo publish --package rc-core --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        continue-on-error: true
+        run: cargo publish --locked --package rc-core
 
       - name: Wait for crates.io
         run: sleep 30
 
       - name: Publish rc-s3
-        run: cargo publish --package rc-s3 --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        continue-on-error: true
+        run: cargo publish --locked --package rc-s3
 
       - name: Wait for crates.io
         run: sleep 30
 
       - name: Publish rustfs-cli
-        run: cargo publish --package rustfs-cli --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        continue-on-error: true
+        run: cargo publish --locked --package rustfs-cli

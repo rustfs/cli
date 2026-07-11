@@ -14,35 +14,62 @@ on:
 permissions:
   contents: read
 
-env:
-  image_tag: ${{ github.event.inputs.tag || github.event.workflow_run.head_branch || 'latest' }}
-
 jobs:
   build-and-push:
+    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Resolve image tags
+        id: image
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          MANUAL_TAG: ${{ github.event.inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            image_tag="$MANUAL_TAG"
+          else
+            workspace_version=$(awk -F'"' '/^version = "/ { print $2; exit }' Cargo.toml)
+            image_tag="v${workspace_version}"
+          fi
+
+          if [[ ! "$image_tag" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
+            echo "Invalid Docker image tag: $image_tag"
+            exit 1
+          fi
+
+          {
+            echo 'tags<<EOF'
+            echo "rustfs/rc:${image_tag}"
+            if [[ "$EVENT_NAME" == "workflow_run" && "$image_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo 'rustfs/rc:latest'
+            fi
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Log in to Docker Hub
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build and push image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: | 
-            rustfs/rc:${{ env.image_tag }}
-            rustfs/rc:latest
+          tags: ${{ steps.image.outputs.tags }}
