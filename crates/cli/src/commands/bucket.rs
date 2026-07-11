@@ -74,27 +74,52 @@ pub enum BucketCommands {
 
 /// Execute the bucket command group
 pub async fn execute(args: BucketArgs, output_config: OutputConfig) -> ExitCode {
+    // Boxing each branch keeps this dispatcher future below Windows' 1 MiB main-thread stack.
     match args.command {
-        BucketCommands::List(args) => ls::execute(args, output_config).await,
-        BucketCommands::Create(args) => mb::execute(args, output_config).await,
-        BucketCommands::Remove(args) => rb::execute(args, output_config).await,
+        BucketCommands::List(args) => Box::pin(ls::execute(args, output_config)).await,
+        BucketCommands::Create(args) => Box::pin(mb::execute(args, output_config)).await,
+        BucketCommands::Remove(args) => Box::pin(rb::execute(args, output_config)).await,
         BucketCommands::Event(cmd) => {
-            event::execute(event::EventArgs { command: cmd }, output_config).await
+            Box::pin(event::execute(
+                event::EventArgs { command: cmd },
+                output_config,
+            ))
+            .await
         }
         BucketCommands::Cors(cmd) => {
-            cors::execute(cors::CorsArgs { command: cmd }, output_config).await
+            Box::pin(cors::execute(
+                cors::CorsArgs { command: cmd },
+                output_config,
+            ))
+            .await
         }
-        BucketCommands::Encryption(args) => encryption::execute(args, output_config).await,
+        BucketCommands::Encryption(args) => {
+            Box::pin(encryption::execute(args, output_config)).await
+        }
         BucketCommands::Version(cmd) => {
-            version::execute(version::VersionArgs { command: cmd }, output_config).await
+            Box::pin(version::execute(
+                version::VersionArgs { command: cmd },
+                output_config,
+            ))
+            .await
         }
         BucketCommands::Quota(cmd) => {
-            quota::execute(quota::QuotaArgs { command: cmd }, output_config).await
+            Box::pin(quota::execute(
+                quota::QuotaArgs { command: cmd },
+                output_config,
+            ))
+            .await
         }
         BucketCommands::Anonymous(cmd) => {
-            anonymous::execute(anonymous::AnonymousArgs { command: cmd }, output_config).await
+            Box::pin(anonymous::execute(
+                anonymous::AnonymousArgs { command: cmd },
+                output_config,
+            ))
+            .await
         }
-        BucketCommands::Lifecycle(args) => ilm::execute(args, output_config).await,
-        BucketCommands::Replication(args) => replicate::execute(args, output_config).await,
+        BucketCommands::Lifecycle(args) => Box::pin(ilm::execute(args, output_config)).await,
+        BucketCommands::Replication(args) => {
+            Box::pin(replicate::execute(args, output_config)).await
+        }
     }
 }

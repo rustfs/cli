@@ -521,13 +521,13 @@ async fn list_all_objects(
                     if item.is_dir {
                         let styled_size = formatter.style_size(&format!("{:>10}", "0B"));
                         let styled_name =
-                            formatter.style_dir(&format!("{}/{}", bucket_name, &item.key));
+                            formatter.style_dir(&format!("{}/{}", bucket_name, item.key));
                         formatter.println(&format!("{styled_date} {styled_size} {styled_name}"));
                     } else {
                         let size = item.size_human.clone().unwrap_or_else(|| "0 B".to_string());
                         let styled_size = formatter.style_size(&format!("{:>10}", size));
                         let styled_name =
-                            formatter.style_file(&format!("{}/{}", bucket_name, &item.key));
+                            formatter.style_file(&format!("{}/{}", bucket_name, item.key));
                         formatter.println(&format!("{styled_date} {styled_size} {styled_name}"));
                     }
                 }

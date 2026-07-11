@@ -4235,7 +4235,7 @@ mod option_behavior_operations {
         );
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            stderr.contains("--parallel must be greater than 0"),
+            stderr.contains("--parallel must be between 1 and 256"),
             "Unexpected error output: {}",
             stderr
         );
