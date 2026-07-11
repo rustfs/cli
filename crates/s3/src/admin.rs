@@ -24,7 +24,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
-/// Admin API client for RustFS/MinIO-compatible servers
+/// Admin API client for RustFS servers
 pub struct AdminClient {
     http_client: Client,
     endpoint: String,
@@ -944,7 +944,7 @@ impl AdminApi for AdminClient {
         entity_name: &str,
     ) -> Result<()> {
         // Detach by setting empty policy
-        // In RustFS/MinIO, you typically set a new policy which replaces the old one
+        // RustFS replaces the previous policy association when a new one is set.
         // For detach, we need to get current policies and remove the specified ones
         let _ = (policy_names, entity_type, entity_name);
         Err(Error::UnsupportedFeature(

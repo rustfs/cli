@@ -10,7 +10,7 @@ A S3-compatible command-line client written in Rust.
 ## Features
 
 - 🚀 **High Performance** - Written in Rust with async concurrent operations
-- 🔧 **S3 Compatible** - Supports RustFS, MinIO, AWS S3, and other S3-compatible services
+- 🔧 **S3 Compatible** - Data operations support RustFS, MinIO, AWS S3, and other S3-compatible services
 - 📦 **Cross-Platform** - Supports Linux, macOS, and Windows
 - 🎨 **Friendly Output** - Human-readable and JSON format output
 - 🔒 **Secure** - Secure credential storage, no sensitive data in logs
@@ -469,12 +469,14 @@ region = "us-east-1"
 
 ### Supported Backends
 
-| Backend             | Tier        | Description         |
-|---------------------|-------------|---------------------|
-| RustFS              | Tier 1      | Fully supported     |
-| MinIO               | Tier 2      | Fully supported     |
-| AWS S3              | Tier 3      | Best effort support |
-| Other S3-compatible | Best Effort | No guarantee        |
+These tiers describe S3-compatible data operations. The `rc admin` commands use the RustFS Admin API and do not support MinIO Admin API endpoints.
+
+| Backend             | Tier        | Description                       |
+|---------------------|-------------|-----------------------------------|
+| RustFS              | Tier 1      | S3 and Admin APIs supported       |
+| MinIO               | Tier 2      | S3 operations supported           |
+| AWS S3              | Tier 3      | Best effort S3 support            |
+| Other S3-compatible | Best Effort | No compatibility guarantee        |
 
 ### Minimum Rust Version
 

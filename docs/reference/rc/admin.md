@@ -2,7 +2,9 @@
 
 ## Purpose
 
-The `rc admin` operation manages RustFS or MinIO-compatible administrative APIs, including cluster information, healing, pools, expansion, decommissioning, rebalance workflows, IAM users, policies, groups, and service accounts.
+The `rc admin` operation manages the RustFS Admin API, including cluster information, healing, pools, expansion, decommissioning, rebalance workflows, IAM users, policies, groups, and service accounts.
+
+`rc admin` does not implement the MinIO Admin API. MinIO aliases remain available to S3 data commands, but MinIO administrative operations require a MinIO-compatible admin client.
 
 ## Syntax
 
@@ -111,7 +113,7 @@ rc admin service-account create local SA_ACCESS_KEY SA_SECRET_KEY --policy ./pol
 
 ## Behavior
 
-Admin operations use the configured alias to create an admin client. The credentials behind the alias must have permissions for the requested administrative API. The command accepts aliases with or without a trailing slash.
+Admin operations use the configured alias to create a RustFS admin client. The credentials behind the alias must have permissions for the requested administrative API. The command accepts aliases with or without a trailing slash.
 
 `rc admin heal status <ALIAS>` reports aggregate background heal status. Manual bucket or prefix heals started with `rc admin heal start` are token-scoped tasks; the start output includes a client token, and subsequent task status or stop requests must pass that token with `--bucket`, optional `--prefix`, and `--client-token`.
 

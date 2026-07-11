@@ -1,7 +1,7 @@
 //! Admin commands for IAM and cluster management
 //!
 //! This module provides commands for managing users, policies, groups,
-//! service accounts, and cluster operations on RustFS/MinIO-compatible servers.
+//! service accounts, and cluster operations through the RustFS Admin API.
 
 mod access_key;
 mod decommission;

@@ -33,7 +33,7 @@ use crate::error::Result;
 ///
 /// This trait defines the interface for managing users, policies, groups,
 /// service accounts, and cluster operations on S3-compatible storage systems
-/// that support the RustFS/MinIO Admin API.
+/// that support the RustFS Admin API.
 #[async_trait]
 pub trait AdminApi: Send + Sync {
     // ==================== Cluster Operations ====================
