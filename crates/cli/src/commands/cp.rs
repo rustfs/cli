@@ -1156,6 +1156,22 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn download_destination_rejects_existing_symlink_file() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("create destination root");
+        let outside = tempfile::tempdir().expect("create outside directory");
+        let outside_file = outside.path().join("file.txt");
+        std::fs::write(&outside_file, b"outside").expect("write outside file");
+        symlink(&outside_file, root.path().join("file.txt")).expect("create test symlink");
+
+        let result = safe_download_destination(root.path(), &PathBuf::from("file.txt")).await;
+
+        assert!(result.is_err());
+    }
+
     #[test]
     fn test_select_upload_content_type_uses_guess_for_small_files() {
         let selected =
