@@ -225,10 +225,7 @@ mod bucket_operations {
     fn test_create_and_delete_bucket() {
         let (endpoint, access_key, secret_key) = match get_test_config() {
             Some(c) => c,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         let config_dir = tempfile::tempdir().expect("Failed to create temp dir");
@@ -295,10 +292,7 @@ mod bucket_operations {
     fn test_mb_ignore_existing_first_and_second_run() {
         let (endpoint, access_key, secret_key) = match get_test_config() {
             Some(c) => c,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         let config_dir = tempfile::tempdir().expect("Failed to create temp dir");
@@ -375,10 +369,7 @@ mod bucket_operations {
     fn test_bucket_cors_set_accepts_stdin_source() {
         let (config_dir, bucket_name) = match setup_with_alias("corsstdin") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         let cors_config = r#"{
@@ -462,10 +453,7 @@ mod object_operations {
     fn test_upload_and_download_small_file() {
         let (config_dir, bucket_name) = match setup_with_alias("small") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         // Create a small test file
@@ -541,10 +529,7 @@ mod object_operations {
     fn test_upload_download_large_file_multipart() {
         let (config_dir, bucket_name) = match setup_with_alias("large") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         // Create a large file (15 MiB to trigger multipart with 5 MiB parts)
@@ -654,10 +639,7 @@ mod object_operations {
     fn test_copy_object_between_paths() {
         let (config_dir, bucket_name) = match setup_with_alias("copy") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         // Create test file
@@ -711,10 +693,7 @@ mod object_operations {
     fn test_move_object() {
         let (config_dir, bucket_name) = match setup_with_alias("move") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         // Create and upload test file
@@ -767,10 +746,7 @@ mod object_operations {
     fn test_move_recursive_prefix_s3_to_s3() {
         let (config_dir, bucket_name) = match setup_with_alias("mvrec") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         let source_files = ["src/dir/a.txt", "src/dir/sub/b.txt"];
@@ -849,10 +825,7 @@ mod object_operations {
     fn test_delete_object() {
         let (config_dir, bucket_name) = match setup_with_alias("delete") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         // Create and upload test file
@@ -913,10 +886,7 @@ mod listing_operations {
     fn test_list_objects_with_prefix() {
         let (config_dir, bucket_name) = match setup_with_alias("list") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         // Create multiple files with different prefixes
@@ -966,10 +936,7 @@ mod listing_operations {
     fn test_recursive_listing() {
         let (config_dir, bucket_name) = match setup_with_alias("recursive") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         // Create nested structure
@@ -1024,10 +991,7 @@ mod admin_operations {
     fn test_admin_info_cluster() {
         let config_dir = match setup_alias_only() {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         let output = run_rc(
@@ -1053,10 +1017,7 @@ mod admin_operations {
     fn test_admin_info_server() {
         let config_dir = match setup_alias_only() {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         let output = run_rc(
@@ -1078,10 +1039,7 @@ mod admin_operations {
     fn test_admin_info_disk() {
         let config_dir = match setup_alias_only() {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         let output = run_rc(
@@ -1103,10 +1061,7 @@ mod admin_operations {
     fn test_admin_heal_status() {
         let config_dir = match setup_alias_only() {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         let output = run_rc(
@@ -1139,10 +1094,7 @@ mod error_handling {
     fn test_not_found_error() {
         let (config_dir, bucket_name) = match setup_with_alias("notfound") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         // Try to stat non-existent object
@@ -1175,10 +1127,7 @@ mod error_handling {
     fn test_bucket_not_found() {
         let (endpoint, access_key, secret_key) = match get_test_config() {
             Some(c) => c,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         let config_dir = tempfile::tempdir().expect("Failed to create temp dir");
@@ -1218,10 +1167,7 @@ mod presigned_urls {
     fn test_generate_presigned_url() {
         let (config_dir, bucket_name) = match setup_with_alias("presign") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         // Upload a test file first
@@ -1277,10 +1223,7 @@ mod multipart_operations {
         // Test file that is exactly on part size boundary (10 MiB)
         let (config_dir, bucket_name) = match setup_with_alias("mpboundary") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         // Create file exactly 10 MiB (2 parts at 5 MiB minimum)
@@ -1339,10 +1282,7 @@ mod multipart_operations {
         // Test file with small last part (10 MiB + 1 byte)
         let (config_dir, bucket_name) = match setup_with_alias("mplastpart") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         // Create file 10 MiB + 1 byte
@@ -1406,10 +1346,7 @@ mod recursive_operations {
     fn test_recursive_delete() {
         let (config_dir, bucket_name) = match setup_with_alias("recdel") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         // Create nested structure
@@ -1477,10 +1414,7 @@ mod recursive_operations {
     fn test_recursive_copy() {
         let (config_dir, bucket_name) = match setup_with_alias("reccopy") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         // Create source structure
@@ -1554,10 +1488,7 @@ mod recursive_operations {
     fn test_recursive_download_prefix_keeps_paths_under_destination() {
         let (config_dir, bucket_name) = match setup_with_alias("cpdownloadprefix") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         let source_key = "src/dir/a.txt";
@@ -1611,10 +1542,7 @@ mod concurrent_operations {
     fn test_concurrent_uploads() {
         let (config_dir, bucket_name) = match setup_with_alias("concurrent") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         // Create multiple test files
@@ -1678,10 +1606,7 @@ mod edge_cases {
     fn test_special_characters_in_key() {
         let (config_dir, bucket_name) = match setup_with_alias("special") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         // Create test file with special characters in name
@@ -1729,10 +1654,7 @@ mod edge_cases {
     fn test_empty_file_upload() {
         let (config_dir, bucket_name) = match setup_with_alias("empty") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         // Create empty file
@@ -1778,10 +1700,7 @@ mod edge_cases {
     fn test_deep_nested_path() {
         let (config_dir, bucket_name) = match setup_with_alias("deep") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         // Create test file
@@ -1835,10 +1754,7 @@ mod content_operations {
     fn test_cat_object() {
         let (config_dir, bucket_name) = match setup_with_alias("cat") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         // Create test file with known content
@@ -1882,10 +1798,7 @@ mod content_operations {
     fn test_head_object() {
         let (config_dir, bucket_name) = match setup_with_alias("head") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         // Create test file with multiple lines
@@ -1948,10 +1861,7 @@ mod content_operations {
     fn test_pipe_to_object() {
         let (config_dir, bucket_name) = match setup_with_alias("pipe") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         let test_content = "Piped content from stdin";
@@ -2006,10 +1916,7 @@ mod find_operations {
     fn test_find_by_name() {
         let (config_dir, bucket_name) = match setup_with_alias("find") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         // Create test files
@@ -2082,10 +1989,7 @@ mod find_operations {
     fn test_find_by_size() {
         let (config_dir, bucket_name) = match setup_with_alias("findsize") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         // Create files of different sizes
@@ -2146,10 +2050,7 @@ mod diff_operations {
     fn test_diff_buckets() {
         let (config_dir, bucket_name) = match setup_with_alias("diff") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         // Create second bucket for comparison
@@ -2239,10 +2140,7 @@ mod mirror_operations {
     fn test_mirror_between_buckets() {
         let (config_dir, bucket_name) = match setup_with_alias("mirror") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         // Create a second bucket for mirroring destination
@@ -2320,10 +2218,7 @@ mod mirror_operations {
     fn test_mirror_preserves_content_type() {
         let (config_dir, bucket_name) = match setup_with_alias("mirrorcontenttype") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         let target_bucket = format!("{}-dest", bucket_name);
@@ -2401,10 +2296,7 @@ mod tree_operations {
     fn test_tree_display() {
         let (config_dir, bucket_name) = match setup_with_alias("tree") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         // Create nested structure
@@ -2468,10 +2360,7 @@ mod version_operations {
     fn test_bucket_versioning() {
         let (config_dir, bucket_name) = match setup_with_alias("version") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         // Get versioning status
@@ -2540,10 +2429,7 @@ mod version_operations {
     fn test_rm_purge_permanently_deletes_versioned_object() {
         let (config_dir, bucket_name) = match setup_with_alias("rmpurge") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         let enable_output = run_rc(
@@ -2798,10 +2684,7 @@ mod version_operations {
     fn test_ls_versions_lists_multiple_object_versions() {
         let (config_dir, bucket_name) = match setup_with_alias("lsversions") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         let enable_output = run_rc(
@@ -2914,10 +2797,7 @@ mod version_operations {
     fn test_ls_versions_json_summary_reports_totals() {
         let (config_dir, bucket_name) = match setup_with_alias("lsversionssummary") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         let enable_output = run_rc(
@@ -3023,10 +2903,7 @@ mod version_operations {
     fn test_rm_recursive_purge_permanently_deletes_versioned_prefix() {
         let (config_dir, bucket_name) = match setup_with_alias("rmpurgeprefix") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         let enable_output = run_rc(
@@ -3126,10 +3003,7 @@ mod tag_operations {
     fn test_object_tags() {
         let (config_dir, bucket_name) = match setup_with_alias("tag") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         // Create and upload test file
@@ -3223,10 +3097,7 @@ mod quota_operations {
     fn test_bucket_quota_set_info_clear() {
         let (config_dir, bucket_name) = match setup_with_alias("quota") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         let bucket_path = format!("test/{}", bucket_name);
@@ -3282,10 +3153,7 @@ mod alias_operations {
     fn test_alias_lifecycle() {
         let (endpoint, access_key, secret_key) = match get_test_config() {
             Some(c) => c,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         let config_dir = tempfile::tempdir().expect("Failed to create temp dir");
@@ -3367,10 +3235,7 @@ mod encryption_operations {
     fn test_bucket_encryption_set_info_clear() {
         let (config_dir, bucket_name) = match setup_with_alias("encryption") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         let output = run_rc(
@@ -3468,10 +3333,7 @@ mod encryption_operations {
     fn test_cp_enc_s3_upload() {
         let (config_dir, bucket_name) = match setup_with_alias("cpencs3") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         let temp_file = tempfile::NamedTempFile::new().expect("Failed to create temp file");
@@ -3510,10 +3372,7 @@ mod encryption_operations {
     fn test_mv_enc_s3_remote_copy() {
         let (config_dir, bucket_name) = match setup_with_alias("mvencs3") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         upload_text_object(
@@ -3562,10 +3421,7 @@ mod encryption_operations {
     fn test_pipe_enc_s3_upload() {
         let (config_dir, bucket_name) = match setup_with_alias("pipeencs3") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         let target = format!("test/{}/piped-sse-s3.txt", bucket_name);
@@ -3619,10 +3475,7 @@ mod option_behavior_operations {
     fn test_cp_dry_run_does_not_create_target_object() {
         let (config_dir, bucket_name) = match setup_with_alias("cpdryrun") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         upload_text_object(
@@ -3678,10 +3531,7 @@ mod option_behavior_operations {
     fn test_mv_dry_run_keeps_source_and_skips_target() {
         let (config_dir, bucket_name) = match setup_with_alias("mvdryrun") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         upload_text_object(
@@ -3737,10 +3587,7 @@ mod option_behavior_operations {
     fn test_rm_dry_run_does_not_delete_object() {
         let (config_dir, bucket_name) = match setup_with_alias("rmdryrun") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         upload_text_object(
@@ -3791,10 +3638,7 @@ mod option_behavior_operations {
     fn test_rm_purge_dry_run_does_not_delete_versioned_object() {
         let (config_dir, bucket_name) = match setup_with_alias("rmpurgedryrun") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         let enable_output = run_rc(
@@ -3882,10 +3726,7 @@ mod option_behavior_operations {
     fn test_object_remove_purge_dry_run_does_not_delete_versioned_object() {
         let (config_dir, bucket_name) = match setup_with_alias("objectremovepurgedryrun") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         let enable_output = run_rc(
@@ -3974,10 +3815,7 @@ mod option_behavior_operations {
     fn test_head_bytes_returns_prefix_bytes() {
         let (config_dir, bucket_name) = match setup_with_alias("headbytes") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         upload_text_object(
@@ -4013,10 +3851,7 @@ mod option_behavior_operations {
     fn test_find_count_json_reports_match_count() {
         let (config_dir, bucket_name) = match setup_with_alias("findcount") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         upload_text_object(config_dir.path(), &bucket_name, "a.txt", "aaaaa");
@@ -4052,10 +3887,7 @@ mod option_behavior_operations {
     fn test_share_upload_generates_upload_url_with_expiration() {
         let (config_dir, bucket_name) = match setup_with_alias("shareupload") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         let object_path = format!("test/{}/upload-target.bin", bucket_name);
@@ -4120,10 +3952,7 @@ mod option_behavior_operations {
     fn test_find_print_outputs_full_remote_path() {
         let (config_dir, bucket_name) = match setup_with_alias("findprint") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         upload_text_object(
@@ -4165,10 +3994,7 @@ mod option_behavior_operations {
     fn test_find_exec_runs_command_with_full_remote_path() {
         let (config_dir, bucket_name) = match setup_with_alias("findexec") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         upload_text_object(config_dir.path(), &bucket_name, "exec-a.txt", "a");
@@ -4213,10 +4039,7 @@ mod option_behavior_operations {
     fn test_find_exec_rejects_json_output() {
         let (config_dir, bucket_name) = match setup_with_alias("findexecjson") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         upload_text_object(config_dir.path(), &bucket_name, "x.txt", "x");
@@ -4251,10 +4074,7 @@ mod option_behavior_operations {
     fn test_find_maxdepth_excludes_deeper_matches() {
         let (config_dir, bucket_name) = match setup_with_alias("finddepth") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         upload_text_object(config_dir.path(), &bucket_name, "top.txt", "top");
@@ -4297,10 +4117,7 @@ mod option_behavior_operations {
     fn test_mirror_remove_with_parallel_synchronizes_destination() {
         let (config_dir, bucket_name) = match setup_with_alias("mirroropt") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         let target_bucket = format!("{}-dest", bucket_name);
@@ -4388,10 +4205,7 @@ mod option_behavior_operations {
     fn test_mirror_parallel_zero_returns_usage_error() {
         let (config_dir, bucket_name) = match setup_with_alias("mirrorparallelzero") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         let target_bucket = format!("{}-dest", bucket_name);
@@ -4434,10 +4248,7 @@ mod option_behavior_operations {
     fn test_tree_option_combination_filters_expected_nodes() {
         let (config_dir, bucket_name) = match setup_with_alias("treeopts") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         upload_text_object(config_dir.path(), &bucket_name, "dir/a.txt", "A");
@@ -4502,10 +4313,7 @@ mod option_behavior_operations {
     fn test_diff_diff_only_excludes_same_entries() {
         let (config_dir, bucket_name) = match setup_with_alias("diffonly") {
             Some(v) => v,
-            None => {
-                eprintln!("Skipping: S3 test config not available");
-                return;
-            }
+            None => panic!("S3 integration test setup failed"),
         };
 
         let second_bucket = format!("{}-second", bucket_name);

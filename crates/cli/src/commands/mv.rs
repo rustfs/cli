@@ -177,6 +177,10 @@ async fn move_s3_to_local(
 ) -> ExitCode {
     use crate::commands::cp;
 
+    if args.recursive {
+        return move_s3_prefix_to_local(src, dst, args, formatter).await;
+    }
+
     // First, copy S3 to local
     let cp_args = cp::CpArgs {
         source: format!("{}/{}/{}", src.alias, src.bucket, src.key),
@@ -241,6 +245,140 @@ async fn move_s3_to_local(
     ExitCode::Success
 }
 
+async fn move_s3_prefix_to_local(
+    src: &RemotePath,
+    dst: &Path,
+    args: &MvArgs,
+    formatter: &Formatter,
+) -> ExitCode {
+    use crate::commands::cp;
+
+    let alias_manager = match AliasManager::new() {
+        Ok(manager) => manager,
+        Err(error) => {
+            formatter.error(&format!("Failed to load aliases: {error}"));
+            return ExitCode::GeneralError;
+        }
+    };
+    let alias = match alias_manager.get(&src.alias) {
+        Ok(alias) => alias,
+        Err(_) => {
+            formatter.error(&format!("Alias '{}' not found", src.alias));
+            return ExitCode::NotFound;
+        }
+    };
+    let client = match S3Client::new(alias).await {
+        Ok(client) => client,
+        Err(error) => {
+            formatter.error(&format!("Failed to create S3 client: {error}"));
+            return ExitCode::NetworkError;
+        }
+    };
+
+    let mut continuation_token = None;
+    let mut objects = Vec::new();
+    loop {
+        let result = match client
+            .list_objects(
+                src,
+                ListOptions {
+                    recursive: true,
+                    max_keys: Some(1000),
+                    continuation_token: continuation_token.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                formatter.error(&format!("Failed to list source objects: {error}"));
+                return ExitCode::NetworkError;
+            }
+        };
+
+        objects.extend(result.items.into_iter().filter(|item| !item.is_dir));
+        if !result.truncated {
+            break;
+        }
+        continuation_token = result.continuation_token;
+    }
+
+    let cp_args = cp::CpArgs {
+        source: src.to_string(),
+        target: dst.to_string_lossy().to_string(),
+        recursive: true,
+        preserve: false,
+        continue_on_error: args.continue_on_error,
+        overwrite: true,
+        dry_run: args.dry_run,
+        storage_class: None,
+        content_type: None,
+        enc_s3: Vec::new(),
+        enc_kms: Vec::new(),
+    };
+    let mut errors = 0usize;
+
+    for item in objects {
+        let relative = match cp::safe_download_relative_path(&item.key, &src.key) {
+            Ok(relative) => relative,
+            Err(error) => {
+                errors += 1;
+                formatter.error(&format!(
+                    "Refusing unsafe object key '{}': {error}",
+                    item.key
+                ));
+                if !args.continue_on_error {
+                    return ExitCode::UsageError;
+                }
+                continue;
+            }
+        };
+        let object = RemotePath::new(&src.alias, &src.bucket, &item.key);
+        let target = match cp::safe_download_destination(dst, &relative).await {
+            Ok(target) => target,
+            Err(error) => {
+                errors += 1;
+                formatter.error(&format!(
+                    "Refusing unsafe destination for '{}': {error}",
+                    item.key
+                ));
+                if !args.continue_on_error {
+                    return ExitCode::UsageError;
+                }
+                continue;
+            }
+        };
+        let result = cp::download_file(&client, &object, &target, &cp_args, formatter).await;
+        if result != ExitCode::Success {
+            errors += 1;
+            if !args.continue_on_error {
+                return result;
+            }
+            continue;
+        }
+
+        if !args.dry_run
+            && let Err(error) = client.delete_object(&object).await
+        {
+            errors += 1;
+            formatter.error(&format!(
+                "Downloaded but failed to delete source '{}': {error}",
+                object
+            ));
+            if !args.continue_on_error {
+                return ExitCode::GeneralError;
+            }
+        }
+    }
+
+    if errors == 0 {
+        ExitCode::Success
+    } else {
+        ExitCode::GeneralError
+    }
+}
+
 async fn move_s3_to_s3(
     src: &RemotePath,
     dst: &RemotePath,
@@ -261,6 +399,11 @@ async fn move_s3_to_s3(
     if src.alias != dst.alias {
         formatter.error("Cross-alias S3-to-S3 move not yet supported.");
         return ExitCode::UnsupportedFeature;
+    }
+
+    if args.recursive && remote_prefixes_overlap(src, dst) {
+        formatter.error("Recursive move source and destination prefixes must not overlap.");
+        return ExitCode::UsageError;
     }
 
     let alias_manager = match AliasManager::new() {
@@ -301,6 +444,7 @@ async fn move_s3_to_s3(
         let mut moved_count = 0usize;
         let mut error_count = 0usize;
         let src_prefix = src.key.clone();
+        let mut objects = Vec::new();
 
         loop {
             let list_opts = ListOptions {
@@ -317,65 +461,7 @@ async fn move_s3_to_s3(
                 }
             };
 
-            for item in &list_result.items {
-                if item.is_dir {
-                    continue;
-                }
-
-                let relative = if src_prefix.is_empty() {
-                    item.key.clone()
-                } else if let Some(rest) = item.key.strip_prefix(&src_prefix) {
-                    rest.trim_start_matches('/').to_string()
-                } else {
-                    item.key.clone()
-                };
-
-                let target_key = if dst.key.is_empty() {
-                    relative.clone()
-                } else if dst.key.ends_with('/') {
-                    format!("{}{}", dst.key, relative)
-                } else {
-                    format!("{}/{}", dst.key, relative)
-                };
-
-                let src_obj = RemotePath::new(&src.alias, &src.bucket, &item.key);
-                let dst_obj = RemotePath::new(&dst.alias, &dst.bucket, &target_key);
-                let src_obj_display = src_obj.to_string();
-                let dst_obj_display = dst_obj.to_string();
-
-                match client
-                    .copy_object(&src_obj, &dst_obj, encryption.as_ref())
-                    .await
-                {
-                    Ok(_) => match client.delete_object(&src_obj).await {
-                        Ok(()) => {
-                            moved_count += 1;
-                            if !formatter.is_json() {
-                                formatter
-                                    .println(&format!("{src_obj_display} -> {dst_obj_display}"));
-                            }
-                        }
-                        Err(e) => {
-                            error_count += 1;
-                            formatter.error(&format!(
-                                "Copied but failed to delete source '{src_obj_display}': {e}"
-                            ));
-                            if !args.continue_on_error {
-                                return ExitCode::GeneralError;
-                            }
-                        }
-                    },
-                    Err(e) => {
-                        error_count += 1;
-                        formatter.error(&format!(
-                            "Failed to move '{src_obj_display}' -> '{dst_obj_display}': {e}"
-                        ));
-                        if !args.continue_on_error {
-                            return ExitCode::NetworkError;
-                        }
-                    }
-                }
-            }
+            objects.extend(list_result.items.into_iter().filter(|item| !item.is_dir));
 
             if !list_result.truncated {
                 break;
@@ -389,6 +475,81 @@ async fn move_s3_to_s3(
                     return ExitCode::GeneralError;
                 }
             };
+        }
+
+        for item in &objects {
+            let relative = if src_prefix.is_empty() {
+                item.key.clone()
+            } else if let Some(rest) = item.key.strip_prefix(&src_prefix) {
+                rest.trim_start_matches('/').to_string()
+            } else {
+                error_count += 1;
+                formatter.error(&format!(
+                    "Source listing returned key '{}' outside prefix '{}'",
+                    item.key, src_prefix
+                ));
+                if !args.continue_on_error {
+                    return ExitCode::GeneralError;
+                }
+                continue;
+            };
+
+            if relative.is_empty() {
+                error_count += 1;
+                formatter.error(&format!(
+                    "Cannot derive a destination key for source '{}'",
+                    item.key
+                ));
+                if !args.continue_on_error {
+                    return ExitCode::UsageError;
+                }
+                continue;
+            }
+
+            let target_key = if dst.key.is_empty() {
+                relative.clone()
+            } else if dst.key.ends_with('/') {
+                format!("{}{}", dst.key, relative)
+            } else {
+                format!("{}/{}", dst.key, relative)
+            };
+
+            let src_obj = RemotePath::new(&src.alias, &src.bucket, &item.key);
+            let dst_obj = RemotePath::new(&dst.alias, &dst.bucket, &target_key);
+            let src_obj_display = src_obj.to_string();
+            let dst_obj_display = dst_obj.to_string();
+
+            match client
+                .copy_object(&src_obj, &dst_obj, encryption.as_ref())
+                .await
+            {
+                Ok(_) => match client.delete_object(&src_obj).await {
+                    Ok(()) => {
+                        moved_count += 1;
+                        if !formatter.is_json() {
+                            formatter.println(&format!("{src_obj_display} -> {dst_obj_display}"));
+                        }
+                    }
+                    Err(e) => {
+                        error_count += 1;
+                        formatter.error(&format!(
+                            "Copied but failed to delete source '{src_obj_display}': {e}"
+                        ));
+                        if !args.continue_on_error {
+                            return ExitCode::GeneralError;
+                        }
+                    }
+                },
+                Err(e) => {
+                    error_count += 1;
+                    formatter.error(&format!(
+                        "Failed to move '{src_obj_display}' -> '{dst_obj_display}': {e}"
+                    ));
+                    if !args.continue_on_error {
+                        return ExitCode::NetworkError;
+                    }
+                }
+            }
         }
 
         if formatter.is_json() {
@@ -463,6 +624,25 @@ async fn move_s3_to_s3(
             }
         }
     }
+}
+
+fn remote_prefixes_overlap(source: &RemotePath, target: &RemotePath) -> bool {
+    if source.alias != target.alias || source.bucket != target.bucket {
+        return false;
+    }
+
+    let source = source.key.trim_matches('/');
+    let target = target.key.trim_matches('/');
+    if source.is_empty() || target.is_empty() || source == target {
+        return true;
+    }
+
+    target
+        .strip_prefix(source)
+        .is_some_and(|rest| rest.starts_with('/'))
+        || source
+            .strip_prefix(target)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 #[cfg(test)]
@@ -582,6 +762,18 @@ mod tests {
 
         assert_eq!(args.enc_s3.len(), 1);
         assert_eq!(args.enc_kms.len(), 1);
+    }
+
+    #[test]
+    fn recursive_move_rejects_overlapping_remote_prefixes() {
+        let source = RemotePath::new("local", "bucket", "source/");
+        let nested_target = RemotePath::new("local", "bucket", "source/archive/");
+        let parent_target = RemotePath::new("local", "bucket", "");
+        let separate_target = RemotePath::new("local", "bucket", "archive/");
+
+        assert!(remote_prefixes_overlap(&source, &nested_target));
+        assert!(remote_prefixes_overlap(&source, &parent_target));
+        assert!(!remote_prefixes_overlap(&source, &separate_target));
     }
 
     #[test]

@@ -9,8 +9,7 @@ use rc_s3::S3Client;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::Semaphore;
-use tokio::task::JoinSet;
+use tokio::task::{JoinError, JoinSet};
 
 use crate::commands::diff::{DiffEntry, DiffStatus};
 use crate::exit_code::ExitCode;
@@ -64,6 +63,14 @@ struct FileInfo {
     etag: Option<String>,
 }
 
+struct MirrorTaskContext<'a> {
+    success_marker: &'a str,
+    operation: &'a str,
+    quiet: bool,
+    formatter: &'a Formatter,
+    progress: Option<&'a ProgressBar>,
+}
+
 trait MirrorCopySource {
     async fn head_object_for_mirror(
         &self,
@@ -79,6 +86,7 @@ trait MirrorCopyTarget {
         path: &RemotePath,
         data: Vec<u8>,
         content_type: Option<&str>,
+        if_absent: bool,
     ) -> rc_core::Result<rc_core::ObjectInfo>;
 }
 
@@ -101,8 +109,13 @@ impl MirrorCopyTarget for S3Client {
         path: &RemotePath,
         data: Vec<u8>,
         content_type: Option<&str>,
+        if_absent: bool,
     ) -> rc_core::Result<rc_core::ObjectInfo> {
-        rc_core::ObjectStore::put_object(self, path, data, content_type, None).await
+        if if_absent {
+            self.put_object_if_absent(path, data, content_type).await
+        } else {
+            rc_core::ObjectStore::put_object(self, path, data, content_type, None).await
+        }
     }
 }
 
@@ -110,8 +123,8 @@ impl MirrorCopyTarget for S3Client {
 pub async fn execute(args: MirrorArgs, output_config: OutputConfig) -> ExitCode {
     let formatter = Formatter::new(output_config);
 
-    if args.parallel == 0 {
-        formatter.error("--parallel must be greater than 0");
+    if !(1..=256).contains(&args.parallel) {
+        formatter.error("--parallel must be between 1 and 256");
         return ExitCode::UsageError;
     }
 
@@ -162,6 +175,16 @@ pub async fn execute(args: MirrorArgs, output_config: OutputConfig) -> ExitCode 
         }
     };
 
+    if mirror_locations_overlap(
+        &source_path,
+        &target_path,
+        &source_alias.endpoint,
+        &target_alias.endpoint,
+    ) {
+        formatter.error("Mirror source and destination prefixes must not overlap");
+        return ExitCode::UsageError;
+    }
+
     let source_client = Arc::new(match S3Client::new(source_alias).await {
         Ok(c) => c,
         Err(e) => {
@@ -198,8 +221,8 @@ pub async fn execute(args: MirrorArgs, output_config: OutputConfig) -> ExitCode 
     // Compare and determine operations
     let diff_entries = compare_objects_internal(&source_objects, &target_objects);
 
-    let mut to_copy: Vec<(&str, &FileInfo)> = Vec::new();
-    let mut to_remove: Vec<&str> = Vec::new();
+    let mut to_copy: Vec<(&str, &FileInfo, bool)> = Vec::new();
+    let mut to_remove: Vec<(&str, &FileInfo)> = Vec::new();
     let mut skipped = 0;
 
     for entry in &diff_entries {
@@ -207,14 +230,14 @@ pub async fn execute(args: MirrorArgs, output_config: OutputConfig) -> ExitCode 
             DiffStatus::OnlyFirst => {
                 // New object, copy it
                 if let Some(info) = source_objects.get(&entry.key) {
-                    to_copy.push((&entry.key, info));
+                    to_copy.push((&entry.key, info, true));
                 }
             }
             DiffStatus::Different => {
                 if args.overwrite {
                     // Different and overwrite enabled, copy it
                     if let Some(info) = source_objects.get(&entry.key) {
-                        to_copy.push((&entry.key, info));
+                        to_copy.push((&entry.key, info, false));
                     }
                 } else {
                     skipped += 1;
@@ -223,7 +246,9 @@ pub async fn execute(args: MirrorArgs, output_config: OutputConfig) -> ExitCode 
             DiffStatus::OnlySecond => {
                 if args.remove {
                     // Extra object at destination, remove it
-                    to_remove.push(&entry.key);
+                    if let Some(info) = target_objects.get(&entry.key) {
+                        to_remove.push((&entry.key, info));
+                    }
                 }
             }
             DiffStatus::Same => {
@@ -240,20 +265,20 @@ pub async fn execute(args: MirrorArgs, output_config: OutputConfig) -> ExitCode 
 
             if !to_copy.is_empty() {
                 formatter.println(&format!("Would copy {} object(s):", to_copy.len()));
-                for (key, info) in &to_copy {
+                for (key, info, _) in &to_copy {
                     let size = info
                         .size
                         .map(|s| humansize::format_size(s as u64, humansize::BINARY))
                         .unwrap_or_default();
-                    formatter.println(&format!("  + {key} ({size})"));
+                    formatter.println(&format!("  + {} ({size})", formatter.sanitize_text(key)));
                 }
                 formatter.println("");
             }
 
             if !to_remove.is_empty() {
                 formatter.println(&format!("Would remove {} object(s):", to_remove.len()));
-                for key in &to_remove {
-                    formatter.println(&format!("  - {key}"));
+                for (key, _) in &to_remove {
+                    formatter.println(&format!("  - {}", formatter.sanitize_text(key)));
                 }
                 formatter.println("");
             }
@@ -303,10 +328,16 @@ pub async fn execute(args: MirrorArgs, output_config: OutputConfig) -> ExitCode 
     let mut errors = 0;
 
     let parallel_limit = args.parallel.max(1);
-    let copy_semaphore = Arc::new(Semaphore::new(parallel_limit));
     let mut copy_tasks: JoinSet<(String, Result<(), String>)> = JoinSet::new();
+    let copy_context = MirrorTaskContext {
+        success_marker: "+",
+        operation: "copy",
+        quiet: args.quiet,
+        formatter: &formatter,
+        progress: overall_pb.as_ref(),
+    };
 
-    for (key, _) in to_copy {
+    for (key, _, if_absent) in to_copy {
         let source_sep = if source_path.key.is_empty() || source_path.key.ends_with('/') {
             ""
         } else {
@@ -332,60 +363,44 @@ pub async fn execute(args: MirrorArgs, output_config: OutputConfig) -> ExitCode 
         let key = key.to_string();
         let source_client = Arc::clone(&source_client);
         let target_client = Arc::clone(&target_client);
-        let permit = copy_semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("semaphore should not be closed");
         copy_tasks.spawn(async move {
-            let _permit = permit;
             let result = copy_object_with_metadata(
                 source_client.as_ref(),
                 target_client.as_ref(),
                 &source_full,
                 &target_full,
+                if_absent,
             )
             .await
             .map_err(|e| format!("Failed to copy {key}: {e}"));
             (key, result)
         });
+
+        if copy_tasks.len() >= parallel_limit
+            && let Some(task_result) = copy_tasks.join_next().await
+        {
+            record_mirror_task(task_result, &copy_context, &mut copied, &mut errors);
+        }
     }
 
     while let Some(task_result) = copy_tasks.join_next().await {
-        match task_result {
-            Ok((key, Ok(()))) => {
-                copied += 1;
-                if !args.quiet && !formatter.is_json() {
-                    formatter.println(&format!("+ {key}"));
-                }
-            }
-            Ok((_, Err(message))) => {
-                errors += 1;
-                if !formatter.is_json() {
-                    formatter.error(&message);
-                }
-            }
-            Err(join_error) => {
-                errors += 1;
-                if !formatter.is_json() {
-                    formatter.error(&format!("Mirror copy worker failed: {join_error}"));
-                }
-            }
-        }
-
-        if let Some(ref pb) = overall_pb {
-            pb.inc(1);
-        }
+        record_mirror_task(task_result, &copy_context, &mut copied, &mut errors);
     }
 
     // Perform remove operations
     let mut removed = 0;
 
-    if args.remove {
-        let remove_semaphore = Arc::new(Semaphore::new(parallel_limit));
+    if args.remove && errors == 0 {
         let mut remove_tasks: JoinSet<(String, Result<(), String>)> = JoinSet::new();
+        let remove_context = MirrorTaskContext {
+            success_marker: "-",
+            operation: "remove",
+            quiet: args.quiet,
+            formatter: &formatter,
+            progress: overall_pb.as_ref(),
+        };
 
-        for key in to_remove {
+        for (key, info) in to_remove {
             let sep = if target_path.key.is_empty() || target_path.key.ends_with('/') {
                 ""
             } else {
@@ -398,49 +413,35 @@ pub async fn execute(args: MirrorArgs, output_config: OutputConfig) -> ExitCode 
             );
 
             let key = key.to_string();
+            let etag = info.etag.clone();
             let target_client = Arc::clone(&target_client);
-            let permit = remove_semaphore
-                .clone()
-                .acquire_owned()
-                .await
-                .expect("semaphore should not be closed");
             remove_tasks.spawn(async move {
-                let _permit = permit;
-                let result = target_client
-                    .delete_object(&target_full)
-                    .await
-                    .map(|_| ())
-                    .map_err(|e| format!("Failed to remove {key}: {e}"));
+                let result = match etag {
+                    Some(etag) => {
+                        target_client
+                            .delete_object_if_match(&target_full, &etag)
+                            .await
+                    }
+                    None => Err(rc_core::Error::Conflict(format!(
+                        "Refusing to remove {key} because its ETag is unavailable"
+                    ))),
+                }
+                .map_err(|e| format!("Failed to remove {key}: {e}"));
                 (key, result)
             });
+
+            if remove_tasks.len() >= parallel_limit
+                && let Some(task_result) = remove_tasks.join_next().await
+            {
+                record_mirror_task(task_result, &remove_context, &mut removed, &mut errors);
+            }
         }
 
         while let Some(task_result) = remove_tasks.join_next().await {
-            match task_result {
-                Ok((key, Ok(()))) => {
-                    removed += 1;
-                    if !args.quiet && !formatter.is_json() {
-                        formatter.println(&format!("- {key}"));
-                    }
-                }
-                Ok((_, Err(message))) => {
-                    errors += 1;
-                    if !formatter.is_json() {
-                        formatter.error(&message);
-                    }
-                }
-                Err(join_error) => {
-                    errors += 1;
-                    if !formatter.is_json() {
-                        formatter.error(&format!("Mirror remove worker failed: {join_error}"));
-                    }
-                }
-            }
-
-            if let Some(ref pb) = overall_pb {
-                pb.inc(1);
-            }
+            record_mirror_task(task_result, &remove_context, &mut removed, &mut errors);
         }
+    } else if args.remove && errors > 0 && !formatter.is_json() {
+        formatter.error("Skipping removals because one or more copy operations failed");
     }
 
     if let Some(pb) = overall_pb {
@@ -473,6 +474,45 @@ pub async fn execute(args: MirrorArgs, output_config: OutputConfig) -> ExitCode 
     }
 }
 
+fn record_mirror_task(
+    task_result: Result<(String, Result<(), String>), JoinError>,
+    context: &MirrorTaskContext<'_>,
+    succeeded: &mut usize,
+    errors: &mut usize,
+) {
+    match task_result {
+        Ok((key, Ok(()))) => {
+            *succeeded += 1;
+            if !context.quiet && !context.formatter.is_json() {
+                context.formatter.println(&format!(
+                    "{} {}",
+                    context.success_marker,
+                    context.formatter.sanitize_text(&key)
+                ));
+            }
+        }
+        Ok((_, Err(message))) => {
+            *errors += 1;
+            if !context.formatter.is_json() {
+                context.formatter.error(&message);
+            }
+        }
+        Err(join_error) => {
+            *errors += 1;
+            if !context.formatter.is_json() {
+                context.formatter.error(&format!(
+                    "Mirror {} worker failed: {join_error}",
+                    context.operation
+                ));
+            }
+        }
+    }
+
+    if let Some(progress) = context.progress {
+        progress.inc(1);
+    }
+}
+
 // Mirror should preserve source content type when metadata is available, but
 // still fall back to a plain byte copy if metadata lookup fails for any reason.
 async fn copy_object_with_metadata<S, T>(
@@ -480,6 +520,7 @@ async fn copy_object_with_metadata<S, T>(
     target_client: &T,
     source_path: &RemotePath,
     target_path: &RemotePath,
+    if_absent: bool,
 ) -> rc_core::Result<()>
 where
     S: MirrorCopySource,
@@ -501,7 +542,7 @@ where
 
     let data = source_client.get_object_for_mirror(source_path).await?;
     target_client
-        .put_object_for_mirror(target_path, data, content_type.as_deref())
+        .put_object_for_mirror(target_path, data, content_type.as_deref(), if_absent)
         .await?;
     Ok(())
 }
@@ -568,7 +609,10 @@ fn compare_objects_internal(
         if let Some(target_info) = target.get(key) {
             // Object exists in both
             let is_same = source_info.size == target_info.size
-                && (source_info.etag == target_info.etag || source_info.etag.is_none());
+                && matches!(
+                    (&source_info.etag, &target_info.etag),
+                    (Some(source_etag), Some(target_etag)) if source_etag == target_etag
+                );
 
             let status = if is_same {
                 DiffStatus::Same
@@ -613,6 +657,45 @@ fn compare_objects_internal(
 
     entries.sort_by(|a, b| a.key.cmp(&b.key));
     entries
+}
+
+fn mirror_locations_overlap(
+    source: &RemotePath,
+    target: &RemotePath,
+    source_endpoint: &str,
+    target_endpoint: &str,
+) -> bool {
+    if source.bucket != target.bucket || !same_endpoint(source_endpoint, target_endpoint) {
+        return false;
+    }
+
+    let source = source.key.trim_matches('/');
+    let target = target.key.trim_matches('/');
+    if source.is_empty() || target.is_empty() || source == target {
+        return true;
+    }
+
+    target
+        .strip_prefix(source)
+        .is_some_and(|rest| rest.starts_with('/'))
+        || source
+            .strip_prefix(target)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn same_endpoint(first: &str, second: &str) -> bool {
+    match (url::Url::parse(first), url::Url::parse(second)) {
+        (Ok(first), Ok(second)) => {
+            first.scheme().eq_ignore_ascii_case(second.scheme())
+                && first.host_str().zip(second.host_str()).is_some_and(
+                    |(first_host, second_host)| first_host.eq_ignore_ascii_case(second_host),
+                )
+                && first.port_or_known_default() == second.port_or_known_default()
+        }
+        _ => first
+            .trim_end_matches('/')
+            .eq_ignore_ascii_case(second.trim_end_matches('/')),
+    }
 }
 
 #[cfg(test)]
@@ -688,6 +771,7 @@ mod tests {
         key: String,
         content_type: Option<String>,
         data: Vec<u8>,
+        if_absent: bool,
     }
 
     #[derive(Debug, Default)]
@@ -701,6 +785,7 @@ mod tests {
             path: &RemotePath,
             data: Vec<u8>,
             content_type: Option<&str>,
+            if_absent: bool,
         ) -> rc_core::Result<ObjectInfo> {
             self.put_calls
                 .lock()
@@ -709,6 +794,7 @@ mod tests {
                     key: path.key.clone(),
                     content_type: content_type.map(ToOwned::to_owned),
                     data: data.clone(),
+                    if_absent,
                 });
 
             Ok(ObjectInfo::file(path.key.clone(), data.len() as i64))
@@ -722,7 +808,7 @@ mod tests {
         let source_path = RemotePath::new("stage", "images", "photo.jpg");
         let target_path = RemotePath::new("prod", "images", "photo.jpg");
 
-        copy_object_with_metadata(&source, &target, &source_path, &target_path)
+        copy_object_with_metadata(&source, &target, &source_path, &target_path, true)
             .await
             .expect("copy should succeed");
 
@@ -752,6 +838,7 @@ mod tests {
                 key: "photo.jpg".to_string(),
                 content_type: Some("image/jpeg".to_string()),
                 data: b"jpeg-bytes".to_vec(),
+                if_absent: true,
             }]
         );
     }
@@ -763,7 +850,7 @@ mod tests {
         let source_path = RemotePath::new("stage", "docs", "readme.txt");
         let target_path = RemotePath::new("prod", "docs", "readme.txt");
 
-        copy_object_with_metadata(&source, &target, &source_path, &target_path)
+        copy_object_with_metadata(&source, &target, &source_path, &target_path, false)
             .await
             .expect("copy should succeed");
 
@@ -777,6 +864,7 @@ mod tests {
                 key: "readme.txt".to_string(),
                 content_type: None,
                 data: b"plain-bytes".to_vec(),
+                if_absent: false,
             }]
         );
     }
@@ -791,7 +879,7 @@ mod tests {
         let source_path = RemotePath::new("stage", "docs", "readme.txt");
         let target_path = RemotePath::new("prod", "docs", "readme.txt");
 
-        copy_object_with_metadata(&source, &target, &source_path, &target_path)
+        copy_object_with_metadata(&source, &target, &source_path, &target_path, false)
             .await
             .expect("copy should succeed");
 
@@ -821,6 +909,7 @@ mod tests {
                 key: "readme.txt".to_string(),
                 content_type: None,
                 data: b"plain-bytes".to_vec(),
+                if_absent: false,
             }]
         );
     }
@@ -949,6 +1038,50 @@ mod tests {
         let entries = compare_objects_internal(&source, &target);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].status, DiffStatus::Different);
+    }
+
+    #[test]
+    fn test_compare_missing_etag_is_different() {
+        let source = HashMap::from([(
+            "file.txt".to_string(),
+            FileInfo {
+                size: Some(100),
+                modified: None,
+                etag: None,
+            },
+        )]);
+        let target = HashMap::from([(
+            "file.txt".to_string(),
+            FileInfo {
+                size: Some(100),
+                modified: None,
+                etag: Some("target-etag".to_string()),
+            },
+        )]);
+
+        let entries = compare_objects_internal(&source, &target);
+
+        assert_eq!(entries[0].status, DiffStatus::Different);
+    }
+
+    #[test]
+    fn mirror_rejects_overlapping_prefixes_across_aliases_for_same_endpoint() {
+        let source = RemotePath::new("source", "bucket", "data/source");
+        let nested = RemotePath::new("target", "bucket", "data/source/archive");
+        let adjacent = RemotePath::new("target", "bucket", "data/source-archive");
+
+        assert!(mirror_locations_overlap(
+            &source,
+            &nested,
+            "https://s3.example.com/",
+            "https://S3.EXAMPLE.COM:443"
+        ));
+        assert!(!mirror_locations_overlap(
+            &source,
+            &adjacent,
+            "https://s3.example.com",
+            "https://s3.example.com"
+        ));
     }
 
     #[test]

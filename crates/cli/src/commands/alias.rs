@@ -55,7 +55,7 @@ pub struct SetArgs {
     #[arg(long, default_value = "us-east-1")]
     pub region: String,
 
-    /// Signature version: v4 or v2 (default: v4)
+    /// Signature version (only v4 is currently supported)
     #[arg(long, default_value = "v4")]
     pub signature: String,
 
@@ -189,7 +189,13 @@ async fn execute_set(args: SetArgs, manager: &AliasManager, formatter: &Formatte
     }
 
     // Validate signature version
-    if args.signature != "v4" && args.signature != "v2" {
+    if args.signature == "v2" {
+        return formatter.fail(
+            ExitCode::UnsupportedFeature,
+            "Only SigV4 aliases are currently supported",
+        );
+    }
+    if args.signature != "v4" {
         return formatter.fail(ExitCode::UsageError, "Signature must be 'v4' or 'v2'");
     }
 

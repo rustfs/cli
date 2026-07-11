@@ -52,6 +52,13 @@ struct MbOutput {
 pub async fn execute(args: MbArgs, output_config: OutputConfig) -> ExitCode {
     let formatter = Formatter::new(output_config);
 
+    if args.region.is_some() || args.with_lock || args.with_versioning {
+        return formatter.fail(
+            ExitCode::UnsupportedFeature,
+            "--region, --with-lock, and --with-versioning are not implemented for bucket creation",
+        );
+    }
+
     // Parse the target path
     let (alias_name, bucket) = match parse_mb_path(&args.target) {
         Ok(parsed) => parsed,

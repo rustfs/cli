@@ -170,14 +170,18 @@ fn parse_expiration(s: &str) -> Result<u64, String> {
         .parse()
         .map_err(|_| format!("Invalid expiration number: {num_str}"))?;
 
-    let seconds = match suffix.to_lowercase().as_str() {
-        "s" => num,
-        "m" => num * 60,
-        "h" => num * 3600,
-        "d" => num * 86400,
-        "w" => num * 604800,
+    let multiplier = match suffix.to_lowercase().as_str() {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86400,
+        "w" => 604800,
         _ => return Err(format!("Unknown expiration suffix: {suffix}")),
     };
+
+    let seconds = num
+        .checked_mul(multiplier)
+        .ok_or_else(|| "Expiration is too large".to_string())?;
 
     Ok(seconds)
 }
@@ -246,6 +250,7 @@ mod tests {
         assert!(parse_expiration("").is_err());
         assert!(parse_expiration("abc").is_err());
         assert!(parse_expiration("1x").is_err());
+        assert!(parse_expiration("30500568904944w").is_err());
     }
 
     #[test]

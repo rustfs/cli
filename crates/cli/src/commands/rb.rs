@@ -37,6 +37,13 @@ struct RbOutput {
 pub async fn execute(args: RbArgs, output_config: OutputConfig) -> ExitCode {
     let formatter = Formatter::new(output_config);
 
+    if args.force || args.dangerous {
+        return formatter.fail(
+            ExitCode::UnsupportedFeature,
+            "--force and --dangerous are not implemented for bucket removal",
+        );
+    }
+
     // Parse the target path
     let (alias_name, bucket) = match parse_rb_path(&args.target) {
         Ok(parsed) => parsed,
@@ -85,9 +92,6 @@ pub async fn execute(args: RbArgs, output_config: OutputConfig) -> ExitCode {
         }
     }
 
-    // TODO: If --force is specified, delete all objects first
-    // This will be implemented in Phase 3 when we have delete_object
-
     // Delete the bucket
     match client.delete_bucket(&bucket).await {
         Ok(()) => {
@@ -108,15 +112,9 @@ pub async fn execute(args: RbArgs, output_config: OutputConfig) -> ExitCode {
         Err(e) => {
             let err_str = e.to_string();
             if err_str.contains("BucketNotEmpty") {
-                if args.force {
-                    formatter.error(&format!(
-                        "Bucket '{alias_name}/{bucket}' is not empty. --force with object deletion not yet implemented."
-                    ));
-                } else {
-                    formatter.error(&format!(
-                        "Bucket '{alias_name}/{bucket}' is not empty. Use --force to delete all objects first."
-                    ));
-                }
+                formatter.error(&format!(
+                    "Bucket '{alias_name}/{bucket}' is not empty. Remove its contents first."
+                ));
                 ExitCode::Conflict
             } else if err_str.contains("NoSuchBucket") || err_str.contains("NotFound") {
                 formatter.error(&format!("Bucket '{alias_name}/{bucket}' does not exist"));

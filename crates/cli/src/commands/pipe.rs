@@ -47,6 +47,12 @@ struct PipeOutput {
 /// Execute the pipe command
 pub async fn execute(args: PipeArgs, output_config: OutputConfig) -> ExitCode {
     let formatter = Formatter::new(output_config);
+    if args.storage_class.is_some() {
+        return formatter.fail(
+            ExitCode::UnsupportedFeature,
+            "--storage-class is not implemented for pipe",
+        );
+    }
     let encryption = match (args.enc_s3, args.enc_kms.as_deref()) {
         (true, None) => Some(ObjectEncryptionRequest::SseS3),
         (false, Some(key_id)) => Some(ObjectEncryptionRequest::SseKms {

@@ -33,6 +33,13 @@ pub struct HeadArgs {
 pub async fn execute(args: HeadArgs, output_config: OutputConfig) -> ExitCode {
     let formatter = Formatter::new(output_config);
 
+    if args.version_id.is_some() {
+        return formatter.fail(
+            ExitCode::UnsupportedFeature,
+            "--version-id is not implemented for head",
+        );
+    }
+
     // Parse the path
     let (alias_name, bucket, key) = match parse_head_path(&args.path) {
         Ok(parsed) => parsed,
@@ -70,47 +77,44 @@ pub async fn execute(args: HeadArgs, output_config: OutputConfig) -> ExitCode {
 
     let path = RemotePath::new(&alias_name, &bucket, &key);
 
+    if let Some(num_bytes) = args.bytes {
+        let mut stdout = tokio::io::stdout();
+        return match client
+            .write_object_to(&path, &mut stdout, Some(num_bytes as u64))
+            .await
+        {
+            Ok(_) => ExitCode::Success,
+            Err(e) => output_get_error(&formatter, &args.path, e),
+        };
+    }
+
     // Get object content
     match client.get_object(&path).await {
         Ok(data) => {
-            let output = if let Some(num_bytes) = args.bytes {
-                // Output first N bytes
-                let end = num_bytes.min(data.len());
-                &data[..end]
-            } else {
-                // Output first N lines
-                let content = String::from_utf8_lossy(&data);
-                let lines: Vec<&str> = content.lines().take(args.lines).collect();
-                let result = lines.join("\n");
-
-                // Write string content and add newline
-                if let Err(e) = writeln!(io::stdout(), "{result}") {
-                    formatter.error(&format!("Failed to write to stdout: {e}"));
-                    return ExitCode::GeneralError;
-                }
-                return ExitCode::Success;
-            };
-
-            // Write bytes directly to stdout
-            if let Err(e) = io::stdout().write_all(output) {
+            let content = String::from_utf8_lossy(&data);
+            let lines: Vec<&str> = content.lines().take(args.lines).collect();
+            let result = lines.join("\n");
+            if let Err(e) = writeln!(io::stdout(), "{result}") {
                 formatter.error(&format!("Failed to write to stdout: {e}"));
                 return ExitCode::GeneralError;
             }
             ExitCode::Success
         }
-        Err(e) => {
-            let err_str = e.to_string();
-            if err_str.contains("NotFound") || err_str.contains("NoSuchKey") {
-                formatter.error(&format!("Object not found: {}", args.path));
-                ExitCode::NotFound
-            } else if err_str.contains("AccessDenied") {
-                formatter.error(&format!("Access denied: {}", args.path));
-                ExitCode::AuthError
-            } else {
-                formatter.error(&format!("Failed to get object: {e}"));
-                ExitCode::NetworkError
-            }
-        }
+        Err(e) => output_get_error(&formatter, &args.path, e),
+    }
+}
+
+fn output_get_error(formatter: &Formatter, path: &str, error: rc_core::Error) -> ExitCode {
+    let message = error.to_string();
+    if message.contains("NotFound") || message.contains("NoSuchKey") {
+        formatter.error(&format!("Object not found: {path}"));
+        ExitCode::NotFound
+    } else if message.contains("AccessDenied") {
+        formatter.error(&format!("Access denied: {path}"));
+        ExitCode::AuthError
+    } else {
+        formatter.error(&format!("Failed to get object: {error}"));
+        ExitCode::NetworkError
     }
 }
 

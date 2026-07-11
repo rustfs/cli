@@ -7,10 +7,11 @@
 use std::io::{IsTerminal, stderr, stdout};
 
 use clap::{Parser, Subcommand, ValueEnum};
-use rc_core::{RequestHeader, set_global_request_headers};
+use rc_core::config::Defaults;
+use rc_core::{ConfigManager, RequestHeader, set_global_request_headers};
 
 use crate::exit_code::ExitCode;
-use crate::output::OutputConfig;
+use crate::output::{Formatter, OutputConfig};
 
 mod admin;
 mod alias;
@@ -106,6 +107,7 @@ struct GlobalOutputOptions {
     format: Option<OutputFormat>,
     json: bool,
     no_color: bool,
+    force_color: bool,
     no_progress: bool,
     quiet: bool,
 }
@@ -116,9 +118,34 @@ impl GlobalOutputOptions {
             format: cli.format,
             json: cli.json,
             no_color: cli.no_color,
+            force_color: false,
             no_progress: cli.no_progress,
             quiet: cli.quiet,
         }
+    }
+
+    fn apply_defaults(mut self, defaults: &Defaults) -> Result<Self, String> {
+        if self.format.is_none() && !self.json {
+            self.format = Some(match defaults.output.as_str() {
+                "human" => OutputFormat::Human,
+                "json" => OutputFormat::Json,
+                value => return Err(format!("Invalid default output format '{value}'")),
+            });
+        }
+
+        if !self.no_color {
+            match defaults.color.as_str() {
+                "auto" => {}
+                "always" => self.force_color = true,
+                "never" => self.no_color = true,
+                value => return Err(format!("Invalid default color mode '{value}'")),
+            }
+        }
+        if !defaults.progress {
+            self.no_progress = true;
+        }
+
+        Ok(self)
     }
 
     fn resolve(self, behavior: OutputBehavior) -> OutputConfig {
@@ -142,7 +169,7 @@ impl GlobalOutputOptions {
 
         OutputConfig {
             json,
-            no_color: self.no_color || !stdout_is_tty || json,
+            no_color: self.no_color || (!self.force_color && !stdout_is_tty) || json,
             no_progress: self.no_progress || !stderr_is_tty || json,
             quiet: self.quiet,
         }
@@ -258,7 +285,41 @@ pub enum Commands {
 /// Execute the CLI command and return an exit code
 pub async fn execute(cli: Cli) -> ExitCode {
     set_global_request_headers(cli.request_headers.clone());
-    let output_options = GlobalOutputOptions::from_cli(&cli);
+    let cli_output_options = GlobalOutputOptions::from_cli(&cli);
+    let defaults = match ConfigManager::new() {
+        Ok(manager) if manager.config_path().exists() => match manager.load() {
+            Ok(config) => Some(config.defaults),
+            Err(error) => {
+                return Formatter::new(cli_output_options.resolve(OutputBehavior::HumanDefault))
+                    .fail(
+                        ExitCode::GeneralError,
+                        &format!("Failed to load configuration: {error}"),
+                    );
+            }
+        },
+        Ok(_) => None,
+        Err(error) => {
+            return Formatter::new(cli_output_options.resolve(OutputBehavior::HumanDefault)).fail(
+                ExitCode::GeneralError,
+                &format!("Failed to load configuration: {error}"),
+            );
+        }
+    };
+    let output_options = cli_output_options;
+    let output_options = if let Some(defaults) = &defaults {
+        match output_options.apply_defaults(defaults) {
+            Ok(options) => options,
+            Err(error) => {
+                return Formatter::new(cli_output_options.resolve(OutputBehavior::HumanDefault))
+                    .fail(
+                        ExitCode::GeneralError,
+                        &format!("Failed to load configuration: {error}"),
+                    );
+            }
+        }
+    } else {
+        output_options
+    };
 
     match cli.command {
         Commands::Alias(cmd) => {
@@ -390,6 +451,7 @@ mod tests {
             format: None,
             json: false,
             no_color: false,
+            force_color: false,
             no_progress: false,
             quiet: false,
         };
@@ -404,6 +466,7 @@ mod tests {
             format: None,
             json: false,
             no_color: false,
+            force_color: false,
             no_progress: false,
             quiet: false,
         };
@@ -418,6 +481,7 @@ mod tests {
             format: Some(OutputFormat::Human),
             json: true,
             no_color: false,
+            force_color: false,
             no_progress: false,
             quiet: false,
         };
@@ -432,6 +496,7 @@ mod tests {
             format: Some(OutputFormat::Human),
             json: false,
             no_color: false,
+            force_color: false,
             no_progress: false,
             quiet: false,
         };
@@ -446,12 +511,57 @@ mod tests {
             format: Some(OutputFormat::Auto),
             json: false,
             no_color: false,
+            force_color: false,
             no_progress: false,
             quiet: false,
         };
 
         let resolved = options.resolve(OutputBehavior::HumanDefault);
         assert_eq!(resolved.json, !std::io::stdout().is_terminal());
+    }
+
+    #[test]
+    fn configured_defaults_control_output_color_and_progress() {
+        let options = GlobalOutputOptions {
+            format: None,
+            json: false,
+            no_color: false,
+            force_color: false,
+            no_progress: false,
+            quiet: false,
+        };
+        let defaults = Defaults {
+            output: "json".to_string(),
+            color: "never".to_string(),
+            progress: false,
+        };
+
+        let resolved = options
+            .apply_defaults(&defaults)
+            .expect("valid defaults")
+            .resolve(OutputBehavior::HumanDefault);
+
+        assert!(resolved.json);
+        assert!(resolved.no_color);
+        assert!(resolved.no_progress);
+    }
+
+    #[test]
+    fn invalid_configured_defaults_are_rejected() {
+        let options = GlobalOutputOptions {
+            format: None,
+            json: false,
+            no_color: false,
+            force_color: false,
+            no_progress: false,
+            quiet: false,
+        };
+        let defaults = Defaults {
+            output: "yaml".to_string(),
+            ..Defaults::default()
+        };
+
+        assert!(options.apply_defaults(&defaults).is_err());
     }
 
     #[test]

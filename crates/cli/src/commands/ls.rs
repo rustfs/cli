@@ -92,6 +92,13 @@ struct VersionSummary {
 pub async fn execute(args: LsArgs, output_config: OutputConfig) -> ExitCode {
     let formatter = Formatter::new(output_config);
 
+    if args.incomplete {
+        return formatter.fail(
+            ExitCode::UnsupportedFeature,
+            "--incomplete is not implemented",
+        );
+    }
+
     // Parse the path
     let (alias_name, bucket, prefix) = match parse_ls_path(&args.path) {
         Ok(parsed) => parsed,
@@ -137,7 +144,9 @@ pub async fn execute(args: LsArgs, output_config: OutputConfig) -> ExitCode {
         };
     }
 
-    let bucket = bucket.unwrap();
+    let Some(bucket) = bucket else {
+        return formatter.fail(ExitCode::UsageError, "Bucket name is required");
+    };
     let path = RemotePath::new(&alias_name, &bucket, prefix.unwrap_or_default());
 
     if args.versions {
@@ -154,7 +163,7 @@ async fn list_object_versions(
     summarize: bool,
     formatter: &Formatter,
 ) -> ExitCode {
-    match client.list_object_versions_page(path, Some(1000)).await {
+    match list_all_object_versions(client, path).await {
         Ok(result) => {
             let versions = result.items.clone();
             let total_size: i64 = versions.iter().filter_map(|v| v.size_bytes).sum();
@@ -176,8 +185,10 @@ async fn list_object_versions(
 
                     formatter.println(&format!(
                         "{latest} {:<40} {:>10} {:>12}{marker}",
-                        version.key,
-                        version.version_id.chars().take(10).collect::<String>(),
+                        formatter.sanitize_text(&version.key),
+                        formatter.sanitize_text(
+                            &version.version_id.chars().take(10).collect::<String>()
+                        ),
                         size
                     ));
                 }
@@ -200,6 +211,52 @@ async fn list_object_versions(
             formatter.error_with_code(exit_code, &format!("Failed to list versions: {e}"));
             exit_code
         }
+    }
+}
+
+async fn list_all_object_versions(
+    client: &S3Client,
+    path: &RemotePath,
+) -> Result<ObjectVersionListResult, Error> {
+    let mut items = Vec::new();
+    let mut key_marker: Option<String> = None;
+    let mut version_id_marker: Option<String> = None;
+
+    loop {
+        let page = client
+            .list_object_versions_page_with_markers(
+                path,
+                Some(1000),
+                key_marker.as_deref(),
+                version_id_marker.as_deref(),
+            )
+            .await?;
+        items.extend(page.items);
+
+        if !page.truncated {
+            return Ok(ObjectVersionListResult {
+                items,
+                truncated: false,
+                continuation_token: None,
+                version_id_marker: None,
+            });
+        }
+
+        let next_key_marker = page.continuation_token.ok_or_else(|| {
+            Error::Network(
+                "S3 returned a truncated version listing without a key marker".to_string(),
+            )
+        })?;
+        let next_version_id_marker = page.version_id_marker;
+        if key_marker.as_deref() == Some(next_key_marker.as_str())
+            && version_id_marker == next_version_id_marker
+        {
+            return Err(Error::Network(
+                "S3 returned a truncated version listing without advancing its markers".to_string(),
+            ));
+        }
+        key_marker = Some(next_key_marker);
+        version_id_marker = next_version_id_marker;
     }
 }
 
@@ -291,7 +348,11 @@ async fn list_buckets(client: &S3Client, formatter: &Formatter, summarize: bool)
         }
         Err(e) => {
             formatter.error(&format!("Failed to list buckets: {e}"));
-            ExitCode::NetworkError
+            match e {
+                Error::Auth(_) => ExitCode::AuthError,
+                Error::NotFound(_) => ExitCode::NotFound,
+                _ => ExitCode::NetworkError,
+            }
         }
     }
 }

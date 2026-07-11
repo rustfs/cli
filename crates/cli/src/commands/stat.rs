@@ -81,6 +81,13 @@ fn build_display_metadata(info: &ObjectInfo) -> BTreeMap<String, String> {
 pub async fn execute(args: StatArgs, output_config: OutputConfig) -> ExitCode {
     let formatter = Formatter::new(output_config);
 
+    if args.version_id.is_some() || args.rewind.is_some() {
+        return formatter.fail(
+            ExitCode::UnsupportedFeature,
+            "--version-id and --rewind are not implemented for stat",
+        );
+    }
+
     // Parse the path
     let (alias_name, bucket, key) = match parse_stat_path(&args.path) {
         Ok(parsed) => parsed,
@@ -130,7 +137,7 @@ pub async fn execute(args: StatArgs, output_config: OutputConfig) -> ExitCode {
                     etag: info.etag.clone(),
                     content_type: info.content_type.clone(),
                     storage_class: info.storage_class.clone(),
-                    version_id: args.version_id,
+                    version_id: None,
                     metadata: info
                         .metadata
                         .as_ref()

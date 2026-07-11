@@ -83,6 +83,20 @@ struct CpOutput {
 /// Execute the cp command
 pub async fn execute(args: CpArgs, output_config: OutputConfig) -> ExitCode {
     let formatter = Formatter::new(output_config);
+
+    if args.preserve {
+        return formatter.fail(
+            ExitCode::UnsupportedFeature,
+            "--preserve is not implemented; refusing to continue with a silently ignored option",
+        );
+    }
+    if args.storage_class.is_some() {
+        return formatter.fail(
+            ExitCode::UnsupportedFeature,
+            "--storage-class is not implemented; refusing to continue with a silently ignored option",
+        );
+    }
+
     let alias_manager = AliasManager::new().ok();
 
     // Parse source and target paths
@@ -119,6 +133,12 @@ pub async fn execute(args: CpArgs, output_config: OutputConfig) -> ExitCode {
             copy_s3_to_local(src, dst, &args, &formatter).await
         }
         (ParsedPath::Remote(src), ParsedPath::Remote(dst)) => {
+            if args.recursive {
+                return formatter.fail(
+                    ExitCode::UnsupportedFeature,
+                    "Recursive S3-to-S3 copy is not implemented",
+                );
+            }
             // S3 to S3
             copy_s3_to_s3(src, dst, &args, &formatter).await
         }
@@ -495,7 +515,7 @@ async fn copy_s3_to_local(
     }
 }
 
-async fn download_file(
+pub(super) async fn download_file(
     client: &S3Client,
     src: &RemotePath,
     dst: &Path,
@@ -507,6 +527,15 @@ async fn download_file(
     // Determine destination path
     let dst_path = if dst.is_dir() || dst.to_string_lossy().ends_with('/') {
         let filename = src.key.rsplit('/').next().unwrap_or(&src.key);
+        let filename = match safe_download_relative_path(filename, "") {
+            Ok(filename) => filename,
+            Err(error) => {
+                return formatter.fail(
+                    ExitCode::UsageError,
+                    &format!("Unsafe object key '{}': {error}", src.key),
+                );
+            }
+        };
         dst.join(filename)
     } else {
         dst.to_path_buf()
@@ -546,7 +575,7 @@ async fn download_file(
 
     // Download object
     let result = client
-        .get_object_with_progress(src, |bytes_downloaded, total_size| {
+        .download_object_to_path(src, &dst_path, |bytes_downloaded, total_size| {
             update_download_progress(&mut progress, &output_config, bytes_downloaded, total_size);
         })
         .await;
@@ -556,15 +585,8 @@ async fn download_file(
     }
 
     match result {
-        Ok(data) => {
-            let size = data.len() as i64;
-
-            if let Err(e) = std::fs::write(&dst_path, &data) {
-                return formatter.fail(
-                    ExitCode::GeneralError,
-                    &format!("Failed to write {dst_display}: {e}"),
-                );
-            }
+        Ok(size) => {
+            let size = size as i64;
 
             if formatter.is_json() {
                 let output = CpOutput {
@@ -631,13 +653,34 @@ async fn download_prefix(
                     }
 
                     // Calculate relative path from prefix
-                    let relative_key = item
-                        .key
-                        .strip_prefix(&src.key)
-                        .unwrap_or(&item.key)
-                        .trim_start_matches('/');
-                    let dst_path =
-                        dst.join(relative_key.replace('/', std::path::MAIN_SEPARATOR_STR));
+                    let relative_path = match safe_download_relative_path(&item.key, &src.key) {
+                        Ok(path) => path,
+                        Err(error) => {
+                            error_count += 1;
+                            formatter.error(&format!(
+                                "Refusing unsafe object key '{}': {error}",
+                                item.key
+                            ));
+                            if !args.continue_on_error {
+                                return ExitCode::UsageError;
+                            }
+                            continue;
+                        }
+                    };
+                    let dst_path = match safe_download_destination(dst, &relative_path).await {
+                        Ok(path) => path,
+                        Err(error) => {
+                            error_count += 1;
+                            formatter.error(&format!(
+                                "Refusing unsafe destination for '{}': {error}",
+                                item.key
+                            ));
+                            if !args.continue_on_error {
+                                return ExitCode::UsageError;
+                            }
+                            continue;
+                        }
+                    };
 
                     let obj_src = RemotePath::new(&src.alias, &src.bucket, &item.key);
                     let result = download_file(client, &obj_src, &dst_path, args, formatter).await;
@@ -681,6 +724,76 @@ async fn download_prefix(
         }
         ExitCode::Success
     }
+}
+
+pub(super) fn safe_download_relative_path(key: &str, prefix: &str) -> Result<PathBuf, String> {
+    let relative = key
+        .strip_prefix(prefix)
+        .ok_or_else(|| format!("key is outside requested prefix '{prefix}'"))?
+        .trim_start_matches('/');
+
+    let mut path = PathBuf::new();
+    for component in relative.split(['/', '\\']) {
+        if component.is_empty() {
+            continue;
+        }
+        if matches!(component, "." | "..") {
+            return Err("path traversal components are not allowed".to_string());
+        }
+        if component.contains(':') {
+            return Err("colon characters are not allowed in download paths".to_string());
+        }
+        if component.ends_with(['.', ' ']) {
+            return Err("download path components must not end in a dot or space".to_string());
+        }
+        let stem = component.split('.').next().unwrap_or_default();
+        let stem = stem.to_ascii_uppercase();
+        if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+            || (stem.len() == 4
+                && (stem.starts_with("COM") || stem.starts_with("LPT"))
+                && matches!(stem.as_bytes()[3], b'1'..=b'9'))
+        {
+            return Err("reserved Windows device names are not allowed".to_string());
+        }
+        path.push(component);
+    }
+
+    if path.as_os_str().is_empty() {
+        return Err("object key does not contain a file path".to_string());
+    }
+
+    Ok(path)
+}
+
+pub(super) async fn safe_download_destination(
+    root: &Path,
+    relative: &Path,
+) -> Result<PathBuf, String> {
+    let mut destination = root.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(component) = component else {
+            return Err("destination path contains a non-normal component".to_string());
+        };
+        destination.push(component);
+        match tokio::fs::symlink_metadata(&destination).await {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!(
+                    "destination component '{}' is a symbolic link",
+                    destination.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "failed to inspect destination '{}': {error}",
+                    destination.display()
+                ));
+            }
+        }
+    }
+
+    Ok(destination)
 }
 
 async fn copy_s3_to_s3(
@@ -744,6 +857,33 @@ async fn copy_s3_to_s3(
         let styled_dst = formatter.style_file(&dst_display);
         formatter.println(&format!("Would copy: {styled_src} -> {styled_dst}"));
         return ExitCode::Success;
+    }
+
+    match client.head_object(src).await {
+        Ok(info)
+            if info
+                .size_bytes
+                .is_some_and(|size| size > 5 * 1024 * 1024 * 1024) =>
+        {
+            return formatter.fail(
+                ExitCode::UnsupportedFeature,
+                "Objects larger than 5 GiB require multipart copy, which is not implemented",
+            );
+        }
+        Ok(_) => {}
+        Err(rc_core::Error::NotFound(_)) => {
+            return formatter.fail_with_suggestion(
+                ExitCode::NotFound,
+                &format!("Source not found: {src_display}"),
+                "Check the source bucket and object key, then retry the copy command.",
+            );
+        }
+        Err(error) => {
+            return formatter.fail(
+                ExitCode::NetworkError,
+                &format!("Failed to inspect source object: {error}"),
+            );
+        }
     }
 
     match client.copy_object(src, dst, encryption.as_ref()).await {
@@ -970,6 +1110,50 @@ mod tests {
 
         let progress = progress.expect("large download should create progress state");
         assert!(!progress.is_visible());
+    }
+
+    #[test]
+    fn download_relative_path_preserves_safe_nested_keys() {
+        let relative = safe_download_relative_path("reports/2026/july/data.csv", "reports/")
+            .expect("safe key should resolve");
+
+        assert_eq!(
+            relative,
+            PathBuf::from("2026").join("july").join("data.csv")
+        );
+    }
+
+    #[test]
+    fn download_relative_path_rejects_traversal_and_absolute_keys() {
+        for key in [
+            "reports/../../escaped",
+            "reports/..\\..\\escaped",
+            "reports/C:/escaped",
+            "reports/safe:stream",
+            "reports/CON.txt",
+            "reports/trailing.",
+            "/absolute/path",
+        ] {
+            assert!(
+                safe_download_relative_path(key, "reports/").is_err(),
+                "unsafe key should be rejected: {key}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn download_destination_rejects_existing_symlink_components() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("create destination root");
+        let outside = tempfile::tempdir().expect("create outside directory");
+        symlink(outside.path(), root.path().join("linked")).expect("create test symlink");
+
+        let result =
+            safe_download_destination(root.path(), &PathBuf::from("linked/file.txt")).await;
+
+        assert!(result.is_err());
     }
 
     #[test]

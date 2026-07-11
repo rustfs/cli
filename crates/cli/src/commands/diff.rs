@@ -216,7 +216,10 @@ pub async fn execute(args: DiffArgs, output_config: OutputConfig) -> ExitCode {
                 DiffStatus::OnlySecond => entry.second_size.map(format_size).unwrap_or_default(),
             };
 
-            formatter.println(&format!("{status_char} {:<50} {size_info}", entry.key));
+            formatter.println(&format!(
+                "{status_char} {:<50} {size_info}",
+                formatter.sanitize_text(&entry.key)
+            ));
         }
 
         // Print summary
@@ -311,7 +314,10 @@ fn compare_objects(
         if let Some(second_info) = second.get(key) {
             // Object exists in both
             let is_same = first_info.size == second_info.size
-                && (first_info.etag == second_info.etag || first_info.etag.is_none());
+                && matches!(
+                    (&first_info.etag, &second_info.etag),
+                    (Some(first_etag), Some(second_etag)) if first_etag == second_etag
+                );
 
             let status = if is_same {
                 DiffStatus::Same
@@ -420,6 +426,30 @@ mod tests {
 
         let entries = compare_objects(&first, &second, false);
         assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].status, DiffStatus::Different);
+    }
+
+    #[test]
+    fn test_compare_objects_missing_etag_is_different() {
+        let first = HashMap::from([(
+            "file.txt".to_string(),
+            FileInfo {
+                size: Some(100),
+                modified: None,
+                etag: None,
+            },
+        )]);
+        let second = HashMap::from([(
+            "file.txt".to_string(),
+            FileInfo {
+                size: Some(100),
+                modified: None,
+                etag: Some("second-etag".to_string()),
+            },
+        )]);
+
+        let entries = compare_objects(&first, &second, false);
+
         assert_eq!(entries[0].status, DiffStatus::Different);
     }
 

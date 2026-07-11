@@ -735,11 +735,6 @@ async fn list_keys_for_prefix(
     let mut options = ListOptions {
         recursive,
         max_keys: Some(1000),
-        prefix: if prefix.is_empty() {
-            None
-        } else {
-            Some(prefix.to_string())
-        },
         ..Default::default()
     };
 

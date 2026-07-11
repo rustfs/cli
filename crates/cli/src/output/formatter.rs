@@ -289,12 +289,18 @@ impl Formatter {
 
     /// Style a directory name (blue + bold)
     pub fn style_dir(&self, text: &str) -> String {
-        self.theme.dir.apply_to(text).to_string()
+        self.theme
+            .dir
+            .apply_to(self.sanitize_text(text))
+            .to_string()
     }
 
     /// Style a file name (default)
     pub fn style_file(&self, text: &str) -> String {
-        self.theme.file.apply_to(text).to_string()
+        self.theme
+            .file
+            .apply_to(self.sanitize_text(text))
+            .to_string()
     }
 
     /// Style a file size (green)
@@ -309,17 +315,51 @@ impl Formatter {
 
     /// Style a property key (cyan)
     pub fn style_key(&self, text: &str) -> String {
-        self.theme.key.apply_to(text).to_string()
+        self.theme
+            .key
+            .apply_to(self.sanitize_text(text))
+            .to_string()
     }
 
     /// Style a URL/endpoint (cyan + underline)
     pub fn style_url(&self, text: &str) -> String {
-        self.theme.url.apply_to(text).to_string()
+        self.theme
+            .url
+            .apply_to(self.sanitize_text(text))
+            .to_string()
     }
 
     /// Style an alias/bucket name (bold)
     pub fn style_name(&self, text: &str) -> String {
-        self.theme.name.apply_to(text).to_string()
+        self.theme
+            .name
+            .apply_to(self.sanitize_text(text))
+            .to_string()
+    }
+
+    pub fn sanitize_text(&self, text: &str) -> String {
+        let mut sanitized = String::with_capacity(text.len());
+        for character in text.chars() {
+            match character {
+                '\n' => sanitized.push_str("\\n"),
+                '\r' => sanitized.push_str("\\r"),
+                '\t' => sanitized.push_str("\\t"),
+                character
+                    if character.is_control()
+                        || matches!(
+                            character,
+                            '\u{200e}'
+                                | '\u{200f}'
+                                | '\u{202a}'..='\u{202e}'
+                                | '\u{2066}'..='\u{2069}'
+                        ) =>
+                {
+                    sanitized.push_str(&format!("\\u{{{:x}}}", character as u32));
+                }
+                character => sanitized.push(character),
+            }
+        }
+        sanitized
     }
 
     /// Style tree branch characters (dim)
@@ -407,7 +447,7 @@ impl Formatter {
             );
         } else {
             let cross = self.theme.error.apply_to("✗");
-            eprintln!("{cross} {}", descriptor.message);
+            eprintln!("{cross} {}", self.sanitize_text(&descriptor.message));
         }
     }
 
@@ -418,7 +458,7 @@ impl Formatter {
         }
 
         let warn_icon = self.theme.warning.apply_to("⚠");
-        eprintln!("{warn_icon} {message}");
+        eprintln!("{warn_icon} {}", self.sanitize_text(message));
     }
 
     /// Output JSON directly
@@ -477,6 +517,16 @@ mod tests {
         };
         let formatter = Formatter::new(config);
         assert!(!formatter.colors_enabled());
+    }
+
+    #[test]
+    fn test_sanitize_text_escapes_terminal_control_characters() {
+        let formatter = Formatter::default();
+
+        assert_eq!(
+            formatter.sanitize_text("safe\n\u{1b}[31m\u{202e}"),
+            "safe\\n\\u{1b}[31m\\u{202e}"
+        );
     }
 
     #[test]

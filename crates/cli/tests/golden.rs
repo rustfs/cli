@@ -9,23 +9,8 @@
 
 use std::process::Command;
 
-/// Get the path to the rc binary
-fn rc_binary() -> String {
-    // Use cargo to build and get the binary path
-    let output = Command::new("cargo")
-        .args(["build", "--release", "-p", "rustfs-cli"])
-        .output()
-        .expect("Failed to build rc binary");
-
-    if !output.status.success() {
-        panic!(
-            "Failed to build rc binary: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    // Return path to binary
-    env!("CARGO_MANIFEST_DIR").to_string() + "/../../target/release/rc"
+fn rc_binary() -> &'static str {
+    env!("CARGO_BIN_EXE_rc")
 }
 
 mod alias_tests {
@@ -259,10 +244,8 @@ mod s3_tests {
 
     #[test]
     fn test_mb_json() {
-        let Some((temp_dir, config_dir)) = setup_test_env_with_alias() else {
-            eprintln!("Skipping test: S3 environment not configured");
-            return;
-        };
+        let (temp_dir, config_dir) =
+            setup_test_env_with_alias().expect("S3 golden test setup failed");
 
         let bucket = unique_bucket_name();
         let output = Command::new(rc_binary())
@@ -292,10 +275,8 @@ mod s3_tests {
 
     #[test]
     fn test_rb_json() {
-        let Some((temp_dir, config_dir)) = setup_test_env_with_alias() else {
-            eprintln!("Skipping test: S3 environment not configured");
-            return;
-        };
+        let (temp_dir, config_dir) =
+            setup_test_env_with_alias().expect("S3 golden test setup failed");
 
         let bucket = unique_bucket_name();
 
@@ -326,10 +307,8 @@ mod s3_tests {
 
     #[test]
     fn test_ls_empty_bucket_json() {
-        let Some((temp_dir, config_dir)) = setup_test_env_with_alias() else {
-            eprintln!("Skipping test: S3 environment not configured");
-            return;
-        };
+        let (temp_dir, config_dir) =
+            setup_test_env_with_alias().expect("S3 golden test setup failed");
 
         let bucket = unique_bucket_name();
 
@@ -368,10 +347,8 @@ mod s3_tests {
 
     #[test]
     fn test_ls_with_objects_json() {
-        let Some((temp_dir, config_dir)) = setup_test_env_with_alias() else {
-            eprintln!("Skipping test: S3 environment not configured");
-            return;
-        };
+        let (temp_dir, config_dir) =
+            setup_test_env_with_alias().expect("S3 golden test setup failed");
 
         let bucket = unique_bucket_name();
 
@@ -383,7 +360,7 @@ mod s3_tests {
             .expect("Failed to create bucket");
 
         // Upload a test file using pipe
-        let output = Command::new(rc_binary())
+        let upload = Command::new(rc_binary())
             .args(["pipe", &format!("test/{}/test-file.txt", bucket), "--json"])
             .env("RC_CONFIG_DIR", &config_dir)
             .stdin(std::process::Stdio::piped())
@@ -393,21 +370,12 @@ mod s3_tests {
             .and_then(|mut child| {
                 use std::io::Write;
                 if let Some(ref mut stdin) = child.stdin {
-                    stdin.write_all(b"Hello, World!").ok();
+                    stdin.write_all(b"Hello, World!")?;
                 }
                 child.wait_with_output()
-            });
-
-        if output.is_err() {
-            // Cleanup and skip
-            Command::new(rc_binary())
-                .args(["rb", &format!("test/{}", bucket), "--force", "--json"])
-                .env("RC_CONFIG_DIR", &config_dir)
-                .output()
-                .ok();
-            eprintln!("Skipping test: pipe command failed");
-            return;
-        }
+            })
+            .expect("pipe upload should execute");
+        assert!(upload.status.success(), "pipe upload should succeed");
 
         // List bucket with object
         let output = Command::new(rc_binary())
@@ -444,10 +412,8 @@ mod s3_tests {
 
     #[test]
     fn test_stat_json() {
-        let Some((temp_dir, config_dir)) = setup_test_env_with_alias() else {
-            eprintln!("Skipping test: S3 environment not configured");
-            return;
-        };
+        let (temp_dir, config_dir) =
+            setup_test_env_with_alias().expect("S3 golden test setup failed");
 
         let bucket = unique_bucket_name();
 
@@ -469,20 +435,12 @@ mod s3_tests {
             .and_then(|mut child| {
                 use std::io::Write;
                 if let Some(ref mut stdin) = child.stdin {
-                    stdin.write_all(b"Test content for stat").ok();
+                    stdin.write_all(b"Test content for stat")?;
                 }
                 child.wait_with_output()
-            });
-
-        if upload.is_err() {
-            Command::new(rc_binary())
-                .args(["rb", &format!("test/{}", bucket), "--force", "--json"])
-                .env("RC_CONFIG_DIR", &config_dir)
-                .output()
-                .ok();
-            eprintln!("Skipping test: pipe command failed");
-            return;
-        }
+            })
+            .expect("pipe upload should execute");
+        assert!(upload.status.success(), "pipe upload should succeed");
 
         // Get stat
         let output = Command::new(rc_binary())
@@ -491,14 +449,13 @@ mod s3_tests {
             .output()
             .expect("Failed to execute rc");
 
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let json: serde_json::Value =
-                serde_json::from_str(&stdout).expect("Output should be valid JSON");
+        assert!(output.status.success(), "stat should succeed");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let json: serde_json::Value =
+            serde_json::from_str(&stdout).expect("Output should be valid JSON");
 
-            assert!(json["key"].is_string());
-            assert!(json["size_bytes"].is_number());
-        }
+        assert!(json["key"].is_string());
+        assert!(json["size_bytes"].is_number());
 
         // Cleanup
         Command::new(rc_binary())

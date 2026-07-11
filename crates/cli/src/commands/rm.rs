@@ -6,6 +6,7 @@ use clap::Args;
 use rc_core::{AliasManager, ListOptions, ObjectStore as _, RemotePath};
 use rc_s3::{DeleteRequestOptions, S3Client};
 use serde::Serialize;
+use std::collections::HashSet;
 
 use crate::exit_code::ExitCode;
 use crate::output::{Formatter, OutputConfig};
@@ -65,6 +66,13 @@ struct RmOutput {
 /// Execute the rm command
 pub async fn execute(args: RmArgs, output_config: OutputConfig) -> ExitCode {
     let formatter = Formatter::new(output_config);
+
+    if args.incomplete || args.versions || args.bypass {
+        return formatter.fail(
+            ExitCode::UnsupportedFeature,
+            "--incomplete, --versions, and --bypass are not implemented; refusing to continue with a silently ignored destructive option",
+        );
+    }
 
     // Process each path
     let mut all_deleted = Vec::new();
@@ -129,6 +137,15 @@ async fn process_rm_path(
         }
     };
 
+    if let Err(error) = validate_removal_scope(&key, args.recursive) {
+        let code = formatter.fail_with_suggestion(
+            ExitCode::UsageError,
+            &error,
+            "Add --recursive only after verifying the bucket or prefix to remove.",
+        );
+        return Err((code, vec![path_str.to_string()]));
+    }
+
     // Load alias
     let alias_manager = match AliasManager::new() {
         Ok(am) => am,
@@ -162,10 +179,7 @@ async fn process_rm_path(
         }
     };
 
-    let is_prefix = key.ends_with('/') || key.is_empty();
-
-    // If recursive or prefix, list and delete all matching objects
-    if args.recursive || is_prefix {
+    if args.recursive {
         delete_recursive(&client, &alias_name, &bucket, &key, args, formatter).await
     } else {
         // Delete single object
@@ -341,7 +355,9 @@ async fn delete_recursive(
             .await
         {
             Ok(deleted_keys) => {
-                for key in &deleted_keys {
+                let (confirmed_keys, failed_keys) =
+                    partition_delete_results(&chunk_keys, deleted_keys);
+                for key in &confirmed_keys {
                     let full_path = format!("{alias_name}/{bucket}/{key}");
                     if !formatter.is_json() {
                         let styled_path = formatter.style_file(&full_path);
@@ -349,6 +365,11 @@ async fn delete_recursive(
                     }
                     deleted.push(full_path);
                 }
+                failed.extend(
+                    failed_keys
+                        .into_iter()
+                        .map(|key| format!("{alias_name}/{bucket}/{key}")),
+                );
             }
             Err(e) => {
                 formatter.error_with_code(
@@ -408,6 +429,24 @@ fn delete_request_options(args: &RmArgs) -> DeleteRequestOptions {
     }
 }
 
+fn validate_removal_scope(key: &str, recursive: bool) -> Result<(), String> {
+    if !recursive && (key.is_empty() || key.ends_with('/')) {
+        return Err("Bucket and prefix removal requires the explicit --recursive flag".to_string());
+    }
+    Ok(())
+}
+
+fn partition_delete_results(
+    requested: &[String],
+    deleted: Vec<String>,
+) -> (Vec<String>, Vec<String>) {
+    let deleted: HashSet<String> = deleted.into_iter().collect();
+    requested
+        .iter()
+        .cloned()
+        .partition(|key| deleted.contains(key))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,6 +488,25 @@ mod tests {
     #[test]
     fn test_parse_rm_path_empty_alias() {
         assert!(parse_rm_path("/mybucket/file.txt").is_err());
+    }
+
+    #[test]
+    fn recursive_targets_require_explicit_recursive_flag() {
+        assert!(validate_removal_scope("", false).is_err());
+        assert!(validate_removal_scope("prefix/", false).is_err());
+        assert!(validate_removal_scope("prefix/", true).is_ok());
+        assert!(validate_removal_scope("object.txt", false).is_ok());
+    }
+
+    #[test]
+    fn partial_batch_delete_marks_missing_results_as_failed() {
+        let requested = vec!["deleted.txt".to_string(), "denied.txt".to_string()];
+        let deleted = vec!["deleted.txt".to_string()];
+
+        let (confirmed, failed) = partition_delete_results(&requested, deleted);
+
+        assert_eq!(confirmed, vec!["deleted.txt"]);
+        assert_eq!(failed, vec!["denied.txt"]);
     }
 
     #[test]

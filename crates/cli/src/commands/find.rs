@@ -329,6 +329,9 @@ fn parse_size(s: &str) -> Result<i64, String> {
     let num: i64 = num_str
         .parse()
         .map_err(|_| format!("Invalid size number: {num_str}"))?;
+    if num < 0 {
+        return Err("Size cannot be negative".to_string());
+    }
 
     let multiplier = match suffix.to_uppercase().as_str() {
         "" | "B" => 1,
@@ -339,7 +342,8 @@ fn parse_size(s: &str) -> Result<i64, String> {
         _ => return Err(format!("Unknown size suffix: {suffix}")),
     };
 
-    Ok(num * multiplier)
+    num.checked_mul(multiplier)
+        .ok_or_else(|| "Size is too large".to_string())
 }
 
 /// Parse duration string and return timestamp that far in the past
@@ -359,15 +363,21 @@ fn parse_duration_ago(s: &str, now: jiff::Timestamp) -> Result<jiff::Timestamp, 
     let num: i64 = num_str
         .parse()
         .map_err(|_| format!("Invalid duration number: {num_str}"))?;
+    if num < 0 {
+        return Err("Duration cannot be negative".to_string());
+    }
 
-    let seconds = match suffix.to_lowercase().as_str() {
-        "s" => num,
-        "m" => num * 60,
-        "h" => num * 3600,
-        "d" => num * 86400,
-        "w" => num * 604800,
+    let multiplier = match suffix.to_lowercase().as_str() {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86400,
+        "w" => 604800,
         _ => return Err(format!("Unknown duration suffix: {suffix}")),
     };
+    let seconds = num
+        .checked_mul(multiplier)
+        .ok_or_else(|| "Duration is too large".to_string())?;
 
     let duration = jiff::Span::new().seconds(seconds);
     now.checked_sub(duration)
@@ -502,6 +512,16 @@ mod tests {
         assert!(parse_size("").is_err());
         assert!(parse_size("abc").is_err());
         assert!(parse_size("1X").is_err());
+        assert!(parse_size("-1K").is_err());
+        assert!(parse_size("8388608T").is_err());
+    }
+
+    #[test]
+    fn test_parse_duration_rejects_negative_and_overflowing_values() {
+        let now = jiff::Timestamp::now();
+
+        assert!(parse_duration_ago("-1h", now).is_err());
+        assert!(parse_duration_ago("2562047788015216h", now).is_err());
     }
 
     #[test]

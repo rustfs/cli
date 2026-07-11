@@ -3,9 +3,8 @@
 //! Outputs the entire content of an object to stdout.
 
 use clap::Args;
-use rc_core::{AliasManager, ObjectStore as _, RemotePath};
+use rc_core::{AliasManager, RemotePath};
 use rc_s3::S3Client;
-use std::io::{self, Write};
 
 use crate::exit_code::ExitCode;
 use crate::output::{Formatter, OutputConfig};
@@ -32,6 +31,13 @@ pub struct CatArgs {
 /// Execute the cat command
 pub async fn execute(args: CatArgs, output_config: OutputConfig) -> ExitCode {
     let formatter = Formatter::new(output_config);
+
+    if args.enc_key.is_some() || args.rewind.is_some() || args.version_id.is_some() {
+        return formatter.fail(
+            ExitCode::UnsupportedFeature,
+            "--enc-key, --rewind, and --version-id are not implemented for cat",
+        );
+    }
 
     // Parse the path
     let (alias_name, bucket, key) = match parse_cat_path(&args.path) {
@@ -71,15 +77,9 @@ pub async fn execute(args: CatArgs, output_config: OutputConfig) -> ExitCode {
     let path = RemotePath::new(&alias_name, &bucket, &key);
 
     // Get object content
-    match client.get_object(&path).await {
-        Ok(data) => {
-            // Write directly to stdout (not through formatter to preserve binary data)
-            if let Err(e) = io::stdout().write_all(&data) {
-                formatter.error(&format!("Failed to write to stdout: {e}"));
-                return ExitCode::GeneralError;
-            }
-            ExitCode::Success
-        }
+    let mut stdout = tokio::io::stdout();
+    match client.write_object_to(&path, &mut stdout, None).await {
+        Ok(_) => ExitCode::Success,
         Err(e) => {
             let err_str = e.to_string();
             if err_str.contains("NotFound") || err_str.contains("NoSuchKey") {
