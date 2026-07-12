@@ -262,6 +262,17 @@
           "type": "boolean",
           "description": "Whether a heal operation is active"
         },
+        "state": {
+          "type": "string",
+          "enum": [
+            "disabled",
+            "uninitialized",
+            "idle",
+            "active",
+            "unknown"
+          ],
+          "description": "Runtime state reported by the heal service"
+        },
         "summary": {
           "type": "string",
           "description": "Token-scoped manual heal task summary"

@@ -216,7 +216,7 @@ fn heal_status_indicator(status: &HealStatus) -> HealStatusIndicator {
         Some(HealRuntimeState::Uninitialized) => HealStatusIndicator::Date("Uninitialized"),
         Some(HealRuntimeState::Active) => HealStatusIndicator::Progress("In Progress"),
         Some(HealRuntimeState::Idle) => HealStatusIndicator::Date("Idle"),
-        None => match status.summary.as_deref() {
+        Some(HealRuntimeState::Unknown) | None => match status.summary.as_deref() {
             Some("running") => HealStatusIndicator::Progress("In Progress"),
             Some("finished") => HealStatusIndicator::Progress("Finished"),
             Some("stopped") => HealStatusIndicator::Date("Stopped"),

@@ -463,6 +463,8 @@ pub enum HealRuntimeState {
     Uninitialized,
     Idle,
     Active,
+    #[serde(other)]
+    Unknown,
 }
 
 /// Request to start a heal operation
@@ -1072,11 +1074,19 @@ mod tests {
         let status = HealStatus::default();
         assert!(status.heal_id.is_empty());
         assert!(!status.healing);
+        assert!(status.state.is_none());
         assert!(status.scan_mode.is_none());
         assert_eq!(status.scan_cycle, 0);
         assert_eq!(status.heal_queue_length, 0);
         assert_eq!(status.heal_active_tasks, 0);
         assert_eq!(status.items_scanned, 0);
+    }
+
+    #[test]
+    fn test_heal_runtime_state_unknown_value_is_preserved() {
+        let state: HealRuntimeState = serde_json::from_str(r#""future""#).unwrap();
+
+        assert_eq!(state, HealRuntimeState::Unknown);
     }
 
     #[test]
