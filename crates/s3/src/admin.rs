@@ -11,10 +11,10 @@ use aws_sigv4::http_request::{
 use aws_sigv4::sign::v4;
 use rc_core::admin::{
     AccessKeyInfo, AdminApi, BucketQuota, ClusterInfo, CreateServiceAccountRequest,
-    DecommissionPoolStatus, DecommissionStatus, Group, GroupStatus, HealScanMode, HealStartRequest,
-    HealStatus, HealTaskRequest, Policy, PolicyEntity, PolicyInfo, PoolStatus, PoolTarget,
-    RebalanceStartResult, RebalanceStatus, ServiceAccount, ServiceAccountCreateResponse,
-    UpdateGroupMembersRequest, User, UserStatus,
+    DecommissionPoolStatus, DecommissionStatus, Group, GroupStatus, HealRuntimeState, HealScanMode,
+    HealStartRequest, HealStatus, HealTaskRequest, Policy, PolicyEntity, PolicyInfo, PoolStatus,
+    PoolTarget, RebalanceStartResult, RebalanceStatus, ServiceAccount,
+    ServiceAccountCreateResponse, UpdateGroupMembersRequest, User, UserStatus,
 };
 use rc_core::{Alias, Error, Result};
 use reqwest::header::{CONTENT_TYPE, HOST, HeaderMap, HeaderName, HeaderValue};
@@ -407,6 +407,8 @@ struct ServiceAccountInfo {
 #[serde(rename_all = "camelCase")]
 struct BackgroundHealStatusResponse {
     #[serde(default)]
+    state: Option<HealRuntimeState>,
+    #[serde(default)]
     bitrot_start_time: Option<String>,
     #[serde(default)]
     bitrot_start_cycle: u64,
@@ -487,6 +489,7 @@ impl From<BackgroundHealStatusResponse> for HealStatus {
             heal_active_tasks: active_tasks,
             ..Default::default()
         };
+        status.state = response.state;
         if let Some(progress) = response.progress {
             progress.apply_to_status(&mut status);
         }
@@ -1444,6 +1447,7 @@ mod tests {
     #[test]
     fn test_background_heal_status_response_maps_to_heal_status() {
         let status = HealStatus::from(BackgroundHealStatusResponse {
+            state: Some(HealRuntimeState::Active),
             bitrot_start_time: Some("2026-04-19T10:00:00Z".to_string()),
             bitrot_start_cycle: 42,
             current_scan_mode: Some(2),
@@ -1454,6 +1458,7 @@ mod tests {
         });
 
         assert!(status.healing);
+        assert_eq!(status.state, Some(HealRuntimeState::Active));
         assert_eq!(status.started.as_deref(), Some("2026-04-19T10:00:00Z"));
         assert_eq!(status.scan_mode, Some(HealScanMode::Deep));
         assert_eq!(status.scan_cycle, 42);
@@ -1461,6 +1466,7 @@ mod tests {
         assert_eq!(status.heal_active_tasks, 1);
 
         let idle = HealStatus::from(BackgroundHealStatusResponse {
+            state: Some(HealRuntimeState::Idle),
             bitrot_start_time: None,
             bitrot_start_cycle: 0,
             current_scan_mode: Some(1),
@@ -1470,10 +1476,12 @@ mod tests {
             progress: None,
         });
         assert!(!idle.healing);
+        assert_eq!(idle.state, Some(HealRuntimeState::Idle));
         assert_eq!(idle.scan_mode, Some(HealScanMode::Normal));
         assert!(idle.started.is_none());
 
         let completed = HealStatus::from(BackgroundHealStatusResponse {
+            state: None,
             bitrot_start_time: Some("2026-04-19T10:00:00Z".to_string()),
             bitrot_start_cycle: 42,
             current_scan_mode: Some(1),
@@ -1487,6 +1495,7 @@ mod tests {
         assert_eq!(completed.started.as_deref(), Some("2026-04-19T10:00:00Z"));
 
         let legacy = HealStatus::from(BackgroundHealStatusResponse {
+            state: None,
             bitrot_start_time: Some("2026-04-19T10:00:00Z".to_string()),
             bitrot_start_cycle: 0,
             current_scan_mode: None,
@@ -1498,6 +1507,7 @@ mod tests {
         assert!(legacy.healing);
 
         let active = HealStatus::from(BackgroundHealStatusResponse {
+            state: None,
             bitrot_start_time: None,
             bitrot_start_cycle: 0,
             current_scan_mode: None,

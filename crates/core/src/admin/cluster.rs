@@ -456,6 +456,15 @@ impl std::str::FromStr for HealScanMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HealRuntimeState {
+    Disabled,
+    Uninitialized,
+    Idle,
+    Active,
+}
+
 /// Request to start a heal operation
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -584,6 +593,9 @@ pub struct HealStatus {
     /// Whether healing is in progress
     #[serde(default)]
     pub healing: bool,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<HealRuntimeState>,
 
     /// Task summary for token-scoped manual heal status
     #[serde(default, skip_serializing_if = "Option::is_none")]

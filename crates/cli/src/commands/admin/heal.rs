@@ -8,7 +8,9 @@ use serde::Serialize;
 use super::get_admin_client;
 use crate::exit_code::ExitCode;
 use crate::output::Formatter;
-use rc_core::admin::{AdminApi, HealScanMode, HealStartRequest, HealStatus, HealTaskRequest};
+use rc_core::admin::{
+    AdminApi, HealRuntimeState, HealScanMode, HealStartRequest, HealStatus, HealTaskRequest,
+};
 
 const HEAL_STOP_SUCCESS_MESSAGE: &str = "Heal operation stopped successfully";
 const HEAL_STOP_STILL_RUNNING_MESSAGE: &str =
@@ -100,6 +102,8 @@ struct HealStatusOutput {
     heal_id: String,
     healing: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<HealRuntimeState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     summary: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<String>,
@@ -126,6 +130,7 @@ impl From<&HealStatus> for HealStatusOutput {
         Self {
             heal_id: status.heal_id.clone(),
             healing: status.healing,
+            state: status.state,
             summary: status.summary.clone(),
             detail: status.detail.clone(),
             bucket: status.bucket.clone(),
@@ -147,6 +152,7 @@ impl From<&HealStatus> for HealStatusOutput {
 
 fn has_heal_status_details(status: &HealStatus) -> bool {
     status.healing
+        || status.state.is_some()
         || !status.heal_id.is_empty()
         || status.summary.is_some()
         || status.detail.is_some()
@@ -199,6 +205,28 @@ fn heal_stop_output(status: &HealStatus) -> (ExitCode, HealOperationOutput) {
     )
 }
 
+enum HealStatusIndicator {
+    Progress(&'static str),
+    Date(&'static str),
+}
+
+fn heal_status_indicator(status: &HealStatus) -> HealStatusIndicator {
+    match status.state {
+        Some(HealRuntimeState::Disabled) => HealStatusIndicator::Date("Disabled"),
+        Some(HealRuntimeState::Uninitialized) => HealStatusIndicator::Date("Uninitialized"),
+        Some(HealRuntimeState::Active) => HealStatusIndicator::Progress("In Progress"),
+        Some(HealRuntimeState::Idle) => HealStatusIndicator::Date("Idle"),
+        None => match status.summary.as_deref() {
+            Some("running") => HealStatusIndicator::Progress("In Progress"),
+            Some("finished") => HealStatusIndicator::Progress("Finished"),
+            Some("stopped") => HealStatusIndicator::Date("Stopped"),
+            Some("notFound") => HealStatusIndicator::Date("Not Found"),
+            _ if status.healing => HealStatusIndicator::Progress("In Progress"),
+            _ => HealStatusIndicator::Date("Idle"),
+        },
+    }
+}
+
 /// Execute a heal subcommand
 pub async fn execute(cmd: HealCommands, formatter: &Formatter) -> ExitCode {
     match cmd {
@@ -247,13 +275,9 @@ async fn execute_status(args: StatusArgs, formatter: &Formatter) -> ExitCode {
 }
 
 fn print_heal_status(status: &HealStatus, formatter: &Formatter) {
-    let healing_status = match status.summary.as_deref() {
-        Some("running") => formatter.style_size("In Progress"),
-        Some("finished") => formatter.style_size("Finished"),
-        Some("stopped") => formatter.style_date("Stopped"),
-        Some("notFound") => formatter.style_date("Not Found"),
-        _ if status.healing => formatter.style_size("In Progress"),
-        _ => formatter.style_date("Idle"),
+    let healing_status = match heal_status_indicator(status) {
+        HealStatusIndicator::Progress(label) => formatter.style_size(label),
+        HealStatusIndicator::Date(label) => formatter.style_date(label),
     };
 
     formatter.println(&format!(
@@ -600,6 +624,7 @@ mod tests {
         let status = HealStatus {
             heal_id: "heal-123".to_string(),
             healing: true,
+            state: Some(HealRuntimeState::Active),
             bucket: "test-bucket".to_string(),
             object: "test/object.txt".to_string(),
             scan_mode: Some(HealScanMode::Deep),
@@ -619,6 +644,7 @@ mod tests {
         let output = HealStatusOutput::from(&status);
         assert_eq!(output.heal_id, "heal-123");
         assert!(output.healing);
+        assert_eq!(output.state, Some(HealRuntimeState::Active));
         assert_eq!(output.bucket, "test-bucket");
         assert_eq!(output.scan_mode, Some(HealScanMode::Deep));
         assert_eq!(output.scan_cycle, 42);
@@ -646,5 +672,23 @@ mod tests {
             heal_active_tasks: 1,
             ..Default::default()
         }));
+
+        assert!(has_heal_status_details(&HealStatus {
+            state: Some(HealRuntimeState::Disabled),
+            ..Default::default()
+        }));
+    }
+
+    #[test]
+    fn test_heal_status_indicator_reports_disabled_runtime() {
+        let status = HealStatus {
+            state: Some(HealRuntimeState::Disabled),
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            heal_status_indicator(&status),
+            HealStatusIndicator::Date("Disabled")
+        ));
     }
 }

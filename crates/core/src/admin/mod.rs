@@ -9,10 +9,11 @@ mod types;
 
 pub use cluster::{
     BackendInfo, BackendType, BucketsInfo, ClusterInfo, DecommissionPoolStatus, DecommissionStatus,
-    DiskInfo, HealDriveInfo, HealDriveInfos, HealResultItem, HealScanMode, HealStartRequest,
-    HealStatus, HealTaskRequest, HealingDiskInfo, MemStats, ObjectsInfo, PoolDecommissionInfo,
-    PoolErasureSetInfo, PoolStatus, PoolTarget, RebalanceCleanupWarnings, RebalancePoolProgress,
-    RebalancePoolStatus, RebalanceStartResult, RebalanceStatus, ServerInfo, UsageInfo,
+    DiskInfo, HealDriveInfo, HealDriveInfos, HealResultItem, HealRuntimeState, HealScanMode,
+    HealStartRequest, HealStatus, HealTaskRequest, HealingDiskInfo, MemStats, ObjectsInfo,
+    PoolDecommissionInfo, PoolErasureSetInfo, PoolStatus, PoolTarget, RebalanceCleanupWarnings,
+    RebalancePoolProgress, RebalancePoolStatus, RebalanceStartResult, RebalanceStatus, ServerInfo,
+    UsageInfo,
 };
 pub use tier::{
     TierAliyun, TierAzure, TierConfig, TierCreds, TierGCS, TierHuaweicloud, TierMinIO, TierR2,
