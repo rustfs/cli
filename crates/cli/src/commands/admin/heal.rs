@@ -491,17 +491,13 @@ fn heal_task_request(
 
     match (has_target, has_token) {
         (false, false) => Ok(None),
-        (true, true) => Ok(Some(HealTaskRequest {
-            bucket: bucket.expect("bucket is present"),
+        (_, true) => Ok(Some(HealTaskRequest {
+            bucket: bucket.unwrap_or_default(),
             prefix,
             client_token: client_token.expect("client token is present"),
         })),
         (true, false) => {
             formatter.error("Heal task request requires --client-token when --bucket is set.");
-            Err(ExitCode::UsageError)
-        }
-        (false, true) => {
-            formatter.error("Heal task request requires --bucket when --client-token is set.");
             Err(ExitCode::UsageError)
         }
     }
@@ -611,10 +607,37 @@ mod tests {
     }
 
     #[test]
-    fn test_heal_task_request_rejects_token_without_bucket() {
+    fn test_heal_task_request_accepts_token_without_bucket() {
         let formatter = Formatter::default();
 
-        let result = heal_task_request(None, None, Some("root-token".to_string()), &formatter);
+        let request = heal_task_request(None, None, Some("root-token".to_string()), &formatter)
+            .expect("root token request should be valid")
+            .expect("root token request should be task scoped");
+
+        assert!(request.bucket.is_empty());
+        assert!(request.prefix.is_none());
+        assert_eq!(request.client_token, "root-token");
+    }
+
+    #[test]
+    fn test_heal_task_request_rejects_bucket_without_token() {
+        let formatter = Formatter::default();
+
+        let result = heal_task_request(Some("logs".to_string()), None, None, &formatter);
+
+        assert!(matches!(result, Err(ExitCode::UsageError)));
+    }
+
+    #[test]
+    fn test_heal_task_request_rejects_prefix_without_bucket() {
+        let formatter = Formatter::default();
+
+        let result = heal_task_request(
+            None,
+            Some("2026/".to_string()),
+            Some("root-token".to_string()),
+            &formatter,
+        );
 
         assert!(matches!(result, Err(ExitCode::UsageError)));
     }

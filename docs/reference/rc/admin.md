@@ -64,6 +64,14 @@ Check global background heal status:
 rc admin heal status local
 ```
 
+Start and inspect a root recursive manual heal:
+
+```bash
+rc admin heal start local
+rc admin heal status local --client-token <TOKEN_FROM_START>
+rc admin heal stop local --client-token <TOKEN_FROM_START>
+```
+
 Check a manual bucket heal task using the client token returned by `start`:
 
 ```bash
@@ -136,7 +144,7 @@ rc admin service restart local
 
 Admin operations use the configured alias to create a RustFS admin client. The credentials behind the alias must have permissions for the requested administrative API. The command accepts aliases with or without a trailing slash.
 
-`rc admin heal status <ALIAS>` reports aggregate background heal status. Manual bucket or prefix heals started with `rc admin heal start` are token-scoped tasks; the start output includes a client token, and subsequent task status or stop requests must pass that token with `--bucket`, optional `--prefix`, and `--client-token`.
+`rc admin heal status <ALIAS>` reports aggregate background heal status. Manual heals started with `rc admin heal start` are token-scoped tasks; the start output includes a client token. Root recursive tasks are inspected or stopped with `--client-token`, while bucket or prefix tasks additionally pass `--bucket` and optional `--prefix`.
 
 ## Heal Workflow
 
@@ -145,9 +153,11 @@ Admin operations use the configured alias to create a RustFS admin client. The c
 | Command | Description |
 | --- | --- |
 | `rc admin heal status <ALIAS>` | Show aggregate background heal status. |
+| `rc admin heal status <ALIAS> --client-token <TOKEN>` | Show a token-scoped root recursive manual heal task. |
 | `rc admin heal status <ALIAS> --bucket <BUCKET> [--prefix <PREFIX>] --client-token <TOKEN>` | Show a token-scoped manual heal task. |
 | `rc admin heal start <ALIAS> [OPTIONS]` | Start a manual heal operation. |
 | `rc admin heal stop <ALIAS>` | Stop the global background heal operation. |
+| `rc admin heal stop <ALIAS> --client-token <TOKEN>` | Stop a token-scoped root recursive manual heal task. |
 | `rc admin heal stop <ALIAS> --bucket <BUCKET> [--prefix <PREFIX>] --client-token <TOKEN>` | Stop a token-scoped manual heal task. |
 
 `heal start` accepts these operation options:
@@ -161,7 +171,7 @@ Admin operations use the configured alias to create a RustFS admin client. The c
 | `--recreate` | Recreate missing data. |
 | `--dry-run` | Report what would be healed without applying changes. |
 
-Manual bucket and prefix heals are token-scoped. Save the `clientToken` returned by `heal start`; the token is required to inspect or stop that manual task.
+All manual heals are token-scoped. Save the `clientToken` returned by `heal start`; the token is required to inspect or stop the task. Root recursive tasks use the token alone, while bucket and prefix tasks also require their original target options.
 
 ## Decommission Workflow
 

@@ -573,24 +573,23 @@ fn rustfs_heal_path(request: &HealStartRequest) -> Result<String> {
 }
 
 fn rustfs_heal_task_path(request: &HealTaskRequest) -> Result<String> {
-    if request.bucket.is_empty() {
-        return Err(Error::InvalidPath(
-            "heal task status requires a bucket target".to_string(),
-        ));
-    }
-
+    let bucket = (!request.bucket.is_empty()).then_some(request.bucket.as_str());
     let prefix = request
         .prefix
         .as_deref()
         .filter(|prefix| !prefix.is_empty());
 
-    match prefix {
-        Some(prefix) => Ok(format!(
+    match (bucket, prefix) {
+        (None, None) => Ok("/heal/".to_string()),
+        (Some(bucket), None) => Ok(format!("/heal/{}", urlencoding::encode(bucket))),
+        (Some(bucket), Some(prefix)) => Ok(format!(
             "/heal/{}/{}",
-            urlencoding::encode(&request.bucket),
+            urlencoding::encode(bucket),
             urlencoding::encode(prefix)
         )),
-        None => Ok(format!("/heal/{}", urlencoding::encode(&request.bucket))),
+        (None, Some(_)) => Err(Error::InvalidPath(
+            "heal task prefix requires a bucket target".to_string(),
+        )),
     }
 }
 
@@ -1466,6 +1465,34 @@ mod tests {
     }
 
     #[test]
+    fn test_rustfs_heal_task_path_supports_root_target() {
+        let request = HealTaskRequest {
+            bucket: String::new(),
+            prefix: None,
+            client_token: "root-token".to_string(),
+        };
+
+        assert_eq!(
+            rustfs_heal_task_path(&request).expect("root task path"),
+            "/heal/"
+        );
+    }
+
+    #[test]
+    fn test_rustfs_heal_task_path_rejects_root_prefix() {
+        let request = HealTaskRequest {
+            bucket: String::new(),
+            prefix: Some("2026/".to_string()),
+            client_token: "root-token".to_string(),
+        };
+
+        assert!(matches!(
+            rustfs_heal_task_path(&request),
+            Err(Error::InvalidPath(_))
+        ));
+    }
+
+    #[test]
     fn test_rustfs_heal_body_matches_server_heal_options() {
         let request = HealStartRequest {
             scan_mode: HealScanMode::Deep,
@@ -1795,6 +1822,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_heal_task_status_queries_root_route_with_client_token() {
+        let (endpoint, receiver, handle) = start_admin_test_server(
+            "200 OK",
+            r#"{"summary":"running","detail":"","startTime":"2026-07-15T00:38:07Z","settings":{"recursive":true,"dryRun":false,"remove":false,"recreate":true,"scanMode":1,"updateParity":false,"nolock":false},"items":[]}"#,
+        );
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let status = client
+            .heal_task_status(HealTaskRequest {
+                bucket: String::new(),
+                prefix: None,
+                client_token: "root-token".to_string(),
+            })
+            .await
+            .expect("root heal task status request");
+
+        assert_eq!(status.heal_id, "root-token");
+        assert!(status.healing);
+        assert!(status.bucket.is_empty());
+        assert!(status.object.is_empty());
+
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(request.method, "POST");
+        assert_eq!(
+            request.target,
+            "/rustfs/admin/v3/heal/?clientToken=root-token"
+        );
+        assert!(request.body.is_empty());
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
     async fn test_heal_task_status_queries_bucket_route_with_client_token() {
         let (endpoint, receiver, handle) = start_admin_test_server(
             "200 OK",
@@ -1861,6 +1920,37 @@ mod tests {
         assert_eq!(
             request.target,
             "/rustfs/admin/v3/heal/raw%20photos/2026%2Fapril?clientToken=heal-token-123"
+        );
+        assert!(request.body.is_empty());
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn test_heal_task_stop_posts_root_force_stop_with_client_token() {
+        let (endpoint, receiver, handle) = start_admin_test_server(
+            "200 OK",
+            r#"{"summary":"stopped","detail":"heal task cancelled","startTime":"2026-07-15T00:38:07Z","settings":{"recursive":true,"dryRun":false,"remove":false,"recreate":true,"scanMode":1,"updateParity":false,"nolock":false},"items":[]}"#,
+        );
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let status = client
+            .heal_task_stop(HealTaskRequest {
+                bucket: String::new(),
+                prefix: None,
+                client_token: "root-token".to_string(),
+            })
+            .await
+            .expect("root heal task stop request");
+
+        assert_eq!(status.heal_id, "root-token");
+        assert!(!status.healing);
+        assert!(status.bucket.is_empty());
+
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(request.method, "POST");
+        assert_eq!(
+            request.target,
+            "/rustfs/admin/v3/heal/?clientToken=root-token&forceStop=true"
         );
         assert!(request.body.is_empty());
         handle.join().expect("server thread should finish");

@@ -256,12 +256,20 @@ rc admin info cluster local
 rc admin info server local
 rc admin info disk local --offline
 
-# Heal operations
+# Aggregate background heal status
 rc admin heal status local
+
+# Root recursive manual heal
+rc admin heal start local --scan-mode deep
+rc admin heal status local --client-token <TOKEN_FROM_START>
+rc admin heal stop local --client-token <TOKEN_FROM_START>
+
+# Bucket manual heal
 rc admin heal start local --bucket mybucket --scan-mode deep
 rc admin heal status local --bucket mybucket --client-token <TOKEN_FROM_START>
-rc admin heal start local --dry-run
 rc admin heal stop local --bucket mybucket --client-token <TOKEN_FROM_START>
+
+# Global force stop
 rc admin heal stop local
 
 # Pool expansion and decommission workflows
