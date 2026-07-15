@@ -2,7 +2,7 @@
 
 ## Purpose
 
-The `rc admin` operation manages the RustFS Admin API, including cluster information, healing, pools, expansion, decommissioning, rebalance workflows, IAM users, policies, groups, and service accounts.
+The `rc admin` operation manages the RustFS Admin API, including cluster information, healing, pools, expansion, decommissioning, rebalance workflows, IAM users, policies, groups, service accounts, site replication, and service control.
 
 `rc admin` does not implement the MinIO Admin API. MinIO aliases remain available to S3 data commands, but MinIO administrative operations require a MinIO-compatible admin client.
 
@@ -21,6 +21,10 @@ rc admin user <ls|add|info|rm|enable|disable> ...
 rc admin policy <ls|create|info|rm|attach> ...
 rc admin group <ls|add|info|rm|enable|disable|add-members|rm-members> ...
 rc admin service-account <ls|create|info|rm> ...
+rc admin service <restart|stop|freeze|unfreeze> <ALIAS>
+rc admin replicate add <ALIAS> <ALIAS> [<ALIAS>...]
+rc admin replicate <info|status> <ALIAS> [OPTIONS]
+rc admin replicate remove <ALIAS> <--all|--site <NAME>>
 ```
 
 ## Commands
@@ -37,6 +41,8 @@ rc admin service-account <ls|create|info|rm> ...
 | `policy` | Manage IAM policies and attachments. |
 | `group` | Manage IAM groups and group membership. |
 | `service-account` | Manage service accounts. |
+| `service` | Control the server process: restart, stop, freeze, unfreeze. |
+| `replicate` | Manage site replication across clusters. |
 
 ## Examples
 
@@ -111,6 +117,21 @@ Create a service account with a policy file:
 rc admin service-account create local SA_ACCESS_KEY SA_SECRET_KEY --policy ./policy.json
 ```
 
+Link two sites for site replication and check the result:
+
+```bash
+rc admin replicate add site1 site2
+rc admin replicate info site1
+rc admin replicate status site1
+```
+
+Gracefully stop or restart a server:
+
+```bash
+rc admin service stop local
+rc admin service restart local
+```
+
 ## Behavior
 
 Admin operations use the configured alias to create a RustFS admin client. The credentials behind the alias must have permissions for the requested administrative API. The command accepts aliases with or without a trailing slash.
@@ -166,6 +187,43 @@ Use `rc admin pool list <ALIAS>` or `rc admin pool status <ALIAS>` to find pool 
 | `rc admin rebalance stop <ALIAS>` | Stop a running rebalance operation. |
 
 `rc admin expand` is an alias-oriented workflow for the same post-expansion rebalance step. The `expand` command is also available as `scale`.
+
+## Service Control Workflow
+
+`rc admin service` controls the server process behind an alias.
+
+| Command | Description |
+| --- | --- |
+| `rc admin service restart <ALIAS>` | Request a graceful shutdown for restart. The supervising process manager (systemd, Kubernetes) is responsible for relaunching the binary. |
+| `rc admin service stop <ALIAS>` | Request a graceful shutdown. |
+| `rc admin service freeze <ALIAS>` | Set the service freeze flag. Currently advisory: the server records the flag but does not yet gate request admission on it. |
+| `rc admin service unfreeze <ALIAS>` | Clear the service freeze flag. |
+
+The server response reports whether the action was `accepted` and whether it is `effective` on the current build. RustFS has no in-process supervisor, so `restart` and `stop` both perform a graceful stop; `restart` relies on the process manager to bring the server back up.
+
+## Site Replication Workflow
+
+`rc admin replicate` manages multi-cluster site replication. Peer sites are given as configured alias names; their endpoints and credentials are resolved from the local alias store, so every participating site needs an alias with root credentials before running `add`.
+
+| Command | Description |
+| --- | --- |
+| `rc admin replicate add <ALIAS> <ALIAS> [<ALIAS>...]` | Link two or more sites into a site replication cluster. The first alias receives the request. |
+| `rc admin replicate info <ALIAS>` | Show the current site replication configuration. |
+| `rc admin replicate status <ALIAS> [OPTIONS]` | Show replication status. Without flags the buckets, users, groups, and policies summaries are requested. |
+| `rc admin replicate remove <ALIAS> --all` | Dissolve the entire site replication cluster. |
+| `rc admin replicate remove <ALIAS> --site <NAME>` | Remove one or more named sites. Repeat `--site` per name. |
+
+`status` accepts these section flags:
+
+| Option | Description |
+| --- | --- |
+| `--buckets` | Include the bucket replication summary. |
+| `--users` | Include the IAM user replication summary. |
+| `--groups` | Include the IAM group replication summary. |
+| `--policies` | Include the IAM policy replication summary. |
+| `--metrics` | Include replication metrics. |
+
+Site replication requires bucket versioning support on every site and replicates buckets, objects, IAM users, groups, policies, and service accounts across all linked sites. The server rejects loopback peer endpoints unless the deployment explicitly allows them (`RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET=true`), which is intended for local testing only.
 
 Global options shown in command syntax use the same meaning everywhere:
 

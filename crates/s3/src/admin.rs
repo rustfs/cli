@@ -12,9 +12,10 @@ use aws_sigv4::sign::v4;
 use rc_core::admin::{
     AccessKeyInfo, AdminApi, BucketQuota, ClusterInfo, CreateServiceAccountRequest,
     DecommissionPoolStatus, DecommissionStatus, Group, GroupStatus, HealRuntimeState, HealScanMode,
-    HealStartRequest, HealStatus, HealTaskRequest, Policy, PolicyEntity, PolicyInfo, PoolStatus,
-    PoolTarget, RebalanceStartResult, RebalanceStatus, ServiceAccount,
-    ServiceAccountCreateResponse, UpdateGroupMembersRequest, User, UserStatus,
+    HealStartRequest, HealStatus, HealTaskRequest, PeerSiteSpec, Policy, PolicyEntity, PolicyInfo,
+    PoolStatus, PoolTarget, RebalanceStartResult, RebalanceStatus, ServiceAccount,
+    ServiceAccountCreateResponse, ServiceActionResult, SiteRemoveSpec, SiteStatusOptions,
+    UpdateGroupMembersRequest, User, UserStatus,
 };
 use rc_core::{Alias, Error, Result};
 use reqwest::header::{CONTENT_TYPE, HOST, HeaderMap, HeaderName, HeaderValue};
@@ -1207,6 +1208,51 @@ impl AdminApi for AdminClient {
     async fn replication_metrics(&self, bucket: &str) -> Result<serde_json::Value> {
         let query: &[(&str, &str)] = &[("bucket", bucket)];
         self.request(Method::GET, "/replicationmetrics", Some(query), None)
+            .await
+    }
+
+    async fn service_action(&self, action: &str) -> Result<ServiceActionResult> {
+        let query: &[(&str, &str)] = &[("action", action)];
+        self.request(Method::POST, "/service", Some(query), None)
+            .await
+    }
+
+    async fn site_replication_info(&self) -> Result<serde_json::Value> {
+        self.request(Method::GET, "/site-replication/info", None, None)
+            .await
+    }
+
+    async fn site_replication_add(&self, sites: &[PeerSiteSpec]) -> Result<serde_json::Value> {
+        let body = serde_json::to_vec(sites).map_err(Error::Json)?;
+        self.request(Method::PUT, "/site-replication/add", None, Some(&body))
+            .await
+    }
+
+    async fn site_replication_status(
+        &self,
+        options: &SiteStatusOptions,
+    ) -> Result<serde_json::Value> {
+        let mut query: Vec<(&str, &str)> = Vec::new();
+        for (flag, enabled) in [
+            ("buckets", options.buckets),
+            ("users", options.users),
+            ("groups", options.groups),
+            ("policies", options.policies),
+            ("metrics", options.metrics),
+            ("peer-state", options.peer_state),
+            ("ilm-expiry-rules", options.ilm_expiry_rules),
+        ] {
+            if enabled {
+                query.push((flag, "true"));
+            }
+        }
+        self.request(Method::GET, "/site-replication/status", Some(&query), None)
+            .await
+    }
+
+    async fn site_replication_remove(&self, spec: &SiteRemoveSpec) -> Result<serde_json::Value> {
+        let body = serde_json::to_vec(spec).map_err(Error::Json)?;
+        self.request(Method::PUT, "/site-replication/remove", None, Some(&body))
             .await
     }
 }

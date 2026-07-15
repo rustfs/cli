@@ -280,6 +280,17 @@ rc admin rebalance start local
 rc admin rebalance status local
 rc admin rebalance stop local
 
+# Site replication across clusters (peer sites given as alias names)
+rc admin replicate add site1 site2
+rc admin replicate info site1
+rc admin replicate status site1
+rc admin replicate remove site1 --all
+
+# Service control (restart/stop perform a graceful shutdown;
+# a process manager such as systemd relaunches after restart)
+rc admin service restart local
+rc admin service stop local
+
 # JSON output
 rc admin info cluster local --json
 rc admin heal status local --json

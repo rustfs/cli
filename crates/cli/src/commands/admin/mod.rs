@@ -12,6 +12,8 @@ mod info;
 mod policy;
 mod pool;
 mod rebalance;
+mod replicate;
+mod service;
 mod service_account;
 mod user;
 
@@ -68,6 +70,14 @@ pub enum AdminCommands {
     /// Inspect access key identities
     #[command(name = "access-key", subcommand)]
     AccessKey(access_key::AccessKeyCommands),
+
+    /// Control the server process (restart, stop, freeze, unfreeze)
+    #[command(subcommand)]
+    Service(service::ServiceCommands),
+
+    /// Manage site replication across clusters
+    #[command(subcommand)]
+    Replicate(replicate::ReplicateCommands),
 }
 
 /// Execute an admin subcommand
@@ -91,6 +101,10 @@ pub async fn execute(cmd: AdminCommands, output_config: OutputConfig) -> ExitCod
         AdminCommands::ServiceAccount(sa_cmd) => service_account::execute(sa_cmd, &formatter).await,
         AdminCommands::AccessKey(access_key_cmd) => {
             access_key::execute(access_key_cmd, &formatter).await
+        }
+        AdminCommands::Service(service_cmd) => service::execute(service_cmd, &formatter).await,
+        AdminCommands::Replicate(replicate_cmd) => {
+            replicate::execute(replicate_cmd, &formatter).await
         }
     }
 }

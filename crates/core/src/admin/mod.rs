@@ -4,6 +4,7 @@
 //! IAM users, policies, groups, service accounts, and cluster operations.
 
 mod cluster;
+mod site;
 pub mod tier;
 mod types;
 
@@ -15,6 +16,7 @@ pub use cluster::{
     RebalancePoolProgress, RebalancePoolStatus, RebalanceStartResult, RebalanceStatus, ServerInfo,
     UsageInfo,
 };
+pub use site::{PeerSiteSpec, ServiceActionResult, SiteRemoveSpec, SiteStatusOptions};
 pub use tier::{
     TierAliyun, TierAzure, TierConfig, TierCreds, TierGCS, TierHuaweicloud, TierMinIO, TierR2,
     TierRustFS, TierS3, TierTencent, TierType,
@@ -223,6 +225,28 @@ pub trait AdminApi: Send + Sync {
 
     /// Get replication metrics for a bucket
     async fn replication_metrics(&self, bucket: &str) -> Result<serde_json::Value>;
+
+    // ==================== Service Control Operations ====================
+
+    /// Request a service action (restart, stop, freeze, unfreeze)
+    async fn service_action(&self, action: &str) -> Result<ServiceActionResult>;
+
+    // ==================== Site Replication Operations ====================
+
+    /// Get current site replication configuration
+    async fn site_replication_info(&self) -> Result<serde_json::Value>;
+
+    /// Add peer sites to the site replication cluster
+    async fn site_replication_add(&self, sites: &[PeerSiteSpec]) -> Result<serde_json::Value>;
+
+    /// Get site replication status
+    async fn site_replication_status(
+        &self,
+        options: &SiteStatusOptions,
+    ) -> Result<serde_json::Value>;
+
+    /// Remove sites from the site replication cluster
+    async fn site_replication_remove(&self, spec: &SiteRemoveSpec) -> Result<serde_json::Value>;
 }
 
 #[cfg(test)]
