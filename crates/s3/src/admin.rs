@@ -688,12 +688,23 @@ struct SetBucketQuotaApiRequest {
     quota_type: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct ServerInfoResponse {
+    info: ClusterInfo,
+}
+
+#[derive(Debug, Deserialize)]
+struct PoolStatusResponse {
+    pool: PoolStatus,
+}
+
 #[async_trait]
 impl AdminApi for AdminClient {
     // ==================== Cluster Operations ====================
 
     async fn cluster_info(&self) -> Result<ClusterInfo> {
-        self.request(Method::GET, "/info", None, None).await
+        let response: ServerInfoResponse = self.request(Method::GET, "/info", None, None).await?;
+        Ok(response.info)
     }
 
     async fn heal_status(&self) -> Result<HealStatus> {
@@ -749,8 +760,10 @@ impl AdminApi for AdminClient {
 
     async fn pool_status(&self, target: PoolTarget) -> Result<PoolStatus> {
         let query = pool_target_query(&target);
-        self.request(Method::GET, "/pools/status", Some(&query), None)
-            .await
+        let response: PoolStatusResponse = self
+            .request(Method::GET, "/pools/status", Some(&query), None)
+            .await?;
+        Ok(response.pool)
     }
 
     async fn decommission_start(&self, target: PoolTarget) -> Result<()> {
@@ -2002,10 +2015,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cluster_info_unwraps_beta9_info_response() {
+        let (endpoint, receiver, handle) = start_admin_test_server(
+            "200 OK",
+            r#"{"info":{"mode":"distributed","deploymentID":"deployment-123","servers":[{"endpoint":"http://node1:9000","state":"online","drives":[]}]},"admin_discovery":{"runtimeCapabilities":"/rustfs/admin/v4/runtime/capabilities","clusterSnapshot":"/rustfs/admin/v4/cluster/snapshot","extensionsCatalog":"/rustfs/admin/v4/extensions/catalog"}}"#,
+        );
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let info = client.cluster_info().await.expect("cluster info request");
+
+        assert_eq!(info.mode.as_deref(), Some("distributed"));
+        assert_eq!(info.deployment_id.as_deref(), Some("deployment-123"));
+        assert_eq!(info.servers.as_ref().map(Vec::len), Some(1));
+
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.target, "/rustfs/admin/v3/info");
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn test_cluster_info_rejects_flat_beta8_response() {
+        let (endpoint, _receiver, handle) = start_admin_test_server(
+            "200 OK",
+            r#"{"mode":"distributed","deploymentID":"legacy"}"#,
+        );
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let error = client
+            .cluster_info()
+            .await
+            .expect_err("flat beta.8 cluster info should be rejected");
+
+        assert!(error.to_string().contains("missing field `info`"));
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
     async fn test_pool_status_uses_pool_status_route_with_by_id_query() {
         let (endpoint, receiver, handle) = start_admin_test_server(
             "200 OK",
-            r#"{"id":1,"cmdline":"/data/pool1/disk{1...4}","lastUpdate":"2026-05-06T00:00:00Z","decommissionInfo":null}"#,
+            r#"{"pool":{"id":1,"cmdline":"/data/pool1/disk{1...4}","lastUpdate":"2026-05-06T00:00:00Z","decommissionInfo":null},"admin_discovery":{"runtimeCapabilities":"/rustfs/admin/v4/runtime/capabilities","clusterSnapshot":"/rustfs/admin/v4/cluster/snapshot","extensionsCatalog":"/rustfs/admin/v4/extensions/catalog"}}"#,
         );
         let client = admin_client_for_endpoint(&endpoint);
 
@@ -2031,10 +2081,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_pool_status_rejects_flat_beta8_response() {
+        let (endpoint, _receiver, handle) =
+            start_admin_test_server("200 OK", r#"{"id":1,"cmdline":"/data/pool1/disk{1...4}"}"#);
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let error = client
+            .pool_status(PoolTarget {
+                pool: "1".to_string(),
+                by_id: true,
+            })
+            .await
+            .expect_err("flat beta.8 pool status should be rejected");
+
+        assert!(error.to_string().contains("missing field `pool`"));
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
     async fn test_pool_status_uses_command_line_query_without_by_id() {
         let (endpoint, receiver, handle) = start_admin_test_server(
             "200 OK",
-            r#"{"id":2,"cmdline":"/data/pool2/disk{1...4}","lastUpdate":"2026-05-06T00:00:00Z","decommissionInfo":null}"#,
+            r#"{"pool":{"id":2,"cmdline":"/data/pool2/disk{1...4}","lastUpdate":"2026-05-06T00:00:00Z","decommissionInfo":null},"admin_discovery":{"runtimeCapabilities":"/rustfs/admin/v4/runtime/capabilities","clusterSnapshot":"/rustfs/admin/v4/cluster/snapshot","extensionsCatalog":"/rustfs/admin/v4/extensions/catalog"}}"#,
         );
         let client = admin_client_for_endpoint(&endpoint);
 

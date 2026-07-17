@@ -92,7 +92,7 @@ fn pool_status_without_target_dispatches_to_pool_list_json() {
 fn pool_status_dispatches_by_id_pool_json() {
     let config_dir = tempfile::tempdir().expect("create config dir");
     let (endpoint, receiver, handle) = start_admin_test_server(
-        r#"{"id":1,"cmdline":"/data/pool1/disk{1...4}","lastUpdate":"2026-05-10T00:00:00Z","status":"active","decommissionStatus":"none","rebalanceStatus":"failed","decommissionInfo":null}"#,
+        r#"{"pool":{"id":1,"cmdline":"/data/pool1/disk{1...4}","lastUpdate":"2026-05-10T00:00:00Z","status":"active","decommissionStatus":"none","rebalanceStatus":"failed","decommissionInfo":null},"admin_discovery":{"runtimeCapabilities":"/rustfs/admin/v4/runtime/capabilities","clusterSnapshot":"/rustfs/admin/v4/cluster/snapshot","extensionsCatalog":"/rustfs/admin/v4/extensions/catalog"}}"#,
     );
 
     let output = Command::new(rc_binary())
