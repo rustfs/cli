@@ -478,11 +478,22 @@ impl From<BackgroundHealStatusResponse> for HealStatus {
                 response.heal_active_tasks.max(operations.active_tasks)
             });
 
+        let legacy_status_healing = matches!(scan_mode, Some(HealScanMode::Deep))
+            || queue_length > 0
+            || active_tasks > 0
+            || legacy_healing;
+        let healing = match response.state {
+            Some(HealRuntimeState::Active) => true,
+            Some(
+                HealRuntimeState::Disabled
+                | HealRuntimeState::Uninitialized
+                | HealRuntimeState::Idle,
+            ) => false,
+            Some(HealRuntimeState::Unknown) | None => legacy_status_healing,
+        };
+
         let mut status = Self {
-            healing: matches!(scan_mode, Some(HealScanMode::Deep))
-                || queue_length > 0
-                || active_tasks > 0
-                || legacy_healing,
+            healing,
             started: response.bitrot_start_time,
             scan_mode,
             scan_cycle: response.bitrot_start_cycle,
@@ -1565,6 +1576,30 @@ mod tests {
         assert_eq!(idle.state, Some(HealRuntimeState::Idle));
         assert_eq!(idle.scan_mode, Some(HealScanMode::Normal));
         assert!(idle.started.is_none());
+
+        let active_without_legacy_counters = HealStatus::from(BackgroundHealStatusResponse {
+            state: Some(HealRuntimeState::Active),
+            bitrot_start_time: None,
+            bitrot_start_cycle: 0,
+            current_scan_mode: Some(1),
+            heal_queue_length: 0,
+            heal_active_tasks: 0,
+            heal_operations: None,
+            progress: None,
+        });
+        assert!(active_without_legacy_counters.healing);
+
+        let disabled_with_stale_counters = HealStatus::from(BackgroundHealStatusResponse {
+            state: Some(HealRuntimeState::Disabled),
+            bitrot_start_time: Some("2026-04-19T10:00:00Z".to_string()),
+            bitrot_start_cycle: 42,
+            current_scan_mode: Some(2),
+            heal_queue_length: 3,
+            heal_active_tasks: 1,
+            heal_operations: None,
+            progress: None,
+        });
+        assert!(!disabled_with_stale_counters.healing);
 
         let completed = HealStatus::from(BackgroundHealStatusResponse {
             state: None,
