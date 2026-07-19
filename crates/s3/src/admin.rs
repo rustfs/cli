@@ -2389,6 +2389,41 @@ mod tests {
         handle.join().expect("server thread should finish");
     }
 
+    #[tokio::test]
+    async fn test_site_replication_add_puts_peer_sites_body() {
+        let (endpoint, receiver, handle) = start_admin_test_server("200 OK", r#"{"success":true}"#);
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let sites = vec![PeerSiteSpec {
+            name: "site-a".to_string(),
+            endpoint: "https://site-a.example:9000".to_string(),
+            access_key: "site-a-access".to_string(),
+            secret_key: "site-a-secret".to_string(),
+            skip_tls_verify: true,
+            ca_cert_pem: String::new(),
+        }];
+
+        let result = client
+            .site_replication_add(&sites)
+            .await
+            .expect("site replication add request");
+
+        assert_eq!(result["success"], true);
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(request.method, "PUT");
+        assert_eq!(request.target, "/rustfs/admin/v3/site-replication/add");
+
+        let body: Vec<PeerSiteSpec> =
+            serde_json::from_slice(&request.body).expect("peer sites body should be JSON");
+        assert_eq!(body.len(), 1);
+        assert_eq!(body[0].name, "site-a");
+        assert_eq!(body[0].endpoint, "https://site-a.example:9000");
+        assert_eq!(body[0].access_key, "site-a-access");
+        assert_eq!(body[0].secret_key, "site-a-secret");
+        assert!(body[0].skip_tls_verify);
+        handle.join().expect("server thread should finish");
+    }
+
     #[test]
     fn test_admin_client_invalid_ca_bundle_path_surfaces_error() {
         let mut alias = Alias::new("test", "https://localhost:9000", "access", "secret");
