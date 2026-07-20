@@ -428,6 +428,47 @@ pub struct CreateServiceAccountRequest {
     pub secret_key: String,
 }
 
+/// Request to update an existing service account
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateServiceAccountRequest {
+    /// Replacement policy document (JSON string)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_policy: Option<String>,
+
+    /// Replacement secret key
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_secret_key: Option<String>,
+
+    /// Replacement account status
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_status: Option<String>,
+
+    /// Replacement friendly name
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_name: Option<String>,
+
+    /// Replacement description
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_description: Option<String>,
+
+    /// Replacement expiration time (ISO 8601)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_expiration: Option<String>,
+}
+
+impl UpdateServiceAccountRequest {
+    /// Return true when the request does not change any field.
+    pub fn is_empty(&self) -> bool {
+        self.new_policy.is_none()
+            && self.new_secret_key.is_none()
+            && self.new_status.is_none()
+            && self.new_name.is_none()
+            && self.new_description.is_none()
+            && self.new_expiration.is_none()
+    }
+}
+
 /// Bucket quota information returned by Admin API
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -618,6 +659,38 @@ mod tests {
             parsed.get("expiration").and_then(|v| v.as_str()),
             Some("2025-12-31T23:59:59Z")
         );
+    }
+
+    #[test]
+    fn test_update_service_account_request_serializes_provided_fields() {
+        let request = UpdateServiceAccountRequest {
+            new_policy: Some(r#"{"Version":"2012-10-17"}"#.to_string()),
+            new_secret_key: Some("new-secret-key".to_string()),
+            new_status: Some("enabled".to_string()),
+            new_name: Some("automation-key".to_string()),
+            new_description: Some("Used by automation".to_string()),
+            new_expiration: Some("2030-01-01T00:00:00Z".to_string()),
+        };
+
+        let value = serde_json::to_value(&request).expect("serialize update request");
+        assert_eq!(value["newPolicy"], r#"{"Version":"2012-10-17"}"#);
+        assert_eq!(value["newSecretKey"], "new-secret-key");
+        assert_eq!(value["newStatus"], "enabled");
+        assert_eq!(value["newName"], "automation-key");
+        assert_eq!(value["newDescription"], "Used by automation");
+        assert_eq!(value["newExpiration"], "2030-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn test_update_service_account_request_omits_unset_fields() {
+        let request = UpdateServiceAccountRequest {
+            new_description: Some("Updated description".to_string()),
+            ..Default::default()
+        };
+
+        let value = serde_json::to_value(&request).expect("serialize update request");
+        assert_eq!(value.as_object().expect("request object").len(), 1);
+        assert_eq!(value["newDescription"], "Updated description");
     }
 
     #[test]

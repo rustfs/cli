@@ -1,6 +1,6 @@
 //! Service account management commands
 //!
-//! Commands for managing service accounts: list, create, info, remove.
+//! Commands for managing service accounts: list, create, update, info, remove.
 
 use clap::Subcommand;
 use serde::Serialize;
@@ -8,7 +8,9 @@ use serde::Serialize;
 use super::get_admin_client;
 use crate::exit_code::ExitCode;
 use crate::output::Formatter;
-use rc_core::admin::{AdminApi, CreateServiceAccountRequest, ServiceAccount};
+use rc_core::admin::{
+    AdminApi, CreateServiceAccountRequest, ServiceAccount, UpdateServiceAccountRequest,
+};
 
 const DEFAULT_SERVICE_ACCOUNT_EXPIRY: &str = "9999-12-31T23:59:59Z";
 
@@ -21,6 +23,10 @@ pub enum ServiceAccountCommands {
 
     /// Create a new service account
     Create(CreateArgs),
+
+    /// Update an existing service account
+    #[command(aliases = ["edit", "set"])]
+    Update(UpdateArgs),
 
     /// Get service account information
     Info(InfoArgs),
@@ -66,6 +72,39 @@ pub struct CreateArgs {
     /// Optional expiration time (ISO 8601 format)
     #[arg(long)]
     pub expiry: Option<String>,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct UpdateArgs {
+    /// Alias name of the server
+    pub alias: String,
+
+    /// Access key of the service account
+    pub access_key: String,
+
+    /// Replacement secret key
+    #[arg(long)]
+    pub secret_key: Option<String>,
+
+    /// Replacement name for the service account
+    #[arg(long)]
+    pub name: Option<String>,
+
+    /// Replacement description
+    #[arg(long)]
+    pub description: Option<String>,
+
+    /// Replacement policy document (JSON file path)
+    #[arg(long)]
+    pub policy: Option<String>,
+
+    /// Replacement expiration time (ISO 8601 format)
+    #[arg(long)]
+    pub expiry: Option<String>,
+
+    /// Replacement account status
+    #[arg(long, value_parser = ["enabled", "disabled"])]
+    pub status: Option<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -142,6 +181,7 @@ pub async fn execute(cmd: ServiceAccountCommands, formatter: &Formatter) -> Exit
     match cmd {
         ServiceAccountCommands::List(args) => execute_list(args, formatter).await,
         ServiceAccountCommands::Create(args) => execute_create(args, formatter).await,
+        ServiceAccountCommands::Update(args) => execute_update(args, formatter).await,
         ServiceAccountCommands::Info(args) => execute_info(args, formatter).await,
         ServiceAccountCommands::Remove(args) => execute_remove(args, formatter).await,
     }
@@ -270,6 +310,78 @@ fn should_retry_with_default_expiry(args: &CreateArgs, error: &rc_core::Error) -
 
     let text = error.to_string();
     text.contains("missing field `expiration`") || text.contains("InvalidExpiration")
+}
+
+async fn execute_update(args: UpdateArgs, formatter: &Formatter) -> ExitCode {
+    let policy = if let Some(policy_path) = &args.policy {
+        match std::fs::read_to_string(policy_path) {
+            Ok(content) => Some(content),
+            Err(e) => {
+                formatter.error(&format!(
+                    "Failed to read policy file '{}': {e}",
+                    policy_path
+                ));
+                return ExitCode::UsageError;
+            }
+        }
+    } else {
+        None
+    };
+
+    let request = build_update_service_account_request(&args, policy);
+    if request.is_empty() {
+        formatter.error("Service account update requires at least one field");
+        return ExitCode::UsageError;
+    }
+
+    let client = match get_admin_client(&args.alias, formatter) {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+
+    match client
+        .update_service_account(&args.access_key, request)
+        .await
+    {
+        Ok(()) => {
+            let output = ServiceAccountOperationOutput {
+                success: true,
+                access_key: args.access_key.clone(),
+                message: format!("Service account '{}' updated successfully", args.access_key),
+            };
+            if formatter.is_json() {
+                formatter.json(&output);
+            } else {
+                let styled_key = formatter.style_name(&args.access_key);
+                formatter.success(&format!(
+                    "Service account '{styled_key}' updated successfully."
+                ));
+            }
+            ExitCode::Success
+        }
+        Err(rc_core::Error::NotFound(_)) => {
+            formatter.error(&format!("Service account '{}' not found", args.access_key));
+            ExitCode::NotFound
+        }
+        Err(e) => {
+            formatter.error(&format!("Failed to update service account: {e}"));
+            ExitCode::GeneralError
+        }
+    }
+}
+
+fn build_update_service_account_request(
+    args: &UpdateArgs,
+    policy: Option<String>,
+) -> UpdateServiceAccountRequest {
+    UpdateServiceAccountRequest {
+        new_policy: policy,
+        new_secret_key: args.secret_key.clone(),
+        new_status: args.status.clone(),
+        new_name: args.name.clone(),
+        new_description: args.description.clone(),
+        new_expiration: args.expiry.clone(),
+    }
 }
 
 async fn execute_info(args: InfoArgs, formatter: &Formatter) -> ExitCode {
@@ -409,6 +521,55 @@ mod tests {
         assert_eq!(request.description.as_deref(), Some("demo"));
         assert_eq!(request.expiry.as_deref(), Some("2030-01-01T00:00:00Z"));
         assert_eq!(request.policy.as_deref(), Some("{\"x\":1}"));
+    }
+
+    #[test]
+    fn test_build_update_request_keeps_only_explicit_fields() {
+        let args = UpdateArgs {
+            alias: "local".to_string(),
+            access_key: "AKIAIOSFODNN7EXAMPLE".to_string(),
+            secret_key: None,
+            name: Some("automation-key".to_string()),
+            description: Some("Updated description".to_string()),
+            policy: Some("policy.json".to_string()),
+            expiry: None,
+            status: Some("enabled".to_string()),
+        };
+
+        let request = build_update_service_account_request(
+            &args,
+            Some("{\"Version\":\"2012-10-17\"}".to_string()),
+        );
+        assert_eq!(
+            request.new_policy.as_deref(),
+            Some("{\"Version\":\"2012-10-17\"}")
+        );
+        assert!(request.new_secret_key.is_none());
+        assert_eq!(request.new_name.as_deref(), Some("automation-key"));
+        assert_eq!(
+            request.new_description.as_deref(),
+            Some("Updated description")
+        );
+        assert!(request.new_expiration.is_none());
+        assert_eq!(request.new_status.as_deref(), Some("enabled"));
+        assert!(!request.is_empty());
+    }
+
+    #[test]
+    fn test_build_update_request_detects_empty_update() {
+        let args = UpdateArgs {
+            alias: "local".to_string(),
+            access_key: "AKIAIOSFODNN7EXAMPLE".to_string(),
+            secret_key: None,
+            name: None,
+            description: None,
+            policy: None,
+            expiry: None,
+            status: None,
+        };
+
+        let request = build_update_service_account_request(&args, None);
+        assert!(request.is_empty());
     }
 
     #[test]

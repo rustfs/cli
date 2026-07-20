@@ -147,6 +147,9 @@ rc admin service-account create local/ AKIAIOSFODNN7EXAMPLE wJalrXUtnFEMI/K7MDEN
 # Create a service account with inline policy file
 rc admin service-account create local/ SAKEY123 SASECRET123 --policy ./service-account-policy.json
 
+# Update selected fields on an existing service account
+rc admin service-account update local/ SAKEY123 --policy ./service-account-policy.json --description "Automation access"
+
 # Inspect any access key and resolve whether it belongs to a user, service account, or STS credential
 rc admin access-key info local/ AKIAIOSFODNN7EXAMPLE
 rc admin access-key info local/ AKIAIOSFODNN7EXAMPLE --json
@@ -345,7 +348,7 @@ For full command documentation, see the [`rc` command reference](docs/reference/
 | `admin user`            | Manage IAM users (add, remove, list, info, enable, disable)                           |
 | `admin policy`          | Manage IAM policies (create, remove, list, info, attach)                              |
 | `admin group`           | Manage IAM groups (add, remove, list, info, enable, disable, add-members, rm-members) |
-| `admin service-account` | Manage service accounts (create, remove, list, info)                                  |
+| `admin service-account` | Manage service accounts (create, update, remove, list, info)                          |
 | `admin access-key`      | Inspect access key identity and metadata (info)                                       |
 | `admin info`            | Display cluster information (cluster, server, disk)                                   |
 | `admin heal`            | Manage cluster healing operations (status, start, stop)                               |

@@ -25,7 +25,7 @@ pub use types::{
     AccessKeyDetails, AccessKeyInfo, BucketQuota, CreateServiceAccountRequest, Group, GroupStatus,
     LdapAccessKeyInfo, OpenIdAccessKeyInfo, Policy, PolicyEntity, PolicyInfo, ServiceAccount,
     ServiceAccountCreateResponse, ServiceAccountCredentials, SetPolicyRequest,
-    UpdateGroupMembersRequest, User, UserStatus,
+    UpdateGroupMembersRequest, UpdateServiceAccountRequest, User, UserStatus,
 };
 
 use async_trait::async_trait;
@@ -169,6 +169,13 @@ pub trait AdminApi: Send + Sync {
         &self,
         request: CreateServiceAccountRequest,
     ) -> Result<ServiceAccount>;
+
+    /// Update an existing service account
+    async fn update_service_account(
+        &self,
+        access_key: &str,
+        request: UpdateServiceAccountRequest,
+    ) -> Result<()>;
 
     /// Delete a service account
     async fn delete_service_account(&self, access_key: &str) -> Result<()>;

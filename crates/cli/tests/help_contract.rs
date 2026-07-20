@@ -760,6 +760,18 @@ fn nested_subcommand_help_contract() {
             expected_tokens: &["--name", "--description", "--policy", "--expiry"],
         },
         HelpCase {
+            args: &["admin", "service-account", "update"],
+            usage: "Usage: rc admin service-account update [OPTIONS] <ALIAS> <ACCESS_KEY>",
+            expected_tokens: &[
+                "--secret-key",
+                "--name",
+                "--description",
+                "--policy",
+                "--expiry",
+                "--status",
+            ],
+        },
+        HelpCase {
             args: &["admin", "service-account", "info"],
             usage: "Usage: rc admin service-account info [OPTIONS] <ALIAS> <ACCESS_KEY>",
             expected_tokens: &[],

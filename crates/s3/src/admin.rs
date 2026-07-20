@@ -15,7 +15,7 @@ use rc_core::admin::{
     HealStartRequest, HealStatus, HealTaskRequest, PeerSiteSpec, Policy, PolicyEntity, PolicyInfo,
     PoolStatus, PoolTarget, RebalanceStartResult, RebalanceStatus, ServiceAccount,
     ServiceAccountCreateResponse, ServiceActionResult, SiteRemoveSpec, SiteStatusOptions,
-    UpdateGroupMembersRequest, User, UserStatus,
+    UpdateGroupMembersRequest, UpdateServiceAccountRequest, User, UserStatus,
 };
 use rc_core::{Alias, Error, Result};
 use reqwest::header::{CONTENT_TYPE, HOST, HeaderMap, HeaderName, HeaderValue};
@@ -1116,6 +1116,22 @@ impl AdminApi for AdminClient {
             description: None,
             implied_policy: None,
         })
+    }
+
+    async fn update_service_account(
+        &self,
+        access_key: &str,
+        request: UpdateServiceAccountRequest,
+    ) -> Result<()> {
+        let query = [("accessKey", access_key)];
+        let body = serde_json::to_vec(&request).map_err(Error::Json)?;
+        self.request_no_response(
+            Method::POST,
+            "/update-service-account",
+            Some(&query),
+            Some(&body),
+        )
+        .await
     }
 
     async fn delete_service_account(&self, access_key: &str) -> Result<()> {
@@ -2421,6 +2437,38 @@ mod tests {
         assert_eq!(body[0].access_key, "site-a-access");
         assert_eq!(body[0].secret_key, "site-a-secret");
         assert!(body[0].skip_tls_verify);
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn test_update_service_account_posts_access_key_and_partial_body() {
+        let (endpoint, receiver, handle) = start_admin_test_server("204 No Content", "");
+        let client = admin_client_for_endpoint(&endpoint);
+
+        client
+            .update_service_account(
+                "service key/one",
+                rc_core::admin::UpdateServiceAccountRequest {
+                    new_policy: Some(r#"{"Version":"2012-10-17"}"#.to_string()),
+                    new_description: Some("Updated description".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("update service account request");
+
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(request.method, "POST");
+        assert_eq!(
+            request.target,
+            "/rustfs/admin/v3/update-service-account?accessKey=service%20key%2Fone"
+        );
+
+        let body: serde_json::Value =
+            serde_json::from_slice(&request.body).expect("update body should be JSON");
+        assert_eq!(body["newPolicy"], r#"{"Version":"2012-10-17"}"#);
+        assert_eq!(body["newDescription"], "Updated description");
+        assert_eq!(body.as_object().expect("request object").len(), 2);
         handle.join().expect("server thread should finish");
     }
 
