@@ -126,6 +126,21 @@ rc share download local/bucket/file.txt --expire 24h
 rc tree local/bucket -L 3
 ```
 
+Bulk copies accept one or more sources followed by a directory or remote-prefix target:
+
+```bash
+rc cp ./january.csv ./february.csv local/reports/ --concurrency 8 --summary
+rc cp -r ./reports/ local/archive/ --include '*.csv' --exclude 'private-*' --newer-than 7d
+rc cp -r ./reports/ local/archive/ --rate-limit 10MiB/s --retry-attempts 5 --continue-on-error
+```
+
+When include rules are present, a path must match at least one of them. Exclude rules are applied
+after include rules and always win, regardless of flag order. Age filters compare source metadata in
+UTC: newer/older boundaries are strict, while `--rewind` includes the specified boundary. Rate,
+concurrency, and retry settings are shared across the full command. Any failed item leaves the
+aggregate command exit code non-zero even when `--continue-on-error` is used. An empty selection
+succeeds by default; pass `--fail-empty` when automation should receive a not-found exit code.
+
 ### Admin Operations (IAM)
 
 ```bash

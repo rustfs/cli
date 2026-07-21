@@ -21,6 +21,7 @@ pub mod replication;
 pub mod retry;
 pub mod select;
 pub mod traits;
+pub mod transfer;
 
 pub use alias::{
     Alias, AliasManager, RequestHeader, global_request_headers, set_global_request_headers,
@@ -49,4 +50,8 @@ pub use select::{
 pub use traits::{
     BucketNotification, Capabilities, ListOptions, ListResult, NotificationTarget, ObjectInfo,
     ObjectStore, ObjectVersion, ObjectVersionListResult,
+};
+pub use transfer::{
+    TransferCandidate, TransferControls, TransferExecutor, TransferOutcome, TransferOutcomeState,
+    TransferPlan, TransferReport, TransferSelection, TransferSummary,
 };

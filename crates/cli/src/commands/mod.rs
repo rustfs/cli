@@ -1092,7 +1092,7 @@ mod tests {
         match cli.command {
             Commands::Object(args) => match args.command {
                 object::ObjectCommands::Copy(arg) => {
-                    assert_eq!(arg.source, "./report.json");
+                    assert_eq!(arg.sources, ["./report.json"]);
                     assert_eq!(arg.target, "local/my-bucket/reports/");
                     assert_eq!(arg.content_type.as_deref(), Some("application/json"));
                     assert_eq!(arg.storage_class.as_deref(), Some("STANDARD_IA"));
@@ -1101,6 +1101,48 @@ mod tests {
                 other => panic!("expected object copy command, got {:?}", other),
             },
             other => panic!("expected object command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_multiple_copy_sources_and_global_transfer_controls() {
+        let cli = Cli::try_parse_from([
+            "rc",
+            "cp",
+            "./a.csv",
+            "./b.csv",
+            "local/reports/",
+            "--include",
+            "*.csv",
+            "--exclude",
+            "private-*",
+            "--newer-than",
+            "1h",
+            "--concurrency",
+            "8",
+            "--rate-limit",
+            "10MiB/s",
+            "--retry-attempts",
+            "5",
+            "--continue-on-error",
+            "--summary",
+        ])
+        .expect("parse multi-source transfer controls");
+
+        match cli.command {
+            Commands::Cp(args) => {
+                assert_eq!(args.sources, ["./a.csv", "./b.csv"]);
+                assert_eq!(args.target, "local/reports/");
+                assert_eq!(args.include, ["*.csv"]);
+                assert_eq!(args.exclude, ["private-*"]);
+                assert_eq!(args.newer_than.as_deref(), Some("1h"));
+                assert_eq!(args.concurrency, 8);
+                assert_eq!(args.rate_limit.as_deref(), Some("10MiB/s"));
+                assert_eq!(args.retry_attempts, 5);
+                assert!(args.continue_on_error);
+                assert!(args.summary);
+            }
+            other => panic!("expected cp command, got {other:?}"),
         }
     }
 
