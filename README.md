@@ -342,6 +342,7 @@ For full command documentation, see the [`rc` command reference](docs/reference/
 | `quota`       | Manage bucket quota                                                          |
 | `ilm`         | Manage lifecycle rules, storage tiers, and object restore                    |
 | `replicate`   | Manage bucket replication                                                    |
+| `watch`       | Stream live RustFS object notifications                                      |
 | `completions` | Generate shell completion scripts                                            |
 
 ### Admin Subcommands

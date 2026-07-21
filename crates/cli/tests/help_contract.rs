@@ -145,6 +145,7 @@ fn top_level_command_help_contract() {
                 "ilm",
                 "replicate",
                 "completions",
+                "watch",
             ],
         },
         HelpCase {
@@ -424,6 +425,21 @@ fn top_level_command_help_contract() {
             args: &["completions"],
             usage: "Usage: rc completions [OPTIONS] <SHELL>",
             expected_tokens: &["[possible values: bash, elvish, fish, powershell, zsh]"],
+        },
+        HelpCase {
+            args: &["watch"],
+            usage: "Usage: rc watch [OPTIONS] <PATH>",
+            expected_tokens: &[
+                "--event",
+                "--prefix",
+                "--suffix",
+                "--ping",
+                "--reconnect-attempts",
+                "--reconnect-delay-ms",
+                "--reconnect-max-delay-ms",
+                "Examples:",
+                "rc watch local/",
+            ],
         },
     ];
 

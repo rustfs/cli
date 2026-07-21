@@ -18,6 +18,7 @@ For installation and quick-start usage, see the [project README](../../../README
 | Mirroring | [`rc mirror`](mirror.md) | none |
 | S3 Select | [`rc sql`](sql.md) | none |
 | Tags | [`rc tag`](tag.md) | none |
+| Live object events | [`rc watch`](watch.md) | `mc watch`-compatible event shorthands |
 | Shell completions | [`rc completions`](completions.md) | none |
 
 Legacy command pages remain documented for users migrating from MinIO `mc`-style workflows:

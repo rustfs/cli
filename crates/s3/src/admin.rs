@@ -1095,9 +1095,20 @@ fn stubbed_report(server_version: Option<String>, reason: String) -> CapabilityR
 }
 
 fn add_known_server_capabilities(version: Option<&str>, capabilities: &mut Vec<CapabilityEntry>) {
-    if !version.is_some_and(|version| version.contains("1.0.0-beta.10")) {
+    let is_beta10 = version
+        .map(str::trim)
+        .map(|version| version.strip_prefix('v').unwrap_or(version))
+        .and_then(|version| version.split('+').next())
+        == Some("1.0.0-beta.10");
+    if !is_beta10 {
         return;
     }
+
+    capabilities.push(CapabilityEntry {
+        name: "listen_notification".to_string(),
+        availability: CapabilityAvailability::Available,
+        reason: None,
+    });
 
     for (name, reason) in [
         (
@@ -1898,6 +1909,22 @@ mod tests {
     const EXTENSIONS_RESPONSE: &str = r#"{"extensions":[{"schema_version":"rustfs.extension-schema.v1","extension_id":"ops.diagnostics","display_name":"Operations Diagnostics","provider":"rustfs","version":"1","kind":"ops_diagnostics","runtime":{"api_version":"v1","boundary":"builtin"},"capabilities":[],"disabled_by_default":false}],"runtime_capabilities":{},"cluster_snapshot":{},"external_plugin_flow":{}}"#;
     const CLUSTER_SNAPSHOT_RESPONSE: &str = r#"{"snapshot":{"summary":{"runtime":{"state":"supported"},"topology":{"state":"supported"},"membership":{"state":"supported"},"peer_health":{"state":"supported"},"rpc_boundary":{"state":"supported"},"observability":{"state":"supported"},"workload_admission":{"state":"supported"},"actionable_pressure":{"state":"disabled"}},"runtime_capabilities_path":"/rustfs/admin/v4/runtime/capabilities","extensions_catalog_path":"/rustfs/admin/v4/extensions/catalog"}}"#;
 
+    #[test]
+    fn known_beta10_capabilities_do_not_overclaim_future_versions() {
+        let mut beta10 = Vec::new();
+        add_known_server_capabilities(Some("v1.0.0-beta.10+build.1"), &mut beta10);
+        assert!(beta10.iter().any(|capability| {
+            capability.name == "listen_notification"
+                && capability.availability == CapabilityAvailability::Available
+        }));
+
+        for version in ["1.0.0-beta.11", "1.0.0-beta.100"] {
+            let mut future = Vec::new();
+            add_known_server_capabilities(Some(version), &mut future);
+            assert!(future.is_empty(), "must not infer support for {version}");
+        }
+    }
+
     #[tokio::test]
     async fn capability_discovery_uses_v4_routes_and_classifies_beta10_stubs() {
         let (endpoint, receiver, handle) = start_admin_sequence_server(vec![
@@ -1930,6 +1957,11 @@ mod tests {
             capability.name == "runtime.memory-sampling"
                 && capability.availability == CapabilityAvailability::Unsupported
                 && capability.reason.as_deref() == Some("not available on this platform")
+        }));
+        assert!(report.capabilities.iter().any(|capability| {
+            capability.name == "listen_notification"
+                && capability.availability == CapabilityAvailability::Available
+                && capability.reason.is_none()
         }));
         for name in [
             "admin.batch",

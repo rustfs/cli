@@ -471,6 +471,25 @@ impl Formatter {
         }
     }
 
+    /// Output one compact JSON Lines record to stdout.
+    pub fn json_line<T: Serialize>(&self, value: &T) {
+        if self.config.quiet {
+            return;
+        }
+        match serde_json::to_string(value) {
+            Ok(json) => println!("{json}"),
+            Err(e) => eprintln!("Error serializing output: {e}"),
+        }
+    }
+
+    /// Output one compact JSON Lines error record to stderr.
+    pub fn json_line_error<T: Serialize>(&self, value: &T) {
+        match serde_json::to_string(value) {
+            Ok(json) => eprintln!("{json}"),
+            Err(e) => eprintln!("Error serializing output: {e}"),
+        }
+    }
+
     /// Output a pre-built JSON error to stderr.
     pub fn json_error<T: Serialize>(&self, value: &T) {
         match serde_json::to_string_pretty(value) {

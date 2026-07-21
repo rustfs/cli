@@ -43,6 +43,7 @@ mod stat;
 mod tag;
 mod tree;
 mod version;
+mod watch;
 
 /// rc - Rust S3 CLI Client
 ///
@@ -278,8 +279,8 @@ pub enum Commands {
     Completions(completions::CompletionsArgs),
     // /// Manage object retention
     // Retention(retention::RetentionArgs),
-    // /// Watch for object events
-    // Watch(watch::WatchArgs),
+    /// Stream live object notifications
+    Watch(watch::WatchArgs),
 }
 
 /// Execute the CLI command and return an exit code
@@ -437,6 +438,9 @@ pub async fn execute(cli: Cli) -> ExitCode {
             replicate::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
         }
         Commands::Completions(args) => completions::execute(args),
+        Commands::Watch(args) => {
+            watch::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
     }
 }
 
@@ -591,6 +595,28 @@ mod tests {
                 .to_string()
                 .contains("Only x-amz-* custom request headers are supported")
         );
+    }
+
+    #[test]
+    fn cli_accepts_repeatable_watch_event_filters() {
+        let cli = Cli::try_parse_from([
+            "rc",
+            "watch",
+            "local/photos",
+            "--event",
+            "put,delete",
+            "--event",
+            "get",
+            "--prefix",
+            "incoming/",
+        ])
+        .expect("parse watch command");
+
+        let Commands::Watch(args) = cli.command else {
+            panic!("expected watch command");
+        };
+        assert_eq!(args.events, vec!["put,delete", "get"]);
+        assert_eq!(args.prefix.as_deref(), Some("incoming/"));
     }
 
     #[test]

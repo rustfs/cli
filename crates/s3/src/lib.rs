@@ -8,6 +8,7 @@ pub mod admin;
 pub mod client;
 pub mod multipart;
 mod select;
+mod watch;
 
 pub use admin::AdminClient;
 pub use client::{DeleteRequestOptions, S3Client};

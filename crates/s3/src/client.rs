@@ -990,6 +990,31 @@ impl S3Client {
         &self.inner
     }
 
+    pub(crate) fn watch_alias(&self) -> &Alias {
+        &self.alias
+    }
+
+    pub(crate) fn watch_http_client(&self) -> &reqwest::Client {
+        &self.xml_http_client
+    }
+
+    pub(crate) fn watch_request_headers(&self) -> &[RequestHeader] {
+        &self.request_headers
+    }
+
+    pub(crate) fn watch_request_host(&self, url: &reqwest::Url) -> Result<String> {
+        self.request_host(url)
+    }
+
+    pub(crate) async fn sign_watch_request(
+        &self,
+        method: &Method,
+        url: &str,
+        headers: &HeaderMap,
+    ) -> Result<HeaderMap> {
+        self.sign_xml_request(method, url, headers, &[]).await
+    }
+
     /// List a single page of object versions and return pagination metadata.
     pub async fn list_object_versions_page(
         &self,

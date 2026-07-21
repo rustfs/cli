@@ -28,7 +28,7 @@ Objects allow additional properties so a newer RustFS server can expose extra di
 
 Paginated records use a `pagination` object with `truncated` and `continuation_token`. The token is `null` when there is no next page.
 
-Streaming commands emit JSON Lines. Each non-empty line is one complete v3 record and validates independently against `output_v3.json`. A watch keepalive is a successful `watch_event` record with `data.event` set to `null` and `data.keepalive` set to `true`. Consumers must not parse an entire JSON Lines stream as one JSON document.
+Streaming commands emit JSON Lines. Each non-empty line is one complete v3 record and validates independently against `output_v3.json`. The schema can represent a watch keepalive with `data.event` set to `null` and `data.keepalive` set to `true`, but `rc watch` consumes RustFS transport keepalives without emitting a line. Event records set `data.keepalive` to `false`. Consumers must not parse an entire JSON Lines stream as one JSON document.
 
 ## Errors
 
