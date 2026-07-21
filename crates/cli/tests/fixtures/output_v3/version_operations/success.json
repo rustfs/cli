@@ -1,0 +1,1 @@
+{"schema_version":3,"type":"versioned_objects","status":"success","data":{"operation":"copy","source":"local/photos/2026/image.jpg","target":"backup/photos/2026/image.jpg","source_version_id":"source-v1","version_id":"destination-v2","size_bytes":1024,"size_human":"1 KiB"}}

@@ -11,7 +11,7 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 
 use crate::exit_code::ExitCode;
-use crate::output::{Formatter, OutputConfig, ProgressBar};
+use crate::output::{Formatter, OutputConfig, ProgressBar, V3SuccessEnvelope};
 
 const CP_AFTER_HELP: &str = "\
 Examples:
@@ -77,6 +77,21 @@ struct CpOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     size_bytes: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    size_human: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_version_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct VersionCopyData {
+    operation: &'static str,
+    source: String,
+    target: String,
+    source_version_id: Option<String>,
+    version_id: Option<String>,
+    size_bytes: Option<i64>,
     size_human: Option<String>,
 }
 
@@ -272,14 +287,7 @@ fn print_upload_success(
     dst_display: &str,
 ) {
     if formatter.is_json() {
-        let output = CpOutput {
-            status: "success",
-            source: src_display.to_string(),
-            target: dst_display.to_string(),
-            size_bytes: info.size_bytes,
-            size_human: info.size_human.clone(),
-        };
-        formatter.json(&output);
+        print_copy_json(formatter, info, src_display, dst_display);
     } else {
         let styled_src = formatter.style_file(src_display);
         let styled_dst = formatter.style_file(dst_display);
@@ -595,6 +603,8 @@ pub(super) async fn download_file(
                     target: dst_display,
                     size_bytes: Some(size),
                     size_human: Some(humansize::format_size(size as u64, humansize::BINARY)),
+                    version_id: None,
+                    source_version_id: None,
                 };
                 formatter.json(&output);
             } else {
@@ -889,14 +899,7 @@ async fn copy_s3_to_s3(
     match client.copy_object(src, dst, encryption.as_ref()).await {
         Ok(info) => {
             if formatter.is_json() {
-                let output = CpOutput {
-                    status: "success",
-                    source: src_display,
-                    target: dst_display,
-                    size_bytes: info.size_bytes,
-                    size_human: info.size_human,
-                };
-                formatter.json(&output);
+                print_copy_json(formatter, &info, &src_display, &dst_display);
             } else {
                 let styled_src = formatter.style_file(&src_display);
                 let styled_dst = formatter.style_file(&dst_display);
@@ -917,6 +920,30 @@ async fn copy_s3_to_s3(
                 formatter.fail(ExitCode::NetworkError, &format!("Failed to copy: {e}"))
             }
         }
+    }
+}
+
+fn print_copy_json(formatter: &Formatter, info: &rc_core::ObjectInfo, source: &str, target: &str) {
+    if info.version_id.is_some() || info.source_version_id.is_some() {
+        formatter.json(&V3SuccessEnvelope::versioned_objects(VersionCopyData {
+            operation: "copy",
+            source: source.to_string(),
+            target: target.to_string(),
+            source_version_id: info.source_version_id.clone(),
+            version_id: info.version_id.clone(),
+            size_bytes: info.size_bytes,
+            size_human: info.size_human.clone(),
+        }));
+    } else {
+        formatter.json(&CpOutput {
+            status: "success",
+            source: source.to_string(),
+            target: target.to_string(),
+            size_bytes: info.size_bytes,
+            size_human: info.size_human.clone(),
+            version_id: None,
+            source_version_id: None,
+        });
     }
 }
 
@@ -1323,10 +1350,14 @@ mod tests {
             target: "dst/file.txt".to_string(),
             size_bytes: Some(1024),
             size_human: Some("1 KiB".to_string()),
+            version_id: Some("destination-v2".to_string()),
+            source_version_id: Some("source-v1".to_string()),
         };
         let json = serde_json::to_string(&output).unwrap();
         assert!(json.contains("\"status\":\"success\""));
         assert!(json.contains("\"size_bytes\":1024"));
+        assert!(json.contains("\"version_id\":\"destination-v2\""));
+        assert!(json.contains("\"source_version_id\":\"source-v1\""));
     }
 
     #[test]
@@ -1337,9 +1368,32 @@ mod tests {
             target: "dst".to_string(),
             size_bytes: None,
             size_human: None,
+            version_id: None,
+            source_version_id: None,
         };
         let json = serde_json::to_string(&output).unwrap();
         assert!(!json.contains("size_bytes"));
         assert!(!json.contains("size_human"));
+        assert!(!json.contains("version_id"));
+    }
+
+    #[test]
+    fn versioned_copy_output_uses_v3_and_preserves_both_version_ids() {
+        let envelope = V3SuccessEnvelope::versioned_objects(VersionCopyData {
+            operation: "copy",
+            source: "src/object.txt".to_string(),
+            target: "dst/object.txt".to_string(),
+            source_version_id: Some("source-v1".to_string()),
+            version_id: Some("destination-v2".to_string()),
+            size_bytes: Some(1024),
+            size_human: Some("1 KiB".to_string()),
+        });
+
+        let json = serde_json::to_value(envelope).expect("serialize versioned copy output");
+        assert_eq!(json["schema_version"], 3);
+        assert_eq!(json["type"], "versioned_objects");
+        assert_eq!(json["data"]["operation"], "copy");
+        assert_eq!(json["data"]["source_version_id"], "source-v1");
+        assert_eq!(json["data"]["version_id"], "destination-v2");
     }
 }

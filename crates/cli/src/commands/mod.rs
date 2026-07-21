@@ -44,6 +44,20 @@ mod tag;
 mod tree;
 mod version;
 
+fn exit_code_for_core_error(error: &rc_core::Error) -> ExitCode {
+    ExitCode::from_i32(error.exit_code()).unwrap_or(ExitCode::GeneralError)
+}
+
+fn validate_version_selector(version_id: Option<&str>, rewind: Option<&str>) -> Result<(), String> {
+    if version_id.is_some() && rewind.is_some() {
+        return Err("--version-id cannot be combined with --rewind".to_string());
+    }
+    if version_id.is_some_and(str::is_empty) {
+        return Err("--version-id cannot be empty".to_string());
+    }
+    Ok(())
+}
+
 /// rc - Rust S3 CLI Client
 ///
 /// A command-line interface for S3-compatible object storage services.
@@ -86,7 +100,17 @@ pub struct Cli {
 }
 
 fn parse_request_header(value: &str) -> Result<RequestHeader, String> {
-    RequestHeader::parse(value).map_err(|error| error.to_string())
+    let header = RequestHeader::parse(value).map_err(|error| error.to_string())?;
+    if header
+        .name
+        .eq_ignore_ascii_case("x-amz-bypass-governance-retention")
+    {
+        return Err(
+            "Use the remove command's explicit --bypass flag for governance retention bypass"
+                .to_string(),
+        );
+    }
+    Ok(header)
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -591,6 +615,20 @@ mod tests {
                 .to_string()
                 .contains("Only x-amz-* custom request headers are supported")
         );
+    }
+
+    #[test]
+    fn cli_requires_bypass_flag_instead_of_custom_governance_header() {
+        let error = Cli::try_parse_from([
+            "rc",
+            "-H",
+            "x-amz-bypass-governance-retention:true",
+            "rm",
+            "local/bucket/key.txt",
+        ])
+        .expect_err("governance bypass header should require --bypass");
+
+        assert!(error.to_string().contains("explicit --bypass flag"));
     }
 
     #[test]
@@ -1241,5 +1279,35 @@ mod tests {
             },
             other => panic!("expected object command, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn version_selector_rejects_ambiguous_or_empty_values() {
+        assert!(validate_version_selector(Some("v1"), None).is_ok());
+        assert!(validate_version_selector(None, Some("1h")).is_ok());
+        assert!(validate_version_selector(Some("v1"), Some("1h")).is_err());
+        assert!(validate_version_selector(Some(""), None).is_err());
+    }
+
+    #[test]
+    fn versioning_errors_map_to_stable_exit_codes() {
+        assert_eq!(
+            exit_code_for_core_error(&rc_core::Error::VersionNotFound {
+                path: "local/bucket/key".to_string(),
+                version_id: "v1".to_string(),
+            }),
+            ExitCode::NotFound
+        );
+        assert_eq!(
+            exit_code_for_core_error(&rc_core::Error::Auth("denied".to_string())),
+            ExitCode::AuthError
+        );
+        assert_eq!(
+            exit_code_for_core_error(&rc_core::Error::GovernanceDenied {
+                path: "local/bucket/key".to_string(),
+                version_id: Some("v1".to_string()),
+            }),
+            ExitCode::Conflict
+        );
     }
 }

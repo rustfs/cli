@@ -47,6 +47,8 @@ pub use select::{
     SelectSseCustomerOptions,
 };
 pub use traits::{
-    BucketNotification, Capabilities, ListOptions, ListResult, NotificationTarget, ObjectInfo,
-    ObjectStore, ObjectVersion, ObjectVersionListResult,
+    BucketNotification, Capabilities, DeleteObjectFailure, DeleteObjectsResult,
+    DeleteRequestOptions, DeletedObject, ListObjectVersionsOptions, ListOptions, ListResult,
+    NotificationTarget, ObjectInfo, ObjectReadOptions, ObjectStore, ObjectVersion,
+    ObjectVersionIdentifier, ObjectVersionListResult,
 };

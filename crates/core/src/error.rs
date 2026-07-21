@@ -54,6 +54,33 @@ pub enum Error {
     #[error("Not found: {0}")]
     NotFound(String),
 
+    /// A requested historical object version does not exist.
+    #[error("Object version '{version_id}' not found: {path}")]
+    VersionNotFound {
+        /// Object path.
+        path: String,
+        /// Requested version identifier.
+        version_id: String,
+    },
+
+    /// A read or metadata request selected a delete marker instead of object data.
+    #[error("Object version '{version_id}' is a delete marker: {path}")]
+    DeleteMarker {
+        /// Object path.
+        path: String,
+        /// Delete marker version identifier.
+        version_id: String,
+    },
+
+    /// Object Lock governance retention rejected a delete request.
+    #[error("Governance retention denied deletion: {path} (version: {version_id:?})")]
+    GovernanceDenied {
+        /// Object path.
+        path: String,
+        /// Requested version identifier, when one was supplied.
+        version_id: Option<String>,
+    },
+
     /// Network error (retryable)
     #[error("Network error: {0}")]
     Network(String),
@@ -75,14 +102,17 @@ impl Error {
     /// Get the appropriate exit code for this error
     pub const fn exit_code(&self) -> i32 {
         match self {
-            Error::InvalidPath(_) => 2,                        // UsageError
-            Error::Config(_) => 2,                             // UsageError
-            Error::Network(_) => 3,                            // NetworkError
-            Error::Auth(_) => 4,                               // AuthError
-            Error::NotFound(_) | Error::AliasNotFound(_) => 5, // NotFound
-            Error::Conflict(_) | Error::AliasExists(_) => 6,   // Conflict
-            Error::UnsupportedFeature(_) => 7,                 // UnsupportedFeature
-            _ => 1,                                            // GeneralError
+            Error::InvalidPath(_) => 2, // UsageError
+            Error::Config(_) => 2,      // UsageError
+            Error::Network(_) => 3,     // NetworkError
+            Error::Auth(_) => 4,        // AuthError
+            Error::NotFound(_)
+            | Error::VersionNotFound { .. }
+            | Error::DeleteMarker { .. }
+            | Error::AliasNotFound(_) => 5, // NotFound
+            Error::Conflict(_) | Error::GovernanceDenied { .. } | Error::AliasExists(_) => 6, // Conflict
+            Error::UnsupportedFeature(_) => 7, // UnsupportedFeature
+            _ => 1,                            // GeneralError
         }
     }
 }
@@ -112,5 +142,28 @@ mod tests {
 
         let err = Error::InvalidPath("/bad/path".into());
         assert_eq!(err.to_string(), "Invalid path: /bad/path");
+    }
+
+    #[test]
+    fn versioning_errors_are_distinct_and_stable() {
+        let missing = Error::VersionNotFound {
+            path: "local/bucket/object.txt".to_string(),
+            version_id: "v1".to_string(),
+        };
+        let marker = Error::DeleteMarker {
+            path: "local/bucket/object.txt".to_string(),
+            version_id: "v2".to_string(),
+        };
+        let governance = Error::GovernanceDenied {
+            path: "local/bucket/object.txt".to_string(),
+            version_id: Some("v3".to_string()),
+        };
+
+        assert_eq!(missing.exit_code(), 5);
+        assert!(missing.to_string().contains("version 'v1'"));
+        assert_eq!(marker.exit_code(), 5);
+        assert!(marker.to_string().contains("delete marker"));
+        assert_eq!(governance.exit_code(), 6);
+        assert!(governance.to_string().contains("Governance retention"));
     }
 }

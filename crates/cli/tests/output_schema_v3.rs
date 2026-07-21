@@ -65,6 +65,12 @@ fn fixture_path(family: &str, case: &str) -> PathBuf {
         .join(format!("{case}.{extension}"))
 }
 
+fn version_operation_fixture_path(case: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/output_v3/version_operations")
+        .join(format!("{case}.json"))
+}
+
 fn snapshot_payload(contents: &str) -> Option<&str> {
     contents
         .split_once("\n---\n")
@@ -122,6 +128,61 @@ fn every_v3_family_has_valid_success_empty_and_error_fixtures() {
             }
         }
     }
+}
+
+#[test]
+fn version_operation_success_empty_error_and_dry_run_fixtures_are_valid() {
+    let validator = load_validator(3);
+
+    for case in ["success", "empty", "error", "dry_run", "stat"] {
+        let path = version_operation_fixture_path(case);
+        let value = load_json(&path);
+        assert_valid(&validator, &value, &path.display().to_string());
+    }
+}
+
+#[test]
+fn version_remove_contract_requires_version_aware_partial_results() {
+    let validator = load_validator(3);
+    let fixture = load_json(&version_operation_fixture_path("error"));
+
+    assert_eq!(fixture["status"], "error");
+    assert_eq!(fixture["data"]["outcome"], "partial");
+    assert_eq!(fixture["data"]["removed"][0]["version_id"], "v1");
+    assert_eq!(fixture["data"]["failed"][0]["version_id"], "v2");
+
+    let mut missing_version = fixture;
+    missing_version["data"]["failed"][0]
+        .as_object_mut()
+        .expect("failure must be an object")
+        .remove("version_id");
+    assert!(
+        !validator.is_valid(&missing_version),
+        "version removal failures must preserve the selected version ID field"
+    );
+}
+
+#[test]
+fn version_dry_run_contract_distinguishes_planned_from_removed_items() {
+    let validator = load_validator(3);
+    let fixture = load_json(&version_operation_fixture_path("dry_run"));
+
+    assert_eq!(fixture["data"]["dry_run"], true);
+    assert_eq!(fixture["data"]["outcome"], "planned");
+    assert_eq!(fixture["data"]["planned"].as_array().map(Vec::len), Some(1));
+    assert_eq!(fixture["data"]["removed"].as_array().map(Vec::len), Some(0));
+    assert_valid(&validator, &fixture, "version removal dry-run fixture");
+
+    let mut contradictory = fixture;
+    contradictory["data"]["removed"] = serde_json::json!([{
+        "path": "local/photos/image.jpg",
+        "version_id": "v1",
+        "delete_marker": false
+    }]);
+    assert!(
+        !validator.is_valid(&contradictory),
+        "dry-run records must never claim that an object version was removed"
+    );
 }
 
 #[test]

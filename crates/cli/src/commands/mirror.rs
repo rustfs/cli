@@ -753,6 +753,9 @@ mod tests {
                 storage_class: None,
                 content_type: self.content_type.clone(),
                 metadata: None,
+                version_id: None,
+                source_version_id: None,
+                is_delete_marker: None,
                 is_dir: false,
             })
         }

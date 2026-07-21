@@ -27,11 +27,14 @@ use http_body::Frame;
 use http_body_util::StreamBody;
 use jiff::Timestamp;
 use quick_xml::de::from_str as from_xml_str;
+pub use rc_core::DeleteRequestOptions;
 use rc_core::{
-    Alias, BucketEncryption, BucketNotification, Capabilities, CorsRule, Error, LifecycleRule,
-    ListOptions, ListResult, NotificationTarget, ObjectEncryptionRequest, ObjectInfo, ObjectStore,
-    ObjectVersion, ObjectVersionListResult, RemotePath, ReplicationConfiguration, RequestHeader,
-    Result, SelectOptions, global_request_headers,
+    Alias, BucketEncryption, BucketNotification, Capabilities, CorsRule, DeleteObjectFailure,
+    DeleteObjectsResult, DeletedObject, Error, LifecycleRule, ListObjectVersionsOptions,
+    ListOptions, ListResult, NotificationTarget, ObjectEncryptionRequest, ObjectInfo,
+    ObjectReadOptions, ObjectStore, ObjectVersion, ObjectVersionIdentifier,
+    ObjectVersionListResult, RemotePath, ReplicationConfiguration, RequestHeader, Result,
+    SelectOptions, global_request_headers,
 };
 use reqwest::Method;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
@@ -856,13 +859,6 @@ pub struct S3Client {
     request_headers: Vec<RequestHeader>,
 }
 
-/// Request-level options for delete operations.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct DeleteRequestOptions {
-    /// Ask RustFS to permanently delete data instead of creating delete markers.
-    pub force_delete: bool,
-}
-
 #[derive(Debug, Clone)]
 struct CustomHeaderInterceptor {
     headers: Vec<RequestHeader>,
@@ -1023,12 +1019,32 @@ impl S3Client {
             builder = builder.version_id_marker(version_id_marker);
         }
 
-        let response = builder.send().await.map_err(|e| {
-            let err_str = Self::format_sdk_error(&e);
-            if err_str.contains("NotFound") || err_str.contains("NoSuchBucket") {
+        let response = builder.send().await.map_err(|error| {
+            let formatted = Self::format_sdk_error(&error);
+            if let aws_sdk_s3::error::SdkError::ServiceError(service_error) = &error {
+                let status = service_error.raw().status().as_u16();
+                let code = service_error.err().code();
+                if matches!(status, 401 | 403)
+                    || matches!(
+                        code,
+                        Some("AccessDenied") | Some("Forbidden") | Some("Unauthorized")
+                    )
+                {
+                    return Error::Auth(formatted);
+                }
+                if status == 404 || matches!(code, Some("NotFound") | Some("NoSuchBucket")) {
+                    return Error::NotFound(format!("Bucket not found: {}", path.bucket));
+                }
+            }
+            if formatted.contains("AccessDenied")
+                || formatted.contains("Forbidden")
+                || formatted.contains("Unauthorized")
+            {
+                Error::Auth(formatted)
+            } else if formatted.contains("NotFound") || formatted.contains("NoSuchBucket") {
                 Error::NotFound(format!("Bucket not found: {}", path.bucket))
             } else {
-                Error::Network(err_str)
+                Error::Network(formatted)
             }
         })?;
 
@@ -1080,23 +1096,37 @@ impl S3Client {
     pub async fn get_object_with_progress(
         &self,
         path: &RemotePath,
+        on_progress: impl FnMut(u64, Option<u64>) + Send,
+    ) -> Result<Vec<u8>> {
+        self.get_object_with_progress_and_options(path, &ObjectReadOptions::default(), on_progress)
+            .await
+    }
+
+    /// Download an exact object version and report downloaded bytes after each chunk.
+    pub async fn get_object_with_progress_and_options(
+        &self,
+        path: &RemotePath,
+        options: &ObjectReadOptions,
         mut on_progress: impl FnMut(u64, Option<u64>) + Send,
     ) -> Result<Vec<u8>> {
-        let response = self
-            .inner
-            .get_object()
-            .bucket(&path.bucket)
-            .key(&path.key)
-            .send()
-            .await
-            .map_err(|e| {
-                let err_str = e.to_string();
-                if err_str.contains("NotFound") || err_str.contains("NoSuchKey") {
-                    Error::NotFound(path.to_string())
-                } else {
-                    Error::Network(err_str)
-                }
-            })?;
+        let mut request = self.inner.get_object().bucket(&path.bucket).key(&path.key);
+        if let Some(version_id) = &options.version_id {
+            request = request.version_id(version_id);
+        }
+        let response = request.send().await.map_err(|error| {
+            Self::map_object_request_error(&error, path, options.version_id.as_deref())
+        })?;
+
+        if response.delete_marker().unwrap_or(false) {
+            return Err(Error::DeleteMarker {
+                path: path.to_string(),
+                version_id: response
+                    .version_id()
+                    .or(options.version_id.as_deref())
+                    .unwrap_or("unknown")
+                    .to_string(),
+            });
+        }
 
         let content_length = response
             .content_length()
@@ -1233,24 +1263,50 @@ impl S3Client {
         max_bytes: Option<u64>,
     ) -> Result<u64>
     where
-        W: AsyncWrite + Unpin + Send,
+        W: AsyncWrite + Unpin + Send + ?Sized,
+    {
+        self.write_object_to_with_options(path, &ObjectReadOptions::default(), writer, max_bytes)
+            .await
+    }
+
+    /// Stream the current object or an exact historical version to a writer.
+    pub async fn write_object_to_with_options<W>(
+        &self,
+        path: &RemotePath,
+        options: &ObjectReadOptions,
+        writer: &mut W,
+        max_bytes: Option<u64>,
+    ) -> Result<u64>
+    where
+        W: AsyncWrite + Unpin + Send + ?Sized,
     {
         if matches!(max_bytes, Some(0)) {
+            if options.version_id.is_some() {
+                self.head_object_with_options(path, options).await?;
+            }
             return Ok(0);
         }
 
         let mut request = self.inner.get_object().bucket(&path.bucket).key(&path.key);
+        if let Some(version_id) = &options.version_id {
+            request = request.version_id(version_id);
+        }
         if let Some(max_bytes) = max_bytes {
             request = request.range(format!("bytes=0-{}", max_bytes - 1));
         }
         let response = request.send().await.map_err(|error| {
-            let message = error.to_string();
-            if message.contains("NotFound") || message.contains("NoSuchKey") {
-                Error::NotFound(path.to_string())
-            } else {
-                Error::Network(message)
-            }
+            Self::map_object_request_error(&error, path, options.version_id.as_deref())
         })?;
+        if response.delete_marker().unwrap_or(false) {
+            return Err(Error::DeleteMarker {
+                path: path.to_string(),
+                version_id: response
+                    .version_id()
+                    .or(options.version_id.as_deref())
+                    .unwrap_or("unknown")
+                    .to_string(),
+            });
+        }
         let mut body = response.body;
         let mut bytes_written = 0u64;
 
@@ -1305,6 +1361,7 @@ impl S3Client {
         info.etag = response
             .e_tag()
             .map(|etag| etag.trim_matches('"').to_string());
+        info.version_id = response.version_id().map(ToString::to_string);
         info.last_modified = Some(jiff::Timestamp::now());
         Ok(info)
     }
@@ -1329,18 +1386,37 @@ impl S3Client {
         Ok(())
     }
 
-    /// Delete an object with RustFS-specific request options.
+    /// Delete an object with version, governance, and RustFS force-delete options.
+    ///
+    /// This compatibility wrapper preserves the original unit result. Call
+    /// [`Self::delete_object_with_result`] when version-aware response fields are needed.
     pub async fn delete_object_with_options(
         &self,
         path: &RemotePath,
         options: DeleteRequestOptions,
     ) -> Result<()> {
-        let mut request = self
+        self.delete_object_with_result(path, options).await?;
+        Ok(())
+    }
+
+    /// Delete an object and preserve the returned version and delete-marker fields.
+    pub async fn delete_object_with_result(
+        &self,
+        path: &RemotePath,
+        options: DeleteRequestOptions,
+    ) -> Result<DeletedObject> {
+        let mut builder = self
             .inner
             .delete_object()
             .bucket(&path.bucket)
-            .key(&path.key)
-            .customize();
+            .key(&path.key);
+        if let Some(version_id) = &options.version_id {
+            builder = builder.version_id(version_id);
+        }
+        if options.bypass_governance {
+            builder = builder.bypass_governance_retention(true);
+        }
+        let mut request = builder.customize();
 
         if options.force_delete {
             request = request.mutate_request(|request| {
@@ -1350,67 +1426,105 @@ impl S3Client {
             });
         }
 
-        request.send().await.map_err(|e| {
-            let err_str = Self::format_sdk_error(&e);
-            let is_missing_key = if let aws_sdk_s3::error::SdkError::ServiceError(service_err) = &e
-            {
-                let code = service_err.err().code().or_else(|| {
-                    service_err
-                        .raw()
-                        .headers()
-                        .get("x-amz-error-code")
-                        .and_then(|value| std::str::from_utf8(value.as_bytes()).ok())
-                });
-                matches!(code, Some("NoSuchKey") | Some("NotFound"))
-                    || service_err.raw().status().as_u16() == 404
-            } else {
-                err_str.contains("NotFound") || err_str.contains("NoSuchKey")
-            };
-
-            if is_missing_key {
-                Error::NotFound(path.to_string())
-            } else {
-                Error::Network(err_str)
-            }
+        let response = request.send().await.map_err(|error| {
+            Self::map_object_request_error(&error, path, options.version_id.as_deref())
         })?;
 
-        Ok(())
+        Ok(DeletedObject {
+            key: path.key.clone(),
+            version_id: response
+                .version_id()
+                .or(options.version_id.as_deref())
+                .map(ToString::to_string),
+            is_delete_marker: response.delete_marker().unwrap_or(false),
+        })
     }
 
-    /// Delete multiple objects with RustFS-specific request options.
+    /// Delete multiple objects with governance and RustFS force-delete options.
     pub async fn delete_objects_with_options(
         &self,
         bucket: &str,
         keys: Vec<String>,
         options: DeleteRequestOptions,
     ) -> Result<Vec<String>> {
-        use aws_sdk_s3::types::{Delete, ObjectIdentifier};
-
         if keys.is_empty() {
             return Ok(vec![]);
         }
+        if options.version_id.is_some() {
+            return Err(Error::InvalidPath(
+                "Batch key deletion cannot apply one version ID to multiple objects".to_string(),
+            ));
+        }
 
-        let objects: Vec<ObjectIdentifier> =
-            keys.iter()
-                .map(|key| {
-                    ObjectIdentifier::builder().key(key).build().map_err(|e| {
-                        Error::General(format!("invalid delete object identifier: {e}"))
-                    })
+        let identifiers = keys
+            .into_iter()
+            .map(|key| ObjectVersionIdentifier {
+                key,
+                version_id: None,
+                is_delete_marker: false,
+            })
+            .collect();
+        let result = self
+            .delete_object_versions_with_options(bucket, identifiers, options)
+            .await?;
+
+        if !result.failures.is_empty() {
+            let error_keys: Vec<&str> = result
+                .failures
+                .iter()
+                .map(|failure| failure.key.as_str())
+                .collect();
+            tracing::warn!("Failed to delete some objects: {:?}", error_keys);
+        }
+
+        Ok(result
+            .deleted
+            .into_iter()
+            .map(|deleted| deleted.key)
+            .collect())
+    }
+
+    /// Delete exact object versions and delete markers with optional governance bypass.
+    pub async fn delete_object_versions_with_options(
+        &self,
+        bucket: &str,
+        objects: Vec<ObjectVersionIdentifier>,
+        options: DeleteRequestOptions,
+    ) -> Result<DeleteObjectsResult> {
+        use aws_sdk_s3::types::{Delete, ObjectIdentifier};
+
+        if objects.is_empty() {
+            return Ok(DeleteObjectsResult::default());
+        }
+        if options.version_id.is_some() {
+            return Err(Error::InvalidPath(
+                "Multi-object version deletion requires version IDs on each object identifier"
+                    .to_string(),
+            ));
+        }
+
+        let sdk_objects = objects
+            .iter()
+            .map(|object| {
+                let mut builder = ObjectIdentifier::builder().key(&object.key);
+                if let Some(version_id) = &object.version_id {
+                    builder = builder.version_id(version_id);
+                }
+                builder.build().map_err(|error| {
+                    Error::General(format!("invalid delete object identifier: {error}"))
                 })
-                .collect::<Result<Vec<_>>>()?;
-
+            })
+            .collect::<Result<Vec<_>>>()?;
         let delete = Delete::builder()
-            .set_objects(Some(objects))
+            .set_objects(Some(sdk_objects))
             .build()
-            .map_err(|e| Error::General(e.to_string()))?;
+            .map_err(|error| Error::General(error.to_string()))?;
 
-        let mut request = self
-            .inner
-            .delete_objects()
-            .bucket(bucket)
-            .delete(delete)
-            .customize();
-
+        let mut builder = self.inner.delete_objects().bucket(bucket).delete(delete);
+        if options.bypass_governance {
+            builder = builder.bypass_governance_retention(true);
+        }
+        let mut request = builder.customize();
         if options.force_delete {
             request = request.mutate_request(|request| {
                 request
@@ -1419,27 +1533,43 @@ impl S3Client {
             });
         }
 
-        let response = request
-            .send()
-            .await
-            .map_err(|e| Error::Network(e.to_string()))?;
+        let first = &objects[0];
+        let error_path = RemotePath::new(&self.alias.name, bucket, &first.key);
+        let response = request.send().await.map_err(|error| {
+            Self::map_object_request_error(&error, &error_path, first.version_id.as_deref())
+        })?;
 
-        let deleted: Vec<String> = response
+        let deleted = response
             .deleted()
             .iter()
-            .filter_map(|d| d.key().map(|k| k.to_string()))
+            .filter_map(|entry| {
+                let key = entry.key()?.to_string();
+                let version_id = entry
+                    .version_id()
+                    .or(entry.delete_marker_version_id())
+                    .map(ToString::to_string);
+                let requested_marker = objects.iter().any(|object| {
+                    object.key == key && object.version_id == version_id && object.is_delete_marker
+                });
+                Some(DeletedObject {
+                    key,
+                    version_id,
+                    is_delete_marker: entry.delete_marker().unwrap_or(false) || requested_marker,
+                })
+            })
+            .collect();
+        let failures = response
+            .errors()
+            .iter()
+            .map(|entry| DeleteObjectFailure {
+                key: entry.key().unwrap_or_default().to_string(),
+                version_id: entry.version_id().map(ToString::to_string),
+                code: entry.code().map(ToString::to_string),
+                message: entry.message().map(ToString::to_string),
+            })
             .collect();
 
-        if !response.errors().is_empty() {
-            let error_keys: Vec<String> = response
-                .errors()
-                .iter()
-                .filter_map(|e| e.key().map(|k| k.to_string()))
-                .collect();
-            tracing::warn!("Failed to delete some objects: {:?}", error_keys);
-        }
-
-        Ok(deleted)
+        Ok(DeleteObjectsResult { deleted, failures })
     }
 
     /// Format AWS SDK error into a detailed error message
@@ -1469,6 +1599,110 @@ impl S3Client {
             }
             _ => error.to_string(),
         }
+    }
+
+    fn map_object_request_error<E>(
+        error: &aws_sdk_s3::error::SdkError<E>,
+        path: &RemotePath,
+        requested_version: Option<&str>,
+    ) -> Error
+    where
+        E: ProvideErrorMetadata + std::fmt::Display,
+    {
+        let formatted = Self::format_sdk_error(error);
+
+        if let aws_sdk_s3::error::SdkError::ServiceError(service_error) = error {
+            let raw = service_error.raw();
+            let code = service_error.err().code().or_else(|| {
+                raw.headers()
+                    .get("x-amz-error-code")
+                    .and_then(|value| std::str::from_utf8(value.as_bytes()).ok())
+            });
+            let status = raw.status().as_u16();
+            if status == 401 || matches!(code, Some("Unauthorized")) {
+                return Error::Auth(formatted);
+            }
+
+            let version_header = raw
+                .headers()
+                .get("x-amz-version-id")
+                .and_then(|value| std::str::from_utf8(value.as_bytes()).ok());
+            let is_delete_marker = raw
+                .headers()
+                .get("x-amz-delete-marker")
+                .and_then(|value| std::str::from_utf8(value.as_bytes()).ok())
+                .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+
+            let service_message = service_error.err().message().unwrap_or(formatted.as_str());
+            if Self::is_retention_denial(service_message) {
+                return Error::GovernanceDenied {
+                    path: path.to_string(),
+                    version_id: requested_version.map(ToString::to_string),
+                };
+            }
+
+            if matches!(code, Some("AccessDenied") | Some("Forbidden")) || status == 403 {
+                return Error::Auth(formatted);
+            }
+
+            if is_delete_marker {
+                return Error::DeleteMarker {
+                    path: path.to_string(),
+                    version_id: version_header
+                        .or(requested_version)
+                        .unwrap_or("unknown")
+                        .to_string(),
+                };
+            }
+
+            if matches!(code, Some("NoSuchVersion"))
+                || (requested_version.is_some()
+                    && (matches!(code, Some("NoSuchKey") | Some("NotFound")) || status == 404))
+            {
+                return Error::VersionNotFound {
+                    path: path.to_string(),
+                    version_id: requested_version.unwrap_or("unknown").to_string(),
+                };
+            }
+
+            if matches!(code, Some("NoSuchKey") | Some("NotFound")) || status == 404 {
+                return Error::NotFound(path.to_string());
+            }
+        }
+
+        if Self::is_retention_denial(&formatted) {
+            return Error::GovernanceDenied {
+                path: path.to_string(),
+                version_id: requested_version.map(ToString::to_string),
+            };
+        }
+        if formatted.contains("AccessDenied")
+            || formatted.contains("Forbidden")
+            || formatted.contains("Unauthorized")
+        {
+            return Error::Auth(formatted);
+        }
+        if formatted.contains("NoSuchVersion")
+            || (requested_version.is_some()
+                && (formatted.contains("NoSuchKey") || formatted.contains("NotFound")))
+        {
+            return Error::VersionNotFound {
+                path: path.to_string(),
+                version_id: requested_version.unwrap_or("unknown").to_string(),
+            };
+        }
+        if formatted.contains("NoSuchKey") || formatted.contains("NotFound") {
+            return Error::NotFound(path.to_string());
+        }
+        Error::Network(formatted)
+    }
+
+    fn is_retention_denial(message: &str) -> bool {
+        let normalized = message.to_ascii_lowercase();
+        normalized.contains("governance")
+            || normalized.contains("retention")
+            || normalized.contains("object lock")
+            || normalized.contains("worm")
     }
 
     fn should_use_multipart(file_size: u64) -> bool {
@@ -1888,6 +2122,7 @@ impl S3Client {
         if let Some(etag) = response.e_tag() {
             info.etag = Some(etag.trim_matches('"').to_string());
         }
+        info.version_id = response.version_id().map(ToString::to_string);
         info.last_modified = Some(jiff::Timestamp::now());
 
         Ok(info)
@@ -2058,6 +2293,7 @@ impl S3Client {
         if let Some(etag) = complete_response.e_tag() {
             info.etag = Some(etag.trim_matches('"').to_string());
         }
+        info.version_id = complete_response.version_id().map(ToString::to_string);
         info.last_modified = Some(jiff::Timestamp::now());
 
         Ok(info)
@@ -2259,21 +2495,33 @@ impl ObjectStore for S3Client {
     }
 
     async fn head_object(&self, path: &RemotePath) -> Result<ObjectInfo> {
-        let response = self
-            .inner
-            .head_object()
-            .bucket(&path.bucket)
-            .key(&path.key)
-            .send()
+        self.head_object_with_options(path, &ObjectReadOptions::default())
             .await
-            .map_err(|e| {
-                let err_str = e.to_string();
-                if err_str.contains("NotFound") || err_str.contains("NoSuchKey") {
-                    Error::NotFound(path.to_string())
-                } else {
-                    Error::Network(err_str)
-                }
-            })?;
+    }
+
+    async fn head_object_with_options(
+        &self,
+        path: &RemotePath,
+        options: &ObjectReadOptions,
+    ) -> Result<ObjectInfo> {
+        let mut request = self.inner.head_object().bucket(&path.bucket).key(&path.key);
+        if let Some(version_id) = &options.version_id {
+            request = request.version_id(version_id);
+        }
+        let response = request.send().await.map_err(|error| {
+            Self::map_object_request_error(&error, path, options.version_id.as_deref())
+        })?;
+
+        if response.delete_marker().unwrap_or(false) {
+            return Err(Error::DeleteMarker {
+                path: path.to_string(),
+                version_id: response
+                    .version_id()
+                    .or(options.version_id.as_deref())
+                    .unwrap_or("unknown")
+                    .to_string(),
+            });
+        }
 
         let size = response.content_length().unwrap_or(0);
         let mut info = ObjectInfo::file(&path.key, size);
@@ -2299,6 +2547,10 @@ impl ObjectStore for S3Client {
         {
             info.metadata = Some(meta.clone());
         }
+        info.version_id = response
+            .version_id()
+            .or(options.version_id.as_deref())
+            .map(ToString::to_string);
 
         Ok(info)
     }
@@ -2374,6 +2626,25 @@ impl ObjectStore for S3Client {
         self.get_object_with_progress(path, |_, _| {}).await
     }
 
+    async fn get_object_with_options(
+        &self,
+        path: &RemotePath,
+        options: &ObjectReadOptions,
+    ) -> Result<Vec<u8>> {
+        self.get_object_with_progress_and_options(path, options, |_, _| {})
+            .await
+    }
+
+    async fn write_object_to_with_options(
+        &self,
+        path: &RemotePath,
+        options: &ObjectReadOptions,
+        writer: &mut (dyn AsyncWrite + Send + Unpin),
+        max_bytes: Option<u64>,
+    ) -> Result<u64> {
+        S3Client::write_object_to_with_options(self, path, options, writer, max_bytes).await
+    }
+
     async fn put_object(
         &self,
         path: &RemotePath,
@@ -2406,18 +2677,36 @@ impl ObjectStore for S3Client {
         if let Some(etag) = response.e_tag() {
             info.etag = Some(etag.trim_matches('"').to_string());
         }
+        info.version_id = response.version_id().map(ToString::to_string);
         info.last_modified = Some(jiff::Timestamp::now());
 
         Ok(info)
     }
 
     async fn delete_object(&self, path: &RemotePath) -> Result<()> {
-        self.delete_object_with_options(path, DeleteRequestOptions::default())
-            .await
+        S3Client::delete_object_with_options(self, path, DeleteRequestOptions::default()).await
+    }
+
+    async fn delete_object_with_options(
+        &self,
+        path: &RemotePath,
+        options: DeleteRequestOptions,
+    ) -> Result<DeletedObject> {
+        self.delete_object_with_result(path, options).await
     }
 
     async fn delete_objects(&self, bucket: &str, keys: Vec<String>) -> Result<Vec<String>> {
         self.delete_objects_with_options(bucket, keys, DeleteRequestOptions::default())
+            .await
+    }
+
+    async fn delete_object_versions(
+        &self,
+        bucket: &str,
+        objects: Vec<ObjectVersionIdentifier>,
+        options: DeleteRequestOptions,
+    ) -> Result<DeleteObjectsResult> {
+        self.delete_object_versions_with_options(bucket, objects, options)
             .await
     }
 
@@ -2454,6 +2743,10 @@ impl ObjectStore for S3Client {
 
         // Update etag from copy response if available
         let mut result = info;
+        if let Some(version_id) = response.version_id() {
+            result.version_id = Some(version_id.to_string());
+        }
+        result.source_version_id = response.copy_source_version_id().map(ToString::to_string);
         if let Some(copy_result) = response.copy_object_result()
             && let Some(etag) = copy_result.e_tag()
         {
@@ -2643,6 +2936,20 @@ impl ObjectStore for S3Client {
         max_keys: Option<i32>,
     ) -> Result<Vec<ObjectVersion>> {
         Ok(self.list_object_versions_page(path, max_keys).await?.items)
+    }
+
+    async fn list_object_versions_page_with_options(
+        &self,
+        path: &RemotePath,
+        options: &ListObjectVersionsOptions,
+    ) -> Result<ObjectVersionListResult> {
+        self.list_object_versions_page_with_markers(
+            path,
+            options.max_keys,
+            options.key_marker.as_deref(),
+            options.version_id_marker.as_deref(),
+        )
+        .await
     }
 
     async fn get_object_tags(
@@ -4473,11 +4780,59 @@ mod tests {
         let path = RemotePath::new("test", "bucket", "key.txt");
 
         let _ = client
-            .delete_object_with_options(&path, DeleteRequestOptions { force_delete: true })
+            .delete_object_with_options(
+                &path,
+                DeleteRequestOptions {
+                    force_delete: true,
+                    ..Default::default()
+                },
+            )
             .await;
 
         let request = request_receiver.expect_request();
         assert_eq!(request.headers().get("x-rustfs-force-delete"), Some("true"));
+    }
+
+    #[tokio::test]
+    async fn versioned_delete_sends_version_and_only_explicit_governance_bypass() {
+        let (client, request_receiver) = test_s3_client(None);
+        let path = RemotePath::new("test", "bucket", "key.txt");
+
+        let _ = client
+            .delete_object_with_options(
+                &path,
+                DeleteRequestOptions {
+                    version_id: Some("v1".to_string()),
+                    bypass_governance: true,
+                    force_delete: false,
+                },
+            )
+            .await;
+
+        let request = request_receiver.expect_request();
+        assert!(request.uri().to_string().contains("versionId=v1"));
+        assert_eq!(
+            request.headers().get("x-amz-bypass-governance-retention"),
+            Some("true")
+        );
+
+        let (default_client, default_request_receiver) = test_s3_client(None);
+        let _ = default_client
+            .delete_object_with_options(
+                &path,
+                DeleteRequestOptions {
+                    version_id: Some("v1".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await;
+        let default_request = default_request_receiver.expect_request();
+        assert!(
+            default_request
+                .headers()
+                .get("x-amz-bypass-governance-retention")
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -4558,6 +4913,163 @@ mod tests {
         assert_eq!(request.headers().get("range"), Some("bytes=0-2"));
         assert_eq!(written, 3);
         assert_eq!(output, b"abc");
+    }
+
+    #[tokio::test]
+    async fn get_object_with_options_selects_exact_version() {
+        let response = http::Response::builder()
+            .status(200)
+            .header("content-length", "3")
+            .header("x-amz-version-id", "v1")
+            .body(SdkBody::from("old"))
+            .expect("build versioned get response");
+        let (client, request_receiver) = test_s3_client(Some(response));
+        let path = RemotePath::new("test", "bucket", "key.txt");
+        let options =
+            ObjectReadOptions::for_version(Some("v1".to_string())).expect("valid version ID");
+
+        let data = client
+            .get_object_with_options(&path, &options)
+            .await
+            .expect("read exact version");
+
+        let request = request_receiver.expect_request();
+        assert!(request.uri().to_string().contains("versionId=v1"));
+        assert_eq!(data, b"old");
+    }
+
+    #[tokio::test]
+    async fn head_object_with_options_preserves_version_id() {
+        let response = http::Response::builder()
+            .status(200)
+            .header("content-length", "3")
+            .header("x-amz-version-id", "v1")
+            .body(SdkBody::from(""))
+            .expect("build versioned head response");
+        let (client, request_receiver) = test_s3_client(Some(response));
+        let path = RemotePath::new("test", "bucket", "key.txt");
+        let options =
+            ObjectReadOptions::for_version(Some("v1".to_string())).expect("valid version ID");
+
+        let info = client
+            .head_object_with_options(&path, &options)
+            .await
+            .expect("inspect exact version");
+
+        let request = request_receiver.expect_request();
+        assert!(request.uri().to_string().contains("versionId=v1"));
+        assert_eq!(info.version_id.as_deref(), Some("v1"));
+    }
+
+    #[tokio::test]
+    async fn exact_version_errors_distinguish_missing_versions_and_delete_markers() {
+        let missing_response = http::Response::builder()
+            .status(404)
+            .header("x-amz-error-code", "NoSuchVersion")
+            .body(SdkBody::from(
+                "<Error><Code>NoSuchVersion</Code><Message>missing</Message></Error>",
+            ))
+            .expect("build missing version response");
+        let (missing_client, _) = test_s3_client(Some(missing_response));
+        let path = RemotePath::new("test", "bucket", "key.txt");
+        let options =
+            ObjectReadOptions::for_version(Some("missing".to_string())).expect("valid version ID");
+
+        assert!(matches!(
+            missing_client
+                .get_object_with_options(&path, &options)
+                .await,
+            Err(Error::VersionNotFound { .. })
+        ));
+
+        let marker_response = http::Response::builder()
+            .status(405)
+            .header("x-amz-error-code", "MethodNotAllowed")
+            .header("x-amz-delete-marker", "true")
+            .header("x-amz-version-id", "marker-v1")
+            .body(SdkBody::from(
+                "<Error><Code>MethodNotAllowed</Code><Message>delete marker</Message></Error>",
+            ))
+            .expect("build delete marker response");
+        let (marker_client, _) = test_s3_client(Some(marker_response));
+        let marker_options = ObjectReadOptions::for_version(Some("marker-v1".to_string()))
+            .expect("valid version ID");
+
+        assert!(matches!(
+            marker_client
+                .get_object_with_options(&path, &marker_options)
+                .await,
+            Err(Error::DeleteMarker { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn exact_version_maps_generic_missing_key_responses_to_missing_version() {
+        let response = http::Response::builder()
+            .status(404)
+            .header("x-amz-error-code", "NoSuchKey")
+            .body(SdkBody::from(
+                "<Error><Code>NoSuchKey</Code><Message>missing</Message></Error>",
+            ))
+            .expect("build generic missing response");
+        let (client, _) = test_s3_client(Some(response));
+        let path = RemotePath::new("test", "bucket", "key.txt");
+        let options =
+            ObjectReadOptions::for_version(Some("missing".to_string())).expect("valid version ID");
+
+        assert!(matches!(
+            client.get_object_with_options(&path, &options).await,
+            Err(Error::VersionNotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn exact_version_maps_bare_unauthorized_status_to_auth() {
+        let response = http::Response::builder()
+            .status(401)
+            .body(SdkBody::from(""))
+            .expect("build unauthorized response");
+        let (client, _) = test_s3_client(Some(response));
+        let path = RemotePath::new("test", "bucket", "key.txt");
+        let options =
+            ObjectReadOptions::for_version(Some("v1".to_string())).expect("valid version ID");
+
+        assert!(matches!(
+            client.get_object_with_options(&path, &options).await,
+            Err(Error::Auth(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn exact_version_maps_unauthorized_with_retention_text_to_auth() {
+        let response = http::Response::builder()
+            .status(401)
+            .body(SdkBody::from("governance retention is active"))
+            .expect("build unauthorized response");
+        let (client, _) = test_s3_client(Some(response));
+        let path = RemotePath::new("test", "bucket", "key.txt");
+        let options =
+            ObjectReadOptions::for_version(Some("v1".to_string())).expect("valid version ID");
+
+        assert!(matches!(
+            client.get_object_with_options(&path, &options).await,
+            Err(Error::Auth(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn version_listing_maps_bare_forbidden_status_to_auth() {
+        let response = http::Response::builder()
+            .status(403)
+            .body(SdkBody::from(""))
+            .expect("build forbidden response");
+        let (client, _) = test_s3_client(Some(response));
+        let path = RemotePath::new("test", "bucket", "logs/");
+
+        assert!(matches!(
+            client.list_object_versions_page(&path, Some(1000)).await,
+            Err(Error::Auth(_))
+        ));
     }
 
     #[tokio::test]
@@ -4656,6 +5168,26 @@ mod tests {
             request.headers().get("x-amz-server-side-encryption"),
             Some("AES256")
         );
+    }
+
+    #[tokio::test]
+    async fn put_object_preserves_returned_version_id() {
+        let response = http::Response::builder()
+            .status(200)
+            .header("etag", "\"etag-v2\"")
+            .header("x-amz-version-id", "v2")
+            .body(SdkBody::from(""))
+            .expect("build versioned put response");
+        let (client, _) = test_s3_client(Some(response));
+        let path = RemotePath::new("test", "bucket", "file.txt");
+
+        let info = client
+            .put_object(&path, b"payload".to_vec(), Some("text/plain"), None)
+            .await
+            .expect("put versioned object");
+
+        assert_eq!(info.version_id.as_deref(), Some("v2"));
+        assert_eq!(info.etag.as_deref(), Some("etag-v2"));
     }
 
     #[tokio::test]
@@ -5104,7 +5636,10 @@ mod tests {
             .delete_objects_with_options(
                 "bucket",
                 vec!["key.txt".to_string()],
-                DeleteRequestOptions { force_delete: true },
+                DeleteRequestOptions {
+                    force_delete: true,
+                    ..Default::default()
+                },
             )
             .await;
 
@@ -5133,6 +5668,57 @@ mod tests {
 
         let request = request_receiver.expect_request();
         assert!(request.headers().get("x-rustfs-force-delete").is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_object_versions_preserves_versions_markers_and_bypass() {
+        let response = http::Response::builder()
+            .status(200)
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Deleted><Key>key.txt</Key><VersionId>v1</VersionId></Deleted>
+  <Deleted><Key>key.txt</Key><VersionId>marker-v2</VersionId><DeleteMarker>true</DeleteMarker><DeleteMarkerVersionId>marker-v2</DeleteMarkerVersionId></Deleted>
+</DeleteResult>"#,
+            ))
+            .expect("build version delete response");
+        let (client, request_receiver) = test_s3_client(Some(response));
+
+        let result = client
+            .delete_object_versions_with_options(
+                "bucket",
+                vec![
+                    ObjectVersionIdentifier {
+                        key: "key.txt".to_string(),
+                        version_id: Some("v1".to_string()),
+                        is_delete_marker: false,
+                    },
+                    ObjectVersionIdentifier {
+                        key: "key.txt".to_string(),
+                        version_id: Some("marker-v2".to_string()),
+                        is_delete_marker: true,
+                    },
+                ],
+                DeleteRequestOptions {
+                    bypass_governance: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("delete exact versions");
+
+        let request = request_receiver.expect_request();
+        assert_eq!(
+            request.headers().get("x-amz-bypass-governance-retention"),
+            Some("true")
+        );
+        let body = request.body().bytes().expect("request body bytes");
+        let body = std::str::from_utf8(body).expect("request body is utf8");
+        assert!(body.contains("<VersionId>v1</VersionId>"));
+        assert!(body.contains("<VersionId>marker-v2</VersionId>"));
+        assert_eq!(result.deleted.len(), 2);
+        assert!(result.deleted[1].is_delete_marker);
+        assert!(result.failures.is_empty());
     }
 
     #[tokio::test]

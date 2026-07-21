@@ -104,7 +104,7 @@
         "storage_class": { "$ref": "#/definitions/nullableString" }
       }
     },
-    "versionedObjectsData": {
+    "versionedObjectsListData": {
       "type": "object",
       "required": ["items", "pagination"],
       "properties": {
@@ -114,6 +114,211 @@
         },
         "pagination": { "$ref": "#/definitions/pagination" }
       }
+    },
+    "versionOperationItem": {
+      "type": "object",
+      "required": ["path", "version_id", "delete_marker"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "version_id": { "$ref": "#/definitions/nullableString" },
+        "delete_marker": { "type": "boolean" }
+      }
+    },
+    "versionOperationFailure": {
+      "type": "object",
+      "required": ["path", "version_id", "error_type", "message"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "version_id": { "$ref": "#/definitions/nullableString" },
+        "error_type": {
+          "type": "string",
+          "enum": [
+            "general_error", "usage_error", "network_error", "auth_error",
+            "not_found", "conflict", "unsupported_feature", "interrupted"
+          ]
+        },
+        "message": { "type": "string", "minLength": 1 }
+      }
+    },
+    "versionRemoveSummary": {
+      "type": "object",
+      "required": ["planned", "removed", "failed"],
+      "properties": {
+        "planned": { "type": "integer", "minimum": 0 },
+        "removed": { "type": "integer", "minimum": 0 },
+        "failed": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "versionRemoveData": {
+      "type": "object",
+      "required": [
+        "operation", "outcome", "dry_run", "planned", "removed", "failed", "summary"
+      ],
+      "properties": {
+        "operation": { "const": "remove" },
+        "outcome": {
+          "type": "string",
+          "enum": ["success", "empty", "planned", "partial", "failed"]
+        },
+        "dry_run": { "type": "boolean" },
+        "planned": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/versionOperationItem" }
+        },
+        "removed": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/versionOperationItem" }
+        },
+        "failed": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/versionOperationFailure" }
+        },
+        "summary": { "$ref": "#/definitions/versionRemoveSummary" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "outcome": { "const": "planned" } },
+            "required": ["outcome"]
+          },
+          "then": {
+            "properties": {
+              "dry_run": { "const": true },
+              "planned": { "minItems": 1 },
+              "removed": { "maxItems": 0 },
+              "failed": { "maxItems": 0 }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "outcome": { "const": "partial" } },
+            "required": ["outcome"]
+          },
+          "then": {
+            "properties": {
+              "dry_run": { "const": false },
+              "planned": { "maxItems": 0 },
+              "removed": { "minItems": 1 },
+              "failed": { "minItems": 1 }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "outcome": { "const": "failed" } },
+            "required": ["outcome"]
+          },
+          "then": {
+            "properties": {
+              "removed": { "maxItems": 0 },
+              "failed": { "minItems": 1 }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "outcome": { "const": "success" } },
+            "required": ["outcome"]
+          },
+          "then": {
+            "properties": {
+              "dry_run": { "const": false },
+              "planned": { "maxItems": 0 },
+              "removed": { "minItems": 1 },
+              "failed": { "maxItems": 0 }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "outcome": { "const": "empty" } },
+            "required": ["outcome"]
+          },
+          "then": {
+            "properties": {
+              "planned": { "maxItems": 0 },
+              "removed": { "maxItems": 0 },
+              "failed": { "maxItems": 0 }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "dry_run": { "const": true } },
+            "required": ["dry_run"]
+          },
+          "then": {
+            "properties": { "removed": { "maxItems": 0 } }
+          }
+        }
+      ]
+    },
+    "versionCopyData": {
+      "type": "object",
+      "required": [
+        "operation", "source", "target", "source_version_id", "version_id",
+        "size_bytes", "size_human"
+      ],
+      "properties": {
+        "operation": { "const": "copy" },
+        "source": { "type": "string", "minLength": 1 },
+        "target": { "type": "string", "minLength": 1 },
+        "source_version_id": { "$ref": "#/definitions/nullableString" },
+        "version_id": { "$ref": "#/definitions/nullableString" },
+        "size_bytes": { "$ref": "#/definitions/nullableBytes" },
+        "size_human": { "$ref": "#/definitions/nullableString" }
+      }
+    },
+    "versionStatObject": {
+      "type": "object",
+      "required": [
+        "path", "bucket", "key", "version_id", "delete_marker", "last_modified",
+        "size_bytes", "size_human", "etag", "content_type", "storage_class", "metadata"
+      ],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "bucket": { "type": "string", "minLength": 1 },
+        "key": { "type": "string" },
+        "version_id": { "$ref": "#/definitions/nullableString" },
+        "delete_marker": { "type": "boolean" },
+        "last_modified": { "$ref": "#/definitions/nullableTimestamp" },
+        "size_bytes": { "$ref": "#/definitions/nullableBytes" },
+        "size_human": { "$ref": "#/definitions/nullableString" },
+        "etag": { "$ref": "#/definitions/nullableString" },
+        "content_type": { "$ref": "#/definitions/nullableString" },
+        "storage_class": { "$ref": "#/definitions/nullableString" },
+        "metadata": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": { "type": "string" }
+            },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "versionStatData": {
+      "type": "object",
+      "required": ["operation", "object"],
+      "properties": {
+        "operation": { "const": "stat" },
+        "object": { "$ref": "#/definitions/versionStatObject" }
+      }
+    },
+    "versionOperationData": {
+      "oneOf": [
+        { "$ref": "#/definitions/versionStatData" },
+        { "$ref": "#/definitions/versionCopyData" },
+        { "$ref": "#/definitions/versionRemoveData" }
+      ]
+    },
+    "versionedObjectsData": {
+      "oneOf": [
+        { "$ref": "#/definitions/versionedObjectsListData" },
+        { "$ref": "#/definitions/versionOperationData" }
+      ]
     },
     "retention": {
       "type": ["object", "null"],
@@ -318,8 +523,22 @@
             { "$ref": "#/definitions/standardError" }
           ]
         },
+        "data": { "type": "object" },
         "meta": { "$ref": "#/definitions/meta" }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "type": { "const": "versioned_objects" } },
+            "required": ["type", "data"]
+          },
+          "then": {
+            "properties": {
+              "data": { "$ref": "#/definitions/versionOperationData" }
+            }
+          }
+        }
+      ]
     }
   },
   "oneOf": [

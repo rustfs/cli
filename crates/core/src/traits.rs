@@ -8,11 +8,11 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWrite;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::cors::CorsRule;
 use crate::encryption::{BucketEncryption, ObjectEncryptionRequest};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::lifecycle::LifecycleRule;
 use crate::path::RemotePath;
 use crate::replication::ReplicationConfiguration;
@@ -64,6 +64,94 @@ pub struct ObjectVersionListResult {
     pub version_id_marker: Option<String>,
 }
 
+/// Options for selecting an object version during read and metadata operations.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ObjectReadOptions {
+    /// Exact object version to select. `None` selects the current object.
+    pub version_id: Option<String>,
+}
+
+impl ObjectReadOptions {
+    /// Build read options while rejecting ambiguous empty version identifiers.
+    pub fn for_version(version_id: Option<String>) -> Result<Self> {
+        if version_id.as_deref().is_some_and(str::is_empty) {
+            return Err(Error::InvalidPath("Version ID cannot be empty".to_string()));
+        }
+        Ok(Self { version_id })
+    }
+}
+
+/// Pagination options for listing object versions and delete markers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ListObjectVersionsOptions {
+    /// Maximum number of entries to return.
+    pub max_keys: Option<i32>,
+    /// Key marker returned by the previous page.
+    pub key_marker: Option<String>,
+    /// Version marker returned by the previous page.
+    pub version_id_marker: Option<String>,
+}
+
+/// Request-level options for object deletion.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeleteRequestOptions {
+    /// Exact object version to delete. `None` targets the current object state.
+    pub version_id: Option<String>,
+    /// Explicitly bypass Object Lock governance retention.
+    pub bypass_governance: bool,
+    /// Ask RustFS to permanently delete data instead of creating delete markers.
+    pub force_delete: bool,
+}
+
+/// An object key and optional historical version selected for deletion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectVersionIdentifier {
+    /// Object key.
+    pub key: String,
+    /// Exact version to delete, when version-aware deletion is requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version_id: Option<String>,
+    /// Whether the selected version was listed as a delete marker.
+    pub is_delete_marker: bool,
+}
+
+/// A version-aware delete result returned by the object store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeletedObject {
+    /// Deleted object key.
+    pub key: String,
+    /// Deleted object version, when reported by the backend.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version_id: Option<String>,
+    /// Whether the deleted entry is a delete marker.
+    pub is_delete_marker: bool,
+}
+
+/// A per-object failure returned by a multi-object delete request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteObjectFailure {
+    /// Object key that could not be deleted.
+    pub key: String,
+    /// Requested version, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version_id: Option<String>,
+    /// S3 error code, when provided.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    /// Backend error message, when provided.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// Result of deleting multiple version-aware object identifiers.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteObjectsResult {
+    /// Successfully deleted entries.
+    pub deleted: Vec<DeletedObject>,
+    /// Entries rejected by the backend.
+    pub failures: Vec<DeleteObjectFailure>,
+}
+
 /// Metadata for an object or bucket
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObjectInfo {
@@ -98,6 +186,18 @@ pub struct ObjectInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<HashMap<String, String>>,
 
+    /// Object version selected or created by the operation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version_id: Option<String>,
+
+    /// Source object version used by a copy operation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_version_id: Option<String>,
+
+    /// Whether the selected version is a delete marker.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_delete_marker: Option<bool>,
+
     /// Whether this is a directory/prefix
     pub is_dir: bool,
 }
@@ -114,6 +214,9 @@ impl ObjectInfo {
             storage_class: None,
             content_type: None,
             metadata: None,
+            version_id: None,
+            source_version_id: None,
+            is_delete_marker: None,
             is_dir: false,
         }
     }
@@ -129,6 +232,9 @@ impl ObjectInfo {
             storage_class: None,
             content_type: None,
             metadata: None,
+            version_id: None,
+            source_version_id: None,
+            is_delete_marker: None,
             is_dir: true,
         }
     }
@@ -144,6 +250,9 @@ impl ObjectInfo {
             storage_class: None,
             content_type: None,
             metadata: None,
+            version_id: None,
+            source_version_id: None,
+            is_delete_marker: None,
             is_dir: true,
         }
     }
@@ -262,6 +371,20 @@ pub trait ObjectStore: Send + Sync {
     /// Get object metadata
     async fn head_object(&self, path: &RemotePath) -> Result<ObjectInfo>;
 
+    /// Get metadata for the current object or an exact historical version.
+    async fn head_object_with_options(
+        &self,
+        path: &RemotePath,
+        options: &ObjectReadOptions,
+    ) -> Result<ObjectInfo> {
+        if options.version_id.is_some() {
+            return Err(Error::UnsupportedFeature(
+                "Exact-version metadata reads are not implemented by this object store".to_string(),
+            ));
+        }
+        self.head_object(path).await
+    }
+
     /// Check if a bucket exists
     async fn bucket_exists(&self, bucket: &str) -> Result<bool>;
 
@@ -277,6 +400,38 @@ pub trait ObjectStore: Send + Sync {
     /// Get object content as bytes
     async fn get_object(&self, path: &RemotePath) -> Result<Vec<u8>>;
 
+    /// Get current object content or an exact historical version as bytes.
+    async fn get_object_with_options(
+        &self,
+        path: &RemotePath,
+        options: &ObjectReadOptions,
+    ) -> Result<Vec<u8>> {
+        if options.version_id.is_some() {
+            return Err(Error::UnsupportedFeature(
+                "Exact-version object reads are not implemented by this object store".to_string(),
+            ));
+        }
+        self.get_object(path).await
+    }
+
+    /// Stream current object content or an exact historical version to a writer.
+    async fn write_object_to_with_options(
+        &self,
+        path: &RemotePath,
+        options: &ObjectReadOptions,
+        writer: &mut (dyn AsyncWrite + Send + Unpin),
+        max_bytes: Option<u64>,
+    ) -> Result<u64> {
+        let data = self.get_object_with_options(path, options).await?;
+        let write_len = max_bytes
+            .and_then(|limit| usize::try_from(limit).ok())
+            .map(|limit| limit.min(data.len()))
+            .unwrap_or(data.len());
+        writer.write_all(&data[..write_len]).await?;
+        writer.flush().await?;
+        Ok(write_len as u64)
+    }
+
     /// Upload object from bytes
     async fn put_object(
         &self,
@@ -289,8 +444,40 @@ pub trait ObjectStore: Send + Sync {
     /// Delete an object
     async fn delete_object(&self, path: &RemotePath) -> Result<()>;
 
+    /// Delete the current object state or one exact version with explicit request options.
+    async fn delete_object_with_options(
+        &self,
+        path: &RemotePath,
+        options: DeleteRequestOptions,
+    ) -> Result<DeletedObject> {
+        if options.version_id.is_some() || options.bypass_governance || options.force_delete {
+            return Err(Error::UnsupportedFeature(
+                "Version-aware or policy-bypassing deletion is not implemented by this object store"
+                    .to_string(),
+            ));
+        }
+        self.delete_object(path).await?;
+        Ok(DeletedObject {
+            key: path.key.clone(),
+            version_id: None,
+            is_delete_marker: false,
+        })
+    }
+
     /// Delete multiple objects (batch delete)
     async fn delete_objects(&self, bucket: &str, keys: Vec<String>) -> Result<Vec<String>>;
+
+    /// Delete exact object versions and delete markers in one request.
+    async fn delete_object_versions(
+        &self,
+        _bucket: &str,
+        _objects: Vec<ObjectVersionIdentifier>,
+        _options: DeleteRequestOptions,
+    ) -> Result<DeleteObjectsResult> {
+        Err(Error::UnsupportedFeature(
+            "Multi-object version deletion is not implemented by this object store".to_string(),
+        ))
+    }
 
     /// Copy object within S3 (server-side copy)
     async fn copy_object(
@@ -335,6 +522,17 @@ pub trait ObjectStore: Send + Sync {
         path: &RemotePath,
         max_keys: Option<i32>,
     ) -> Result<Vec<ObjectVersion>>;
+
+    /// List one page of object versions and delete markers with both S3 pagination markers.
+    async fn list_object_versions_page_with_options(
+        &self,
+        _path: &RemotePath,
+        _options: &ListObjectVersionsOptions,
+    ) -> Result<ObjectVersionListResult> {
+        Err(Error::UnsupportedFeature(
+            "Paginated object version listing is not implemented by this object store".to_string(),
+        ))
+    }
 
     /// Get object tags
     async fn get_object_tags(
@@ -451,6 +649,47 @@ mod tests {
         assert_eq!(info.key, "test.txt");
         assert_eq!(info.size_bytes, Some(1024));
         assert!(!info.is_dir);
+        assert_eq!(info.version_id, None);
+        assert_eq!(info.source_version_id, None);
+        assert_eq!(info.is_delete_marker, None);
+    }
+
+    #[test]
+    fn object_read_options_reject_empty_version_ids() {
+        let error = ObjectReadOptions::for_version(Some(String::new()))
+            .expect_err("empty version IDs must be rejected");
+
+        assert!(matches!(error, crate::Error::InvalidPath(_)));
+    }
+
+    #[test]
+    fn versioned_delete_targets_are_serializable_for_structured_output() {
+        let target = ObjectVersionIdentifier {
+            key: "reports/a.csv".to_string(),
+            version_id: Some("v1".to_string()),
+            is_delete_marker: true,
+        };
+
+        let json = serde_json::to_value(target).expect("serialize versioned delete target");
+        assert_eq!(json["key"], "reports/a.csv");
+        assert_eq!(json["version_id"], "v1");
+        assert_eq!(json["is_delete_marker"], true);
+    }
+
+    #[test]
+    fn object_info_version_fields_are_optional_and_serializable() {
+        let current = serde_json::to_value(ObjectInfo::file("current.txt", 1))
+            .expect("serialize current object info");
+        assert!(current.get("version_id").is_none());
+        assert!(current.get("source_version_id").is_none());
+        assert!(current.get("is_delete_marker").is_none());
+
+        let mut copied = ObjectInfo::file("copy.txt", 1);
+        copied.version_id = Some("destination-v2".to_string());
+        copied.source_version_id = Some("source-v1".to_string());
+        let copied = serde_json::to_value(copied).expect("serialize copy object info");
+        assert_eq!(copied["version_id"], "destination-v2");
+        assert_eq!(copied["source_version_id"], "source-v1");
     }
 
     #[test]
