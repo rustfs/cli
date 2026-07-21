@@ -21,6 +21,53 @@ use crate::path::RemotePath;
 use crate::replication::ReplicationConfiguration;
 use crate::select::SelectOptions;
 
+/// Requested behavior for bucket creation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateBucketOptions {
+    /// Explicit S3 location constraint. `None` omits the request body.
+    pub region: Option<String>,
+    /// Whether the resulting bucket must have versioning enabled.
+    pub versioning_enabled: bool,
+    /// Whether Object Lock must be enabled in the create request.
+    pub object_lock_enabled: bool,
+}
+
+impl CreateBucketOptions {
+    /// Build CLI options while applying Object Lock's required versioning invariant.
+    pub fn for_cli(
+        region: Option<String>,
+        versioning_enabled: bool,
+        object_lock_enabled: bool,
+    ) -> Result<Self> {
+        let options = Self {
+            region,
+            versioning_enabled: versioning_enabled || object_lock_enabled,
+            object_lock_enabled,
+        };
+        options.validate()?;
+        Ok(options)
+    }
+
+    /// Reject request states that cannot produce the promised bucket state.
+    pub fn validate(&self) -> Result<()> {
+        if self.object_lock_enabled && !self.versioning_enabled {
+            return Err(Error::InvalidPath(
+                "Bucket Object Lock requires versioning to be enabled".to_string(),
+            ));
+        }
+        if self
+            .region
+            .as_deref()
+            .is_some_and(|region| region.trim().is_empty())
+        {
+            return Err(Error::InvalidPath(
+                "Bucket region cannot be empty".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Metadata for an object version
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObjectVersion {
@@ -394,6 +441,33 @@ pub trait ObjectStore: Send + Sync {
     /// Create a bucket
     async fn create_bucket(&self, bucket: &str) -> Result<()>;
 
+    /// Create a bucket with explicit region, versioning, and Object Lock intent.
+    ///
+    /// The default preserves existing implementations for the option-free request and rejects
+    /// advanced behavior instead of silently ignoring it.
+    async fn create_bucket_with_options(
+        &self,
+        bucket: &str,
+        options: &CreateBucketOptions,
+    ) -> Result<()> {
+        options.validate()?;
+        if options != &CreateBucketOptions::default() {
+            return Err(Error::UnsupportedFeature(
+                "Bucket creation options are not implemented by this object store".to_string(),
+            ));
+        }
+        self.create_bucket(bucket).await
+    }
+
+    /// Return the effective location reported by the service.
+    ///
+    /// `None` is the S3 representation for the default `us-east-1` location.
+    async fn get_bucket_location(&self, _bucket: &str) -> Result<Option<String>> {
+        Err(Error::UnsupportedFeature(
+            "Bucket location inspection is not implemented by this object store".to_string(),
+        ))
+    }
+
     /// Delete a bucket
     async fn delete_bucket(&self, bucket: &str) -> Result<()>;
 
@@ -714,6 +788,31 @@ pub trait ObjectStore: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn create_bucket_options_reject_lock_without_versioning() {
+        let options = CreateBucketOptions {
+            region: Some("us-east-1".to_string()),
+            versioning_enabled: false,
+            object_lock_enabled: true,
+        };
+
+        let error = options
+            .validate()
+            .expect_err("Object Lock without versioning must be rejected");
+
+        assert!(matches!(error, crate::Error::InvalidPath(_)));
+    }
+
+    #[test]
+    fn create_bucket_options_normalize_cli_lock_to_versioning() {
+        let options = CreateBucketOptions::for_cli(Some("us-east-1".to_string()), false, true)
+            .expect("CLI Object Lock options should be valid");
+
+        assert!(options.object_lock_enabled);
+        assert!(options.versioning_enabled);
+        assert_eq!(options.region.as_deref(), Some("us-east-1"));
+    }
 
     #[test]
     fn test_object_info_file() {

@@ -31,7 +31,8 @@
         "watch_event",
         "usage",
         "metrics",
-        "admin_operations"
+        "admin_operations",
+        "bucket_operations"
       ]
     },
     "pagination": {
@@ -513,6 +514,87 @@
         }
       }
     },
+    "bucketCreateRequest": {
+      "type": "object",
+      "required": ["versioning_enabled", "object_lock_enabled"],
+      "properties": {
+        "region": { "$ref": "#/definitions/nullableString" },
+        "versioning_enabled": { "type": "boolean" },
+        "object_lock_enabled": { "type": "boolean" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "object_lock_enabled": { "const": true } },
+            "required": ["object_lock_enabled"]
+          },
+          "then": {
+            "properties": { "versioning_enabled": { "const": true } }
+          }
+        }
+      ]
+    },
+    "bucketOperationsData": {
+      "type": "object",
+      "required": [
+        "operation", "bucket", "outcome", "created", "requested",
+        "completed_stages"
+      ],
+      "properties": {
+        "operation": { "const": "create" },
+        "bucket": { "type": "string", "minLength": 1 },
+        "outcome": {
+          "type": "string",
+          "enum": ["created", "existing", "partial", "failed"]
+        },
+        "created": { "type": "boolean" },
+        "requested": { "$ref": "#/definitions/bucketCreateRequest" },
+        "effective_region": { "$ref": "#/definitions/nullableString" },
+        "region_semantics": { "const": "service_reported" },
+        "effective_versioning": { "type": "boolean" },
+        "effective_object_lock": { "type": "boolean" },
+        "completed_stages": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "existing_bucket_detected", "bucket_created", "region_verified",
+              "versioning_enabled", "versioning_verified", "object_lock_verified"
+            ]
+          }
+        },
+        "failed_stage": {
+          "type": "string",
+          "enum": [
+            "validate_options", "check_bucket_exists", "create_bucket",
+            "verify_region", "enable_versioning", "verify_versioning",
+            "verify_object_lock"
+          ]
+        }
+      }
+    },
+    "bucketOperationsSuccessData": {
+      "allOf": [
+        { "$ref": "#/definitions/bucketOperationsData" },
+        {
+          "properties": {
+            "outcome": { "enum": ["created", "existing"] }
+          },
+          "not": { "required": ["failed_stage"] }
+        }
+      ]
+    },
+    "bucketOperationsErrorData": {
+      "allOf": [
+        { "$ref": "#/definitions/bucketOperationsData" },
+        {
+          "required": ["failed_stage"],
+          "properties": {
+            "outcome": { "enum": ["partial", "failed"] }
+          }
+        }
+      ]
+    },
     "unsupportedFeatureError": {
       "type": "object",
       "required": ["type", "message", "retryable", "capability", "server"],
@@ -566,6 +648,17 @@
           "then": {
             "properties": {
               "data": { "$ref": "#/definitions/versionOperationData" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "type": { "const": "bucket_operations" } },
+            "required": ["type", "data"]
+          },
+          "then": {
+            "properties": {
+              "data": { "$ref": "#/definitions/bucketOperationsErrorData" }
             }
           }
         }
@@ -657,6 +750,17 @@
           "properties": {
             "type": { "const": "admin_operations" },
             "data": { "$ref": "#/definitions/adminOperationsData" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/definitions/successEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "bucket_operations" },
+            "data": { "$ref": "#/definitions/bucketOperationsSuccessData" }
           }
         }
       ]

@@ -30,12 +30,12 @@ use quick_xml::de::from_str as from_xml_str;
 pub use rc_core::DeleteRequestOptions;
 use rc_core::{
     Alias, BucketEncryption, BucketNotification, BucketObjectLockConfiguration, Capabilities,
-    CorsRule, DefaultRetention, DeleteObjectFailure, DeleteObjectsResult, DeletedObject, Error,
-    LegalHoldStatus, LifecycleRule, ListObjectVersionsOptions, ListOptions, ListResult,
-    NotificationTarget, ObjectEncryptionRequest, ObjectInfo, ObjectLockOptions, ObjectReadOptions,
-    ObjectRetention, ObjectStore, ObjectVersion, ObjectVersionIdentifier, ObjectVersionListResult,
-    RemotePath, ReplicationConfiguration, RequestHeader, Result, RetentionDuration,
-    RetentionDurationUnit, RetentionMode, SelectOptions, global_request_headers,
+    CorsRule, CreateBucketOptions, DefaultRetention, DeleteObjectFailure, DeleteObjectsResult,
+    DeletedObject, Error, LegalHoldStatus, LifecycleRule, ListObjectVersionsOptions, ListOptions,
+    ListResult, NotificationTarget, ObjectEncryptionRequest, ObjectInfo, ObjectLockOptions,
+    ObjectReadOptions, ObjectRetention, ObjectStore, ObjectVersion, ObjectVersionIdentifier,
+    ObjectVersionListResult, RemotePath, ReplicationConfiguration, RequestHeader, Result,
+    RetentionDuration, RetentionDurationUnit, RetentionMode, SelectOptions, global_request_headers,
 };
 use reqwest::Method;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
@@ -2879,14 +2879,90 @@ impl ObjectStore for S3Client {
     }
 
     async fn create_bucket(&self, bucket: &str) -> Result<()> {
+        ObjectStore::create_bucket_with_options(self, bucket, &CreateBucketOptions::default()).await
+    }
+
+    async fn create_bucket_with_options(
+        &self,
+        bucket: &str,
+        options: &CreateBucketOptions,
+    ) -> Result<()> {
+        use aws_sdk_s3::types::{BucketLocationConstraint, CreateBucketConfiguration};
+
+        options.validate()?;
+        let mut request = self.inner.create_bucket().bucket(bucket);
+        if let Some(region) = &options.region {
+            let configuration = CreateBucketConfiguration::builder()
+                .location_constraint(BucketLocationConstraint::from(region.as_str()))
+                .build();
+            request = request.create_bucket_configuration(configuration);
+        }
+        if options.object_lock_enabled {
+            request = request.object_lock_enabled_for_bucket(true);
+        }
+
+        request.send().await.map_err(|error| {
+            let formatted = Self::format_sdk_error(&error);
+            let mapped = if let aws_sdk_s3::error::SdkError::ServiceError(service_error) = &error {
+                let status = service_error.raw().status().as_u16();
+                let code = service_error.err().code();
+                if matches!(status, 401 | 403)
+                    || matches!(
+                        code,
+                        Some("AccessDenied")
+                            | Some("InvalidAccessKeyId")
+                            | Some("Forbidden")
+                            | Some("Unauthorized")
+                    )
+                {
+                    Error::Auth(formatted)
+                } else if status == 409
+                    || matches!(
+                        code,
+                        Some("BucketAlreadyExists") | Some("BucketAlreadyOwnedByYou")
+                    )
+                {
+                    Error::Conflict(formatted)
+                } else {
+                    Error::Network(formatted)
+                }
+            } else {
+                Error::Network(formatted)
+            };
+            self.redact_sensitive_error(mapped)
+        })?;
+
+        Ok(())
+    }
+
+    async fn get_bucket_location(&self, bucket: &str) -> Result<Option<String>> {
         self.inner
-            .create_bucket()
+            .get_bucket_location()
             .bucket(bucket)
             .send()
             .await
-            .map_err(|e| Error::Network(Self::format_sdk_error(&e)))?;
-
-        Ok(())
+            .map(|response| {
+                response
+                    .location_constraint()
+                    .map(|location| location.as_str().to_string())
+            })
+            .map_err(|error| {
+                let formatted = Self::format_sdk_error(&error);
+                let mapped =
+                    if let aws_sdk_s3::error::SdkError::ServiceError(service_error) = &error {
+                        let status = service_error.raw().status().as_u16();
+                        if matches!(status, 401 | 403) {
+                            Error::Auth(formatted)
+                        } else if status == 404 {
+                            Error::NotFound(format!("Bucket not found: {bucket}"))
+                        } else {
+                            Error::Network(formatted)
+                        }
+                    } else {
+                        Error::Network(formatted)
+                    };
+                self.redact_sensitive_error(mapped)
+            })
     }
 
     async fn delete_bucket(&self, bucket: &str) -> Result<()> {
@@ -6009,7 +6085,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_bucket_preserves_service_error_code() {
+    async fn create_bucket_maps_access_denial_to_auth() {
         let response = http::Response::builder()
             .status(403)
             .header("x-amz-error-code", "InvalidAccessKeyId")
@@ -6026,9 +6102,95 @@ mod tests {
         let result = client.create_bucket("bucket").await;
 
         match result {
-            Err(Error::Network(message)) => assert!(message.contains("InvalidAccessKeyId")),
-            other => panic!("Expected Network for create bucket failure, got: {other:?}"),
+            Err(Error::Auth(message)) => assert!(message.contains("InvalidAccessKeyId")),
+            other => panic!("Expected Auth for create bucket failure, got: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn create_bucket_with_options_sends_region_and_object_lock() {
+        let response = http::Response::builder()
+            .status(200)
+            .body(SdkBody::empty())
+            .expect("build create bucket response");
+        let (client, request_receiver) = test_s3_client(Some(response));
+        let options = CreateBucketOptions::for_cli(Some("eu-west-1".to_string()), false, true)
+            .expect("valid create options");
+
+        ObjectStore::create_bucket_with_options(&client, "locked-bucket", &options)
+            .await
+            .expect("create bucket with options");
+
+        let request = request_receiver.expect_request();
+        assert_eq!(
+            request.headers().get("x-amz-bucket-object-lock-enabled"),
+            Some("true")
+        );
+        let body = request.body().bytes().expect("request body bytes");
+        let body = std::str::from_utf8(body).expect("request body is utf8");
+        assert!(body.contains("<LocationConstraint>eu-west-1</LocationConstraint>"));
+    }
+
+    #[tokio::test]
+    async fn create_bucket_with_default_options_omits_region_and_object_lock() {
+        let response = http::Response::builder()
+            .status(200)
+            .body(SdkBody::empty())
+            .expect("build create bucket response");
+        let (client, request_receiver) = test_s3_client(Some(response));
+
+        ObjectStore::create_bucket_with_options(
+            &client,
+            "plain-bucket",
+            &CreateBucketOptions::default(),
+        )
+        .await
+        .expect("create bucket without options");
+
+        let request = request_receiver.expect_request();
+        assert!(
+            request
+                .headers()
+                .get("x-amz-bucket-object-lock-enabled")
+                .is_none()
+        );
+        assert!(request.body().bytes().unwrap_or_default().is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_bucket_with_invalid_options_makes_no_request() {
+        let (client, request_receiver) = test_s3_client(None);
+        let invalid = CreateBucketOptions {
+            region: None,
+            versioning_enabled: false,
+            object_lock_enabled: true,
+        };
+
+        let result = ObjectStore::create_bucket_with_options(&client, "bucket", &invalid).await;
+
+        assert!(matches!(result, Err(Error::InvalidPath(_))));
+        request_receiver.expect_no_request();
+    }
+
+    #[tokio::test]
+    async fn get_bucket_location_returns_the_service_reported_constraint() {
+        let response = http::Response::builder()
+            .status(200)
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/">eu-west-1</LocationConstraint>"#,
+            ))
+            .expect("build bucket location response");
+        let (client, request_receiver) = test_s3_client(Some(response));
+
+        let location = ObjectStore::get_bucket_location(&client, "bucket")
+            .await
+            .expect("read bucket location");
+
+        assert_eq!(location.as_deref(), Some("eu-west-1"));
+        let request = request_receiver.expect_request();
+        assert_eq!(request.method(), http::Method::GET);
+        assert!(request.uri().contains("?location"));
     }
 
     #[tokio::test]

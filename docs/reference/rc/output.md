@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | [`output_v1.json`](../../../schemas/output_v1.json) | Original S3 and alias command output | Preserved unchanged |
 | [`output_v2.json`](../../../schemas/output_v2.json) | Existing cluster and administrative output | Preserved unchanged |
-| [`output_v3.json`](../../../schemas/output_v3.json) | New capability, version, lock, multipart, watch, usage, metrics, and admin-operation families | Contract for new implementations |
+| [`output_v3.json`](../../../schemas/output_v3.json) | New capability, version, lock, multipart, watch, usage, metrics, admin-operation, and bucket-operation families | Contract for new implementations |
 
 Adding v3 does not silently change the JSON emitted by existing commands. Each command implementation must document when it adopts v3. Consumers should choose a parser from the command's documented output version instead of inferring a version from the installed `rc` release.
 
@@ -45,6 +45,22 @@ Version removal sets `data.dry_run` explicitly. Its `outcome` is `planned`, `emp
 Errors use the same family-specific `type` as successful output. An unsupported server capability has the typed error `unsupported_feature`, including the capability name and nullable server version. Other errors use the stable error kinds defined by the schema.
 
 Non-streaming success records are written to standard output. Error records, including partial version-removal records that retain `data`, are written as one JSON document to standard error.
+
+## Bucket creation records
+
+`rc mb` and `rc bucket create` use the v3 `bucket_operations` family. The request is recorded under
+`data.requested`; verified service state is recorded in the optional `effective_region`,
+`effective_versioning`, and `effective_object_lock` fields. `region_semantics: service_reported`
+means the value came from the service location API and does not assert per-bucket persistence.
+
+The outcome is `created`, `existing`, `partial`, or `failed`. Partial and failed workflows retain
+`completed_stages` and `failed_stage` in an error envelope. A partial result is durable: the CLI
+does not delete a bucket or undo versioning after a later verification failure.
+
+This command migration is breaking for scripts that consumed the former root-level
+`{status, bucket, message}` bucket creation object. Dispatch on `schema_version`, then read creation
+details under `data` and error details under `error`. Existing output v1 and v2 schemas are not
+modified.
 
 ## Migrating from v1 or v2
 

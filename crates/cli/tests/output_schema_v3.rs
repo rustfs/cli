@@ -15,6 +15,7 @@ const V3_FAMILIES: &[&str] = &[
     "usage",
     "metrics",
     "admin_operations",
+    "bucket_operations",
 ];
 
 fn repository_root() -> PathBuf {
@@ -215,6 +216,19 @@ fn locks_contract_types_bucket_defaults_and_mutation_metadata() {
         !validator.is_valid(&overflowing),
         "bucket default retention must fit the S3 signed 32-bit field"
     );
+}
+
+#[test]
+fn bucket_creation_partial_contract_preserves_effective_state_and_failed_stage() {
+    let validator = load_validator(3);
+    let fixture = load_json(&fixture_path("bucket_operations", "error"));
+
+    assert_valid(&validator, &fixture, "partial bucket creation fixture");
+    assert_eq!(fixture["status"], "error");
+    assert_eq!(fixture["data"]["outcome"], "partial");
+    assert_eq!(fixture["data"]["created"], true);
+    assert_eq!(fixture["data"]["effective_versioning"], true);
+    assert_eq!(fixture["data"]["failed_stage"], "verify_object_lock");
 }
 
 #[test]

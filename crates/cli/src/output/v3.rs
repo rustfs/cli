@@ -6,6 +6,7 @@ use crate::exit_code::ExitCode;
 
 const VERSIONED_OBJECTS_FAMILY: &str = "versioned_objects";
 const LOCKS_FAMILY: &str = "locks";
+const BUCKET_OPERATIONS_FAMILY: &str = "bucket_operations";
 
 #[derive(Debug, Serialize)]
 pub struct V3SuccessEnvelope<T> {
@@ -30,6 +31,15 @@ impl<T> V3SuccessEnvelope<T> {
         Self {
             schema_version: 3,
             family: LOCKS_FAMILY,
+            status: "success",
+            data,
+        }
+    }
+
+    pub fn bucket_operations(data: T) -> Self {
+        Self {
+            schema_version: 3,
+            family: BUCKET_OPERATIONS_FAMILY,
             status: "success",
             data,
         }
@@ -67,6 +77,19 @@ impl V3ErrorEnvelope {
             error: V3ErrorDetail::from_exit_code(code, message.into(), capability),
         }
     }
+
+    pub fn bucket_operations(
+        code: ExitCode,
+        message: impl Into<String>,
+        capability: Option<&str>,
+    ) -> Self {
+        Self {
+            schema_version: 3,
+            family: BUCKET_OPERATIONS_FAMILY,
+            status: "error",
+            error: V3ErrorDetail::from_exit_code(code, message.into(), capability),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -89,6 +112,21 @@ impl<T> V3PartialErrorEnvelope<T> {
         Self {
             schema_version: 3,
             family: VERSIONED_OBJECTS_FAMILY,
+            status: "error",
+            error: V3ErrorDetail::from_exit_code(code, message.into(), capability),
+            data,
+        }
+    }
+
+    pub fn bucket_operations(
+        code: ExitCode,
+        message: impl Into<String>,
+        capability: Option<&str>,
+        data: T,
+    ) -> Self {
+        Self {
+            schema_version: 3,
+            family: BUCKET_OPERATIONS_FAMILY,
             status: "error",
             error: V3ErrorDetail::from_exit_code(code, message.into(), capability),
             data,
@@ -228,5 +266,24 @@ mod tests {
         assert_eq!(success["type"], "locks");
         assert_eq!(error["type"], "locks");
         assert_eq!(error["error"]["type"], "conflict");
+    }
+
+    #[test]
+    fn bucket_operation_envelopes_preserve_partial_stage_data() {
+        let success = serde_json::to_value(V3SuccessEnvelope::bucket_operations(
+            serde_json::json!({ "operation": "create" }),
+        ))
+        .expect("serialize bucket operation success");
+        let partial = serde_json::to_value(V3PartialErrorEnvelope::bucket_operations(
+            ExitCode::Conflict,
+            "Versioning verification failed",
+            Some("bucket_versioning"),
+            serde_json::json!({ "failed_stage": "verify_versioning" }),
+        ))
+        .expect("serialize bucket operation partial failure");
+
+        assert_eq!(success["type"], "bucket_operations");
+        assert_eq!(partial["type"], "bucket_operations");
+        assert_eq!(partial["data"]["failed_stage"], "verify_versioning");
     }
 }

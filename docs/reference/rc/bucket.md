@@ -48,8 +48,9 @@ rc bucket replication <add|update|list|status|remove|export|import> ...
 | `--versions` | Include object versions when listing supported versioned buckets. |
 | `--summarize` | Show totals only for list output. |
 | `--ignore-existing` | Do not fail if the bucket already exists when creating it. |
+| `--region REGION` | Send and verify an explicit bucket location constraint when creating a bucket. |
 | `--with-versioning` | Enable versioning when creating the bucket. |
-| `--with-lock` | Enable object lock when creating the bucket. |
+| `--with-lock` | Enable Object Lock at creation time and imply versioning. |
 | `--mode governance\|compliance` | Select the default mode for `bucket lock set`. |
 | `--days COUNT` | Set a positive default retention duration in days. Conflicts with `--years`. |
 | `--years COUNT` | Set a positive default retention duration in years. Conflicts with `--days`. |
@@ -115,6 +116,18 @@ Prefer `rc bucket ...` for new scripts. Legacy commands such as `rc mb`, `rc rb`
 `rc bucket encryption set`, `info`, and `clear` manage only the bucket default for future writes. They do not rewrite, decrypt, or re-encrypt existing objects in the bucket. For object-level encryption flags and more detailed examples, see [Encryption workflows](encryption.md).
 
 `rc bucket lock clear` removes only the default retention rule. S3 Object Lock cannot be disabled after enablement. Bucket lock JSON uses the output v3 `locks` family and includes the typed default duration unit. The `rc retention --default` forms provide `mc retention` compatible entry points; see [Retention](retention.md).
+
+`rc bucket create` shares its implementation with `rc mb`. Object Lock is included in the create
+request and cannot be added retroactively. Versioning requested without Object Lock is enabled
+after creation and verified. `--ignore-existing` may reconcile versioning, but a lock request
+requires the existing bucket to be locked already. RustFS beta.10 reports a server-global bucket
+location, so an explicit `--region` is transmitted and compared with that service-reported value;
+the output does not claim per-bucket region persistence.
+
+Bucket creation uses the output v3 `bucket_operations` JSON family. Partial failures preserve the
+completed and failed workflow stages, and `rc` does not roll back a bucket that was already
+created. This is a breaking migration from the former root-level bucket creation JSON object; see
+[JSON output contracts](output.md#bucket-creation-records).
 
 Global options shown in command syntax use the same meaning everywhere:
 
