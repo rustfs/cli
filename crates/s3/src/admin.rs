@@ -9,15 +9,18 @@ use aws_sigv4::http_request::{
     SignableBody, SignableRequest, SignatureLocation, SigningSettings, sign,
 };
 use aws_sigv4::sign::v4;
+use futures::StreamExt;
 use rc_core::admin::{
     AccessKeyInfo, AdminApi, BucketQuota, CapabilityApi, CapabilityAvailability, CapabilityEntry,
     CapabilityReport, ClusterInfo, ClusterSnapshotMetadata, ClusterSnapshotSummary,
     CreateServiceAccountRequest, DecommissionPoolStatus, DecommissionStatus, ExtensionsCatalog,
     Group, GroupStatus, HealRuntimeState, HealScanMode, HealStartRequest, HealStatus,
-    HealTaskRequest, PeerSiteSpec, Policy, PolicyEntity, PolicyInfo, PoolStatus, PoolTarget,
-    RebalanceStartResult, RebalanceStatus, RuntimeCapabilitiesSnapshot, RuntimeCapabilityStatus,
-    ServiceAccount, ServiceAccountCreateResponse, ServiceActionResult, SiteRemoveSpec,
-    SiteStatusOptions, UpdateGroupMembersRequest, UpdateServiceAccountRequest, User, UserStatus,
+    HealTaskRequest, MAX_METRICS_LINE_BYTES, MAX_METRICS_RESPONSE_BYTES, MAX_METRICS_SAMPLES,
+    MetricsBatch, MetricsQuery, ObservabilityApi, PeerSiteSpec, Policy, PolicyEntity, PolicyInfo,
+    PoolStatus, PoolTarget, RealtimeMetrics, RebalanceStartResult, RebalanceStatus,
+    RuntimeCapabilitiesSnapshot, RuntimeCapabilityStatus, ScannerStatus, ServiceAccount,
+    ServiceAccountCreateResponse, ServiceActionResult, SiteRemoveSpec, SiteStatusOptions,
+    StorageInfo, UpdateGroupMembersRequest, UpdateServiceAccountRequest, User, UserStatus,
 };
 use rc_core::{Alias, Error, Result};
 use reqwest::header::{CONTENT_TYPE, HOST, HeaderMap, HeaderName, HeaderValue};
@@ -858,6 +861,11 @@ struct ClusterSnapshotResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct StorageInfoResponse {
+    info: StorageInfo,
+}
+
+#[derive(Debug, Deserialize)]
 struct ClusterSnapshotPayload {
     summary: ClusterSnapshotSummary,
     runtime_capabilities_path: String,
@@ -1140,6 +1148,174 @@ impl CapabilityApi for AdminClient {
         self.store_capabilities(&report)?;
         Ok(report)
     }
+}
+
+#[async_trait]
+impl ObservabilityApi for AdminClient {
+    async fn scanner_status(&self) -> Result<ScannerStatus> {
+        self.request(Method::GET, "/scanner/status", None, None)
+            .await
+            .map_err(|error| observability_route_error(error, "Scanner status"))
+    }
+
+    async fn storage_info(&self) -> Result<StorageInfo> {
+        let response: StorageInfoResponse = self
+            .request(Method::GET, "/storageinfo", None, None)
+            .await
+            .map_err(|error| observability_route_error(error, "Storage information"))?;
+        Ok(response.info)
+    }
+
+    async fn realtime_metrics(&self, query: &MetricsQuery) -> Result<MetricsBatch> {
+        if query.samples == 0 || query.samples > MAX_METRICS_SAMPLES {
+            return Err(Error::InvalidPath(format!(
+                "Metrics samples must be between 1 and {MAX_METRICS_SAMPLES}"
+            )));
+        }
+
+        let disks = query.disks.join(",");
+        let hosts = query.hosts.join(",");
+        let interval = query.interval.clone().unwrap_or_default();
+        let samples = query.samples.to_string();
+        let types = query.types_mask().to_string();
+        let mut params = Vec::new();
+        if !disks.is_empty() {
+            params.push(("disks", disks.as_str()));
+        }
+        if !hosts.is_empty() {
+            params.push(("hosts", hosts.as_str()));
+        }
+        if !interval.is_empty() {
+            params.push(("interval", interval.as_str()));
+        }
+        params.push(("n", samples.as_str()));
+        params.push(("types", types.as_str()));
+        if query.by_disk {
+            params.push(("by-disk", "true"));
+        }
+        if query.by_host {
+            params.push(("by-host", "true"));
+        }
+        if let Some(job_id) = query.job_id.as_deref() {
+            params.push(("by-jobID", job_id));
+        }
+        if let Some(deployment_id) = query.deployment_id.as_deref() {
+            params.push(("by-depID", deployment_id));
+        }
+
+        let mut url = self.admin_url("/metrics");
+        let query_string = params
+            .iter()
+            .map(|(key, value)| {
+                format!(
+                    "{}={}",
+                    urlencoding::encode(key),
+                    urlencoding::encode(value)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("&");
+        url.push('?');
+        url.push_str(&query_string);
+
+        let headers = self.request_headers(&[])?;
+        let signed_headers = self.sign_request(&Method::GET, &url, &headers, &[]).await?;
+        let mut request_builder = self.http_client.get(&url);
+        for (name, value) in &signed_headers {
+            request_builder = request_builder.header(name, value);
+        }
+        let response = request_builder
+            .send()
+            .await
+            .map_err(|error| Error::Network(format!("Request failed: {error}")))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(observability_route_error(
+                self.map_error(status, &body),
+                "Realtime metrics",
+            ));
+        }
+
+        let mut stream = response.bytes_stream();
+        let mut pending = Vec::new();
+        let mut snapshots = Vec::new();
+        let mut encoded_bytes = 0usize;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk
+                .map_err(|error| Error::Network(format!("Failed to read response: {error}")))?;
+            encoded_bytes = encoded_bytes.saturating_add(chunk.len());
+            if encoded_bytes > MAX_METRICS_RESPONSE_BYTES {
+                return Err(Error::General(format!(
+                    "Metrics response exceeded the {MAX_METRICS_RESPONSE_BYTES}-byte limit"
+                )));
+            }
+            pending.extend_from_slice(&chunk);
+            parse_metrics_records(&mut pending, &mut snapshots, false)?;
+            if snapshots.len() > usize::from(query.samples) {
+                return Err(Error::General(format!(
+                    "Metrics response exceeded the requested {} record limit",
+                    query.samples
+                )));
+            }
+        }
+        parse_metrics_records(&mut pending, &mut snapshots, true)?;
+        if snapshots.len() > usize::from(query.samples) {
+            return Err(Error::General(format!(
+                "Metrics response exceeded the requested {} record limit",
+                query.samples
+            )));
+        }
+
+        Ok(MetricsBatch {
+            snapshots,
+            encoded_bytes,
+        })
+    }
+}
+
+fn observability_route_error(error: Error, feature: &str) -> Error {
+    match error {
+        Error::NotFound(_) => {
+            Error::UnsupportedFeature(format!("{feature} is unavailable on this RustFS server"))
+        }
+        error => error,
+    }
+}
+
+fn parse_metrics_records(
+    pending: &mut Vec<u8>,
+    snapshots: &mut Vec<RealtimeMetrics>,
+    flush: bool,
+) -> Result<()> {
+    loop {
+        let record_end = pending.iter().position(|byte| *byte == b'\n');
+        let record = match record_end {
+            Some(index) => pending.drain(..=index).collect::<Vec<_>>(),
+            None if flush && !pending.is_empty() => std::mem::take(pending),
+            None => break,
+        };
+        let record = record.strip_suffix(b"\n").unwrap_or(record.as_slice());
+        let record = record.strip_suffix(b"\r").unwrap_or(record);
+        if record.is_empty() {
+            continue;
+        }
+        if record.len() > MAX_METRICS_LINE_BYTES {
+            return Err(Error::General(format!(
+                "Metrics record exceeded the {MAX_METRICS_LINE_BYTES}-byte record limit"
+            )));
+        }
+        snapshots.push(serde_json::from_slice(record).map_err(Error::Json)?);
+    }
+    if pending.len() > MAX_METRICS_LINE_BYTES {
+        return Err(Error::General(format!(
+            "Metrics record exceeded the {MAX_METRICS_LINE_BYTES}-byte record limit"
+        )));
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -1844,6 +2020,38 @@ mod tests {
                     .write_all(response.as_bytes())
                     .expect("write HTTP response");
             }
+        });
+
+        (endpoint, receiver, handle)
+    }
+
+    fn start_admin_owned_test_server(
+        response_status: &str,
+        content_type: &str,
+        response_body: String,
+    ) -> (
+        String,
+        mpsc::Receiver<CapturedAdminRequest>,
+        thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        let (sender, receiver) = mpsc::channel();
+        let response_status = response_status.to_string();
+        let content_type = content_type.to_string();
+
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let request = read_admin_request(&mut stream);
+            sender.send(request).expect("send captured request");
+
+            let response = format!(
+                "HTTP/1.1 {response_status}\r\ncontent-length: {}\r\ncontent-type: {content_type}\r\nconnection: close\r\n\r\n{response_body}",
+                response_body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write HTTP response");
         });
 
         (endpoint, receiver, handle)
@@ -3391,6 +3599,148 @@ mod tests {
             }
             Ok(_) => panic!("Expected Error::Network for invalid PEM, got Ok(_)"),
             Err(e) => panic!("Expected Error::Network for invalid PEM, got Err({e})"),
+        }
+    }
+
+    #[tokio::test]
+    async fn scanner_status_uses_beta10_route_and_typed_response() {
+        let body = r#"{
+            "enabled":true,
+            "disabled_reason":null,
+            "freshness":{"state":"fresh","last_cycle_end_unix_secs":10,"max_expected_age_seconds":120,"reason":null},
+            "metrics":{"collected_at":"2026-07-21T04:00:00Z","current_cycle":7,"last_cycle_end_unix_secs":10,"last_cycle_result":"success"},
+            "cycle_schedule":{"effective_interval_seconds":60,"clean_idle_backoff_enabled":false,"clean_idle_backoff_multiplier":1},
+            "runtime_config":{"speed":{"value":"fast","source":"default"}}
+        }"#;
+        let (endpoint, receiver, handle) = start_admin_test_server("200 OK", body);
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let status = client
+            .scanner_status()
+            .await
+            .expect("scanner status should succeed");
+
+        assert_eq!(status.health(), rc_core::admin::ScannerHealth::Healthy);
+        assert_eq!(status.metrics.current_cycle, 7);
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.target, "/rustfs/admin/v3/scanner/status");
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn storage_info_unwraps_current_response_envelope() {
+        let body = r#"{
+            "info":{
+                "disks":[{"endpoint":"node1","path":"/data1","state":"online","totalspace":100,"usedspace":40,"availspace":60}],
+                "backend":{"BackendType":"Erasure","OnlineDisks":{"set-1":1},"OfflineDisks":{}}
+            },
+            "admin_discovery":{}
+        }"#;
+        let (endpoint, receiver, handle) = start_admin_test_server("200 OK", body);
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let info = client
+            .storage_info()
+            .await
+            .expect("storage info should succeed");
+
+        assert_eq!(info.disks.len(), 1);
+        assert_eq!(info.total_capacity(), 100);
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(request.target, "/rustfs/admin/v3/storageinfo");
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn realtime_metrics_encodes_exact_query_and_reads_ndjson_incrementally() {
+        let body = concat!(
+            "{\"errors\":[],\"hosts\":[],\"aggregated\":{\"scanner\":{\"collected\":\"2026-07-21T04:00:00Z\",\"current_cycle\":7}},\"by_host\":{},\"by_disk\":{},\"final\":false}\n",
+            "{\"errors\":[],\"hosts\":[],\"aggregated\":{\"scanner\":{\"collected\":\"2026-07-21T04:00:03Z\",\"current_cycle\":8}},\"by_host\":{},\"by_disk\":{},\"final\":true}\n"
+        );
+        let (endpoint, receiver, handle) =
+            start_admin_owned_test_server("200 OK", "application/x-ndjson", body.to_string());
+        let client = admin_client_for_endpoint(&endpoint);
+        let query = rc_core::admin::MetricsQuery {
+            scopes: vec![
+                rc_core::admin::MetricsScope::Scanner,
+                rc_core::admin::MetricsScope::Disk,
+            ],
+            hosts: vec!["node 1".to_string()],
+            disks: vec!["/data/one".to_string()],
+            interval: Some("3s".to_string()),
+            samples: 2,
+            by_host: true,
+            by_disk: true,
+            job_id: Some("job/1".to_string()),
+            deployment_id: Some("dep 1".to_string()),
+        };
+
+        let batch = client
+            .realtime_metrics(&query)
+            .await
+            .expect("metrics should succeed");
+
+        assert_eq!(batch.snapshots.len(), 2);
+        assert!(!batch.is_partial());
+        assert!(batch.encoded_bytes > 0);
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(request.method, "GET");
+        assert_eq!(
+            request.target,
+            "/rustfs/admin/v3/metrics?disks=%2Fdata%2Fone&hosts=node%201&interval=3s&n=2&types=3&by-disk=true&by-host=true&by-jobID=job%2F1&by-depID=dep%201"
+        );
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn realtime_metrics_rejects_malformed_and_oversized_records() {
+        let (endpoint, _receiver, handle) = start_admin_owned_test_server(
+            "200 OK",
+            "application/x-ndjson",
+            "{not-json}\n".to_string(),
+        );
+        let client = admin_client_for_endpoint(&endpoint);
+        let error = client
+            .realtime_metrics(&rc_core::admin::MetricsQuery::default())
+            .await
+            .expect_err("malformed metrics should fail");
+        assert!(matches!(error, Error::Json(_)));
+        handle.join().expect("server thread should finish");
+
+        let oversized = format!(
+            "{{\"padding\":\"{}\"}}\n",
+            "x".repeat(rc_core::admin::MAX_METRICS_LINE_BYTES)
+        );
+        let (endpoint, _receiver, handle) =
+            start_admin_owned_test_server("200 OK", "application/x-ndjson", oversized);
+        let client = admin_client_for_endpoint(&endpoint);
+        let error = client
+            .realtime_metrics(&rc_core::admin::MetricsQuery::default())
+            .await
+            .expect_err("oversized metrics should fail");
+        assert!(matches!(error, Error::General(message) if message.contains("record limit")));
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn observability_routes_distinguish_permission_denial_from_unsupported() {
+        for (status, expected_auth) in [("403 Forbidden", true), ("404 Not Found", false)] {
+            let (endpoint, _receiver, handle) = start_admin_test_server(
+                status,
+                r#"{"code":"AccessDenied","message":"denied or absent"}"#,
+            );
+            let client = admin_client_for_endpoint(&endpoint);
+            let error = client
+                .scanner_status()
+                .await
+                .expect_err("request should fail");
+            if expected_auth {
+                assert!(matches!(error, Error::Auth(_)));
+            } else {
+                assert!(matches!(error, Error::UnsupportedFeature(_)));
+            }
+            handle.join().expect("server thread should finish");
         }
     }
 }

@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | [`output_v1.json`](../../../schemas/output_v1.json) | Original S3 and alias command output | Preserved unchanged |
 | [`output_v2.json`](../../../schemas/output_v2.json) | Existing cluster and administrative output | Preserved unchanged |
-| [`output_v3.json`](../../../schemas/output_v3.json) | New capability, version, lock, multipart, watch, usage, metrics, and admin-operation families | Contract for new implementations |
+| [`output_v3.json`](../../../schemas/output_v3.json) | New capability, version, lock, multipart, watch, usage, metrics, scanner-status, storage-info, and admin-operation families | Contract for new implementations |
 
 Adding v3 does not silently change the JSON emitted by existing commands. Each command implementation must document when it adopts v3. Consumers should choose a parser from the command's documented output version instead of inferring a version from the installed `rc` release.
 
@@ -28,7 +28,7 @@ Objects allow additional properties so a newer RustFS server can expose extra di
 
 Paginated records use a `pagination` object with `truncated` and `continuation_token`. The token is `null` when there is no next page.
 
-Streaming commands emit JSON Lines. Each non-empty line is one complete v3 record and validates independently against `output_v3.json`. A watch keepalive is a successful `watch_event` record with `data.event` set to `null` and `data.keepalive` set to `true`. Consumers must not parse an entire JSON Lines stream as one JSON document.
+Streaming commands emit JSON Lines. Each non-empty line is one complete v3 record and validates independently against `output_v3.json`. A watch keepalive is a successful `watch_event` record with `data.event` set to `null` and `data.keepalive` set to `true`. Normalized `admin metrics` output uses the same JSON Lines rule; `--metrics-format raw` is explicitly outside the v3 envelope and emits bounded RustFS records unchanged. Consumers must not parse an entire JSON Lines stream as one JSON document.
 
 ## Errors
 
@@ -45,6 +45,7 @@ When migrating:
 3. Read failures under `error` and handle `unsupported_feature` separately.
 4. Treat nullable server fields as unavailable data, not as zero values.
 5. For watch output, validate and process each JSON Lines record independently.
-6. Ignore unknown object properties while continuing to require documented fields and types.
+6. For normalized metrics, retain labels and per-sample `collected_at` timestamps; do not infer one timestamp for the entire stream.
+7. Ignore unknown object properties while continuing to require documented fields and types.
 
 The golden fixtures under `crates/cli/tests/fixtures/output_v3/` provide success, empty, and error examples for every v3 family.

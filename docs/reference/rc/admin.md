@@ -2,7 +2,7 @@
 
 ## Purpose
 
-The `rc admin` operation manages the RustFS Admin API, including cluster information, healing, pools, expansion, decommissioning, rebalance workflows, IAM users, policies, groups, service accounts, site replication, and service control.
+The `rc admin` operation manages the RustFS Admin API, including scanner and storage diagnostics, bounded realtime metrics, cluster information, healing, pools, expansion, decommissioning, rebalance workflows, IAM users, policies, groups, service accounts, site replication, and service control.
 
 `rc admin` does not implement the MinIO Admin API. MinIO aliases remain available to S3 data commands, but MinIO administrative operations require a MinIO-compatible admin client.
 
@@ -10,7 +10,9 @@ The `rc admin` operation manages the RustFS Admin API, including cluster informa
 
 ```bash
 rc [GLOBAL OPTIONS] admin <COMMAND>
-rc admin info <cluster|server|disk> <ALIAS> [OPTIONS]
+rc admin info <cluster|server|disk|storage> <ALIAS> [OPTIONS]
+rc admin scanner status <ALIAS>
+rc admin metrics <ALIAS> [OPTIONS]
 rc admin heal <status|start|stop> <ALIAS> [OPTIONS]
 rc admin pool <list|status> <ALIAS> [POOL] [OPTIONS]
 rc admin expand <start|status|stop> <ALIAS>
@@ -32,6 +34,8 @@ rc admin replicate remove <ALIAS> <--all|--site <NAME>>
 | Command | Description |
 | --- | --- |
 | `info` | Display cluster, server, or disk information. |
+| `scanner` | Inspect scanner health, freshness, and cycle state. |
+| `metrics` | Query bounded realtime metrics as normalized JSON Lines or raw server records. |
 | `heal` | Start, stop, or inspect healing operations. |
 | `pool` | List pools and inspect pool status. |
 | `expand` | Manage post-expansion data rebalancing. Alias: `scale`. |
@@ -50,6 +54,19 @@ Show cluster information:
 
 ```bash
 rc admin info cluster local
+```
+
+Inspect scanner health and storage topology:
+
+```bash
+rc admin scanner status local
+rc admin info storage local
+```
+
+Collect two scanner and disk metric snapshots:
+
+```bash
+rc --json admin metrics local --scope scanner,disk --samples 2 --interval 3s --by-host --by-disk
 ```
 
 Start a deep heal for a prefix:
@@ -143,6 +160,32 @@ rc admin service restart local
 ## Behavior
 
 Admin operations use the configured alias to create a RustFS admin client. The credentials behind the alias must have permissions for the requested administrative API. The command accepts aliases with or without a trailing slash.
+
+## Observability Workflow
+
+The read-only observability commands target RustFS Admin API v3 routes introduced with the beta.10 diagnostics surface.
+
+| Command | Description |
+| --- | --- |
+| `rc admin scanner status <ALIAS>` | Classify scanner state as `healthy`, `stale`, `empty`, `partial`, or `disabled` and retain current server diagnostic fields. |
+| `rc admin info storage <ALIAS>` | Show backend topology, disk health, and aggregate capacity. |
+| `rc admin metrics <ALIAS> [OPTIONS]` | Stream bounded realtime metric snapshots. |
+
+`admin metrics` accepts these query and output options:
+
+| Option | Description |
+| --- | --- |
+| `--scope <SCOPES>` | Comma-separated scopes: `scanner`, `disk`, `os`, `batch-jobs`, `site-resync`, `network`, `memory`, `cpu`, `rpc`, or `all`. |
+| `--samples <1..120>` | Limit the number of server snapshots. Defaults to `1`. |
+| `--interval <DURATION>` | Set the server sampling interval, for example `3s`. |
+| `--host <HOST>` / `--disk <PATH>` | Restrict metrics to selected hosts or disks. Each option may be repeated. |
+| `--by-host` / `--by-disk` | Request grouped host or disk metrics. |
+| `--job-id <ID>` / `--deployment-id <ID>` | Restrict batch-job or site-resync metrics. |
+| `--metrics-format normalized\|raw` | Emit v3 normalized JSON Lines or bounded raw server JSON records. |
+
+Normalized metrics always use one compact v3 JSON object per line, including numeric samples, labels, per-sample timestamps, errors, partial/final markers, and the retained raw snapshot. Raw mode intentionally omits the v3 wrapper. The client rejects responses above 16 MiB, individual records above 1 MiB, and records beyond the requested sample count.
+
+Permission failures return the authentication exit code. A missing observability route returns `unsupported_feature`, allowing automation to distinguish an older RustFS server from missing credentials. Malformed and oversized responses fail without emitting partial normalized records.
 
 `rc admin heal status <ALIAS>` reports aggregate background heal status. Manual heals started with `rc admin heal start` are token-scoped tasks; the start output includes a client token. Root recursive tasks are inspected or stopped with `--client-token`, while bucket or prefix tasks additionally pass `--bucket` and optional `--prefix`.
 

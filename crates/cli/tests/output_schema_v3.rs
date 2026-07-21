@@ -14,6 +14,8 @@ const V3_FAMILIES: &[&str] = &[
     "watch_event",
     "usage",
     "metrics",
+    "scanner_status",
+    "storage_info",
     "admin_operations",
 ];
 
@@ -183,4 +185,18 @@ fn v3_rejects_field_renames_and_type_changes() {
         !validator.is_valid(&wrong_type),
         "byte counts encoded as strings must fail"
     );
+}
+
+#[test]
+fn metrics_v3_preserves_numeric_values_labels_and_sample_timestamps() {
+    let validator = load_validator(3);
+    let fixture = load_json(&fixture_path("metrics", "success"));
+
+    assert!(fixture["data"]["samples"][0]["value"].is_number());
+    assert_eq!(fixture["data"]["samples"][0]["labels"]["node"], "node-1");
+    assert_eq!(
+        fixture["data"]["samples"][0]["collected_at"],
+        "2026-07-21T04:00:00Z"
+    );
+    assert_valid(&validator, &fixture, "timestamped metrics fixture");
 }

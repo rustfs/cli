@@ -10,15 +10,19 @@ mod expand;
 mod group;
 mod heal;
 mod info;
+mod metrics;
 mod policy;
 mod pool;
 mod rebalance;
 mod replicate;
+mod scanner;
 mod service;
 mod service_account;
 mod user;
 
 use clap::Subcommand;
+use rc_core::Error;
+use serde::Serialize;
 
 use crate::exit_code::ExitCode;
 use crate::output::{Formatter, OutputConfig};
@@ -30,6 +34,13 @@ use rc_s3::AdminClient;
 pub enum AdminCommands {
     /// Discover effective RustFS runtime capabilities
     Capabilities(capabilities::CapabilitiesArgs),
+
+    /// Query bounded RustFS realtime metrics
+    Metrics(metrics::MetricsArgs),
+
+    /// Inspect scanner health and freshness
+    #[command(subcommand)]
+    Scanner(scanner::ScannerCommands),
 
     /// Display cluster information (servers, disks, usage)
     #[command(subcommand)]
@@ -90,6 +101,8 @@ pub async fn execute(cmd: AdminCommands, output_config: OutputConfig) -> ExitCod
 
     match cmd {
         AdminCommands::Capabilities(args) => capabilities::execute(args, &formatter).await,
+        AdminCommands::Metrics(args) => metrics::execute(args, &formatter).await,
+        AdminCommands::Scanner(scanner_cmd) => scanner::execute(scanner_cmd, &formatter).await,
         AdminCommands::Info(info_cmd) => info::execute(info_cmd, &formatter).await,
         AdminCommands::Heal(heal_cmd) => heal::execute(heal_cmd, &formatter).await,
         AdminCommands::Pool(pool_cmd) => pool::execute(pool_cmd, &formatter).await,
@@ -111,6 +124,79 @@ pub async fn execute(cmd: AdminCommands, output_config: OutputConfig) -> ExitCod
         AdminCommands::Replicate(replicate_cmd) => {
             replicate::execute(replicate_cmd, &formatter).await
         }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct AdminV3ErrorEnvelope<'a> {
+    schema_version: u8,
+    #[serde(rename = "type")]
+    output_type: &'a str,
+    status: &'static str,
+    error: AdminV3Error<'a>,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminV3Error<'a> {
+    #[serde(rename = "type")]
+    error_type: &'static str,
+    message: String,
+    retryable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capability: Option<&'a str>,
+    server: Option<String>,
+    suggestion: Option<&'static str>,
+}
+
+fn emit_observability_error(
+    output_type: &str,
+    capability: &str,
+    context: &str,
+    error: &Error,
+    formatter: &Formatter,
+) -> ExitCode {
+    let code = ExitCode::from_i32(error.exit_code()).unwrap_or(ExitCode::GeneralError);
+    let message = format!("{context}: {error}");
+    if formatter.is_json() {
+        let unsupported = matches!(error, Error::UnsupportedFeature(_));
+        formatter.json_error(&AdminV3ErrorEnvelope {
+            schema_version: 3,
+            output_type,
+            status: "error",
+            error: AdminV3Error {
+                error_type: observability_error_type(error),
+                message,
+                retryable: matches!(error, Error::Network(_)),
+                capability: unsupported.then_some(capability),
+                server: None,
+                suggestion: observability_error_suggestion(error),
+            },
+        });
+    } else {
+        formatter.error_with_code(code, &message);
+    }
+    code
+}
+
+fn observability_error_type(error: &Error) -> &'static str {
+    match error {
+        Error::InvalidPath(_) | Error::Config(_) => "usage_error",
+        Error::Network(_) => "network_error",
+        Error::Auth(_) => "auth_error",
+        Error::NotFound(_) | Error::AliasNotFound(_) => "not_found",
+        Error::Conflict(_) | Error::AliasExists(_) => "conflict",
+        Error::UnsupportedFeature(_) => "unsupported_feature",
+        _ => "general_error",
+    }
+}
+
+fn observability_error_suggestion(error: &Error) -> Option<&'static str> {
+    match error {
+        Error::InvalidPath(_) | Error::Config(_) => Some("Review the command arguments and retry."),
+        Error::Network(_) => Some("Verify the endpoint and network connectivity, then retry."),
+        Error::Auth(_) => Some("Verify credentials and required admin permissions, then retry."),
+        Error::UnsupportedFeature(_) => Some("Upgrade RustFS to beta.10 or later."),
+        _ => None,
     }
 }
 

@@ -157,6 +157,8 @@ fn top_level_command_help_contract() {
             usage: "Usage: rc admin [OPTIONS] <COMMAND>",
             expected_tokens: &[
                 "info",
+                "scanner",
+                "metrics",
                 "heal",
                 "pool",
                 "expand",
@@ -472,6 +474,35 @@ fn nested_subcommand_help_contract() {
             args: &["admin", "info", "disk"],
             usage: "Usage: rc admin info disk [OPTIONS] <ALIAS>",
             expected_tokens: &["--offline", "--healing"],
+        },
+        HelpCase {
+            args: &["admin", "info", "storage"],
+            usage: "Usage: rc admin info storage [OPTIONS] <ALIAS>",
+            expected_tokens: &[],
+        },
+        HelpCase {
+            args: &["admin", "scanner"],
+            usage: "Usage: rc admin scanner [OPTIONS] <COMMAND>",
+            expected_tokens: &["status"],
+        },
+        HelpCase {
+            args: &["admin", "scanner", "status"],
+            usage: "Usage: rc admin scanner status [OPTIONS] <ALIAS>",
+            expected_tokens: &[],
+        },
+        HelpCase {
+            args: &["admin", "metrics"],
+            usage: "Usage: rc admin metrics [OPTIONS] <ALIAS>",
+            expected_tokens: &[
+                "--scope",
+                "--samples",
+                "--interval",
+                "--host",
+                "--disk",
+                "--by-host",
+                "--by-disk",
+                "--metrics-format",
+            ],
         },
         HelpCase {
             args: &["admin", "heal", "status"],

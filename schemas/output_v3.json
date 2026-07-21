@@ -31,6 +31,8 @@
         "watch_event",
         "usage",
         "metrics",
+        "scanner_status",
+        "storage_info",
         "admin_operations"
       ]
     },
@@ -228,7 +230,7 @@
     },
     "metricSample": {
       "type": "object",
-      "required": ["name", "value", "unit", "labels"],
+      "required": ["name", "value", "unit", "labels", "collected_at"],
       "properties": {
         "name": { "type": "string", "minLength": 1 },
         "value": { "type": "number" },
@@ -236,19 +238,59 @@
         "labels": {
           "type": "object",
           "additionalProperties": { "type": "string" }
-        }
+        },
+        "collected_at": { "$ref": "#/definitions/timestamp" }
       }
     },
     "metricsData": {
       "type": "object",
-      "required": ["scope", "collected_at", "samples"],
+      "required": ["scope", "collected_at", "samples", "errors", "partial", "final", "raw"],
       "properties": {
         "scope": { "type": "string", "minLength": 1 },
         "collected_at": { "$ref": "#/definitions/timestamp" },
         "samples": {
           "type": "array",
           "items": { "$ref": "#/definitions/metricSample" }
-        }
+        },
+        "errors": { "type": "array", "items": { "type": "string" } },
+        "partial": { "type": "boolean" },
+        "final": { "type": "boolean" },
+        "raw": { "type": "object" }
+      }
+    },
+    "scannerStatusData": {
+      "type": "object",
+      "required": ["health", "enabled", "disabled_reason", "freshness", "metrics", "cycle_schedule", "runtime_config"],
+      "properties": {
+        "health": { "type": "string", "enum": ["healthy", "stale", "empty", "partial", "disabled"] },
+        "enabled": { "type": "boolean" },
+        "disabled_reason": { "$ref": "#/definitions/nullableString" },
+        "freshness": { "type": "object" },
+        "metrics": { "type": "object" },
+        "cycle_schedule": { "type": "object" },
+        "runtime_config": { "type": "object" }
+      }
+    },
+    "storageSummary": {
+      "type": "object",
+      "required": ["backend", "total_disks", "online_disks", "offline_disks", "total_capacity_bytes", "used_capacity_bytes", "available_capacity_bytes"],
+      "properties": {
+        "backend": { "type": "string" },
+        "total_disks": { "type": "integer", "minimum": 0 },
+        "online_disks": { "type": "integer", "minimum": 0 },
+        "offline_disks": { "type": "integer", "minimum": 0 },
+        "total_capacity_bytes": { "type": "integer", "minimum": 0 },
+        "used_capacity_bytes": { "type": "integer", "minimum": 0 },
+        "available_capacity_bytes": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "storageInfoData": {
+      "type": "object",
+      "required": ["summary", "backend", "disks"],
+      "properties": {
+        "summary": { "$ref": "#/definitions/storageSummary" },
+        "backend": { "type": "object" },
+        "disks": { "type": "array", "items": { "type": "object" } }
       }
     },
     "adminOperation": {
@@ -331,6 +373,28 @@
           "properties": {
             "type": { "const": "capabilities" },
             "data": { "$ref": "#/definitions/capabilitiesData" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/definitions/successEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "scanner_status" },
+            "data": { "$ref": "#/definitions/scannerStatusData" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/definitions/successEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "storage_info" },
+            "data": { "$ref": "#/definitions/storageInfoData" }
           }
         }
       ]
