@@ -61,4 +61,12 @@ When migrating:
 
 Commands adopting version-operation records migrate only their version-aware JSON paths. Legacy JSON remains unchanged for unversioned `stat`, `rm`, and `cp` results where the server reports no version identifiers. Scripts selecting versions must dispatch on `schema_version: 3` and read operation fields under `data`.
 
+## Object Lock records
+
+Bucket Object Lock, object retention, and legal-hold commands always use the v3 `locks` family in JSON mode. `data.operation` distinguishes the command, `data.changed` distinguishes reads from successful mutations, and `data.items` contains deterministic lock state records.
+
+Object retention timestamps are normalized to UTC. A bucket default uses `default_retention.duration.unit` with the explicit value `days` or `years`; consumers must not infer a unit from the numeric value. New command output uses `null` for retention, legal-hold, or default-retention state that the selected operation did not read.
+
+This is an additive v3 extension. Output v1 and v2 require no migration, and the pre-existing v3 lock fields remain valid. Consumers adopting the new commands should dispatch on `schema_version: 3`, then on `type: locks`, and finally on `data.operation`.
+
 The golden fixtures under `crates/cli/tests/fixtures/output_v3/` provide success, empty, and error examples for every v3 family.

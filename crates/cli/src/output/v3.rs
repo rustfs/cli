@@ -5,6 +5,7 @@ use serde::Serialize;
 use crate::exit_code::ExitCode;
 
 const VERSIONED_OBJECTS_FAMILY: &str = "versioned_objects";
+const LOCKS_FAMILY: &str = "locks";
 
 #[derive(Debug, Serialize)]
 pub struct V3SuccessEnvelope<T> {
@@ -20,6 +21,15 @@ impl<T> V3SuccessEnvelope<T> {
         Self {
             schema_version: 3,
             family: VERSIONED_OBJECTS_FAMILY,
+            status: "success",
+            data,
+        }
+    }
+
+    pub fn locks(data: T) -> Self {
+        Self {
+            schema_version: 3,
+            family: LOCKS_FAMILY,
             status: "success",
             data,
         }
@@ -44,6 +54,15 @@ impl V3ErrorEnvelope {
         Self {
             schema_version: 3,
             family: VERSIONED_OBJECTS_FAMILY,
+            status: "error",
+            error: V3ErrorDetail::from_exit_code(code, message.into(), capability),
+        }
+    }
+
+    pub fn locks(code: ExitCode, message: impl Into<String>, capability: Option<&str>) -> Self {
+        Self {
+            schema_version: 3,
+            family: LOCKS_FAMILY,
             status: "error",
             error: V3ErrorDetail::from_exit_code(code, message.into(), capability),
         }
@@ -191,5 +210,23 @@ mod tests {
         assert_eq!(value["status"], "error");
         assert_eq!(value["error"]["type"], "auth_error");
         assert_eq!(value["error"]["retryable"], false);
+    }
+
+    #[test]
+    fn lock_success_and_errors_use_the_locks_family() {
+        let success = serde_json::to_value(V3SuccessEnvelope::locks(
+            serde_json::json!({ "operation": "retention_info" }),
+        ))
+        .expect("serialize lock success envelope");
+        let error = serde_json::to_value(V3ErrorEnvelope::locks(
+            ExitCode::Conflict,
+            "Compliance retention cannot be shortened",
+            Some("object_retention"),
+        ))
+        .expect("serialize lock error envelope");
+
+        assert_eq!(success["type"], "locks");
+        assert_eq!(error["type"], "locks");
+        assert_eq!(error["error"]["type"], "conflict");
     }
 }

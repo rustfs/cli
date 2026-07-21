@@ -14,6 +14,9 @@ use crate::cors::CorsRule;
 use crate::encryption::{BucketEncryption, ObjectEncryptionRequest};
 use crate::error::{Error, Result};
 use crate::lifecycle::LifecycleRule;
+use crate::object_lock::{
+    BucketObjectLockConfiguration, LegalHoldStatus, ObjectLockOptions, ObjectRetention,
+};
 use crate::path::RemotePath;
 use crate::replication::ReplicationConfiguration;
 use crate::select::SelectOptions;
@@ -505,6 +508,75 @@ pub trait ObjectStore: Send + Sync {
 
     /// Set bucket versioning status
     async fn set_versioning(&self, bucket: &str, enabled: bool) -> Result<()>;
+
+    /// Get a bucket's Object Lock configuration.
+    ///
+    /// `None` means the bucket exists but has no Object Lock configuration.
+    async fn get_bucket_object_lock_configuration(
+        &self,
+        _bucket: &str,
+    ) -> Result<Option<BucketObjectLockConfiguration>> {
+        Err(Error::UnsupportedFeature(
+            "Bucket Object Lock configuration is not implemented by this object store".to_string(),
+        ))
+    }
+
+    /// Update an Object Lock enabled bucket's configuration.
+    async fn put_bucket_object_lock_configuration(
+        &self,
+        _bucket: &str,
+        _configuration: BucketObjectLockConfiguration,
+    ) -> Result<()> {
+        Err(Error::UnsupportedFeature(
+            "Bucket Object Lock configuration is not implemented by this object store".to_string(),
+        ))
+    }
+
+    /// Get retention applied to the selected object version.
+    async fn get_object_retention(
+        &self,
+        _path: &RemotePath,
+        _options: &ObjectLockOptions,
+    ) -> Result<Option<ObjectRetention>> {
+        Err(Error::UnsupportedFeature(
+            "Object retention is not implemented by this object store".to_string(),
+        ))
+    }
+
+    /// Set or clear retention on the selected object version.
+    async fn put_object_retention(
+        &self,
+        _path: &RemotePath,
+        _retention: Option<ObjectRetention>,
+        _options: &ObjectLockOptions,
+    ) -> Result<()> {
+        Err(Error::UnsupportedFeature(
+            "Object retention is not implemented by this object store".to_string(),
+        ))
+    }
+
+    /// Get legal-hold status for the selected object version.
+    async fn get_object_legal_hold(
+        &self,
+        _path: &RemotePath,
+        _options: &ObjectLockOptions,
+    ) -> Result<LegalHoldStatus> {
+        Err(Error::UnsupportedFeature(
+            "Object legal hold is not implemented by this object store".to_string(),
+        ))
+    }
+
+    /// Set legal-hold status for the selected object version.
+    async fn put_object_legal_hold(
+        &self,
+        _path: &RemotePath,
+        _status: LegalHoldStatus,
+        _options: &ObjectLockOptions,
+    ) -> Result<()> {
+        Err(Error::UnsupportedFeature(
+            "Object legal hold is not implemented by this object store".to_string(),
+        ))
+    }
 
     /// Get bucket default encryption. Returns None when encryption is not configured.
     async fn get_bucket_encryption(&self, bucket: &str) -> Result<Option<BucketEncryption>>;

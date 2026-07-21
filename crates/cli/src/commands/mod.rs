@@ -27,6 +27,8 @@ mod event;
 mod find;
 mod head;
 mod ilm;
+mod legalhold;
+mod lock;
 mod ls;
 mod mb;
 mod mirror;
@@ -36,6 +38,7 @@ mod pipe;
 mod quota;
 mod rb;
 mod replicate;
+mod retention;
 mod rm;
 mod share;
 mod sql;
@@ -106,7 +109,7 @@ fn parse_request_header(value: &str) -> Result<RequestHeader, String> {
         .eq_ignore_ascii_case("x-amz-bypass-governance-retention")
     {
         return Err(
-            "Use the remove command's explicit --bypass flag for governance retention bypass"
+            "Use the retention or remove command's explicit --bypass flag for governance retention bypass"
                 .to_string(),
         );
     }
@@ -297,11 +300,15 @@ pub enum Commands {
     /// Deprecated: use `rc bucket replication`
     Replicate(replicate::ReplicateArgs),
 
+    /// Manage object retention with mc-compatible command syntax
+    Retention(retention::RetentionArgs),
+
+    /// Manage object legal hold with mc-compatible command syntax
+    Legalhold(legalhold::LegalHoldArgs),
+
     // Phase 6: Utilities
     /// Generate shell completion scripts
     Completions(completions::CompletionsArgs),
-    // /// Manage object retention
-    // Retention(retention::RetentionArgs),
     // /// Watch for object events
     // Watch(watch::WatchArgs),
 }
@@ -459,6 +466,20 @@ pub async fn execute(cli: Cli) -> ExitCode {
         }
         Commands::Replicate(args) => {
             replicate::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
+        Commands::Retention(args) => {
+            retention::execute(
+                args,
+                output_options.resolve(OutputBehavior::StructuredDefault),
+            )
+            .await
+        }
+        Commands::Legalhold(args) => {
+            legalhold::execute(
+                args,
+                output_options.resolve(OutputBehavior::StructuredDefault),
+            )
+            .await
         }
         Commands::Completions(args) => completions::execute(args),
     }

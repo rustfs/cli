@@ -328,6 +328,22 @@
         "retain_until": { "$ref": "#/definitions/timestamp" }
       }
     },
+    "retentionDuration": {
+      "type": "object",
+      "required": ["unit", "value"],
+      "properties": {
+        "unit": { "type": "string", "enum": ["days", "years"] },
+        "value": { "type": "integer", "minimum": 1, "maximum": 2147483647 }
+      }
+    },
+    "defaultRetention": {
+      "type": "object",
+      "required": ["mode", "duration"],
+      "properties": {
+        "mode": { "type": "string", "enum": ["governance", "compliance"] },
+        "duration": { "$ref": "#/definitions/retentionDuration" }
+      }
+    },
     "lockState": {
       "type": "object",
       "required": [
@@ -340,13 +356,28 @@
         "version_id": { "$ref": "#/definitions/nullableString" },
         "object_lock_enabled": { "type": "boolean" },
         "retention": { "$ref": "#/definitions/retention" },
-        "legal_hold": { "type": ["boolean", "null"] }
+        "legal_hold": { "type": ["boolean", "null"] },
+        "default_retention": {
+          "oneOf": [
+            { "$ref": "#/definitions/defaultRetention" },
+            { "type": "null" }
+          ]
+        }
       }
     },
     "locksData": {
       "type": "object",
       "required": ["items"],
       "properties": {
+        "operation": {
+          "type": "string",
+          "enum": [
+            "bucket_lock_info", "bucket_lock_set", "bucket_lock_clear",
+            "retention_info", "retention_set", "retention_clear",
+            "legal_hold_info", "legal_hold_set", "legal_hold_clear"
+          ]
+        },
+        "changed": { "type": "boolean" },
         "items": {
           "type": "array",
           "items": { "$ref": "#/definitions/lockState" }

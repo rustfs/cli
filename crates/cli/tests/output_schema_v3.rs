@@ -186,6 +186,38 @@ fn version_dry_run_contract_distinguishes_planned_from_removed_items() {
 }
 
 #[test]
+fn locks_contract_types_bucket_defaults_and_mutation_metadata() {
+    let validator = load_validator(3);
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/output_v3/locks/bucket.json");
+    let fixture = load_json(&path);
+
+    assert_valid(&validator, &fixture, "bucket Object Lock fixture");
+    assert_eq!(fixture["data"]["operation"], "bucket_lock_info");
+    assert_eq!(fixture["data"]["changed"], false);
+    assert_eq!(
+        fixture["data"]["items"][0]["default_retention"]["duration"]["unit"],
+        "days"
+    );
+
+    let mut invalid = fixture.clone();
+    invalid["data"]["items"][0]["default_retention"]["duration"]["unit"] =
+        Value::String("months".to_string());
+    assert!(
+        !validator.is_valid(&invalid),
+        "bucket default retention must use an unambiguous day or year unit"
+    );
+
+    let mut overflowing = fixture;
+    overflowing["data"]["items"][0]["default_retention"]["duration"]["value"] =
+        serde_json::json!(2_147_483_648_i64);
+    assert!(
+        !validator.is_valid(&overflowing),
+        "bucket default retention must fit the S3 signed 32-bit field"
+    );
+}
+
+#[test]
 fn legacy_schemas_compile_and_existing_v1_golden_snapshots_remain_valid() {
     let v1_validator = load_validator(1);
     // Compiling v2 guards its existing references even though this repository does not yet

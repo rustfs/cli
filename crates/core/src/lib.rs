@@ -16,6 +16,7 @@ pub mod cors;
 pub mod encryption;
 pub mod error;
 pub mod lifecycle;
+pub mod object_lock;
 pub mod path;
 pub mod replication;
 pub mod retry;
@@ -33,6 +34,10 @@ pub use error::{Error, Result};
 pub use lifecycle::{
     LifecycleConfiguration, LifecycleExpiration, LifecycleRule, LifecycleRuleStatus,
     LifecycleTransition, NoncurrentVersionExpiration, NoncurrentVersionTransition,
+};
+pub use object_lock::{
+    BucketObjectLockConfiguration, DefaultRetention, LegalHoldStatus, ObjectLockOptions,
+    ObjectRetention, RetentionDuration, RetentionDurationUnit, RetentionMode,
 };
 pub use path::{ParsedPath, RemotePath, parse_object_path, parse_path};
 pub use replication::{

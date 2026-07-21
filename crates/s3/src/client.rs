@@ -29,12 +29,13 @@ use jiff::Timestamp;
 use quick_xml::de::from_str as from_xml_str;
 pub use rc_core::DeleteRequestOptions;
 use rc_core::{
-    Alias, BucketEncryption, BucketNotification, Capabilities, CorsRule, DeleteObjectFailure,
-    DeleteObjectsResult, DeletedObject, Error, LifecycleRule, ListObjectVersionsOptions,
-    ListOptions, ListResult, NotificationTarget, ObjectEncryptionRequest, ObjectInfo,
-    ObjectReadOptions, ObjectStore, ObjectVersion, ObjectVersionIdentifier,
-    ObjectVersionListResult, RemotePath, ReplicationConfiguration, RequestHeader, Result,
-    SelectOptions, global_request_headers,
+    Alias, BucketEncryption, BucketNotification, BucketObjectLockConfiguration, Capabilities,
+    CorsRule, DefaultRetention, DeleteObjectFailure, DeleteObjectsResult, DeletedObject, Error,
+    LegalHoldStatus, LifecycleRule, ListObjectVersionsOptions, ListOptions, ListResult,
+    NotificationTarget, ObjectEncryptionRequest, ObjectInfo, ObjectLockOptions, ObjectReadOptions,
+    ObjectRetention, ObjectStore, ObjectVersion, ObjectVersionIdentifier, ObjectVersionListResult,
+    RemotePath, ReplicationConfiguration, RequestHeader, Result, RetentionDuration,
+    RetentionDurationUnit, RetentionMode, SelectOptions, global_request_headers,
 };
 use reqwest::Method;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
@@ -524,6 +525,143 @@ fn apply_object_encryption_to_copy_request(
             .ssekms_key_id(key_id),
         None => request,
     }
+}
+
+fn sdk_retention_mode(mode: RetentionMode) -> aws_sdk_s3::types::ObjectLockRetentionMode {
+    match mode {
+        RetentionMode::Governance => aws_sdk_s3::types::ObjectLockRetentionMode::Governance,
+        RetentionMode::Compliance => aws_sdk_s3::types::ObjectLockRetentionMode::Compliance,
+    }
+}
+
+fn core_retention_mode(mode: &aws_sdk_s3::types::ObjectLockRetentionMode) -> Result<RetentionMode> {
+    match mode.as_str() {
+        "GOVERNANCE" => Ok(RetentionMode::Governance),
+        "COMPLIANCE" => Ok(RetentionMode::Compliance),
+        value => Err(Error::General(format!(
+            "Unsupported Object Lock retention mode '{value}'"
+        ))),
+    }
+}
+
+fn sdk_default_retention(default: DefaultRetention) -> Result<aws_sdk_s3::types::DefaultRetention> {
+    if default.duration.value <= 0 {
+        return Err(Error::InvalidPath(
+            "Retention duration must be a positive number of days or years".to_string(),
+        ));
+    }
+    let builder =
+        aws_sdk_s3::types::DefaultRetention::builder().mode(sdk_retention_mode(default.mode));
+    Ok(match default.duration.unit {
+        RetentionDurationUnit::Days => builder.days(default.duration.value).build(),
+        RetentionDurationUnit::Years => builder.years(default.duration.value).build(),
+    })
+}
+
+fn core_retention_duration(
+    retention: &aws_sdk_s3::types::DefaultRetention,
+) -> Result<RetentionDuration> {
+    match (retention.days(), retention.years()) {
+        (Some(days), None) => RetentionDuration::days(days).map_err(|_| {
+            Error::General(format!(
+                "Bucket Object Lock configuration contains an invalid Days value: {days}"
+            ))
+        }),
+        (None, Some(years)) => RetentionDuration::years(years).map_err(|_| {
+            Error::General(format!(
+                "Bucket Object Lock configuration contains an invalid Years value: {years}"
+            ))
+        }),
+        (Some(_), Some(_)) => Err(Error::General(
+            "Bucket Object Lock configuration contains both Days and Years".to_string(),
+        )),
+        (None, None) => Err(Error::General(
+            "Bucket Object Lock configuration is missing its retention duration".to_string(),
+        )),
+    }
+}
+
+fn sdk_timestamp(timestamp: Timestamp) -> Result<aws_smithy_types::DateTime> {
+    let nanoseconds = u32::try_from(timestamp.subsec_nanosecond()).map_err(|error| {
+        Error::General(format!(
+            "Object retention timestamp has invalid nanoseconds: {error}"
+        ))
+    })?;
+    Ok(aws_smithy_types::DateTime::from_secs_and_nanos(
+        timestamp.as_second(),
+        nanoseconds,
+    ))
+}
+
+fn core_timestamp(timestamp: &aws_smithy_types::DateTime) -> Result<Timestamp> {
+    let nanoseconds = i32::try_from(timestamp.subsec_nanos()).map_err(|error| {
+        Error::General(format!(
+            "Object retention timestamp has invalid nanoseconds: {error}"
+        ))
+    })?;
+    Timestamp::new(timestamp.secs(), nanoseconds).map_err(|error| {
+        Error::General(format!(
+            "Object retention timestamp is outside the supported range: {error}"
+        ))
+    })
+}
+
+fn sdk_bucket_lock_configuration(
+    configuration: BucketObjectLockConfiguration,
+) -> Result<aws_sdk_s3::types::ObjectLockConfiguration> {
+    if !configuration.enabled {
+        return Err(Error::InvalidPath(
+            "Object Lock cannot be disabled after it has been enabled".to_string(),
+        ));
+    }
+
+    let mut builder = aws_sdk_s3::types::ObjectLockConfiguration::builder()
+        .object_lock_enabled(aws_sdk_s3::types::ObjectLockEnabled::Enabled);
+    if let Some(default) = configuration.default_retention {
+        let retention = sdk_default_retention(default)?;
+        let rule = aws_sdk_s3::types::ObjectLockRule::builder()
+            .default_retention(retention)
+            .build();
+        builder = builder.rule(rule);
+    }
+    Ok(builder.build())
+}
+
+fn core_bucket_lock_configuration(
+    configuration: &aws_sdk_s3::types::ObjectLockConfiguration,
+) -> Result<BucketObjectLockConfiguration> {
+    let enabled = match configuration
+        .object_lock_enabled()
+        .map(|value| value.as_str())
+    {
+        Some("Enabled") => true,
+        None => false,
+        Some(value) => {
+            return Err(Error::General(format!(
+                "Unsupported bucket Object Lock enabled state '{value}'"
+            )));
+        }
+    };
+    let default_retention = configuration
+        .rule()
+        .and_then(|rule| rule.default_retention())
+        .map(|retention| -> Result<DefaultRetention> {
+            let mode = retention.mode().ok_or_else(|| {
+                Error::General(
+                    "Bucket Object Lock configuration is missing its retention mode".to_string(),
+                )
+            })?;
+            Ok(DefaultRetention {
+                mode: core_retention_mode(mode)?,
+                duration: core_retention_duration(retention)?,
+            })
+        })
+        .transpose()?;
+
+    Ok(BucketObjectLockConfiguration {
+        enabled,
+        default_retention,
+    })
 }
 
 fn core_cors_rule_to_sdk(rule: &CorsRule) -> Result<aws_sdk_s3::types::CorsRule> {
@@ -1697,6 +1835,171 @@ impl S3Client {
         Error::Network(formatted)
     }
 
+    fn map_bucket_object_lock_error<E>(
+        error: &aws_sdk_s3::error::SdkError<E>,
+        bucket: &str,
+    ) -> Error
+    where
+        E: ProvideErrorMetadata + std::fmt::Display,
+    {
+        let formatted = Self::format_sdk_error(error);
+        if let aws_sdk_s3::error::SdkError::ServiceError(service_error) = error {
+            let raw = service_error.raw();
+            let code = service_error.err().code().or_else(|| {
+                raw.headers()
+                    .get("x-amz-error-code")
+                    .and_then(|value| std::str::from_utf8(value.as_bytes()).ok())
+            });
+            let status = raw.status().as_u16();
+            if status == 501 || matches!(code, Some("NotImplemented")) {
+                return Error::UnsupportedFeature(
+                    "The S3 endpoint does not support bucket Object Lock configuration".to_string(),
+                );
+            }
+            if status == 401
+                || status == 403
+                || matches!(
+                    code,
+                    Some("Unauthorized") | Some("AccessDenied") | Some("Forbidden")
+                )
+            {
+                return Error::Auth(formatted);
+            }
+            if status == 404 || matches!(code, Some("NoSuchBucket")) {
+                return Error::NotFound(format!("Bucket not found: {bucket}"));
+            }
+            if matches!(code, Some("InvalidRequest") | Some("InvalidBucketState")) {
+                return Error::Conflict(formatted);
+            }
+        }
+
+        if formatted.contains("NotImplemented") {
+            Error::UnsupportedFeature(
+                "The S3 endpoint does not support bucket Object Lock configuration".to_string(),
+            )
+        } else {
+            Error::Network(formatted)
+        }
+    }
+
+    fn redact_sensitive_error(&self, error: Error) -> Error {
+        match error {
+            Error::Config(message) => Error::Config(self.redact_sensitive_text(message)),
+            Error::InvalidPath(message) => Error::InvalidPath(self.redact_sensitive_text(message)),
+            Error::AliasNotFound(message) => {
+                Error::AliasNotFound(self.redact_sensitive_text(message))
+            }
+            Error::AliasExists(message) => Error::AliasExists(self.redact_sensitive_text(message)),
+            Error::Auth(message) => Error::Auth(self.redact_sensitive_text(message)),
+            Error::VersionNotFound { path, version_id } => Error::VersionNotFound {
+                path: self.redact_sensitive_text(path),
+                version_id: self.redact_sensitive_text(version_id),
+            },
+            Error::DeleteMarker { path, version_id } => Error::DeleteMarker {
+                path: self.redact_sensitive_text(path),
+                version_id: self.redact_sensitive_text(version_id),
+            },
+            Error::GovernanceDenied { path, version_id } => Error::GovernanceDenied {
+                path: self.redact_sensitive_text(path),
+                version_id: version_id.map(|value| self.redact_sensitive_text(value)),
+            },
+            Error::Network(message) => Error::Network(self.redact_sensitive_text(message)),
+            Error::Conflict(message) => Error::Conflict(self.redact_sensitive_text(message)),
+            Error::UnsupportedFeature(message) => {
+                Error::UnsupportedFeature(self.redact_sensitive_text(message))
+            }
+            Error::General(message) => Error::General(self.redact_sensitive_text(message)),
+            Error::NotFound(message) => Error::NotFound(self.redact_sensitive_text(message)),
+            other => other,
+        }
+    }
+
+    fn redact_object_lock_service_error<E>(
+        &self,
+        sdk_error: &aws_sdk_s3::error::SdkError<E>,
+        error: Error,
+    ) -> Error
+    where
+        E: ProvideErrorMetadata + std::fmt::Display,
+    {
+        let (code, status, detail) = match sdk_error {
+            aws_sdk_s3::error::SdkError::ServiceError(service_error) => {
+                let raw = service_error.raw();
+                let code = service_error.err().code().or_else(|| {
+                    raw.headers()
+                        .get("x-amz-error-code")
+                        .and_then(|value| std::str::from_utf8(value.as_bytes()).ok())
+                });
+                (
+                    code.map(str::to_string),
+                    Some(raw.status().as_u16()),
+                    service_error.err().message().map(str::to_string),
+                )
+            }
+            _ => (None, None, None),
+        };
+        let error = if status == Some(501) || code.as_deref() == Some("NotImplemented") {
+            match error {
+                existing @ Error::UnsupportedFeature(_) => existing,
+                _ => Error::UnsupportedFeature(
+                    "The S3 endpoint does not support this Object Lock operation".to_string(),
+                ),
+            }
+        } else if matches!(
+            code.as_deref(),
+            Some("InvalidRequest") | Some("InvalidBucketState")
+        ) {
+            match error {
+                Error::Network(message) => Error::Conflict(message),
+                Error::GovernanceDenied { .. } => {
+                    Error::Conflict("The server rejected the Object Lock request".to_string())
+                }
+                other => other,
+            }
+        } else {
+            error
+        };
+        let error = match detail.as_deref().filter(|detail| !detail.is_empty()) {
+            Some(detail) => match error {
+                Error::Auth(message) => Error::Auth(Self::append_service_detail(message, detail)),
+                Error::Network(message) => {
+                    Error::Network(Self::append_service_detail(message, detail))
+                }
+                Error::Conflict(message) => {
+                    Error::Conflict(Self::append_service_detail(message, detail))
+                }
+                Error::General(message) => {
+                    Error::General(Self::append_service_detail(message, detail))
+                }
+                other => other,
+            },
+            None => error,
+        };
+        self.redact_sensitive_error(error)
+    }
+
+    fn append_service_detail(message: String, detail: &str) -> String {
+        if message.contains(detail) {
+            message
+        } else {
+            format!("{message}: {detail}")
+        }
+    }
+
+    fn redact_sensitive_text(&self, mut message: String) -> String {
+        for header in &self.request_headers {
+            if !header.value.is_empty() {
+                message = message.replace(&header.value, "[REDACTED]");
+            }
+        }
+        for value in [&self.alias.access_key, &self.alias.secret_key] {
+            if !value.is_empty() {
+                message = message.replace(value, "[REDACTED]");
+            }
+        }
+        message
+    }
+
     fn is_retention_denial(message: &str) -> bool {
         let normalized = message.to_ascii_lowercase();
         normalized.contains("governance")
@@ -2611,7 +2914,7 @@ impl ObjectStore for S3Client {
         // because `rc sql` determines support from the real request result.
         Ok(Capabilities {
             versioning: true,
-            object_lock: false,
+            object_lock: true,
             tagging: true,
             anonymous: true,
             select: false,
@@ -2836,6 +3139,209 @@ impl ObjectStore for S3Client {
             .await
             .map_err(|e| Error::General(format!("set_versioning: {e}")))?;
 
+        Ok(())
+    }
+
+    async fn get_bucket_object_lock_configuration(
+        &self,
+        bucket: &str,
+    ) -> Result<Option<BucketObjectLockConfiguration>> {
+        let response = match self
+            .inner
+            .get_object_lock_configuration()
+            .bucket(bucket)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                if let aws_sdk_s3::error::SdkError::ServiceError(service_error) = &error {
+                    let raw = service_error.raw();
+                    let code = service_error.err().code().or_else(|| {
+                        raw.headers()
+                            .get("x-amz-error-code")
+                            .and_then(|value| std::str::from_utf8(value.as_bytes()).ok())
+                    });
+                    if raw.status().as_u16() == 404
+                        && matches!(
+                            code,
+                            Some("ObjectLockConfigurationNotFoundError")
+                                | Some("NoSuchObjectLockConfiguration")
+                        )
+                    {
+                        return Ok(None);
+                    }
+                }
+                return Err(self.redact_object_lock_service_error(
+                    &error,
+                    Self::map_bucket_object_lock_error(&error, bucket),
+                ));
+            }
+        };
+
+        response
+            .object_lock_configuration()
+            .map(core_bucket_lock_configuration)
+            .transpose()
+            .map_err(|error| self.redact_sensitive_error(error))
+    }
+
+    async fn put_bucket_object_lock_configuration(
+        &self,
+        bucket: &str,
+        configuration: BucketObjectLockConfiguration,
+    ) -> Result<()> {
+        let configuration = sdk_bucket_lock_configuration(configuration)?;
+        self.inner
+            .put_object_lock_configuration()
+            .bucket(bucket)
+            .object_lock_configuration(configuration)
+            .send()
+            .await
+            .map_err(|error| {
+                self.redact_object_lock_service_error(
+                    &error,
+                    Self::map_bucket_object_lock_error(&error, bucket),
+                )
+            })?;
+        Ok(())
+    }
+
+    async fn get_object_retention(
+        &self,
+        path: &RemotePath,
+        options: &ObjectLockOptions,
+    ) -> Result<Option<ObjectRetention>> {
+        let mut request = self
+            .inner
+            .get_object_retention()
+            .bucket(&path.bucket)
+            .key(&path.key);
+        if let Some(version_id) = &options.version_id {
+            request = request.version_id(version_id);
+        }
+        let response = request.send().await.map_err(|error| {
+            self.redact_object_lock_service_error(
+                &error,
+                Self::map_object_request_error(&error, path, options.version_id.as_deref()),
+            )
+        })?;
+        let Some(retention) = response.retention() else {
+            return Ok(None);
+        };
+        let mode = retention.mode().filter(|mode| !mode.as_str().is_empty());
+        let retain_until = retention.retain_until_date();
+        let result = match (mode, retain_until) {
+            (None, None) => Ok(None),
+            (Some(mode), Some(retain_until)) => core_retention_mode(mode).and_then(|mode| {
+                core_timestamp(retain_until)
+                    .map(|retain_until| Some(ObjectRetention { mode, retain_until }))
+            }),
+            _ => Err(Error::General(
+                "Object retention response must contain both Mode and RetainUntilDate".to_string(),
+            )),
+        };
+        result.map_err(|error| self.redact_sensitive_error(error))
+    }
+
+    async fn put_object_retention(
+        &self,
+        path: &RemotePath,
+        retention: Option<ObjectRetention>,
+        options: &ObjectLockOptions,
+    ) -> Result<()> {
+        let retention = match retention {
+            Some(retention) => aws_sdk_s3::types::ObjectLockRetention::builder()
+                .mode(sdk_retention_mode(retention.mode))
+                .retain_until_date(sdk_timestamp(retention.retain_until)?)
+                .build(),
+            None => aws_sdk_s3::types::ObjectLockRetention::builder().build(),
+        };
+        let mut request = self
+            .inner
+            .put_object_retention()
+            .bucket(&path.bucket)
+            .key(&path.key)
+            .retention(retention);
+        if let Some(version_id) = &options.version_id {
+            request = request.version_id(version_id);
+        }
+        if options.bypass_governance {
+            request = request.bypass_governance_retention(true);
+        }
+        request.send().await.map_err(|error| {
+            self.redact_object_lock_service_error(
+                &error,
+                Self::map_object_request_error(&error, path, options.version_id.as_deref()),
+            )
+        })?;
+        Ok(())
+    }
+
+    async fn get_object_legal_hold(
+        &self,
+        path: &RemotePath,
+        options: &ObjectLockOptions,
+    ) -> Result<LegalHoldStatus> {
+        let mut request = self
+            .inner
+            .get_object_legal_hold()
+            .bucket(&path.bucket)
+            .key(&path.key);
+        if let Some(version_id) = &options.version_id {
+            request = request.version_id(version_id);
+        }
+        let response = request.send().await.map_err(|error| {
+            self.redact_object_lock_service_error(
+                &error,
+                Self::map_object_request_error(&error, path, options.version_id.as_deref()),
+            )
+        })?;
+        let status = response
+            .legal_hold()
+            .and_then(|legal_hold| legal_hold.status())
+            .map(|status| status.as_str());
+        let result = match status {
+            Some("ON") => Ok(LegalHoldStatus::On),
+            Some("OFF") => Ok(LegalHoldStatus::Off),
+            Some(value) => Err(Error::General(format!(
+                "Unsupported object legal-hold status '{value}'"
+            ))),
+            None => Err(Error::General(
+                "Object legal-hold response is missing its status".to_string(),
+            )),
+        };
+        result.map_err(|error| self.redact_sensitive_error(error))
+    }
+
+    async fn put_object_legal_hold(
+        &self,
+        path: &RemotePath,
+        status: LegalHoldStatus,
+        options: &ObjectLockOptions,
+    ) -> Result<()> {
+        let sdk_status = match status {
+            LegalHoldStatus::On => aws_sdk_s3::types::ObjectLockLegalHoldStatus::On,
+            LegalHoldStatus::Off => aws_sdk_s3::types::ObjectLockLegalHoldStatus::Off,
+        };
+        let legal_hold = aws_sdk_s3::types::ObjectLockLegalHold::builder()
+            .status(sdk_status)
+            .build();
+        let mut request = self
+            .inner
+            .put_object_legal_hold()
+            .bucket(&path.bucket)
+            .key(&path.key)
+            .legal_hold(legal_hold);
+        if let Some(version_id) = &options.version_id {
+            request = request.version_id(version_id);
+        }
+        request.send().await.map_err(|error| {
+            self.redact_object_lock_service_error(
+                &error,
+                Self::map_object_request_error(&error, path, options.version_id.as_deref()),
+            )
+        })?;
         Ok(())
     }
 
