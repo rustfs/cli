@@ -144,8 +144,11 @@ rc admin policy attach local/ readonly --user newuser
 # Create a service account (access_key + secret_key)
 rc admin service-account create local/ AKIAIOSFODNN7EXAMPLE wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
 
-# Create a service account with inline policy file
+# Create a service account with a policy file
 rc admin service-account create local/ SAKEY123 SASECRET123 --policy ./service-account-policy.json
+
+# Create a service account with inline policy JSON
+rc admin service-account create local/ SAKEY123 SASECRET123 --policy-json '{"Version":"2012-10-17","Statement":[]}'
 
 # Update selected fields on an existing service account
 rc admin service-account update local/ SAKEY123 --policy ./service-account-policy.json --description "Automation access"

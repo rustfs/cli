@@ -66,8 +66,12 @@ pub struct CreateArgs {
     pub description: Option<String>,
 
     /// Optional policy document (JSON file path)
-    #[arg(long)]
+    #[arg(long, conflicts_with = "policy_json")]
     pub policy: Option<String>,
+
+    /// Optional inline policy document (JSON string)
+    #[arg(long, conflicts_with = "policy")]
+    pub policy_json: Option<String>,
 
     /// Optional expiration time (ISO 8601 format)
     #[arg(long)]
@@ -95,8 +99,12 @@ pub struct UpdateArgs {
     pub description: Option<String>,
 
     /// Replacement policy document (JSON file path)
-    #[arg(long)]
+    #[arg(long, conflicts_with = "policy_json")]
     pub policy: Option<String>,
+
+    /// Replacement inline policy document (JSON string)
+    #[arg(long, conflicts_with = "policy")]
+    pub policy_json: Option<String>,
 
     /// Replacement expiration time (ISO 8601 format)
     #[arg(long)]
@@ -226,25 +234,17 @@ async fn execute_list(args: ListArgs, formatter: &Formatter) -> ExitCode {
 }
 
 async fn execute_create(args: CreateArgs, formatter: &Formatter) -> ExitCode {
+    let policy = match resolve_policy_input(args.policy.as_deref(), args.policy_json.as_deref()) {
+        Ok(policy) => policy,
+        Err(error) => {
+            formatter.error(&error);
+            return ExitCode::UsageError;
+        }
+    };
+
     let client = match get_admin_client(&args.alias, formatter) {
         Ok(c) => c,
         Err(code) => return code,
-    };
-
-    // Read policy if provided
-    let policy = if let Some(policy_path) = &args.policy {
-        match std::fs::read_to_string(policy_path) {
-            Ok(content) => Some(content),
-            Err(e) => {
-                formatter.error(&format!(
-                    "Failed to read policy file '{}': {e}",
-                    policy_path
-                ));
-                return ExitCode::UsageError;
-            }
-        }
-    } else {
-        None
     };
 
     let request = build_create_service_account_request(&args, policy);
@@ -313,19 +313,12 @@ fn should_retry_with_default_expiry(args: &CreateArgs, error: &rc_core::Error) -
 }
 
 async fn execute_update(args: UpdateArgs, formatter: &Formatter) -> ExitCode {
-    let policy = if let Some(policy_path) = &args.policy {
-        match std::fs::read_to_string(policy_path) {
-            Ok(content) => Some(content),
-            Err(e) => {
-                formatter.error(&format!(
-                    "Failed to read policy file '{}': {e}",
-                    policy_path
-                ));
-                return ExitCode::UsageError;
-            }
+    let policy = match resolve_policy_input(args.policy.as_deref(), args.policy_json.as_deref()) {
+        Ok(policy) => policy,
+        Err(error) => {
+            formatter.error(&error);
+            return ExitCode::UsageError;
         }
-    } else {
-        None
     };
 
     let request = build_update_service_account_request(&args, policy);
@@ -367,6 +360,27 @@ async fn execute_update(args: UpdateArgs, formatter: &Formatter) -> ExitCode {
             formatter.error(&format!("Failed to update service account: {e}"));
             ExitCode::GeneralError
         }
+    }
+}
+
+fn resolve_policy_input(
+    policy_path: Option<&str>,
+    policy_json: Option<&str>,
+) -> Result<Option<String>, String> {
+    match (policy_path, policy_json) {
+        (Some(_), Some(_)) => Err("--policy and --policy-json cannot be used together".to_string()),
+        (Some(path), None) => std::fs::read_to_string(path)
+            .map(Some)
+            .map_err(|error| format!("Failed to read policy file '{path}': {error}")),
+        (None, Some(policy)) => {
+            let value: serde_json::Value = serde_json::from_str(policy)
+                .map_err(|error| format!("Policy JSON is not valid JSON: {error}"))?;
+            if !value.is_object() {
+                return Err("Policy JSON must be a JSON object".to_string());
+            }
+            Ok(Some(policy.to_string()))
+        }
+        (None, None) => Ok(None),
     }
 }
 
@@ -496,6 +510,7 @@ mod tests {
             name: None,
             description: None,
             policy: None,
+            policy_json: None,
             expiry: None,
         };
 
@@ -513,6 +528,7 @@ mod tests {
             name: Some("manual-name".to_string()),
             description: Some("demo".to_string()),
             policy: None,
+            policy_json: None,
             expiry: Some("2030-01-01T00:00:00Z".to_string()),
         };
 
@@ -524,6 +540,22 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_policy_input_accepts_inline_json_object() {
+        let policy = r#"{"Version":"2012-10-17","Statement":[]}"#;
+        let resolved = resolve_policy_input(None, Some(policy)).expect("resolve inline policy");
+
+        assert_eq!(resolved.as_deref(), Some(policy));
+    }
+
+    #[test]
+    fn test_resolve_policy_input_rejects_non_object_json() {
+        let error = resolve_policy_input(None, Some(r#"["s3:GetObject"]"#))
+            .expect_err("policy must be a JSON object");
+
+        assert_eq!(error, "Policy JSON must be a JSON object");
+    }
+
+    #[test]
     fn test_build_update_request_keeps_only_explicit_fields() {
         let args = UpdateArgs {
             alias: "local".to_string(),
@@ -532,6 +564,7 @@ mod tests {
             name: Some("automation-key".to_string()),
             description: Some("Updated description".to_string()),
             policy: Some("policy.json".to_string()),
+            policy_json: None,
             expiry: None,
             status: Some("enabled".to_string()),
         };
@@ -564,6 +597,7 @@ mod tests {
             name: None,
             description: None,
             policy: None,
+            policy_json: None,
             expiry: None,
             status: None,
         };
@@ -581,6 +615,7 @@ mod tests {
             name: None,
             description: None,
             policy: None,
+            policy_json: None,
             expiry: None,
         };
         let error = rc_core::Error::InvalidPath("missing field `expiration`".to_string());
@@ -596,6 +631,7 @@ mod tests {
             name: None,
             description: None,
             policy: None,
+            policy_json: None,
             expiry: Some("2030-01-01T00:00:00Z".to_string()),
         };
         let error = rc_core::Error::InvalidPath("missing field `expiration`".to_string());

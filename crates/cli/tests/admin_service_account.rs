@@ -9,6 +9,66 @@ use std::time::Duration;
 use admin_support::{rc_binary, rc_host_alias, start_admin_test_server};
 
 #[test]
+fn service_account_create_accepts_inline_policy_json() {
+    let config_dir = tempfile::tempdir().expect("create config dir");
+    let (endpoint, receiver, handle) = start_admin_test_server(
+        r#"{"credentials":{"accessKey":"service-key","secretKey":"service-secret"}}"#,
+    );
+    let policy = r#"{"Version":"2012-10-17","Statement":[]}"#;
+
+    let output = Command::new(rc_binary())
+        .args([
+            "--json",
+            "admin",
+            "service-account",
+            "create",
+            "myalias",
+            "service-key",
+            "service-secret",
+            "--policy-json",
+            policy,
+        ])
+        .env("RC_CONFIG_DIR", config_dir.path())
+        .env("RC_HOST_myalias", rc_host_alias(&endpoint))
+        .output()
+        .expect("run rc command");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let request = receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("captured admin request");
+    assert_eq!(request.method, "PUT");
+    assert_eq!(request.target, "/rustfs/admin/v3/add-service-accounts");
+    handle.join().expect("admin test server finished");
+}
+
+#[test]
+fn service_account_create_rejects_invalid_inline_policy_json() {
+    let config_dir = tempfile::tempdir().expect("create config dir");
+    let output = Command::new(rc_binary())
+        .args([
+            "admin",
+            "service-account",
+            "create",
+            "myalias",
+            "service-key",
+            "service-secret",
+            "--policy-json",
+            "{not-json}",
+        ])
+        .env("RC_CONFIG_DIR", config_dir.path())
+        .output()
+        .expect("run rc command");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Policy JSON is not valid JSON"));
+}
+
+#[test]
 fn service_account_update_dispatches_to_update_endpoint() {
     let config_dir = tempfile::tempdir().expect("create config dir");
     let policy_dir = tempfile::tempdir().expect("create policy dir");
