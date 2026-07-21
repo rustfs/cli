@@ -14,6 +14,11 @@ rc admin info <cluster|server|disk|storage> <ALIAS> [OPTIONS]
 rc admin scanner status <ALIAS>
 rc admin metrics <ALIAS> [OPTIONS]
 rc admin kms status <ALIAS>
+rc admin kms configure <ALIAS> <--config-file PATH|--stdin>
+rc admin kms reconfigure <ALIAS> <--config-file PATH|--stdin>
+rc admin kms start <ALIAS>
+rc admin kms restart <ALIAS> --yes
+rc admin kms stop <ALIAS> --yes
 rc admin kms key list <ALIAS> [--limit N] [--marker TOKEN]
 rc admin kms key status <ALIAS> [KEY_ID]
 rc admin kms key create <ALIAS> [--name NAME] [--description TEXT] [--tag KEY=VALUE]...
@@ -83,6 +88,8 @@ Inspect KMS state and manage a key lifecycle:
 rc admin kms status local
 rc admin kms key list local --limit 100
 rc admin kms key status local
+rc admin kms configure local --config-file /secure/kms.json
+rc admin kms start local
 rc admin kms key create local --name archive --description "Archive key" --tag environment=prod
 rc admin kms key delete local <KEY_ID> --pending-window-days 7 --yes
 rc admin kms key cancel-deletion local <KEY_ID>
@@ -213,6 +220,11 @@ The KMS commands target the native RustFS beta.10 Admin API. They do not impleme
 | Command | Description |
 | --- | --- |
 | `rc admin kms status <ALIAS>` | Show `not-configured`, `configured`, `running`, `error`, or `unknown` service state plus a non-secret configuration summary. |
+| `rc admin kms configure <ALIAS> <--config-file PATH\|--stdin>` | Validate and install an initial Local, Vault KV2, or Vault Transit JSON configuration. |
+| `rc admin kms reconfigure <ALIAS> <--config-file PATH\|--stdin>` | Replace configuration through RustFS's native stop, reconfigure, persist, and restart workflow. |
+| `rc admin kms start <ALIAS>` | Start a configured KMS service. |
+| `rc admin kms restart <ALIAS> --yes` | Force a KMS service restart after explicit confirmation. |
+| `rc admin kms stop <ALIAS> --yes` | Stop KMS after explicit confirmation. |
 | `rc admin kms key list <ALIAS> [--limit N] [--marker TOKEN]` | List native RustFS KMS keys with pagination. The limit range is `1..=1000`. |
 | `rc admin kms key status <ALIAS> [KEY_ID]` | Show key metadata and lifecycle state. When `KEY_ID` is omitted, use the configured default key ID. |
 | `rc admin kms key create <ALIAS> [--name NAME] [--description TEXT] [--tag KEY=VALUE]...` | Create a key. Names are sent through RustFS's reserved `name` tag. Tags reject malformed, duplicate, reserved-name, and control-character input. |
@@ -225,6 +237,12 @@ An unconfigured KMS service is a successful status result with `state=not-config
 Human output includes service state, backend family, health, default key ID, cache state, and key metadata. JSON output uses the v3 `kms` family. Configuration responses are normalized instead of passed through: Vault tokens, AppRole secret IDs, local master keys, plaintext data keys, and ciphertext blobs are never part of the KMS inspection output.
 
 Mutation responses use `key_create`, `key_delete`, and `key_cancel_deletion` operations in the v3 `kms` family. Server error messages are classified into stable permission, missing-key, conflict, unavailable, rejected-request, and malformed-response failures without echoing response bodies. Create and cancellation results deserialize only lifecycle metadata; unknown key-material fields are ignored. These commands do not configure, start, or stop the KMS service and never request or export data keys.
+
+Configuration is never accepted through field-specific command-line flags or positional JSON. Use exactly one of `--config-file PATH` or `--stdin`. Input is limited to 1 MiB and must match one strict `backend_type` request shape: `Local`, `VaultKV2`, or `VaultTransit`. Unknown fields, missing required fields, invalid URLs, relative Local key directories, zero timeout/retry/cache values, insecure production Vault transport, and unsafe Local key-file modes are rejected locally before network access. Vault addresses cannot contain URL credentials, query parameters, or fragments, which prevents hidden secrets from bypassing owned-buffer zeroization. Reconfiguration may use an empty Vault Token value to retain server-stored credentials because RustFS beta.10 defines that sentinel for an existing token; initial configuration may not. AppRole has no equivalent sentinel in beta.10, so both `role_id` and `secret_id` remain mandatory and partial credentials are always rejected.
+
+On Unix, `--config-file` accepts only a regular non-symlink file with no group or other permission bits; mode `0600` is recommended and modes such as `0640` or `0644` are rejected. Standard input has no filesystem permission check and should come from a protected pipe or secret manager. The CLI stores raw input, typed secret fields, serialized request bytes, and the HTTP request body in zeroizing containers. Client errors are static and server response bodies are never copied into diagnostics, so Local master keys, Vault tokens, AppRole IDs, and AppRole secrets are not emitted in debug, human, JSON, or error output.
+
+The v3 lifecycle success operations are `configure`, `reconfigure`, `start`, `restart`, and `stop`, each with the resulting service `state`. Unconfigured start is `not_found`; permission denial is `auth_error`; unavailable service/storage is `network_error`; malformed or rejected responses are `general_error`; missing lifecycle routes are `unsupported_feature`. Restart and stop refuse to contact the server unless `--yes` is present.
 
 `kms key status` describes native RustFS key lifecycle metadata. It does not claim compatibility with the `mc admin kms key status` encryption/decryption probe. RustFS beta.10 has no direct decrypt-test Admin API or KMS-specific metrics selector, and `rc` intentionally does not expose the legacy `generate-data-key` response because that response contains plaintext data-key material.
 

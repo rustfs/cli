@@ -404,6 +404,20 @@
         }
       }
     },
+    "kmsLifecycleData": {
+      "type": "object",
+      "required": ["operation", "state"],
+      "properties": {
+        "operation": {
+          "type": "string",
+          "enum": ["configure", "reconfigure", "start", "restart", "stop"]
+        },
+        "state": {
+          "type": "string",
+          "enum": ["not-configured", "configured", "running", "error", "unknown"]
+        }
+      }
+    },
     "kmsData": {
       "oneOf": [
         { "$ref": "#/definitions/kmsServiceStatusData" },
@@ -411,7 +425,8 @@
         { "$ref": "#/definitions/kmsKeyStatusData" },
         { "$ref": "#/definitions/kmsKeyCreateData" },
         { "$ref": "#/definitions/kmsKeyDeleteData" },
-        { "$ref": "#/definitions/kmsKeyCancelDeletionData" }
+        { "$ref": "#/definitions/kmsKeyCancelDeletionData" },
+        { "$ref": "#/definitions/kmsLifecycleData" }
       ]
     },
     "adminOperation": {

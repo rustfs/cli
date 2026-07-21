@@ -2593,6 +2593,7 @@ dependencies = [
  "tracing",
  "url",
  "urlencoding",
+ "zeroize",
 ]
 
 [[package]]
@@ -2628,6 +2629,7 @@ dependencies = [
  "tracing",
  "url",
  "urlencoding",
+ "zeroize",
 ]
 
 [[package]]
@@ -2842,6 +2844,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "urlencoding",
+ "zeroize",
 ]
 
 [[package]]

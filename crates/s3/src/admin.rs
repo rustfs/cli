@@ -9,6 +9,7 @@ use aws_sigv4::http_request::{
     SignableBody, SignableRequest, SignatureLocation, SigningSettings, sign,
 };
 use aws_sigv4::sign::v4;
+use bytes::Bytes;
 use futures::StreamExt;
 use rc_core::admin::{
     AccessKeyInfo, AdminApi, BucketQuota, CapabilityApi, CapabilityAvailability, CapabilityEntry,
@@ -16,14 +17,15 @@ use rc_core::admin::{
     CreateServiceAccountRequest, DecommissionPoolStatus, DecommissionStatus, ExtensionsCatalog,
     Group, GroupStatus, HealRuntimeState, HealScanMode, HealStartRequest, HealStatus,
     HealTaskRequest, KmsApi, KmsBackendKind, KmsCacheSummary, KmsCancelKeyDeletionResult,
-    KmsConfigSummary, KmsCreateKeyRequest, KmsCreateKeyResult, KmsDeleteKeyRequest,
-    KmsDeleteKeyResult, KmsKey, KmsKeyPage, KmsKeyState, KmsKeyUsage, KmsServiceState, KmsStatus,
-    MAX_METRICS_LINE_BYTES, MAX_METRICS_RESPONSE_BYTES, MAX_METRICS_SAMPLES, MetricsBatch,
-    MetricsQuery, ObservabilityApi, PeerSiteSpec, Policy, PolicyEntity, PolicyInfo, PoolStatus,
-    PoolTarget, RealtimeMetrics, RebalanceStartResult, RebalanceStatus,
-    RuntimeCapabilitiesSnapshot, RuntimeCapabilityStatus, ScannerStatus, ServiceAccount,
-    ServiceAccountCreateResponse, ServiceActionResult, SiteRemoveSpec, SiteStatusOptions,
-    StorageInfo, UpdateGroupMembersRequest, UpdateServiceAccountRequest, User, UserStatus,
+    KmsConfigSummary, KmsConfigureRequest, KmsCreateKeyRequest, KmsCreateKeyResult,
+    KmsDeleteKeyRequest, KmsDeleteKeyResult, KmsKey, KmsKeyPage, KmsKeyState, KmsKeyUsage,
+    KmsServiceState, KmsStatus, MAX_METRICS_LINE_BYTES, MAX_METRICS_RESPONSE_BYTES,
+    MAX_METRICS_SAMPLES, MetricsBatch, MetricsQuery, ObservabilityApi, PeerSiteSpec, Policy,
+    PolicyEntity, PolicyInfo, PoolStatus, PoolTarget, RealtimeMetrics, RebalanceStartResult,
+    RebalanceStatus, RuntimeCapabilitiesSnapshot, RuntimeCapabilityStatus, ScannerStatus,
+    ServiceAccount, ServiceAccountCreateResponse, ServiceActionResult, SiteRemoveSpec,
+    SiteStatusOptions, StorageInfo, UpdateGroupMembersRequest, UpdateServiceAccountRequest, User,
+    UserStatus,
 };
 use rc_core::{Alias, Error, Result};
 use reqwest::header::{CONTENT_TYPE, HOST, HeaderMap, HeaderName, HeaderValue};
@@ -33,6 +35,15 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
+use zeroize::{Zeroize, Zeroizing};
+
+struct SensitiveRequestBody(Zeroizing<Vec<u8>>);
+
+impl AsRef<[u8]> for SensitiveRequestBody {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CapabilityCacheKey {
@@ -358,6 +369,50 @@ impl AdminClient {
 
         if text.is_empty() {
             // Return empty/default for empty responses
+            serde_json::from_str("null").map_err(Error::Json)
+        } else {
+            serde_json::from_str(&text).map_err(Error::Json)
+        }
+    }
+
+    /// Send a KMS request while retaining ownership of its body in zeroizing storage.
+    async fn request_sensitive<T: for<'de> Deserialize<'de>>(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Zeroizing<Vec<u8>>>,
+    ) -> Result<T> {
+        let url = self.admin_url(path);
+        let body_bytes = body
+            .as_ref()
+            .map(|body| body.as_slice())
+            .unwrap_or_default();
+        let headers = self.request_headers(body_bytes)?;
+        let signed_headers = self
+            .sign_request(&method, &url, &headers, body_bytes)
+            .await?;
+        let mut request_builder = self.http_client.request(method, &url);
+        for (name, value) in signed_headers.iter() {
+            request_builder = request_builder.header(name, value);
+        }
+        if let Some(body) = body {
+            request_builder = request_builder.body(Bytes::from_owner(SensitiveRequestBody(body)));
+        }
+        let response = request_builder
+            .send()
+            .await
+            .map_err(|_| Error::Network("KMS administration request failed".to_string()))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(kms_lifecycle_status_error(status));
+        }
+        let text = Zeroizing::new(
+            response
+                .text()
+                .await
+                .map_err(|_| Error::Network("Failed to read KMS response".to_string()))?,
+        );
+        if text.is_empty() {
             serde_json::from_str("null").map_err(Error::Json)
         } else {
             serde_json::from_str(&text).map_err(Error::Json)
@@ -1254,6 +1309,25 @@ struct KmsCancelKeyDeletionResponse {
     key_metadata: Option<KmsKeyResponse>,
 }
 
+#[derive(Debug, Serialize)]
+struct KmsStartBody {
+    force: bool,
+}
+
+#[derive(Deserialize)]
+struct KmsLifecycleResponse {
+    success: bool,
+    message: String,
+    status: serde_json::Value,
+}
+
+impl Drop for KmsLifecycleResponse {
+    fn drop(&mut self) {
+        self.message.zeroize();
+        zeroize_json_value(&mut self.status);
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct KmsKeyResponse {
     key_id: String,
@@ -1353,6 +1427,20 @@ fn kms_backend_kind(value: &str) -> KmsBackendKind {
     }
 }
 
+fn zeroize_json_value(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(value) => value.zeroize(),
+        serde_json::Value::Array(values) => values.iter_mut().for_each(zeroize_json_value),
+        serde_json::Value::Object(values) => {
+            for (mut key, mut value) in std::mem::take(values) {
+                key.zeroize();
+                zeroize_json_value(&mut value);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+}
+
 fn safe_backend_endpoint(value: &str) -> Option<String> {
     let mut endpoint = url::Url::parse(value).ok()?;
     endpoint.set_username("").ok()?;
@@ -1365,14 +1453,20 @@ fn safe_backend_endpoint(value: &str) -> Option<String> {
 fn kms_service_state(value: &serde_json::Value) -> (KmsServiceState, Option<String>) {
     match value {
         serde_json::Value::String(state) => {
-            let state = match state.trim().to_ascii_lowercase().as_str() {
-                "notconfigured" | "not-configured" | "not_configured" => {
-                    KmsServiceState::NotConfigured
-                }
-                "configured" => KmsServiceState::Configured,
-                "running" => KmsServiceState::Running,
-                "error" => KmsServiceState::Error,
-                _ => KmsServiceState::Unknown,
+            let state = state.trim();
+            let state = if ["notconfigured", "not-configured", "not_configured"]
+                .iter()
+                .any(|candidate| state.eq_ignore_ascii_case(candidate))
+            {
+                KmsServiceState::NotConfigured
+            } else if state.eq_ignore_ascii_case("configured") {
+                KmsServiceState::Configured
+            } else if state.eq_ignore_ascii_case("running") {
+                KmsServiceState::Running
+            } else if state.eq_ignore_ascii_case("error") {
+                KmsServiceState::Error
+            } else {
+                KmsServiceState::Unknown
             };
             (state, None)
         }
@@ -1459,6 +1553,84 @@ fn sanitize_kms_mutation_error(operation: &str, error: Error) -> Error {
         Error::InvalidPath(_) | Error::Config(_) => error,
         error => kms_mutation_error(operation, &error.to_string()),
     }
+}
+
+fn kms_lifecycle_error(operation: &str, message: &str) -> Error {
+    if contains_ascii_case_insensitive(message, "not configured")
+        || contains_ascii_case_insensitive(message, "unconfigured")
+    {
+        Error::NotFound("KMS service is not configured".to_string())
+    } else if contains_ascii_case_insensitive(message, "already running")
+        || contains_ascii_case_insensitive(message, "already stopped")
+        || contains_ascii_case_insensitive(message, "conflict")
+    {
+        Error::Conflict(format!(
+            "KMS {operation} conflicts with current service state"
+        ))
+    } else if contains_ascii_case_insensitive(message, "not initialized")
+        || contains_ascii_case_insensitive(message, "unavailable")
+        || contains_ascii_case_insensitive(message, "storage layer not initialized")
+    {
+        Error::Network("KMS service is unavailable".to_string())
+    } else {
+        Error::General(format!("KMS {operation} request was rejected"))
+    }
+}
+
+fn contains_ascii_case_insensitive(value: &str, needle: &str) -> bool {
+    value
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+fn kms_lifecycle_status_error(status: StatusCode) -> Error {
+    match status {
+        StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED => {
+            Error::Auth("KMS administration permission was denied".to_string())
+        }
+        StatusCode::NOT_FOUND | StatusCode::NOT_IMPLEMENTED => Error::UnsupportedFeature(
+            "The RustFS KMS administration route is unavailable".to_string(),
+        ),
+        StatusCode::CONFLICT => {
+            Error::Conflict("KMS operation conflicts with current service state".to_string())
+        }
+        StatusCode::BAD_REQUEST => {
+            Error::General("KMS administration request was rejected".to_string())
+        }
+        _ => Error::Network("KMS service is unavailable".to_string()),
+    }
+}
+
+fn sanitize_kms_lifecycle_error(operation: &str, error: Error) -> Error {
+    match error {
+        Error::Auth(_) => Error::Auth("KMS administration permission was denied".to_string()),
+        Error::NotFound(_) => Error::NotFound("KMS service is not configured".to_string()),
+        Error::Conflict(_) => Error::Conflict(format!(
+            "KMS {operation} conflicts with current service state"
+        )),
+        Error::Network(mut diagnostic) => {
+            let classified = kms_lifecycle_error(operation, &diagnostic);
+            diagnostic.zeroize();
+            match classified {
+                Error::NotFound(_) | Error::Conflict(_) => classified,
+                _ => Error::Network("KMS service is unavailable".to_string()),
+            }
+        }
+        Error::Json(error) => Error::Json(error),
+        Error::UnsupportedFeature(_) => Error::UnsupportedFeature(
+            "The RustFS KMS administration route is unavailable".to_string(),
+        ),
+        Error::InvalidPath(_) | Error::Config(_) => error,
+        _ => Error::General(format!("KMS {operation} request failed")),
+    }
+}
+
+fn kms_lifecycle_state(operation: &str, response: KmsLifecycleResponse) -> Result<KmsServiceState> {
+    if !response.success {
+        return Err(kms_lifecycle_error(operation, &response.message));
+    }
+    Ok(kms_service_state(&response.status).0)
 }
 
 #[async_trait]
@@ -1611,6 +1783,57 @@ impl KmsApi for AdminClient {
                 Error::Network("KMS cancellation response omitted the key identifier".to_string())
             })?;
         Ok(KmsCancelKeyDeletionResult { key_id, key })
+    }
+
+    async fn kms_configure(&self, request: &KmsConfigureRequest) -> Result<KmsServiceState> {
+        request.validate(false)?;
+        self.kms_send_configuration("configure", "/kms/configure", request)
+            .await
+    }
+
+    async fn kms_reconfigure(&self, request: &KmsConfigureRequest) -> Result<KmsServiceState> {
+        request.validate(true)?;
+        self.kms_send_configuration("reconfiguration", "/kms/reconfigure", request)
+            .await
+    }
+
+    async fn kms_start(&self, force: bool) -> Result<KmsServiceState> {
+        let body = Zeroizing::new(serde_json::to_vec(&KmsStartBody { force }).map_err(|_| {
+            Error::General("Failed to encode KMS service control request".to_string())
+        })?);
+        let response: KmsLifecycleResponse = self
+            .request_sensitive(Method::POST, "/kms/start", Some(body))
+            .await
+            .map_err(|error| {
+                sanitize_kms_lifecycle_error(if force { "restart" } else { "start" }, error)
+            })?;
+        kms_lifecycle_state(if force { "restart" } else { "start" }, response)
+    }
+
+    async fn kms_stop(&self) -> Result<KmsServiceState> {
+        let response: KmsLifecycleResponse = self
+            .request_sensitive(Method::POST, "/kms/stop", None)
+            .await
+            .map_err(|error| sanitize_kms_lifecycle_error("stop", error))?;
+        kms_lifecycle_state("stop", response)
+    }
+}
+
+impl AdminClient {
+    async fn kms_send_configuration(
+        &self,
+        operation: &str,
+        path: &str,
+        request: &KmsConfigureRequest,
+    ) -> Result<KmsServiceState> {
+        let body = Zeroizing::new(serde_json::to_vec(request).map_err(|_| {
+            Error::General("Failed to encode KMS configuration request".to_string())
+        })?);
+        let response: KmsLifecycleResponse = self
+            .request_sensitive(Method::POST, path, Some(body))
+            .await
+            .map_err(|error| sanitize_kms_lifecycle_error(operation, error))?;
+        kms_lifecycle_state(operation, response)
     }
 }
 
@@ -4282,6 +4505,135 @@ mod tests {
                 "conflict" => assert!(matches!(error, Error::Conflict(_))),
                 "network" => assert!(matches!(error, Error::Network(_))),
                 _ => panic!("unexpected expected error kind"),
+            }
+            assert!(!error.to_string().contains("MUST_NOT_APPEAR"));
+            handle.join().expect("server thread should finish");
+        }
+    }
+
+    #[tokio::test]
+    async fn kms_configure_posts_strict_sensitive_request_without_debug_exposure() {
+        let body = r#"{"success":true,"message":"configured","status":"Configured"}"#;
+        let (endpoint, receiver, handle) = start_admin_test_server("200 OK", body);
+        let client = admin_client_for_endpoint(&endpoint);
+        let request: KmsConfigureRequest = serde_json::from_str(
+            r#"{"backend_type":"VaultKV2","address":"https://vault.example","auth_method":{"Token":{"token":"VAULT_TOKEN_MUST_NOT_APPEAR"}},"mount_path":"transit","kv_mount":"secret","key_path_prefix":"rustfs/kms/keys"}"#,
+        )
+        .expect("configuration should deserialize");
+
+        let state = client
+            .kms_configure(&request)
+            .await
+            .expect("KMS should configure");
+
+        assert_eq!(state, KmsServiceState::Configured);
+        let captured = receiver.recv().expect("captured configure request");
+        assert_eq!(captured.method, "POST");
+        assert_eq!(captured.target, "/rustfs/admin/v3/kms/configure");
+        let request_body: serde_json::Value =
+            serde_json::from_slice(&captured.body).expect("configure request should be JSON");
+        assert_eq!(request_body["backend_type"], "VaultKV2");
+        assert_eq!(
+            request_body["auth_method"]["Token"]["token"],
+            "VAULT_TOKEN_MUST_NOT_APPEAR"
+        );
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn kms_reconfigure_start_restart_and_stop_use_native_routes() {
+        let responses = vec![
+            (
+                "200 OK",
+                r#"{"success":true,"message":"reconfigured","status":"Running"}"#,
+            ),
+            (
+                "200 OK",
+                r#"{"success":true,"message":"started","status":"Running"}"#,
+            ),
+            (
+                "200 OK",
+                r#"{"success":true,"message":"restarted","status":"Running"}"#,
+            ),
+            (
+                "200 OK",
+                r#"{"success":true,"message":"stopped","status":"Configured"}"#,
+            ),
+        ];
+        let (endpoint, receiver, handle) = start_admin_sequence_server(responses);
+        let client = admin_client_for_endpoint(&endpoint);
+        let request: KmsConfigureRequest = serde_json::from_str(
+            r#"{"backend_type":"VaultTransit","address":"https://vault.example","auth_method":{"Token":{"token":""}},"mount_path":"transit"}"#,
+        )
+        .expect("configuration should deserialize");
+
+        assert_eq!(
+            client
+                .kms_reconfigure(&request)
+                .await
+                .expect("KMS should reconfigure"),
+            KmsServiceState::Running
+        );
+        assert_eq!(
+            client.kms_start(false).await.expect("KMS should start"),
+            KmsServiceState::Running
+        );
+        assert_eq!(
+            client.kms_start(true).await.expect("KMS should restart"),
+            KmsServiceState::Running
+        );
+        assert_eq!(
+            client.kms_stop().await.expect("KMS should stop"),
+            KmsServiceState::Configured
+        );
+
+        let reconfigure = receiver.recv().expect("captured reconfigure request");
+        assert_eq!(reconfigure.target, "/rustfs/admin/v3/kms/reconfigure");
+        let start = receiver.recv().expect("captured start request");
+        assert_eq!(start.target, "/rustfs/admin/v3/kms/start");
+        let start_body: serde_json::Value =
+            serde_json::from_slice(&start.body).expect("start body should be JSON");
+        assert_eq!(start_body["force"], false);
+        let restart = receiver.recv().expect("captured restart request");
+        let restart_body: serde_json::Value =
+            serde_json::from_slice(&restart.body).expect("restart body should be JSON");
+        assert_eq!(restart_body["force"], true);
+        let stop = receiver.recv().expect("captured stop request");
+        assert_eq!(stop.target, "/rustfs/admin/v3/kms/stop");
+        assert!(stop.body.is_empty());
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn kms_lifecycle_errors_are_typed_and_redacted() {
+        for (status, body, expected) in [
+            (
+                "200 OK",
+                r#"{"success":false,"message":"KMS service is not configured: MUST_NOT_APPEAR","status":"NotConfigured"}"#,
+                "not_found",
+            ),
+            (
+                "403 Forbidden",
+                r#"{"message":"denied token MUST_NOT_APPEAR"}"#,
+                "auth",
+            ),
+            (
+                "503 Service Unavailable",
+                r#"{"message":"unavailable token MUST_NOT_APPEAR"}"#,
+                "network",
+            ),
+        ] {
+            let (endpoint, _receiver, handle) = start_admin_test_server(status, body);
+            let client = admin_client_for_endpoint(&endpoint);
+            let error = client
+                .kms_start(false)
+                .await
+                .expect_err("start should fail");
+            match expected {
+                "not_found" => assert!(matches!(error, Error::NotFound(_))),
+                "auth" => assert!(matches!(error, Error::Auth(_))),
+                "network" => assert!(matches!(error, Error::Network(_))),
+                _ => panic!("unexpected error kind"),
             }
             assert!(!error.to_string().contains("MUST_NOT_APPEAR"));
             handle.join().expect("server thread should finish");

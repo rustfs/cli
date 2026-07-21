@@ -51,6 +51,7 @@ humansize.workspace = true
 mime_guess.workspace = true
 glob.workspace = true
 shlex.workspace = true
+zeroize.workspace = true
 urlencoding.workspace = true
 url.workspace = true
 

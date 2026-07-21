@@ -374,6 +374,43 @@ mod tests {
             }
             _ => panic!("Unexpected KMS key cancel-deletion command"),
         }
+
+        let configure = TestCli::parse_from([
+            "rc",
+            "kms",
+            "configure",
+            "local",
+            "--config-file",
+            "/secure/kms.json",
+        ]);
+        match configure.command {
+            AdminCommands::Kms(kms::KmsCommands::Configure(args)) => {
+                assert_eq!(args.alias, "local");
+                assert_eq!(
+                    args.config_file.as_deref(),
+                    Some(std::path::Path::new("/secure/kms.json"))
+                );
+                assert!(!args.stdin);
+            }
+            _ => panic!("Unexpected KMS configure command"),
+        }
+
+        let reconfigure = TestCli::parse_from(["rc", "kms", "reconfigure", "local", "--stdin"]);
+        match reconfigure.command {
+            AdminCommands::Kms(kms::KmsCommands::Reconfigure(args)) => {
+                assert!(args.stdin);
+                assert!(args.config_file.is_none());
+            }
+            _ => panic!("Unexpected KMS reconfigure command"),
+        }
+
+        let restart = TestCli::parse_from(["rc", "kms", "restart", "local", "--yes"]);
+        match restart.command {
+            AdminCommands::Kms(kms::KmsCommands::Restart(args)) => {
+                assert!(args.yes);
+            }
+            _ => panic!("Unexpected KMS restart command"),
+        }
     }
 
     #[test]

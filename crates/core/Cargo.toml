@@ -35,6 +35,7 @@ jiff.workspace = true
 url.workspace = true
 urlencoding.workspace = true
 humansize.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

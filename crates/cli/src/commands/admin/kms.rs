@@ -2,13 +2,17 @@
 
 use clap::{Args, Subcommand};
 use rc_core::admin::{
-    KmsApi, KmsBackendKind, KmsCancelKeyDeletionResult, KmsCreateKeyRequest, KmsCreateKeyResult,
-    KmsDeleteKeyRequest, KmsDeleteKeyResult, KmsKey, KmsKeyPage, KmsKeyState, KmsKeyUsage,
-    KmsServiceState, KmsStatus,
+    KmsApi, KmsBackendKind, KmsCancelKeyDeletionResult, KmsConfigureRequest, KmsCreateKeyRequest,
+    KmsCreateKeyResult, KmsDeleteKeyRequest, KmsDeleteKeyResult, KmsKey, KmsKeyPage, KmsKeyState,
+    KmsKeyUsage, KmsServiceState, KmsStatus,
 };
 use rc_core::{Error, Result};
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::{Read, stdin};
+use std::path::{Path, PathBuf};
+use zeroize::Zeroizing;
 
 use super::{emit_observability_error, get_admin_client};
 use crate::exit_code::ExitCode;
@@ -22,12 +26,66 @@ pub enum KmsCommands {
     /// Inspect KMS keys
     #[command(subcommand)]
     Key(KmsKeyCommands),
+
+    /// Configure KMS from a protected JSON file or standard input
+    Configure(KmsConfigureArgs),
+
+    /// Replace KMS configuration from a protected JSON file or standard input
+    Reconfigure(KmsConfigureArgs),
+
+    /// Start the configured KMS service
+    Start(KmsStartArgs),
+
+    /// Restart the KMS service after explicit confirmation
+    Restart(KmsDisruptiveActionArgs),
+
+    /// Stop the KMS service after explicit confirmation
+    Stop(KmsDisruptiveActionArgs),
 }
 
 #[derive(Args, Debug)]
 pub struct KmsStatusArgs {
     /// Alias name of the server
     pub alias: String,
+}
+
+#[derive(Args, Debug)]
+pub struct KmsConfigureArgs {
+    /// Alias name of the server
+    pub alias: String,
+
+    /// Read the configuration from this protected regular file
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with = "stdin",
+        required_unless_present = "stdin"
+    )]
+    pub config_file: Option<PathBuf>,
+
+    /// Read the configuration from standard input
+    #[arg(
+        long,
+        conflicts_with = "config_file",
+        required_unless_present = "config_file"
+    )]
+    pub stdin: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct KmsStartArgs {
+    /// Alias name of the server
+    pub alias: String,
+}
+
+#[derive(Args, Debug)]
+pub struct KmsDisruptiveActionArgs {
+    /// Alias name of the server
+    pub alias: String,
+
+    /// Confirm the disruptive service operation
+    #[arg(long)]
+    pub yes: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -184,9 +242,22 @@ struct KmsKeyCancelDeletionData<'a> {
     key: Option<&'a KmsKey>,
 }
 
+#[derive(Debug, Serialize)]
+struct KmsLifecycleData<'a> {
+    operation: &'a str,
+    state: &'a KmsServiceState,
+}
+
+const MAX_KMS_CONFIG_BYTES: u64 = 1024 * 1024;
+
 pub async fn execute(command: KmsCommands, formatter: &Formatter) -> ExitCode {
     match command {
         KmsCommands::Status(args) => execute_status(args, formatter).await,
+        KmsCommands::Configure(args) => execute_configure(args, false, formatter).await,
+        KmsCommands::Reconfigure(args) => execute_configure(args, true, formatter).await,
+        KmsCommands::Start(args) => execute_start(args, formatter).await,
+        KmsCommands::Restart(args) => execute_disruptive_control(args, true, formatter).await,
+        KmsCommands::Stop(args) => execute_disruptive_control(args, false, formatter).await,
         KmsCommands::Key(command) => match command {
             KmsKeyCommands::List(args) => execute_key_list(args, formatter).await,
             KmsKeyCommands::Status(args) => execute_key_status(args, formatter).await,
@@ -226,6 +297,206 @@ async fn execute_status_with_api(api: &dyn KmsApi, formatter: &Formatter) -> Exi
             ExitCode::Success
         }
         Err(error) => emit_kms_error("Failed to get KMS status", &error, true, formatter),
+    }
+}
+
+async fn execute_configure(
+    args: KmsConfigureArgs,
+    reconfigure: bool,
+    formatter: &Formatter,
+) -> ExitCode {
+    let request = match load_configuration(&args, reconfigure) {
+        Ok(request) => request,
+        Err(error) => {
+            return emit_kms_error(
+                if reconfigure {
+                    "Failed to validate KMS reconfiguration"
+                } else {
+                    "Failed to validate KMS configuration"
+                },
+                &error,
+                false,
+                formatter,
+            );
+        }
+    };
+    let client = match get_admin_client(&args.alias, formatter) {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
+    let result = if reconfigure {
+        client.kms_reconfigure(&request).await
+    } else {
+        client.kms_configure(&request).await
+    };
+    match result {
+        Ok(state) => {
+            emit_lifecycle_result(
+                if reconfigure {
+                    "reconfigure"
+                } else {
+                    "configure"
+                },
+                &state,
+                formatter,
+            );
+            ExitCode::Success
+        }
+        Err(error) => emit_kms_error(
+            if reconfigure {
+                "Failed to reconfigure KMS"
+            } else {
+                "Failed to configure KMS"
+            },
+            &error,
+            false,
+            formatter,
+        ),
+    }
+}
+
+async fn execute_start(args: KmsStartArgs, formatter: &Formatter) -> ExitCode {
+    let client = match get_admin_client(&args.alias, formatter) {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
+    execute_control_with_api("start", false, &client, formatter).await
+}
+
+async fn execute_disruptive_control(
+    args: KmsDisruptiveActionArgs,
+    restart: bool,
+    formatter: &Formatter,
+) -> ExitCode {
+    let operation = if restart { "restart" } else { "stop" };
+    if !args.yes {
+        return emit_kms_error(
+            &format!("Refused to {operation} KMS"),
+            &Error::InvalidPath(format!("KMS {operation} requires --yes")),
+            false,
+            formatter,
+        );
+    }
+    let client = match get_admin_client(&args.alias, formatter) {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
+    execute_control_with_api(operation, restart, &client, formatter).await
+}
+
+async fn execute_control_with_api(
+    operation: &str,
+    restart: bool,
+    api: &dyn KmsApi,
+    formatter: &Formatter,
+) -> ExitCode {
+    let result = if operation == "stop" {
+        api.kms_stop().await
+    } else {
+        api.kms_start(restart).await
+    };
+    match result {
+        Ok(state) => {
+            emit_lifecycle_result(operation, &state, formatter);
+            ExitCode::Success
+        }
+        Err(error) => emit_kms_error(
+            &format!("Failed to {operation} KMS"),
+            &error,
+            false,
+            formatter,
+        ),
+    }
+}
+
+fn load_configuration(args: &KmsConfigureArgs, reconfigure: bool) -> Result<KmsConfigureRequest> {
+    let bytes = if args.stdin {
+        read_bounded_configuration(stdin().lock())?
+    } else {
+        let path = args.config_file.as_deref().ok_or_else(|| {
+            Error::InvalidPath("Use --config-file or --stdin for KMS configuration".to_string())
+        })?;
+        open_protected_config(path).and_then(read_bounded_configuration)?
+    };
+    if bytes.is_empty() {
+        return Err(Error::InvalidPath(
+            "KMS configuration input cannot be empty".to_string(),
+        ));
+    }
+    let request: KmsConfigureRequest = serde_json::from_slice(bytes.as_slice()).map_err(|_| {
+        Error::InvalidPath(
+            "KMS configuration must match a strict Local, VaultKV2, or VaultTransit JSON shape"
+                .to_string(),
+        )
+    })?;
+    request.validate(reconfigure)?;
+    Ok(request)
+}
+
+fn open_protected_config(path: &Path) -> Result<File> {
+    let path_metadata = std::fs::symlink_metadata(path)
+        .map_err(|_| Error::InvalidPath("Failed to inspect KMS configuration file".to_string()))?;
+    if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
+        return Err(Error::InvalidPath(
+            "KMS configuration input must be a regular file, not a symlink".to_string(),
+        ));
+    }
+    let file = File::open(path)
+        .map_err(|_| Error::InvalidPath("Failed to open KMS configuration file".to_string()))?;
+    let file_metadata = file.metadata().map_err(|_| {
+        Error::InvalidPath("Failed to inspect opened KMS configuration file".to_string())
+    })?;
+    if !file_metadata.is_file() {
+        return Err(Error::InvalidPath(
+            "KMS configuration input must remain a regular file while opening".to_string(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if path_metadata.dev() != file_metadata.dev() || path_metadata.ino() != file_metadata.ino()
+        {
+            return Err(Error::InvalidPath(
+                "KMS configuration file changed while being opened".to_string(),
+            ));
+        }
+        if file_metadata.permissions().mode() & 0o077 != 0 {
+            return Err(Error::InvalidPath(
+                "KMS configuration file cannot grant group or other permissions".to_string(),
+            ));
+        }
+    }
+    Ok(file)
+}
+
+fn read_bounded_configuration(reader: impl Read) -> Result<Zeroizing<Vec<u8>>> {
+    let mut bytes = Zeroizing::new(Vec::new());
+    reader
+        .take(MAX_KMS_CONFIG_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| Error::InvalidPath("Failed to read KMS configuration input".to_string()))?;
+    if bytes.len() as u64 > MAX_KMS_CONFIG_BYTES {
+        return Err(Error::InvalidPath(format!(
+            "KMS configuration input exceeds the {} byte limit",
+            MAX_KMS_CONFIG_BYTES
+        )));
+    }
+    Ok(bytes)
+}
+
+fn emit_lifecycle_result(operation: &str, state: &KmsServiceState, formatter: &Formatter) {
+    if formatter.is_json() {
+        formatter.json(&KmsSuccessOutput {
+            schema_version: 3,
+            output_type: "kms",
+            status: "success",
+            data: KmsLifecycleData { operation, state },
+        });
+    } else {
+        formatter.println(&format!(
+            "KMS {operation} completed; state: {}",
+            service_state_label(state)
+        ));
     }
 }
 

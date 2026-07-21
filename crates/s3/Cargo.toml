@@ -38,6 +38,7 @@ tracing.workspace = true
 jiff.workspace = true
 bytes.workspace = true
 url.workspace = true
+zeroize.workspace = true
 
 # HTTP client for Admin API
 reqwest.workspace = true

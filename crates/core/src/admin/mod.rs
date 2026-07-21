@@ -26,8 +26,10 @@ pub use cluster::{
 };
 pub use kms::{
     KmsApi, KmsBackendKind, KmsCacheSummary, KmsCancelKeyDeletionResult, KmsConfigSummary,
-    KmsCreateKeyRequest, KmsCreateKeyResult, KmsDeleteKeyRequest, KmsDeleteKeyResult, KmsKey,
-    KmsKeyPage, KmsKeyState, KmsKeyUsage, KmsServiceState, KmsStatus,
+    KmsConfigureRequest, KmsCreateKeyRequest, KmsCreateKeyResult, KmsDeleteKeyRequest,
+    KmsDeleteKeyResult, KmsKey, KmsKeyPage, KmsKeyState, KmsKeyUsage, KmsLocalConfigureRequest,
+    KmsServiceState, KmsStatus, KmsVaultAuthMethod, KmsVaultKv2ConfigureRequest,
+    KmsVaultTransitConfigureRequest,
 };
 pub use observability::{
     MAX_METRICS_LINE_BYTES, MAX_METRICS_RESPONSE_BYTES, MAX_METRICS_SAMPLES, MetricGroup,
