@@ -18,7 +18,7 @@ rc bucket version <enable|suspend|info|list> ...
 rc bucket quota <set|info|clear> ...
 rc bucket anonymous <set|set-json|get|get-json|list|links> ...
 rc bucket lifecycle <rule|tier|restore> ...
-rc bucket replication <add|update|list|status|remove|export|import> ...
+rc bucket replication <add|update|list|status|diff|remove|export|import> ...
 ```
 
 ## Commands
@@ -35,7 +35,7 @@ rc bucket replication <add|update|list|status|remove|export|import> ...
 | `quota` | Manage bucket quota. |
 | `anonymous` | Manage anonymous bucket or prefix access. |
 | `lifecycle` | Manage lifecycle rules, remote tiers, and object restore requests. |
-| `replication` | Manage bucket replication rules and replication status. |
+| `replication` | Manage bucket replication rules and inspect replication status or differences. |
 
 ## Parameters
 
@@ -95,11 +95,19 @@ Check replication status:
 rc bucket replication status local/archive
 ```
 
+Scan for pending or failed versions below a prefix:
+
+```bash
+rc bucket replication diff local/archive --prefix reports/2026/
+```
+
 ## Behavior
 
 Prefer `rc bucket ...` for new scripts. Legacy commands such as `rc mb`, `rc rb`, `rc event`, `rc cors`, `rc version`, `rc anonymous`, `rc quota`, `rc ilm`, and `rc replicate` remain available and delegate to the same implementations.
 
 `rc bucket encryption set`, `info`, and `clear` manage only the bucket default for future writes. They do not rewrite, decrypt, or re-encrypt existing objects in the bucket. For object-level encryption flags and more detailed examples, see [Encryption workflows](encryption.md).
+
+`rc bucket replication diff` performs a bounded, read-only scan. A truncated result is partial and cannot be resumed; narrow `--prefix` and run the command again. An empty truncated result does not prove that the bucket has no replication backlog.
 
 Global options shown in command syntax use the same meaning everywhere:
 

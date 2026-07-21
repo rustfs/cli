@@ -5,15 +5,15 @@
 
 use clap::{Args, Subcommand};
 use comfy_table::{Cell, Table};
-use rc_core::admin::AdminApi;
+use rc_core::admin::{AdminApi, ReplicationDiff, ReplicationDiffApi, ReplicationDiffEntry};
 use rc_core::replication::{
     BucketTarget, BucketTargetCredentials, ReplicationConfiguration, ReplicationDestination,
     ReplicationRule, ReplicationRuleStatus,
 };
-use rc_core::{AliasManager, ObjectStore as _};
+use rc_core::{AliasManager, Error, ObjectStore as _};
 use rc_s3::{AdminClient, S3Client};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use crate::exit_code::ExitCode;
@@ -60,6 +60,9 @@ pub enum ReplicateCommands {
     /// Show replication status/metrics for a bucket
     Status(BucketArg),
 
+    /// Scan for object versions that have not replicated
+    Diff(DiffArgs),
+
     /// Remove replication rules from a bucket
     Remove(RemoveArgs),
 
@@ -78,6 +81,16 @@ pub struct BucketArg {
     /// Force operation even if capability detection fails
     #[arg(long)]
     pub force: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct DiffArgs {
+    /// Source bucket path (ALIAS/BUCKET)
+    pub path: String,
+
+    /// Limit the scan to object keys below this prefix
+    #[arg(long)]
+    pub prefix: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -266,6 +279,79 @@ struct ReplicationTargetTlsSettings {
     ca_cert_pem: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct ReplicationDiffSuccessOutput {
+    schema_version: u8,
+    #[serde(rename = "type")]
+    output_type: &'static str,
+    status: &'static str,
+    data: ReplicationDiffData,
+}
+
+#[derive(Debug, Serialize)]
+struct ReplicationDiffData {
+    operation: &'static str,
+    bucket: String,
+    prefix: Option<String>,
+    entries: Vec<ReplicationDiffEntryOutput>,
+    scan: ReplicationDiffScanOutput,
+    extensions: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReplicationDiffEntryOutput {
+    object: String,
+    version_id: Option<String>,
+    delete_marker: bool,
+    size_bytes: u64,
+    replication_status: String,
+    last_modified: Option<jiff::Timestamp>,
+    extensions: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReplicationDiffScanOutput {
+    scanned_versions: usize,
+    truncated: bool,
+    resumable: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ReplicationDiffErrorOutput {
+    schema_version: u8,
+    #[serde(rename = "type")]
+    output_type: &'static str,
+    status: &'static str,
+    error: ReplicationDiffError,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum ReplicationDiffError {
+    Unsupported(ReplicationDiffUnsupportedError),
+    Standard(ReplicationDiffStandardError),
+}
+
+#[derive(Debug, Serialize)]
+struct ReplicationDiffUnsupportedError {
+    #[serde(rename = "type")]
+    error_type: &'static str,
+    message: String,
+    retryable: bool,
+    capability: &'static str,
+    server: Option<String>,
+    suggestion: Option<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReplicationDiffStandardError {
+    #[serde(rename = "type")]
+    error_type: &'static str,
+    message: String,
+    retryable: bool,
+    suggestion: Option<&'static str>,
+}
+
 // ==================== execute ====================
 
 /// Execute the replicate command
@@ -275,9 +361,256 @@ pub async fn execute(args: ReplicateArgs, output_config: OutputConfig) -> ExitCo
         ReplicateCommands::Update(args) => execute_update(args, output_config).await,
         ReplicateCommands::List(args) => execute_list(args, output_config).await,
         ReplicateCommands::Status(args) => execute_status(args, output_config).await,
+        ReplicateCommands::Diff(args) => execute_diff(args, output_config).await,
         ReplicateCommands::Remove(args) => execute_remove(args, output_config).await,
         ReplicateCommands::Export(args) => execute_export(args, output_config).await,
         ReplicateCommands::Import(args) => execute_import(args, output_config).await,
+    }
+}
+
+// ==================== Diff ====================
+
+async fn execute_diff(args: DiffArgs, output_config: OutputConfig) -> ExitCode {
+    let formatter = Formatter::new(output_config);
+    let (alias_name, bucket) = match parse_bucket_path(&args.path) {
+        Ok(parts) => parts,
+        Err(error) => {
+            return formatter.fail_with_suggestion(
+                ExitCode::UsageError,
+                &error,
+                "Use a bucket path in the form alias/bucket.",
+            );
+        }
+    };
+    let client = match setup_admin_client(&alias_name, &formatter) {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
+
+    execute_diff_with_api(&bucket, args.prefix, &client, &formatter).await
+}
+
+async fn execute_diff_with_api(
+    bucket: &str,
+    prefix: Option<String>,
+    api: &dyn ReplicationDiffApi,
+    formatter: &Formatter,
+) -> ExitCode {
+    match api.replication_diff(bucket, prefix.as_deref()).await {
+        Ok(diff) => {
+            if formatter.is_json() {
+                formatter.json(&replication_diff_output(bucket, prefix, diff));
+            } else {
+                for line in replication_diff_lines(bucket, prefix.as_deref(), &diff, formatter) {
+                    formatter.println(&line);
+                }
+            }
+            ExitCode::Success
+        }
+        Err(error) => emit_replication_diff_error(&error, formatter),
+    }
+}
+
+fn replication_diff_output(
+    bucket: &str,
+    prefix: Option<String>,
+    mut diff: ReplicationDiff,
+) -> ReplicationDiffSuccessOutput {
+    sort_replication_diff_entries(&mut diff.entries);
+    ReplicationDiffSuccessOutput {
+        schema_version: 3,
+        output_type: "replication",
+        status: "success",
+        data: ReplicationDiffData {
+            operation: "diff",
+            bucket: bucket.to_string(),
+            prefix,
+            entries: diff
+                .entries
+                .into_iter()
+                .map(|entry| ReplicationDiffEntryOutput {
+                    object: entry.object,
+                    version_id: entry.version_id,
+                    delete_marker: entry.delete_marker,
+                    size_bytes: entry.size_bytes,
+                    replication_status: entry.replication_status,
+                    last_modified: entry.last_modified,
+                    extensions: entry.extra,
+                })
+                .collect(),
+            scan: ReplicationDiffScanOutput {
+                scanned_versions: diff.scanned_versions,
+                truncated: diff.is_truncated,
+                resumable: false,
+            },
+            extensions: diff.extra,
+        },
+    }
+}
+
+fn replication_diff_lines(
+    bucket: &str,
+    prefix: Option<&str>,
+    diff: &ReplicationDiff,
+    formatter: &Formatter,
+) -> Vec<String> {
+    let bucket = formatter.sanitize_text(bucket);
+    let scope = match prefix {
+        Some(prefix) => format!("{bucket} (prefix: {})", formatter.sanitize_text(prefix)),
+        None => bucket,
+    };
+    let mut entries = diff.entries.clone();
+    sort_replication_diff_entries(&mut entries);
+    let mut lines = vec![format!("Replication diff for '{scope}':")];
+
+    if diff.is_truncated {
+        lines.push(format!(
+            "Partial scan: inspected {} versions; results are non-resumable. Narrow --prefix and run again for a more complete view.",
+            diff.scanned_versions
+        ));
+    } else {
+        lines.push(format!(
+            "Complete scan: inspected {} versions.",
+            diff.scanned_versions
+        ));
+    }
+
+    if entries.is_empty() {
+        lines.push(if diff.is_truncated {
+            "No pending or failed versions were found in this partial scan; this does not prove the bucket has no replication backlog.".to_string()
+        } else {
+            "No pending or failed versions found.".to_string()
+        });
+        return lines;
+    }
+
+    lines.push(String::new());
+    lines.push("OBJECT  VERSION  TYPE  SIZE  STATUS  LAST MODIFIED".to_string());
+    for entry in entries {
+        lines.push(format!(
+            "{}  {}  {}  {}  {}  {}",
+            formatter.sanitize_text(&entry.object),
+            formatter.sanitize_text(entry.version_id.as_deref().unwrap_or("-")),
+            if entry.delete_marker {
+                "delete-marker"
+            } else {
+                "object"
+            },
+            entry.size_bytes,
+            formatter.sanitize_text(&entry.replication_status),
+            formatter.sanitize_text(
+                entry
+                    .last_modified
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .as_deref()
+                    .unwrap_or("-")
+            )
+        ));
+    }
+    lines
+}
+
+fn sort_replication_diff_entries(entries: &mut [ReplicationDiffEntry]) {
+    entries.sort_by(|left, right| {
+        (
+            &left.object,
+            &left.version_id,
+            left.delete_marker,
+            &left.replication_status,
+            &left.last_modified,
+        )
+            .cmp(&(
+                &right.object,
+                &right.version_id,
+                right.delete_marker,
+                &right.replication_status,
+                &right.last_modified,
+            ))
+    });
+}
+
+fn emit_replication_diff_error(error: &Error, formatter: &Formatter) -> ExitCode {
+    let code = ExitCode::from_i32(error.exit_code()).unwrap_or(ExitCode::GeneralError);
+    let message = format!("Failed to scan replication diff: {error}");
+    if formatter.is_json() {
+        formatter.json_error(&replication_diff_error_output(error, code, message));
+    } else {
+        formatter.error_with_code(code, &message);
+    }
+    code
+}
+
+fn replication_diff_error_output(
+    error: &Error,
+    code: ExitCode,
+    message: String,
+) -> ReplicationDiffErrorOutput {
+    let error = if matches!(error, Error::UnsupportedFeature(_)) {
+        ReplicationDiffError::Unsupported(ReplicationDiffUnsupportedError {
+            error_type: "unsupported_feature",
+            message,
+            retryable: false,
+            capability: "replication_diff",
+            server: None,
+            suggestion: Some(
+                "Upgrade RustFS or verify that the replication diff route is enabled.",
+            ),
+        })
+    } else {
+        let (error_type, retryable, suggestion) = replication_diff_error_metadata(code);
+        ReplicationDiffError::Standard(ReplicationDiffStandardError {
+            error_type,
+            message,
+            retryable,
+            suggestion,
+        })
+    };
+    ReplicationDiffErrorOutput {
+        schema_version: 3,
+        output_type: "replication",
+        status: "error",
+        error,
+    }
+}
+
+const fn replication_diff_error_metadata(
+    code: ExitCode,
+) -> (&'static str, bool, Option<&'static str>) {
+    match code {
+        ExitCode::UsageError => (
+            "usage_error",
+            false,
+            Some("Verify the alias configuration and command arguments."),
+        ),
+        ExitCode::NetworkError => (
+            "network_error",
+            true,
+            Some("Verify the endpoint and network connectivity, then retry."),
+        ),
+        ExitCode::AuthError => (
+            "auth_error",
+            false,
+            Some("Verify the alias credentials and replication admin permission."),
+        ),
+        ExitCode::NotFound => (
+            "not_found",
+            false,
+            Some("Verify the bucket name and that replication is configured."),
+        ),
+        ExitCode::Conflict => (
+            "conflict",
+            false,
+            Some("Review the replication configuration and retry."),
+        ),
+        ExitCode::Interrupted => (
+            "interrupted",
+            true,
+            Some("Run the diff again if the scan is still needed."),
+        ),
+        ExitCode::Success | ExitCode::GeneralError | ExitCode::UnsupportedFeature => {
+            ("general_error", false, None)
+        }
     }
 }
 
@@ -1381,8 +1714,65 @@ fn strip_endpoint_path(endpoint: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use std::collections::HashMap;
     use tempfile::NamedTempFile;
+
+    enum StubDiffOutcome {
+        Success(ReplicationDiff),
+        Auth,
+        NotFound,
+        Unsupported,
+        Network,
+        General,
+    }
+
+    struct StubReplicationDiffApi {
+        outcome: StubDiffOutcome,
+    }
+
+    #[async_trait]
+    impl ReplicationDiffApi for StubReplicationDiffApi {
+        async fn replication_diff(
+            &self,
+            _bucket: &str,
+            _prefix: Option<&str>,
+        ) -> rc_core::Result<ReplicationDiff> {
+            match &self.outcome {
+                StubDiffOutcome::Success(diff) => Ok(diff.clone()),
+                StubDiffOutcome::Auth => Err(Error::Auth("Access denied".to_string())),
+                StubDiffOutcome::NotFound => {
+                    Err(Error::NotFound("replication is not configured".to_string()))
+                }
+                StubDiffOutcome::Unsupported => {
+                    Err(Error::UnsupportedFeature("route unavailable".to_string()))
+                }
+                StubDiffOutcome::Network => Err(Error::Network("connection reset".to_string())),
+                StubDiffOutcome::General => Err(Error::General("malformed response".to_string())),
+            }
+        }
+    }
+
+    fn diff_with_entries(entries: Vec<ReplicationDiffEntry>) -> ReplicationDiff {
+        ReplicationDiff {
+            entries,
+            is_truncated: false,
+            scanned_versions: 24,
+            extra: BTreeMap::new(),
+        }
+    }
+
+    fn diff_entry(object: &str, version_id: Option<&str>) -> ReplicationDiffEntry {
+        ReplicationDiffEntry {
+            object: object.to_string(),
+            version_id: version_id.map(str::to_string),
+            size_bytes: 42,
+            delete_marker: false,
+            replication_status: "FAILED".to_string(),
+            last_modified: Some("2026-07-21T04:00:00Z".parse().expect("valid timestamp")),
+            extra: BTreeMap::new(),
+        }
+    }
 
     #[test]
     fn test_parse_bucket_path_success() {
@@ -1402,6 +1792,107 @@ mod tests {
         assert!(parse_bucket_path("/bucket").is_err());
         assert!(parse_bucket_path("local/").is_err());
         assert!(parse_bucket_path("local/my-bucket/object.txt").is_err());
+    }
+
+    #[test]
+    fn replication_diff_json_is_deterministic_and_preserves_extensions() {
+        let mut second = diff_entry("reports/b.json", Some("v2"));
+        second.extra.insert(
+            "TargetDetail".to_string(),
+            serde_json::json!({ "attempts": 2 }),
+        );
+        let mut diff = diff_with_entries(vec![second, diff_entry("reports/a.json", Some("v1"))]);
+        diff.extra
+            .insert("ServerRevision".to_string(), serde_json::json!(7));
+
+        let value = serde_json::to_value(replication_diff_output(
+            "source",
+            Some("reports/".to_string()),
+            diff,
+        ))
+        .expect("replication diff output should serialize");
+
+        assert_eq!(value["schema_version"], 3);
+        assert_eq!(value["type"], "replication");
+        assert_eq!(value["data"]["operation"], "diff");
+        assert_eq!(value["data"]["entries"][0]["object"], "reports/a.json");
+        assert_eq!(
+            value["data"]["entries"][1]["extensions"]["TargetDetail"]["attempts"],
+            2
+        );
+        assert_eq!(value["data"]["extensions"]["ServerRevision"], 7);
+        assert_eq!(value["data"]["scan"]["resumable"], false);
+    }
+
+    #[test]
+    fn truncated_empty_human_output_is_partial_and_sanitized() {
+        let formatter = Formatter::new(OutputConfig {
+            no_color: true,
+            ..Default::default()
+        });
+        let diff = ReplicationDiff {
+            entries: Vec::new(),
+            is_truncated: true,
+            scanned_versions: 10000,
+            extra: BTreeMap::new(),
+        };
+
+        let lines = replication_diff_lines(
+            "bucket\n\u{1b}[31m",
+            Some("archive\r\n2026/"),
+            &diff,
+            &formatter,
+        );
+
+        assert!(lines.iter().any(|line| line.contains("Partial scan")));
+        assert!(lines.iter().any(|line| line.contains("non-resumable")));
+        assert!(lines.iter().any(|line| line.contains("does not prove")));
+        assert!(lines.iter().all(|line| !line.contains('\u{1b}')));
+        assert!(lines.iter().all(|line| !line.contains('\r')));
+        assert!(lines.iter().all(|line| !line.contains('\n')));
+    }
+
+    #[tokio::test]
+    async fn replication_diff_command_preserves_success_and_error_exit_codes() {
+        let formatter = Formatter::new(OutputConfig {
+            quiet: true,
+            ..Default::default()
+        });
+        let cases = [
+            (
+                StubDiffOutcome::Success(diff_with_entries(Vec::new())),
+                ExitCode::Success,
+            ),
+            (StubDiffOutcome::Auth, ExitCode::AuthError),
+            (StubDiffOutcome::NotFound, ExitCode::NotFound),
+            (StubDiffOutcome::Unsupported, ExitCode::UnsupportedFeature),
+            (StubDiffOutcome::Network, ExitCode::NetworkError),
+            (StubDiffOutcome::General, ExitCode::GeneralError),
+        ];
+
+        for (outcome, expected) in cases {
+            let api = StubReplicationDiffApi { outcome };
+            assert_eq!(
+                execute_diff_with_api("source", None, &api, &formatter).await,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn replication_diff_unsupported_error_uses_specialized_v3_shape() {
+        let error = Error::UnsupportedFeature("route unavailable".to_string());
+        let value = serde_json::to_value(replication_diff_error_output(
+            &error,
+            ExitCode::UnsupportedFeature,
+            format!("Failed to scan replication diff: {error}"),
+        ))
+        .expect("replication diff error should serialize");
+
+        assert_eq!(value["type"], "replication");
+        assert_eq!(value["error"]["type"], "unsupported_feature");
+        assert_eq!(value["error"]["capability"], "replication_diff");
+        assert_eq!(value["error"]["server"], serde_json::Value::Null);
     }
 
     #[test]

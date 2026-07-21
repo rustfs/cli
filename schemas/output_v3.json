@@ -31,7 +31,8 @@
         "watch_event",
         "usage",
         "metrics",
-        "admin_operations"
+        "admin_operations",
+        "replication"
       ]
     },
     "pagination": {
@@ -278,6 +279,48 @@
         }
       }
     },
+    "replicationDiffEntry": {
+      "type": "object",
+      "required": [
+        "object", "version_id", "delete_marker", "size_bytes",
+        "replication_status", "last_modified", "extensions"
+      ],
+      "properties": {
+        "object": { "type": "string" },
+        "version_id": { "$ref": "#/definitions/nullableString" },
+        "delete_marker": { "type": "boolean" },
+        "size_bytes": { "type": "integer", "minimum": 0 },
+        "replication_status": { "type": "string", "minLength": 1 },
+        "last_modified": { "$ref": "#/definitions/nullableTimestamp" },
+        "extensions": { "type": "object" }
+      }
+    },
+    "replicationDiffScan": {
+      "type": "object",
+      "required": ["scanned_versions", "truncated", "resumable"],
+      "properties": {
+        "scanned_versions": { "type": "integer", "minimum": 0 },
+        "truncated": { "type": "boolean" },
+        "resumable": { "const": false }
+      }
+    },
+    "replicationData": {
+      "type": "object",
+      "required": [
+        "operation", "bucket", "prefix", "entries", "scan", "extensions"
+      ],
+      "properties": {
+        "operation": { "const": "diff" },
+        "bucket": { "type": "string", "minLength": 1 },
+        "prefix": { "$ref": "#/definitions/nullableString" },
+        "entries": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/replicationDiffEntry" }
+        },
+        "scan": { "$ref": "#/definitions/replicationDiffScan" },
+        "extensions": { "type": "object" }
+      }
+    },
     "unsupportedFeatureError": {
       "type": "object",
       "required": ["type", "message", "retryable", "capability", "server"],
@@ -408,6 +451,17 @@
           "properties": {
             "type": { "const": "admin_operations" },
             "data": { "$ref": "#/definitions/adminOperationsData" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/definitions/successEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "replication" },
+            "data": { "$ref": "#/definitions/replicationData" }
           }
         }
       ]

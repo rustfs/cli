@@ -15,6 +15,7 @@ const V3_FAMILIES: &[&str] = &[
     "usage",
     "metrics",
     "admin_operations",
+    "replication",
 ];
 
 fn repository_root() -> PathBuf {
@@ -161,6 +162,16 @@ fn v3_allows_unknown_server_fields() {
         serde_json::json!({ "route": "/minio/admin/v4/runtime/capabilities" });
 
     assert_valid(&validator, &value, "extended capabilities output");
+}
+
+#[test]
+fn replication_truncated_fixture_is_explicitly_non_resumable() {
+    let validator = load_validator(3);
+    let value = load_json(&fixture_path("replication", "truncated"));
+
+    assert_eq!(value["data"]["scan"]["truncated"], true);
+    assert_eq!(value["data"]["scan"]["resumable"], false);
+    assert_valid(&validator, &value, "truncated replication diff");
 }
 
 #[test]

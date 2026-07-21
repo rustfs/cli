@@ -929,6 +929,33 @@ mod tests {
     }
 
     #[test]
+    fn cli_accepts_bucket_replication_diff_prefix() {
+        let cli = Cli::try_parse_from([
+            "rc",
+            "bucket",
+            "replication",
+            "diff",
+            "local/my-bucket",
+            "--prefix",
+            "reports/2026/",
+        ])
+        .expect("parse bucket replication diff");
+
+        match cli.command {
+            Commands::Bucket(args) => match args.command {
+                bucket::BucketCommands::Replication(replicate::ReplicateArgs {
+                    command: replicate::ReplicateCommands::Diff(arg),
+                }) => {
+                    assert_eq!(arg.path, "local/my-bucket");
+                    assert_eq!(arg.prefix.as_deref(), Some("reports/2026/"));
+                }
+                other => panic!("expected bucket replication diff command, got {:?}", other),
+            },
+            other => panic!("expected bucket command, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn cli_accepts_bucket_replication_add_tls_flags() {
         let cli = Cli::try_parse_from([
             "rc",
