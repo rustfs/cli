@@ -11,8 +11,9 @@ mod types;
 
 pub use capabilities::{
     CapabilityAvailability, CapabilityEntry, CapabilityReport, ClusterSnapshotMetadata,
-    ClusterSnapshotSummary, ExtensionMetadata, ExtensionsCatalog, RuntimeCapabilitiesSnapshot,
-    RuntimeCapabilitiesSummary, RuntimeCapabilityState, RuntimeCapabilityStatus,
+    ClusterSnapshotSummary, DiagnosticCapability, DiagnosticCapabilityGuardError,
+    ExtensionMetadata, ExtensionsCatalog, RuntimeCapabilitiesSnapshot, RuntimeCapabilitiesSummary,
+    RuntimeCapabilityState, RuntimeCapabilityStatus,
 };
 pub use cluster::{
     BackendInfo, BackendType, BucketsInfo, ClusterInfo, DecommissionPoolStatus, DecommissionStatus,

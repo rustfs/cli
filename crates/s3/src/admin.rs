@@ -12,12 +12,13 @@ use aws_sigv4::sign::v4;
 use rc_core::admin::{
     AccessKeyInfo, AdminApi, BucketQuota, CapabilityApi, CapabilityAvailability, CapabilityEntry,
     CapabilityReport, ClusterInfo, ClusterSnapshotMetadata, ClusterSnapshotSummary,
-    CreateServiceAccountRequest, DecommissionPoolStatus, DecommissionStatus, ExtensionsCatalog,
-    Group, GroupStatus, HealRuntimeState, HealScanMode, HealStartRequest, HealStatus,
-    HealTaskRequest, PeerSiteSpec, Policy, PolicyEntity, PolicyInfo, PoolStatus, PoolTarget,
-    RebalanceStartResult, RebalanceStatus, RuntimeCapabilitiesSnapshot, RuntimeCapabilityStatus,
-    ServiceAccount, ServiceAccountCreateResponse, ServiceActionResult, SiteRemoveSpec,
-    SiteStatusOptions, UpdateGroupMembersRequest, UpdateServiceAccountRequest, User, UserStatus,
+    CreateServiceAccountRequest, DecommissionPoolStatus, DecommissionStatus, DiagnosticCapability,
+    ExtensionsCatalog, Group, GroupStatus, HealRuntimeState, HealScanMode, HealStartRequest,
+    HealStatus, HealTaskRequest, PeerSiteSpec, Policy, PolicyEntity, PolicyInfo, PoolStatus,
+    PoolTarget, RebalanceStartResult, RebalanceStatus, RuntimeCapabilitiesSnapshot,
+    RuntimeCapabilityStatus, ServiceAccount, ServiceAccountCreateResponse, ServiceActionResult,
+    SiteRemoveSpec, SiteStatusOptions, UpdateGroupMembersRequest, UpdateServiceAccountRequest,
+    User, UserStatus,
 };
 use rc_core::{Alias, Error, Result};
 use reqwest::header::{CONTENT_TYPE, HOST, HeaderMap, HeaderName, HeaderValue};
@@ -1059,12 +1060,18 @@ fn version_gated_entry(name: &str, reason: &str) -> CapabilityEntry {
 
 fn version_gated_report(server_version: Option<String>) -> CapabilityReport {
     let reason = "RustFS Admin API v4 capability discovery is not available on this server version";
+    let mut capabilities = vec![version_gated_entry("admin.runtime-capabilities", reason)];
+    add_uniform_diagnostic_capabilities(
+        &mut capabilities,
+        CapabilityAvailability::VersionGated,
+        reason,
+    );
     CapabilityReport {
         server_version,
         runtime_path: "/rustfs/admin/v4/runtime/capabilities".to_string(),
         extensions_path: "/rustfs/admin/v4/extensions/catalog".to_string(),
         cluster_snapshot_path: "/rustfs/admin/v4/cluster/snapshot".to_string(),
-        capabilities: vec![version_gated_entry("admin.runtime-capabilities", reason)],
+        capabilities,
         extensions: Vec::new(),
         cluster: ClusterSnapshotMetadata {
             summary: None,
@@ -1075,16 +1082,25 @@ fn version_gated_report(server_version: Option<String>) -> CapabilityReport {
 }
 
 fn stubbed_report(server_version: Option<String>, reason: String) -> CapabilityReport {
+    let diagnostic_reason = format!(
+        "Diagnostic support cannot be classified because runtime capability discovery is stubbed: {reason}"
+    );
+    let mut capabilities = vec![CapabilityEntry {
+        name: "admin.runtime-capabilities".to_string(),
+        availability: CapabilityAvailability::Stubbed,
+        reason: Some(reason),
+    }];
+    add_uniform_diagnostic_capabilities(
+        &mut capabilities,
+        CapabilityAvailability::Unknown,
+        &diagnostic_reason,
+    );
     CapabilityReport {
         server_version,
         runtime_path: "/rustfs/admin/v4/runtime/capabilities".to_string(),
         extensions_path: "/rustfs/admin/v4/extensions/catalog".to_string(),
         cluster_snapshot_path: "/rustfs/admin/v4/cluster/snapshot".to_string(),
-        capabilities: vec![CapabilityEntry {
-            name: "admin.runtime-capabilities".to_string(),
-            availability: CapabilityAvailability::Stubbed,
-            reason: Some(reason),
-        }],
+        capabilities,
         extensions: Vec::new(),
         cluster: ClusterSnapshotMetadata {
             summary: None,
@@ -1095,7 +1111,12 @@ fn stubbed_report(server_version: Option<String>, reason: String) -> CapabilityR
 }
 
 fn add_known_server_capabilities(version: Option<&str>, capabilities: &mut Vec<CapabilityEntry>) {
-    if !version.is_some_and(|version| version.contains("1.0.0-beta.10")) {
+    if !is_rustfs_beta10(version) {
+        add_uniform_diagnostic_capabilities(
+            capabilities,
+            CapabilityAvailability::Unknown,
+            "No pinned diagnostic capability contract is available for this server version",
+        );
         return;
     }
 
@@ -1127,6 +1148,117 @@ fn add_known_server_capabilities(version: Option<&str>, capabilities: &mut Vec<C
             reason: Some(reason.to_string()),
         });
     }
+
+    add_beta10_diagnostic_capabilities(capabilities);
+}
+
+fn is_rustfs_beta10(version: Option<&str>) -> bool {
+    version.is_some_and(|version| {
+        version == "1.0.0-beta.10"
+            || version
+                .strip_prefix("1.0.0-beta.10+")
+                .is_some_and(|metadata| !metadata.is_empty())
+    })
+}
+
+fn add_uniform_diagnostic_capabilities(
+    capabilities: &mut Vec<CapabilityEntry>,
+    availability: CapabilityAvailability,
+    reason: &str,
+) {
+    capabilities.extend(
+        DiagnosticCapability::ALL
+            .into_iter()
+            .map(|capability| CapabilityEntry {
+                name: capability.name().to_string(),
+                availability,
+                reason: Some(reason.to_string()),
+            }),
+    );
+}
+
+fn add_beta10_diagnostic_capabilities(capabilities: &mut Vec<CapabilityEntry>) {
+    for (capability, availability, reason) in [
+        (
+            DiagnosticCapability::HealthSnapshot,
+            CapabilityAvailability::Available,
+            "RustFS beta.10 provides a detailed health snapshot implementation",
+        ),
+        (
+            DiagnosticCapability::DriveObservations,
+            CapabilityAvailability::Available,
+            "RustFS beta.10 provides drive storage observations",
+        ),
+        (
+            DiagnosticCapability::ClientDevnull,
+            CapabilityAvailability::Available,
+            "RustFS beta.10 implements client devnull throughput measurement",
+        ),
+        (
+            DiagnosticCapability::InspectArchive,
+            CapabilityAvailability::Unsupported,
+            "RustFS beta.10 inspect-data returns reconstructed object bytes, not an inspection archive",
+        ),
+        (
+            DiagnosticCapability::ObjectSpeedtest,
+            CapabilityAvailability::Stubbed,
+            "RustFS beta.10 returns placeholder object speedtest results",
+        ),
+        (
+            DiagnosticCapability::NetworkSpeedtest,
+            CapabilityAvailability::Stubbed,
+            "RustFS beta.10 returns placeholder network speedtest results",
+        ),
+        (
+            DiagnosticCapability::SiteSpeedtest,
+            CapabilityAvailability::Stubbed,
+            "RustFS beta.10 returns placeholder site speedtest results",
+        ),
+        (
+            DiagnosticCapability::SiteReplicationNetperf,
+            CapabilityAvailability::Stubbed,
+            "RustFS beta.10 site-replication netperf does not perform a peer network measurement",
+        ),
+    ] {
+        capabilities.push(CapabilityEntry {
+            name: capability.name().to_string(),
+            availability,
+            reason: Some(reason.to_string()),
+        });
+    }
+
+    mirror_diagnostic_route(
+        capabilities,
+        DiagnosticCapability::ClusterSnapshot,
+        "admin.cluster-snapshot-route",
+    );
+    mirror_diagnostic_route(
+        capabilities,
+        DiagnosticCapability::ExtensionsCatalog,
+        "admin.extensions-catalog",
+    );
+}
+
+fn mirror_diagnostic_route(
+    capabilities: &mut Vec<CapabilityEntry>,
+    diagnostic: DiagnosticCapability,
+    route_capability_name: &str,
+) {
+    let route_state = capabilities
+        .iter()
+        .find(|capability| capability.name == route_capability_name)
+        .map(|capability| (capability.availability, capability.reason.clone()));
+    let (availability, reason) = route_state.unwrap_or_else(|| {
+        (
+            CapabilityAvailability::Unknown,
+            Some("The diagnostic route was not classified during discovery".to_string()),
+        )
+    });
+    capabilities.push(CapabilityEntry {
+        name: diagnostic.name().to_string(),
+        availability,
+        reason,
+    });
 }
 
 #[async_trait]
@@ -1894,6 +2026,7 @@ mod tests {
     }
 
     const CAPABILITY_INFO_RESPONSE: &str = r#"{"info":{"mode":"distributed","servers":[{"endpoint":"http://node1:9000","state":"online","version":"1.0.0-beta.10","drives":[]}]}}"#;
+    const UNKNOWN_CAPABILITY_INFO_RESPONSE: &str = r#"{"info":{"mode":"distributed","servers":[{"endpoint":"http://node1:9000","state":"online","version":"1.0.0-beta.11","drives":[]}]}}"#;
     const RUNTIME_CAPABILITIES_RESPONSE: &str = r#"{"summary":{"observability":{"state":"supported"},"userspace_profiling":{"state":"disabled","reason":"disabled by configuration"},"memory_sampling":{"state":"unsupported","reason":"not available on this platform"},"platform":{"state":"supported"},"topology":{"state":"unknown","reason":"storage is initializing"},"cluster_snapshot":{"state":"supported"}},"cluster_snapshot_path":"/rustfs/admin/v4/cluster/snapshot","cluster_snapshot_summary":{"state":"supported"},"observability":{},"workload_admission":{},"topology":null,"topology_status":{"state":"unknown"}}"#;
     const EXTENSIONS_RESPONSE: &str = r#"{"extensions":[{"schema_version":"rustfs.extension-schema.v1","extension_id":"ops.diagnostics","display_name":"Operations Diagnostics","provider":"rustfs","version":"1","kind":"ops_diagnostics","runtime":{"api_version":"v1","boundary":"builtin"},"capabilities":[],"disabled_by_default":false}],"runtime_capabilities":{},"cluster_snapshot":{},"external_plugin_flow":{}}"#;
     const CLUSTER_SNAPSHOT_RESPONSE: &str = r#"{"snapshot":{"summary":{"runtime":{"state":"supported"},"topology":{"state":"supported"},"membership":{"state":"supported"},"peer_health":{"state":"supported"},"rpc_boundary":{"state":"supported"},"observability":{"state":"supported"},"workload_admission":{"state":"supported"},"actionable_pressure":{"state":"disabled"}},"runtime_capabilities_path":"/rustfs/admin/v4/runtime/capabilities","extensions_catalog_path":"/rustfs/admin/v4/extensions/catalog"}}"#;
@@ -1941,6 +2074,81 @@ mod tests {
             assert!(report.capabilities.iter().any(|capability| {
                 capability.name == name
                     && capability.availability == CapabilityAvailability::Stubbed
+            }));
+        }
+        for name in [
+            "admin.diagnostics.health-snapshot",
+            "admin.diagnostics.cluster-snapshot",
+            "admin.diagnostics.extensions-catalog",
+            "admin.diagnostics.drive-observations",
+            "admin.diagnostics.client-devnull",
+        ] {
+            assert!(report.capabilities.iter().any(|capability| {
+                capability.name == name
+                    && capability.availability == CapabilityAvailability::Available
+            }));
+        }
+        assert!(report.capabilities.iter().any(|capability| {
+            capability.name == "admin.diagnostics.inspect-archive"
+                && capability.availability == CapabilityAvailability::Unsupported
+        }));
+        for name in [
+            "admin.diagnostics.object-speedtest",
+            "admin.diagnostics.network-speedtest",
+            "admin.diagnostics.site-speedtest",
+            "admin.site-replication.netperf",
+        ] {
+            assert!(report.capabilities.iter().any(|capability| {
+                capability.name == name
+                    && capability.availability == CapabilityAvailability::Stubbed
+            }));
+        }
+
+        let targets = (0..4)
+            .map(|_| receiver.recv().expect("captured request").target)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            targets,
+            vec![
+                "/rustfs/admin/v3/info",
+                "/rustfs/admin/v4/runtime/capabilities",
+                "/rustfs/admin/v4/extensions/catalog",
+                "/rustfs/admin/v4/cluster/snapshot",
+            ]
+        );
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn capability_discovery_fails_closed_for_unknown_server_versions() {
+        let (endpoint, receiver, handle) = start_admin_sequence_server(vec![
+            ("200 OK", UNKNOWN_CAPABILITY_INFO_RESPONSE),
+            ("200 OK", RUNTIME_CAPABILITIES_RESPONSE),
+            ("200 OK", EXTENSIONS_RESPONSE),
+            ("200 OK", CLUSTER_SNAPSHOT_RESPONSE),
+        ]);
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let report = client
+            .discover_capabilities(false)
+            .await
+            .expect("capability discovery should succeed");
+
+        for name in [
+            "admin.diagnostics.health-snapshot",
+            "admin.diagnostics.cluster-snapshot",
+            "admin.diagnostics.extensions-catalog",
+            "admin.diagnostics.drive-observations",
+            "admin.diagnostics.client-devnull",
+            "admin.diagnostics.inspect-archive",
+            "admin.diagnostics.object-speedtest",
+            "admin.diagnostics.network-speedtest",
+            "admin.diagnostics.site-speedtest",
+            "admin.site-replication.netperf",
+        ] {
+            assert!(report.capabilities.iter().any(|capability| {
+                capability.name == name
+                    && capability.availability == CapabilityAvailability::Unknown
             }));
         }
 
@@ -2073,10 +2281,11 @@ mod tests {
             .await
             .expect("v4 absence should produce a report");
 
-        assert_eq!(report.capabilities.len(), 1);
-        assert_eq!(
-            report.capabilities[0].availability,
-            CapabilityAvailability::VersionGated
+        assert_eq!(report.capabilities.len(), 11);
+        assert!(
+            report.capabilities.iter().all(|capability| {
+                capability.availability == CapabilityAvailability::VersionGated
+            })
         );
         assert_eq!(
             receiver.recv().expect("info request").target,
@@ -2105,14 +2314,21 @@ mod tests {
             .await
             .expect("an explicit stub response should produce a report");
 
-        assert_eq!(report.capabilities.len(), 1);
-        assert_eq!(
-            report.capabilities[0].availability,
-            CapabilityAvailability::Stubbed
-        );
-        assert_eq!(
-            report.capabilities[0].reason.as_deref(),
-            Some("route is not implemented")
+        assert_eq!(report.capabilities.len(), 11);
+        assert!(report.capabilities.iter().any(|capability| {
+            capability.name == "admin.runtime-capabilities"
+                && capability.availability == CapabilityAvailability::Stubbed
+                && capability.reason.as_deref() == Some("route is not implemented")
+        }));
+        assert!(
+            report
+                .capabilities
+                .iter()
+                .filter(|capability| {
+                    capability.name.starts_with("admin.diagnostics.")
+                        || capability.name == "admin.site-replication.netperf"
+                })
+                .all(|capability| capability.availability == CapabilityAvailability::Unknown)
         );
         assert_eq!(
             receiver.recv().expect("info request").target,

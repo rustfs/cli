@@ -141,6 +141,95 @@ pub struct CapabilityEntry {
     pub reason: Option<String>,
 }
 
+/// A diagnostic operation whose support must be known before it is invoked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagnosticCapability {
+    HealthSnapshot,
+    ClusterSnapshot,
+    ExtensionsCatalog,
+    DriveObservations,
+    ClientDevnull,
+    InspectArchive,
+    ObjectSpeedtest,
+    NetworkSpeedtest,
+    SiteSpeedtest,
+    SiteReplicationNetperf,
+}
+
+impl DiagnosticCapability {
+    /// All diagnostic capabilities in stable display order.
+    pub const ALL: [Self; 10] = [
+        Self::HealthSnapshot,
+        Self::ClusterSnapshot,
+        Self::ExtensionsCatalog,
+        Self::DriveObservations,
+        Self::ClientDevnull,
+        Self::InspectArchive,
+        Self::ObjectSpeedtest,
+        Self::NetworkSpeedtest,
+        Self::SiteSpeedtest,
+        Self::SiteReplicationNetperf,
+    ];
+
+    /// Stable machine-readable capability name.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::HealthSnapshot => "admin.diagnostics.health-snapshot",
+            Self::ClusterSnapshot => "admin.diagnostics.cluster-snapshot",
+            Self::ExtensionsCatalog => "admin.diagnostics.extensions-catalog",
+            Self::DriveObservations => "admin.diagnostics.drive-observations",
+            Self::ClientDevnull => "admin.diagnostics.client-devnull",
+            Self::InspectArchive => "admin.diagnostics.inspect-archive",
+            Self::ObjectSpeedtest => "admin.diagnostics.object-speedtest",
+            Self::NetworkSpeedtest => "admin.diagnostics.network-speedtest",
+            Self::SiteSpeedtest => "admin.diagnostics.site-speedtest",
+            Self::SiteReplicationNetperf => "admin.site-replication.netperf",
+        }
+    }
+}
+
+/// Error returned when a diagnostic operation is not explicitly available.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiagnosticCapabilityGuardError {
+    capability: DiagnosticCapability,
+    availability: CapabilityAvailability,
+    reason: Option<String>,
+}
+
+impl DiagnosticCapabilityGuardError {
+    /// Diagnostic operation rejected by the guard.
+    pub const fn capability(&self) -> DiagnosticCapability {
+        self.capability
+    }
+
+    /// Effective support classification that caused the rejection.
+    pub const fn availability(&self) -> CapabilityAvailability {
+        self.availability
+    }
+
+    /// Server or client explanation for the classification, when available.
+    pub fn reason(&self) -> Option<&str> {
+        self.reason.as_deref()
+    }
+}
+
+impl fmt::Display for DiagnosticCapabilityGuardError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "diagnostic capability '{}' is {}",
+            self.capability.name(),
+            self.availability
+        )?;
+        if let Some(reason) = &self.reason {
+            write!(formatter, ": {reason}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for DiagnosticCapabilityGuardError {}
+
 /// Aggregate capability discovery result.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CapabilityReport {
@@ -153,9 +242,56 @@ pub struct CapabilityReport {
     pub cluster: ClusterSnapshotMetadata,
 }
 
+impl CapabilityReport {
+    /// Find a normalized capability by its stable machine-readable name.
+    pub fn capability(&self, name: &str) -> Option<&CapabilityEntry> {
+        self.capabilities.iter().find(|entry| entry.name == name)
+    }
+
+    /// Require explicit availability before invoking a diagnostic operation.
+    ///
+    /// Missing entries and every non-available state fail closed. This prevents
+    /// route presence or placeholder HTTP success responses from being treated
+    /// as proof that an active diagnostic is implemented.
+    pub fn require_diagnostic_capability(
+        &self,
+        capability: DiagnosticCapability,
+    ) -> Result<&CapabilityEntry, DiagnosticCapabilityGuardError> {
+        match self.capability(capability.name()) {
+            Some(entry) if entry.availability == CapabilityAvailability::Available => Ok(entry),
+            Some(entry) => Err(DiagnosticCapabilityGuardError {
+                capability,
+                availability: entry.availability,
+                reason: entry.reason.clone(),
+            }),
+            None => Err(DiagnosticCapabilityGuardError {
+                capability,
+                availability: CapabilityAvailability::Unknown,
+                reason: None,
+            }),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn report(capabilities: Vec<CapabilityEntry>) -> CapabilityReport {
+        CapabilityReport {
+            server_version: Some("1.0.0-beta.10".to_string()),
+            runtime_path: "/v4/runtime/capabilities".to_string(),
+            extensions_path: "/v4/extensions/catalog".to_string(),
+            cluster_snapshot_path: "/v4/cluster/snapshot".to_string(),
+            capabilities,
+            extensions: Vec::new(),
+            cluster: ClusterSnapshotMetadata {
+                summary: None,
+                runtime_capabilities_path: None,
+                extensions_catalog_path: None,
+            },
+        }
+    }
 
     #[test]
     fn runtime_states_map_without_overstating_support() {
@@ -198,5 +334,73 @@ mod tests {
                 .expect("availability should serialize"),
             "\"unsupported\""
         );
+    }
+
+    #[test]
+    fn diagnostic_capability_names_are_stable_and_unique() {
+        let names = DiagnosticCapability::ALL.map(DiagnosticCapability::name);
+
+        assert_eq!(names.len(), 10);
+        assert_eq!(names[0], "admin.diagnostics.health-snapshot");
+        assert_eq!(names[9], "admin.site-replication.netperf");
+        for (index, name) in names.iter().enumerate() {
+            assert!(!names[..index].contains(name), "duplicate name: {name}");
+        }
+    }
+
+    #[test]
+    fn diagnostic_guard_allows_only_available_capabilities() {
+        let capability = DiagnosticCapability::HealthSnapshot;
+        let report = report(vec![CapabilityEntry {
+            name: capability.name().to_string(),
+            availability: CapabilityAvailability::Available,
+            reason: Some("Pinned server contract".to_string()),
+        }]);
+
+        let entry = report
+            .require_diagnostic_capability(capability)
+            .expect("available diagnostics should pass the guard");
+
+        assert_eq!(entry.name, capability.name());
+    }
+
+    #[test]
+    fn diagnostic_guard_preserves_non_available_states() {
+        let capability = DiagnosticCapability::ObjectSpeedtest;
+        let blocked_states = [
+            CapabilityAvailability::Stubbed,
+            CapabilityAvailability::Unsupported,
+            CapabilityAvailability::Disabled,
+            CapabilityAvailability::VersionGated,
+            CapabilityAvailability::PermissionDenied,
+            CapabilityAvailability::Unknown,
+        ];
+
+        for availability in blocked_states {
+            let report = report(vec![CapabilityEntry {
+                name: capability.name().to_string(),
+                availability,
+                reason: Some("Server classification".to_string()),
+            }]);
+            let error = report
+                .require_diagnostic_capability(capability)
+                .expect_err("non-available diagnostics must fail closed");
+
+            assert_eq!(error.capability(), capability);
+            assert_eq!(error.availability(), availability);
+            assert_eq!(error.reason(), Some("Server classification"));
+        }
+    }
+
+    #[test]
+    fn diagnostic_guard_treats_missing_entries_as_unknown() {
+        let capability = DiagnosticCapability::NetworkSpeedtest;
+        let error = report(Vec::new())
+            .require_diagnostic_capability(capability)
+            .expect_err("missing diagnostic classifications must fail closed");
+
+        assert_eq!(error.capability(), capability);
+        assert_eq!(error.availability(), CapabilityAvailability::Unknown);
+        assert_eq!(error.reason(), None);
     }
 }
