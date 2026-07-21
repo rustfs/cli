@@ -65,6 +65,25 @@ fn fixture_path(family: &str, case: &str) -> PathBuf {
         .join(format!("{case}.{extension}"))
 }
 
+fn snapshot_payload(contents: &str) -> Option<&str> {
+    contents
+        .split_once("\n---\n")
+        .or_else(|| contents.split_once("\r\n---\r\n"))
+        .map(|(_, payload)| payload)
+}
+
+#[test]
+fn snapshot_payload_accepts_lf_and_crlf_delimiters() {
+    assert_eq!(
+        snapshot_payload("header\n---\n{\"schema_version\":1}\n"),
+        Some("{\"schema_version\":1}\n")
+    );
+    assert_eq!(
+        snapshot_payload("header\r\n---\r\n{\"schema_version\":1}\r\n"),
+        Some("{\"schema_version\":1}\r\n")
+    );
+}
+
 #[test]
 fn every_v3_family_has_valid_success_empty_and_error_fixtures() {
     let validator = load_validator(3);
@@ -121,10 +140,8 @@ fn legacy_schemas_compile_and_existing_v1_golden_snapshots_remain_valid() {
         }
 
         let contents = fs::read_to_string(&path).expect("snapshot must be readable");
-        let payload = contents
-            .split_once("\n---\n")
-            .map(|(_, payload)| payload)
-            .expect("snapshot must contain a payload delimiter");
+        let payload =
+            snapshot_payload(&contents).expect("snapshot must contain a payload delimiter");
         let value: Value = serde_json::from_str(payload).expect("snapshot payload must be JSON");
 
         assert_valid(
