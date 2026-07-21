@@ -145,6 +145,9 @@ fn top_level_command_help_contract() {
                 "ilm",
                 "replicate",
                 "completions",
+                "du",
+                "ping",
+                "ready",
             ],
         },
         HelpCase {
@@ -424,6 +427,26 @@ fn top_level_command_help_contract() {
             args: &["completions"],
             usage: "Usage: rc completions [OPTIONS] <SHELL>",
             expected_tokens: &["[possible values: bash, elvish, fish, powershell, zsh]"],
+        },
+        HelpCase {
+            args: &["ping"],
+            usage: "Usage: rc ping [OPTIONS] <ALIAS>",
+            expected_tokens: &["--timeout", "service liveness", "round-trip latency"],
+        },
+        HelpCase {
+            args: &["ready"],
+            usage: "Usage: rc ready [OPTIONS] <ALIAS>",
+            expected_tokens: &["--timeout", "required dependencies"],
+        },
+        HelpCase {
+            args: &["du"],
+            usage: "Usage: rc du [OPTIONS] <TARGET>",
+            expected_tokens: &[
+                "--fallback",
+                "--versions",
+                "--incomplete",
+                "client-side S3 scan",
+            ],
         },
     ];
 

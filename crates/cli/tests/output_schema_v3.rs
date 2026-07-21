@@ -12,6 +12,7 @@ const V3_FAMILIES: &[&str] = &[
     "locks",
     "multipart_uploads",
     "watch_event",
+    "health",
     "usage",
     "metrics",
     "admin_operations",

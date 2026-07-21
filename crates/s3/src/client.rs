@@ -1025,7 +1025,11 @@ impl S3Client {
 
         let response = builder.send().await.map_err(|e| {
             let err_str = Self::format_sdk_error(&e);
-            if err_str.contains("NotFound") || err_str.contains("NoSuchBucket") {
+            if let aws_sdk_s3::error::SdkError::ServiceError(service_error) = &e
+                && matches!(service_error.raw().status().as_u16(), 401 | 403)
+            {
+                Error::Auth(err_str)
+            } else if err_str.contains("NotFound") || err_str.contains("NoSuchBucket") {
                 Error::NotFound(format!("Bucket not found: {}", path.bucket))
             } else {
                 Error::Network(err_str)
@@ -2206,7 +2210,11 @@ impl ObjectStore for S3Client {
 
         let response = request.send().await.map_err(|e| {
             let err_str = Self::format_sdk_error(&e);
-            if err_str.contains("NotFound") || err_str.contains("NoSuchBucket") {
+            if let aws_sdk_s3::error::SdkError::ServiceError(service_error) = &e
+                && matches!(service_error.raw().status().as_u16(), 401 | 403)
+            {
+                Error::Auth(err_str)
+            } else if err_str.contains("NotFound") || err_str.contains("NoSuchBucket") {
                 Error::NotFound(format!("Bucket not found: {}", path.bucket))
             } else {
                 Error::Network(err_str)
@@ -4920,6 +4928,50 @@ mod tests {
             Err(Error::Network(message)) => assert!(message.contains("InternalError")),
             other => panic!("Expected Network for list versions failure, got: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn list_object_versions_page_maps_permission_denied_to_auth() {
+        let response = http::Response::builder()
+            .status(403)
+            .header("x-amz-error-code", "AccessDenied")
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>AccessDenied</Code><Message>Access denied.</Message></Error>"#,
+            ))
+            .expect("build access denied response");
+        let (client, _request_receiver) = test_s3_client(Some(response));
+        let path = RemotePath::new("test", "bucket", "");
+
+        let result = client.list_object_versions_page(&path, Some(1000)).await;
+
+        assert!(matches!(result, Err(Error::Auth(_))));
+    }
+
+    #[tokio::test]
+    async fn list_objects_maps_permission_denied_to_auth() {
+        let response = http::Response::builder()
+            .status(403)
+            .header("x-amz-error-code", "AccessDenied")
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>AccessDenied</Code><Message>Access denied.</Message></Error>"#,
+            ))
+            .expect("build access denied response");
+        let (client, _request_receiver) = test_s3_client(Some(response));
+        let path = RemotePath::new("test", "bucket", "");
+
+        let result = client
+            .list_objects(
+                &path,
+                ListOptions {
+                    recursive: true,
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        assert!(matches!(result, Err(Error::Auth(_))));
     }
 
     #[tokio::test]

@@ -22,6 +22,7 @@ mod completions;
 mod cors;
 pub mod cp;
 pub mod diff;
+mod du;
 mod encryption;
 mod event;
 mod find;
@@ -32,9 +33,12 @@ mod mb;
 mod mirror;
 mod mv;
 mod object;
+mod ops_output;
+mod ping;
 mod pipe;
 mod quota;
 mod rb;
+mod ready;
 mod replicate;
 mod rm;
 mod share;
@@ -276,6 +280,15 @@ pub enum Commands {
     // Phase 6: Utilities
     /// Generate shell completion scripts
     Completions(completions::CompletionsArgs),
+
+    /// Summarize storage usage
+    Du(du::DuArgs),
+
+    /// Check service liveness and round-trip latency
+    Ping(ping::PingArgs),
+
+    /// Check whether required dependencies are ready
+    Ready(ready::ReadyArgs),
     // /// Manage object retention
     // Retention(retention::RetentionArgs),
     // /// Watch for object events
@@ -437,6 +450,15 @@ pub async fn execute(cli: Cli) -> ExitCode {
             replicate::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
         }
         Commands::Completions(args) => completions::execute(args),
+        Commands::Du(args) => {
+            du::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
+        Commands::Ping(args) => {
+            ping::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
+        Commands::Ready(args) => {
+            ready::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
     }
 }
 

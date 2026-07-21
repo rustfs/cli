@@ -29,6 +29,7 @@
         "locks",
         "multipart_uploads",
         "watch_event",
+        "health",
         "usage",
         "metrics",
         "admin_operations"
@@ -199,6 +200,24 @@
         "keepalive": { "type": "boolean" }
       }
     },
+    "healthData": {
+      "type": "object",
+      "required": [
+        "check", "alias", "endpoint", "path", "healthy", "status_code",
+        "latency_ms", "status", "service"
+      ],
+      "properties": {
+        "check": { "type": "string", "enum": ["liveness", "readiness"] },
+        "alias": { "type": "string", "minLength": 1 },
+        "endpoint": { "type": "string", "minLength": 1 },
+        "path": { "type": "string", "enum": ["/health", "/health/ready"] },
+        "healthy": { "type": "boolean" },
+        "status_code": { "type": "integer", "minimum": 100, "maximum": 599 },
+        "latency_ms": { "type": "integer", "minimum": 0 },
+        "status": { "$ref": "#/definitions/nullableString" },
+        "service": { "$ref": "#/definitions/nullableString" }
+      }
+    },
     "usageData": {
       "type": "object",
       "required": [
@@ -212,6 +231,27 @@
         "object_count": { "type": ["integer", "null"], "minimum": 0 },
         "version_count": { "type": ["integer", "null"], "minimum": 0 },
         "delete_marker_count": { "type": ["integer", "null"], "minimum": 0 },
+        "source": {
+          "type": "string",
+          "enum": ["server_snapshot", "client_scan"]
+        },
+        "snapshot_at": { "$ref": "#/definitions/nullableTimestamp" },
+        "snapshot_age_seconds": { "type": ["integer", "null"], "minimum": 0 },
+        "stale": { "type": "boolean" },
+        "incomplete_upload_count": { "type": ["integer", "null"], "minimum": 0 },
+        "incomplete_upload_bytes": { "$ref": "#/definitions/nullableBytes" },
+        "partial": { "type": "boolean" },
+        "failures": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["bucket", "message"],
+            "properties": {
+              "bucket": { "type": "string", "minLength": 1 },
+              "message": { "type": "string", "minLength": 1 }
+            }
+          }
+        },
         "buckets": {
           "type": "array",
           "items": {
@@ -220,7 +260,11 @@
             "properties": {
               "name": { "type": "string", "minLength": 1 },
               "total_bytes": { "$ref": "#/definitions/nullableBytes" },
-              "object_count": { "type": ["integer", "null"], "minimum": 0 }
+              "object_count": { "type": ["integer", "null"], "minimum": 0 },
+              "version_count": { "type": ["integer", "null"], "minimum": 0 },
+              "delete_marker_count": { "type": ["integer", "null"], "minimum": 0 },
+              "incomplete_upload_count": { "type": ["integer", "null"], "minimum": 0 },
+              "incomplete_upload_bytes": { "$ref": "#/definitions/nullableBytes" }
             }
           }
         }
@@ -375,6 +419,17 @@
           "properties": {
             "type": { "const": "watch_event" },
             "data": { "$ref": "#/definitions/watchData" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/definitions/successEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "health" },
+            "data": { "$ref": "#/definitions/healthData" }
           }
         }
       ]
