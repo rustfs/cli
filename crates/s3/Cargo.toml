@@ -48,6 +48,7 @@ http-body-util.workspace = true
 sha2.workspace = true
 hex.workspace = true
 urlencoding.workspace = true
+tempfile.workspace = true
 
 # Serialization
 serde.workspace = true
@@ -56,5 +57,4 @@ quick-xml.workspace = true
 
 [dev-dependencies]
 aws-smithy-http-client = { version = "1.1.5", features = ["test-util"] }
-tempfile.workspace = true
 mockall.workspace = true
