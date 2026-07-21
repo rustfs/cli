@@ -8,7 +8,8 @@ use comfy_table::{Cell, Table};
 use rc_core::admin::{AdminApi, ReplicationDiff, ReplicationDiffApi, ReplicationDiffEntry};
 use rc_core::replication::{
     BucketTarget, BucketTargetCredentials, ReplicationConfiguration, ReplicationDestination,
-    ReplicationRule, ReplicationRuleStatus,
+    ReplicationResyncStartOptions, ReplicationResyncStartResult, ReplicationResyncStatus,
+    ReplicationResyncTargetStatus, ReplicationRule, ReplicationRuleStatus,
 };
 use rc_core::{AliasManager, Error, ObjectStore as _};
 use rc_s3::{AdminClient, S3Client};
@@ -71,6 +72,76 @@ pub enum ReplicateCommands {
 
     /// Import replication configuration from a JSON file
     Import(ImportArgs),
+
+    /// Actively validate configured replication targets
+    Check(CheckArgs),
+
+    /// Manage bucket replication resync operations
+    #[command(subcommand)]
+    Resync(ResyncCommands),
+}
+
+#[derive(Args, Debug)]
+pub struct CheckArgs {
+    /// Source bucket path (ALIAS/BUCKET)
+    pub path: String,
+
+    /// Confirm the active remote write/delete validation probe
+    #[arg(long)]
+    pub yes: bool,
+
+    /// Force operation even if generic replication capability detection fails
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ResyncCommands {
+    /// Start resyncing previously replicated objects
+    Start(ResyncStartArgs),
+
+    /// Show persisted server-side resync status
+    Status(ResyncStatusArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ResyncStartArgs {
+    /// Source bucket path (ALIAS/BUCKET)
+    pub path: String,
+
+    /// Select a configured replication target ARN
+    #[arg(long)]
+    pub target_arn: Option<String>,
+
+    /// Only resync objects older than this duration (for example, 7d10h31s)
+    #[arg(long)]
+    pub older_than: Option<String>,
+
+    /// Supply a stable resync identifier instead of using a server-generated ID
+    #[arg(long)]
+    pub reset_id: Option<String>,
+
+    /// Confirm the active server-side resync
+    #[arg(long)]
+    pub yes: bool,
+
+    /// Force operation even if generic replication capability detection fails
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct ResyncStatusArgs {
+    /// Source bucket path (ALIAS/BUCKET)
+    pub path: String,
+
+    /// Filter status to one configured replication target ARN
+    #[arg(long)]
+    pub target_arn: Option<String>,
+
+    /// Force operation even if generic replication capability detection fails
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Args, Debug)]
@@ -264,6 +335,41 @@ struct ReplicateOperationOutput {
     action: String,
 }
 
+#[derive(Debug, Serialize)]
+struct ReplicationV3Output {
+    schema_version: u8,
+    #[serde(rename = "type")]
+    output_type: &'static str,
+    status: &'static str,
+    data: ReplicationV3Data,
+}
+
+#[derive(Debug, Serialize)]
+struct ReplicationV3Data {
+    operation: &'static str,
+    bucket: String,
+    valid: Option<bool>,
+    targets: Vec<ReplicationV3Target>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReplicationV3Target {
+    target_arn: String,
+    reset_id: String,
+    reset_before: Option<jiff::Timestamp>,
+    started_at: Option<jiff::Timestamp>,
+    last_updated_at: Option<jiff::Timestamp>,
+    state: Option<rc_core::ReplicationResyncState>,
+    server_state: Option<String>,
+    replicated_count: Option<u64>,
+    replicated_size: Option<u64>,
+    failed_count: Option<u64>,
+    failed_size: Option<u64>,
+    current_bucket: Option<String>,
+    current_object: Option<String>,
+    error: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ReplicationExport {
@@ -365,6 +471,13 @@ pub async fn execute(args: ReplicateArgs, output_config: OutputConfig) -> ExitCo
         ReplicateCommands::Remove(args) => execute_remove(args, output_config).await,
         ReplicateCommands::Export(args) => execute_export(args, output_config).await,
         ReplicateCommands::Import(args) => execute_import(args, output_config).await,
+        ReplicateCommands::Check(args) => execute_check(args, output_config).await,
+        ReplicateCommands::Resync(ResyncCommands::Start(args)) => {
+            execute_resync_start(args, output_config).await
+        }
+        ReplicateCommands::Resync(ResyncCommands::Status(args)) => {
+            execute_resync_status(args, output_config).await
+        }
     }
 }
 
@@ -1379,6 +1492,474 @@ async fn execute_import(args: ImportArgs, output_config: OutputConfig) -> ExitCo
     }
 }
 
+// ==================== Target check and resync ====================
+
+async fn execute_check(args: CheckArgs, output_config: OutputConfig) -> ExitCode {
+    let formatter = Formatter::new(output_config);
+    let (alias, bucket) = match validate_resync_inputs(&args.path, None, None, None) {
+        Ok(validated) => validated,
+        Err(error) => return fail_replication(&formatter, &error, "check"),
+    };
+    if !args.yes {
+        return fail_replication(
+            &formatter,
+            &Error::InvalidPath(
+                "Replication check performs a remote write/delete probe; pass --yes to confirm"
+                    .to_string(),
+            ),
+            "check",
+        );
+    }
+
+    let client = match setup_replication_operation_client(&alias, args.force).await {
+        Ok(client) => client,
+        Err(error) => return fail_replication(&formatter, &error, "check"),
+    };
+    match client.check_bucket_replication(&bucket).await {
+        Ok(()) => {
+            output_replication_success(&formatter, "check", bucket.clone(), Some(true), Vec::new());
+            if !formatter.is_json() {
+                let display_path = formatter.sanitize_text(&format!("{alias}/{bucket}"));
+                formatter.success(&format!(
+                    "Replication targets for '{display_path}' passed the active validation probe."
+                ));
+            }
+            ExitCode::Success
+        }
+        Err(error) => fail_replication(&formatter, &error, "check"),
+    }
+}
+
+async fn execute_resync_start(args: ResyncStartArgs, output_config: OutputConfig) -> ExitCode {
+    let formatter = Formatter::new(output_config);
+    let (alias, bucket) = match validate_resync_inputs(
+        &args.path,
+        args.target_arn.as_deref(),
+        args.reset_id.as_deref(),
+        args.older_than.as_deref(),
+    ) {
+        Ok(validated) => validated,
+        Err(error) => return fail_replication(&formatter, &error, "resync_start"),
+    };
+    if !args.yes {
+        return fail_replication(
+            &formatter,
+            &Error::InvalidPath("Starting a replication resync requires --yes".to_string()),
+            "resync_start",
+        );
+    }
+    let older_than = match args
+        .older_than
+        .as_deref()
+        .map(parse_resync_duration)
+        .transpose()
+    {
+        Ok(value) => value,
+        Err(error) => return fail_replication(&formatter, &error, "resync_start"),
+    };
+    let client = match setup_replication_operation_client(&alias, args.force).await {
+        Ok(client) => client,
+        Err(error) => return fail_replication(&formatter, &error, "resync_start"),
+    };
+    let options = ReplicationResyncStartOptions {
+        target_arn: args.target_arn,
+        older_than,
+        reset_id: args.reset_id,
+    };
+    match client
+        .start_bucket_replication_resync(&bucket, options)
+        .await
+    {
+        Ok(result) => {
+            let target = start_target_output(&result);
+            output_replication_success(
+                &formatter,
+                "resync_start",
+                bucket.clone(),
+                None,
+                vec![target],
+            );
+            if !formatter.is_json() {
+                let display_path = formatter.sanitize_text(&format!("{alias}/{bucket}"));
+                formatter.success(&format!(
+                    "Replication resync started for '{display_path}' target '{}' with ID '{}'.",
+                    formatter.sanitize_text(&result.target_arn),
+                    formatter.sanitize_text(&result.reset_id)
+                ));
+            }
+            ExitCode::Success
+        }
+        Err(error) => fail_replication(&formatter, &error, "resync_start"),
+    }
+}
+
+async fn execute_resync_status(args: ResyncStatusArgs, output_config: OutputConfig) -> ExitCode {
+    let formatter = Formatter::new(output_config);
+    let (alias, bucket) =
+        match validate_resync_inputs(&args.path, args.target_arn.as_deref(), None, None) {
+            Ok(validated) => validated,
+            Err(error) => return fail_replication(&formatter, &error, "resync_status"),
+        };
+    let client = match setup_replication_operation_client(&alias, args.force).await {
+        Ok(client) => client,
+        Err(error) => return fail_replication(&formatter, &error, "resync_status"),
+    };
+    match client
+        .bucket_replication_resync_status(&bucket, args.target_arn.as_deref())
+        .await
+    {
+        Ok(status) => {
+            output_resync_status(&formatter, &alias, &bucket, status);
+            ExitCode::Success
+        }
+        Err(error) => fail_replication(&formatter, &error, "resync_status"),
+    }
+}
+
+fn output_resync_status(
+    formatter: &Formatter,
+    alias: &str,
+    bucket: &str,
+    status: ReplicationResyncStatus,
+) {
+    let targets = status
+        .targets
+        .iter()
+        .cloned()
+        .map(status_target_output)
+        .collect::<Vec<_>>();
+    output_replication_success(
+        formatter,
+        "resync_status",
+        bucket.to_string(),
+        None,
+        targets,
+    );
+    if formatter.is_json() {
+        return;
+    }
+    if status.targets.is_empty() {
+        formatter.println("No replication resync status is available.");
+        return;
+    }
+    let display_path = formatter.sanitize_text(&format!("{alias}/{bucket}"));
+    formatter.println(&format!("Replication resync status for '{display_path}':"));
+    for target in status.targets {
+        let has_error = target.error.is_some();
+        let lines = resync_status_human_lines(formatter, &target);
+        let last_index = lines.len().saturating_sub(1);
+        for (index, line) in lines.into_iter().enumerate() {
+            if has_error && index == last_index {
+                formatter.warning(&line);
+            } else {
+                formatter.println(&line);
+            }
+        }
+    }
+}
+
+fn resync_status_human_lines(
+    formatter: &Formatter,
+    target: &ReplicationResyncTargetStatus,
+) -> Vec<String> {
+    let state = serde_json::to_value(&target.state)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string());
+    let server_value = |value: &str| {
+        if value.is_empty() {
+            "<empty>".to_string()
+        } else {
+            formatter.sanitize_text(value)
+        }
+    };
+    let timestamp = |value: Option<&jiff::Timestamp>| {
+        value
+            .map(|value| formatter.sanitize_text(&value.to_string()))
+            .unwrap_or_else(|| "<none>".to_string())
+    };
+    let optional_value = |value: Option<&str>| {
+        value
+            .map(server_value)
+            .unwrap_or_else(|| "<none>".to_string())
+    };
+
+    let mut lines = vec![
+        format!("  target ARN: {}", server_value(&target.target_arn)),
+        format!("    reset ID: {}", server_value(&target.reset_id)),
+        format!(
+            "    reset before: {}",
+            timestamp(target.reset_before.as_ref())
+        ),
+        format!("    started at: {}", timestamp(target.started_at.as_ref())),
+        format!(
+            "    last update (server EndTime): {}",
+            timestamp(target.last_updated_at.as_ref())
+        ),
+        format!("    state: {state}"),
+        format!("    server state: {}", server_value(&target.server_state)),
+        format!(
+            "    replicated: {} objects ({} bytes)",
+            target.replicated_count, target.replicated_size
+        ),
+        format!(
+            "    failed: {} objects ({} bytes)",
+            target.failed_count, target.failed_size
+        ),
+        format!(
+            "    current bucket: {}",
+            optional_value(target.current_bucket.as_deref())
+        ),
+        format!(
+            "    current object: {}",
+            optional_value(target.current_object.as_deref())
+        ),
+    ];
+    if let Some(error) = target.error.as_deref() {
+        lines.push(format!("    server error detail: {}", server_value(error)));
+    }
+    lines
+}
+
+fn output_replication_success(
+    formatter: &Formatter,
+    operation: &'static str,
+    bucket: String,
+    valid: Option<bool>,
+    targets: Vec<ReplicationV3Target>,
+) {
+    if formatter.is_json() {
+        formatter.json(&ReplicationV3Output {
+            schema_version: 3,
+            output_type: "replication_operations",
+            status: "success",
+            data: ReplicationV3Data {
+                operation,
+                bucket,
+                valid,
+                targets,
+            },
+        });
+    }
+}
+
+fn start_target_output(result: &ReplicationResyncStartResult) -> ReplicationV3Target {
+    ReplicationV3Target {
+        target_arn: result.target_arn.clone(),
+        reset_id: result.reset_id.clone(),
+        reset_before: None,
+        started_at: None,
+        last_updated_at: None,
+        state: None,
+        server_state: None,
+        replicated_count: None,
+        replicated_size: None,
+        failed_count: None,
+        failed_size: None,
+        current_bucket: None,
+        current_object: None,
+        error: None,
+    }
+}
+
+fn status_target_output(target: ReplicationResyncTargetStatus) -> ReplicationV3Target {
+    ReplicationV3Target {
+        target_arn: target.target_arn,
+        reset_id: target.reset_id,
+        reset_before: target.reset_before,
+        started_at: target.started_at,
+        last_updated_at: target.last_updated_at,
+        state: Some(target.state),
+        server_state: Some(target.server_state),
+        replicated_count: Some(target.replicated_count),
+        replicated_size: Some(target.replicated_size),
+        failed_count: Some(target.failed_count),
+        failed_size: Some(target.failed_size),
+        current_bucket: target.current_bucket,
+        current_object: target.current_object,
+        error: target.error,
+    }
+}
+
+fn fail_replication(formatter: &Formatter, error: &Error, operation: &str) -> ExitCode {
+    let code = exit_code_from_replication_error(error);
+    let message = format!("Replication {operation} failed: {error}");
+    if formatter.is_json() {
+        formatter.json_error(&replication_error_json(error, operation));
+        code
+    } else {
+        formatter.fail(code, &message)
+    }
+}
+
+fn replication_error_json(error: &Error, operation: &str) -> serde_json::Value {
+    let code = exit_code_from_replication_error(error);
+    let message = format!("Replication {operation} failed: {error}");
+    let (error_type, retryable, suggestion) = replication_error_metadata(code);
+    let error_value = if code == ExitCode::UnsupportedFeature {
+        let capability = if operation == "check" {
+            "bucket_replication_check"
+        } else {
+            "bucket_replication_resync"
+        };
+        serde_json::json!({
+            "type": "unsupported_feature",
+            "message": message,
+            "retryable": false,
+            "capability": capability,
+            "server": null,
+            "suggestion": suggestion,
+        })
+    } else {
+        serde_json::json!({
+            "type": error_type,
+            "message": message,
+            "retryable": retryable,
+            "suggestion": suggestion,
+        })
+    };
+    serde_json::json!({
+        "schema_version": 3,
+        "type": "replication_operations",
+        "status": "error",
+        "error": error_value,
+    })
+}
+
+fn exit_code_from_replication_error(error: &Error) -> ExitCode {
+    match error {
+        Error::InvalidPath(_) | Error::Config(_) => ExitCode::UsageError,
+        Error::Network(_) => ExitCode::NetworkError,
+        Error::Auth(_) => ExitCode::AuthError,
+        Error::NotFound(_) | Error::AliasNotFound(_) => ExitCode::NotFound,
+        Error::Conflict(_) | Error::AliasExists(_) => ExitCode::Conflict,
+        Error::UnsupportedFeature(_) => ExitCode::UnsupportedFeature,
+        _ => ExitCode::GeneralError,
+    }
+}
+
+const fn replication_error_metadata(code: ExitCode) -> (&'static str, bool, Option<&'static str>) {
+    match code {
+        ExitCode::UsageError => (
+            "usage_error",
+            false,
+            Some("Review the command arguments and required --yes confirmation."),
+        ),
+        ExitCode::NetworkError => (
+            "network_error",
+            true,
+            Some("Verify endpoint connectivity and retry."),
+        ),
+        ExitCode::AuthError => (
+            "auth_error",
+            false,
+            Some("Verify S3 replication permissions and alias credentials."),
+        ),
+        ExitCode::NotFound => (
+            "not_found",
+            false,
+            Some("Verify the bucket and replication configuration."),
+        ),
+        ExitCode::Conflict => (
+            "conflict",
+            false,
+            Some("Review the replication target configuration and server error."),
+        ),
+        ExitCode::Interrupted => ("interrupted", true, Some("Retry the operation if needed.")),
+        ExitCode::Success | ExitCode::GeneralError | ExitCode::UnsupportedFeature => {
+            ("general_error", false, None)
+        }
+    }
+}
+
+fn validate_resync_inputs(
+    path: &str,
+    target_arn: Option<&str>,
+    reset_id: Option<&str>,
+    older_than: Option<&str>,
+) -> Result<(String, String), Error> {
+    let (alias, bucket) = parse_bucket_path(path).map_err(Error::InvalidPath)?;
+    validate_s3_bucket_name(&bucket)?;
+    if let Some(target_arn) = target_arn {
+        validate_target_arn(target_arn)?;
+    }
+    if let Some(reset_id) = reset_id {
+        validate_reset_id(reset_id)?;
+    }
+    if let Some(older_than) = older_than {
+        parse_resync_duration(older_than)?;
+    }
+    Ok((alias, bucket))
+}
+
+fn validate_s3_bucket_name(bucket: &str) -> Result<(), Error> {
+    let valid_length = (3..=63).contains(&bucket.len());
+    let valid_characters = bucket.bytes().all(|byte| {
+        byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'.')
+    });
+    let valid_labels = bucket
+        .split('.')
+        .all(|label| !label.is_empty() && !label.starts_with('-') && !label.ends_with('-'));
+    if !valid_length
+        || !valid_characters
+        || !valid_labels
+        || bucket.parse::<std::net::Ipv4Addr>().is_ok()
+    {
+        return Err(Error::InvalidPath(format!(
+            "Invalid S3 bucket name: {bucket}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_target_arn(target_arn: &str) -> Result<(), Error> {
+    if target_arn.is_empty()
+        || target_arn.trim() != target_arn
+        || target_arn.len() > 2048
+        || target_arn.chars().any(char::is_control)
+        || target_arn.chars().any(char::is_whitespace)
+        || !target_arn.starts_with("arn:")
+        || !target_arn.contains(":replication:")
+    {
+        return Err(Error::InvalidPath(
+            "--target-arn must be a bounded replication ARN without whitespace or control characters"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_reset_id(reset_id: &str) -> Result<(), Error> {
+    if reset_id.is_empty()
+        || reset_id.trim() != reset_id
+        || reset_id.len() > 256
+        || reset_id.chars().any(char::is_control)
+    {
+        return Err(Error::InvalidPath(
+            "--reset-id must be 1 to 256 bytes without surrounding whitespace or control characters"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_resync_duration(value: &str) -> Result<std::time::Duration, Error> {
+    let duration = humantime::parse_duration(value).map_err(|error| {
+        Error::InvalidPath(format!("Invalid --older-than duration '{value}': {error}"))
+    })?;
+    if duration.is_zero() {
+        return Err(Error::InvalidPath(
+            "--older-than must be greater than zero".to_string(),
+        ));
+    }
+    if duration.as_secs() > i64::MAX as u64 {
+        return Err(Error::InvalidPath(
+            "--older-than exceeds the RustFS duration range".to_string(),
+        ));
+    }
+    Ok(duration)
+}
+
 // ==================== Helpers ====================
 
 fn parse_bucket_path(path: &str) -> Result<(String, String), String> {
@@ -1423,6 +2004,28 @@ fn resolve_alias(alias_name: &str, formatter: &Formatter) -> Result<rc_core::Ali
             "Run `rc alias list` to inspect configured aliases or add one with `rc alias set ...`.",
         )),
     }
+}
+
+async fn setup_replication_operation_client(
+    alias_name: &str,
+    force: bool,
+) -> Result<S3Client, Error> {
+    let alias_manager = AliasManager::new()?;
+    let alias = alias_manager.get(alias_name)?;
+    let client = S3Client::new(alias).await?;
+
+    match client.capabilities().await {
+        Ok(capabilities) if !force && !capabilities.replication => {
+            return Err(Error::UnsupportedFeature(
+                "Backend does not advertise generic bucket replication support".to_string(),
+            ));
+        }
+        Ok(_) => {}
+        Err(_) if force => {}
+        Err(error) => return Err(error),
+    }
+
+    Ok(client)
 }
 
 async fn setup_s3_client(
@@ -2249,6 +2852,195 @@ mod tests {
         };
 
         let code = execute(args, OutputConfig::default()).await;
+        assert_eq!(code, ExitCode::UsageError);
+    }
+
+    #[test]
+    fn resync_input_validation_is_local_and_conservative() {
+        assert!(
+            validate_resync_inputs(
+                "local/source-bucket",
+                Some("arn:rustfs:replication::id:target"),
+                Some("caller-reset-1"),
+                Some("7d10h31s")
+            )
+            .is_ok()
+        );
+        assert!(validate_resync_inputs("local/Bad_Bucket", None, None, None).is_err());
+        assert!(
+            validate_resync_inputs(
+                "local/source-bucket",
+                Some("arn:rustfs:replication::id:target\n"),
+                None,
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            validate_resync_inputs("local/source-bucket", None, Some(" reset-1"), None).is_err()
+        );
+    }
+
+    #[test]
+    fn resync_duration_accepts_large_values_and_rejects_server_overflow() {
+        assert_eq!(
+            parse_resync_duration("1h").expect("one hour"),
+            std::time::Duration::from_secs(3600)
+        );
+        assert!(parse_resync_duration("1000y").is_ok());
+        assert!(parse_resync_duration("0s").is_err());
+        assert!(parse_resync_duration("-1h").is_err());
+        assert!(parse_resync_duration("9223372036854775808s").is_err());
+    }
+
+    #[test]
+    fn replication_v3_status_output_preserves_server_state() {
+        let target = status_target_output(ReplicationResyncTargetStatus {
+            target_arn: "arn:rustfs:replication::id:backup".to_string(),
+            reset_id: "reset-1".to_string(),
+            reset_before: None,
+            started_at: None,
+            last_updated_at: None,
+            state: rc_core::ReplicationResyncState::Unknown,
+            server_state: "FutureState".to_string(),
+            replicated_count: 3,
+            replicated_size: 30,
+            failed_count: 2,
+            failed_size: 20,
+            current_bucket: Some("source-bucket".to_string()),
+            current_object: Some("last.txt".to_string()),
+            error: Some("target unavailable".to_string()),
+        });
+        let value = serde_json::to_value(ReplicationV3Output {
+            schema_version: 3,
+            output_type: "replication_operations",
+            status: "success",
+            data: ReplicationV3Data {
+                operation: "resync_status",
+                bucket: "source-bucket".to_string(),
+                valid: None,
+                targets: vec![target],
+            },
+        })
+        .expect("serialize replication v3 output");
+
+        assert_eq!(value["schema_version"], 3);
+        assert_eq!(value["type"], "replication_operations");
+        assert_eq!(value["data"]["targets"][0]["state"], "unknown");
+        assert_eq!(value["data"]["targets"][0]["server_state"], "FutureState");
+    }
+
+    #[test]
+    fn replication_operation_errors_classify_auth_not_found_and_missing_routes() {
+        let cases = [
+            (
+                Error::Auth("access denied".to_string()),
+                ExitCode::AuthError,
+                "auth_error",
+            ),
+            (
+                Error::NotFound("replication configuration missing".to_string()),
+                ExitCode::NotFound,
+                "not_found",
+            ),
+            (
+                Error::UnsupportedFeature("extension route missing".to_string()),
+                ExitCode::UnsupportedFeature,
+                "unsupported_feature",
+            ),
+        ];
+
+        for (error, expected_code, expected_type) in cases {
+            assert_eq!(exit_code_from_replication_error(&error), expected_code);
+            let value = replication_error_json(&error, "resync_status");
+            assert_eq!(value["schema_version"], 3);
+            assert_eq!(value["type"], "replication_operations");
+            assert_eq!(value["status"], "error");
+            assert_eq!(value["error"]["type"], expected_type);
+        }
+
+        let unsupported = replication_error_json(
+            &Error::UnsupportedFeature("extension route missing".to_string()),
+            "check",
+        );
+        assert_eq!(
+            unsupported["error"]["capability"],
+            "bucket_replication_check"
+        );
+    }
+
+    #[test]
+    fn resync_status_human_lines_retain_and_sanitize_server_fields() {
+        let formatter = Formatter::new(OutputConfig {
+            no_color: true,
+            ..OutputConfig::default()
+        });
+        let target = ReplicationResyncTargetStatus {
+            target_arn: "arn:target\nspoof".to_string(),
+            reset_id: "reset\rid".to_string(),
+            reset_before: Some("2026-07-01T00:00:00Z".parse().expect("timestamp")),
+            started_at: Some("2026-07-02T00:00:00Z".parse().expect("timestamp")),
+            last_updated_at: Some("2026-07-02T00:01:00Z".parse().expect("timestamp")),
+            state: rc_core::ReplicationResyncState::Unknown,
+            server_state: "Future\tState".to_string(),
+            replicated_count: 3,
+            replicated_size: 30,
+            failed_count: 2,
+            failed_size: 20,
+            current_bucket: Some("source\nbucket".to_string()),
+            current_object: Some("last\r.txt".to_string()),
+            error: Some("target\tunavailable".to_string()),
+        };
+
+        let lines = resync_status_human_lines(&formatter, &target);
+        let output = lines.join("\n");
+        for expected in [
+            "arn:target\\nspoof",
+            "reset\\rid",
+            "reset before: 2026-07-01T00:00:00Z",
+            "started at: 2026-07-02T00:00:00Z",
+            "last update (server EndTime): 2026-07-02T00:01:00Z",
+            "server state: Future\\tState",
+            "current bucket: source\\nbucket",
+            "current object: last\\r.txt",
+            "server error detail: target\\tunavailable",
+        ] {
+            assert!(output.contains(expected), "missing human field: {expected}");
+        }
+        assert!(!output.contains('\r'));
+        assert!(!output.contains('\t'));
+    }
+
+    #[tokio::test]
+    async fn check_requires_confirmation_before_alias_or_network_setup() {
+        let args = ReplicateArgs {
+            command: ReplicateCommands::Check(CheckArgs {
+                path: "missing-alias/source-bucket".to_string(),
+                yes: false,
+                force: false,
+            }),
+        };
+
+        let code = execute(args, OutputConfig::default()).await;
+
+        assert_eq!(code, ExitCode::UsageError);
+    }
+
+    #[tokio::test]
+    async fn resync_start_requires_confirmation_before_alias_or_network_setup() {
+        let args = ReplicateArgs {
+            command: ReplicateCommands::Resync(ResyncCommands::Start(ResyncStartArgs {
+                path: "missing-alias/source-bucket".to_string(),
+                target_arn: None,
+                older_than: None,
+                reset_id: None,
+                yes: false,
+                force: false,
+            })),
+        };
+
+        let code = execute(args, OutputConfig::default()).await;
+
         assert_eq!(code, ExitCode::UsageError);
     }
 }

@@ -985,6 +985,103 @@ mod tests {
     }
 
     #[test]
+    fn cli_accepts_bucket_replication_check_confirmation() {
+        let cli = Cli::try_parse_from([
+            "rc",
+            "bucket",
+            "replication",
+            "check",
+            "local/my-bucket",
+            "--yes",
+            "--force",
+        ])
+        .expect("parse bucket replication check");
+
+        match cli.command {
+            Commands::Bucket(args) => match args.command {
+                bucket::BucketCommands::Replication(replicate::ReplicateArgs {
+                    command: replicate::ReplicateCommands::Check(arg),
+                }) => {
+                    assert_eq!(arg.path, "local/my-bucket");
+                    assert!(arg.yes);
+                    assert!(arg.force);
+                }
+                other => panic!("expected bucket replication check command, got {other:?}"),
+            },
+            other => panic!("expected bucket command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_bucket_replication_resync_lifecycle() {
+        let start = Cli::try_parse_from([
+            "rc",
+            "bucket",
+            "replication",
+            "resync",
+            "start",
+            "local/my-bucket",
+            "--target-arn",
+            "arn:rustfs:replication::id:backup",
+            "--older-than",
+            "7d",
+            "--reset-id",
+            "caller-id",
+            "--yes",
+        ])
+        .expect("parse bucket replication resync start");
+
+        match start.command {
+            Commands::Bucket(args) => match args.command {
+                bucket::BucketCommands::Replication(replicate::ReplicateArgs {
+                    command:
+                        replicate::ReplicateCommands::Resync(replicate::ResyncCommands::Start(arg)),
+                }) => {
+                    assert_eq!(arg.path, "local/my-bucket");
+                    assert_eq!(
+                        arg.target_arn.as_deref(),
+                        Some("arn:rustfs:replication::id:backup")
+                    );
+                    assert_eq!(arg.older_than.as_deref(), Some("7d"));
+                    assert_eq!(arg.reset_id.as_deref(), Some("caller-id"));
+                    assert!(arg.yes);
+                }
+                other => panic!("expected bucket replication resync start, got {other:?}"),
+            },
+            other => panic!("expected bucket command, got {other:?}"),
+        }
+
+        let status = Cli::try_parse_from([
+            "rc",
+            "bucket",
+            "replication",
+            "resync",
+            "status",
+            "local/my-bucket",
+            "--target-arn",
+            "arn:rustfs:replication::id:backup",
+        ])
+        .expect("parse bucket replication resync status");
+
+        match status.command {
+            Commands::Bucket(args) => match args.command {
+                bucket::BucketCommands::Replication(replicate::ReplicateArgs {
+                    command:
+                        replicate::ReplicateCommands::Resync(replicate::ResyncCommands::Status(arg)),
+                }) => {
+                    assert_eq!(arg.path, "local/my-bucket");
+                    assert_eq!(
+                        arg.target_arn.as_deref(),
+                        Some("arn:rustfs:replication::id:backup")
+                    );
+                }
+                other => panic!("expected bucket replication resync status, got {other:?}"),
+            },
+            other => panic!("expected bucket command, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn cli_accepts_bucket_remove_subcommand() {
         let cli = Cli::try_parse_from(["rc", "bucket", "remove", "local/my-bucket"])
             .expect("parse bucket remove");

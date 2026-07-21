@@ -18,7 +18,7 @@ rc bucket version <enable|suspend|info|list> ...
 rc bucket quota <set|info|clear> ...
 rc bucket anonymous <set|set-json|get|get-json|list|links> ...
 rc bucket lifecycle <rule|tier|restore> ...
-rc bucket replication <add|update|list|status|diff|remove|export|import> ...
+rc bucket replication <add|update|list|status|diff|remove|export|import|check|resync> ...
 ```
 
 ## Commands
@@ -99,6 +99,14 @@ Scan for pending or failed versions below a prefix:
 
 ```bash
 rc bucket replication diff local/archive --prefix reports/2026/
+```
+
+Actively validate configured targets and start a confirmed existing-object resync:
+
+```bash
+rc bucket replication check local/archive --yes
+rc bucket replication resync start local/archive --older-than 30d --yes
+rc bucket replication resync status local/archive
 ```
 
 ## Behavior
