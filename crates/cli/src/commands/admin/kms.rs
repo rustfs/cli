@@ -1,12 +1,14 @@
-//! Read-only RustFS KMS inspection commands.
+//! RustFS KMS inspection and safe key lifecycle commands.
 
 use clap::{Args, Subcommand};
 use rc_core::admin::{
-    KmsApi, KmsBackendKind, KmsKey, KmsKeyPage, KmsKeyState, KmsKeyUsage, KmsServiceState,
-    KmsStatus,
+    KmsApi, KmsBackendKind, KmsCancelKeyDeletionResult, KmsCreateKeyRequest, KmsCreateKeyResult,
+    KmsDeleteKeyRequest, KmsDeleteKeyResult, KmsKey, KmsKeyPage, KmsKeyState, KmsKeyUsage,
+    KmsServiceState, KmsStatus,
 };
 use rc_core::{Error, Result};
 use serde::Serialize;
+use std::collections::BTreeMap;
 
 use super::{emit_observability_error, get_admin_client};
 use crate::exit_code::ExitCode;
@@ -35,6 +37,15 @@ pub enum KmsKeyCommands {
 
     /// Display key lifecycle status; defaults to the configured KMS key
     Status(KmsKeyStatusArgs),
+
+    /// Create a KMS key without exporting key material
+    Create(KmsKeyCreateArgs),
+
+    /// Schedule or immediately delete a KMS key
+    Delete(KmsKeyDeleteArgs),
+
+    /// Cancel a scheduled KMS key deletion
+    CancelDeletion(KmsKeyCancelDeletionArgs),
 }
 
 #[derive(Args, Debug)]
@@ -58,6 +69,62 @@ pub struct KmsKeyStatusArgs {
 
     /// Key identifier; when omitted, use the configured default KMS key
     pub key_id: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct KmsKeyCreateArgs {
+    /// Alias name of the server
+    pub alias: String,
+
+    /// Optional friendly key name stored in the reserved name tag
+    #[arg(long)]
+    pub name: Option<String>,
+
+    /// Optional key description
+    #[arg(long)]
+    pub description: Option<String>,
+
+    /// Key metadata tag in KEY=VALUE form; may be repeated
+    #[arg(long = "tag", value_name = "KEY=VALUE")]
+    pub tags: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct KmsKeyDeleteArgs {
+    /// Alias name of the server
+    pub alias: String,
+
+    /// Key identifier
+    pub key_id: String,
+
+    /// Number of days before deletion; defaults to 7
+    #[arg(
+        long,
+        value_parser = clap::value_parser!(u32).range(7..=30),
+        conflicts_with = "immediate"
+    )]
+    pub pending_window_days: Option<u32>,
+
+    /// Delete immediately instead of scheduling deletion
+    #[arg(long)]
+    pub immediate: bool,
+
+    /// Confirm deletion without an interactive prompt
+    #[arg(long)]
+    pub yes: bool,
+
+    /// Acknowledge that immediate deletion cannot be cancelled
+    #[arg(long, requires = "immediate")]
+    pub confirm_immediate: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct KmsKeyCancelDeletionArgs {
+    /// Alias name of the server
+    pub alias: String,
+
+    /// Key identifier
+    pub key_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -95,12 +162,39 @@ struct KmsKeyStatusData<'a> {
     key: &'a KmsKey,
 }
 
+#[derive(Debug, Serialize)]
+struct KmsKeyCreateData<'a> {
+    operation: &'static str,
+    key_id: &'a str,
+    key: Option<&'a KmsKey>,
+}
+
+#[derive(Debug, Serialize)]
+struct KmsKeyDeleteData<'a> {
+    operation: &'static str,
+    key_id: &'a str,
+    deletion_date: Option<&'a str>,
+    immediate: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct KmsKeyCancelDeletionData<'a> {
+    operation: &'static str,
+    key_id: &'a str,
+    key: Option<&'a KmsKey>,
+}
+
 pub async fn execute(command: KmsCommands, formatter: &Formatter) -> ExitCode {
     match command {
         KmsCommands::Status(args) => execute_status(args, formatter).await,
         KmsCommands::Key(command) => match command {
             KmsKeyCommands::List(args) => execute_key_list(args, formatter).await,
             KmsKeyCommands::Status(args) => execute_key_status(args, formatter).await,
+            KmsKeyCommands::Create(args) => execute_key_create(args, formatter).await,
+            KmsKeyCommands::Delete(args) => execute_key_delete(args, formatter).await,
+            KmsKeyCommands::CancelDeletion(args) => {
+                execute_key_cancel_deletion(args, formatter).await
+            }
         },
     }
 }
@@ -205,6 +299,240 @@ async fn execute_key_status_with_api(
             ExitCode::Success
         }
         Err(error) => emit_kms_error("Failed to get KMS key status", &error, false, formatter),
+    }
+}
+
+async fn execute_key_create(args: KmsKeyCreateArgs, formatter: &Formatter) -> ExitCode {
+    let request = match build_create_request(&args) {
+        Ok(request) => request,
+        Err(error) => {
+            return emit_kms_error("Failed to create KMS key", &error, false, formatter);
+        }
+    };
+    let client = match get_admin_client(&args.alias, formatter) {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
+    execute_key_create_with_api(&request, &client, formatter).await
+}
+
+async fn execute_key_create_with_api(
+    request: &KmsCreateKeyRequest,
+    api: &dyn KmsApi,
+    formatter: &Formatter,
+) -> ExitCode {
+    match api.kms_create_key(request).await {
+        Ok(result) => {
+            emit_key_create_result(&result, formatter);
+            ExitCode::Success
+        }
+        Err(error) => emit_kms_error("Failed to create KMS key", &error, false, formatter),
+    }
+}
+
+async fn execute_key_delete(args: KmsKeyDeleteArgs, formatter: &Formatter) -> ExitCode {
+    let request = match build_delete_request(&args) {
+        Ok(request) => request,
+        Err(error) => {
+            return emit_kms_error("Refused to delete KMS key", &error, false, formatter);
+        }
+    };
+    let client = match get_admin_client(&args.alias, formatter) {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
+    execute_key_delete_with_api(&request, &client, formatter).await
+}
+
+async fn execute_key_delete_with_api(
+    request: &KmsDeleteKeyRequest,
+    api: &dyn KmsApi,
+    formatter: &Formatter,
+) -> ExitCode {
+    match api.kms_delete_key(request).await {
+        Ok(result) => {
+            emit_key_delete_result(&result, formatter);
+            ExitCode::Success
+        }
+        Err(error) => emit_kms_error("Failed to delete KMS key", &error, false, formatter),
+    }
+}
+
+async fn execute_key_cancel_deletion(
+    args: KmsKeyCancelDeletionArgs,
+    formatter: &Formatter,
+) -> ExitCode {
+    let key_id = match validated_nonempty("KMS key id", &args.key_id) {
+        Ok(key_id) => key_id,
+        Err(error) => {
+            return emit_kms_error(
+                "Failed to cancel KMS key deletion",
+                &error,
+                false,
+                formatter,
+            );
+        }
+    };
+    let client = match get_admin_client(&args.alias, formatter) {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
+    execute_key_cancel_deletion_with_api(key_id, &client, formatter).await
+}
+
+async fn execute_key_cancel_deletion_with_api(
+    key_id: &str,
+    api: &dyn KmsApi,
+    formatter: &Formatter,
+) -> ExitCode {
+    match api.kms_cancel_key_deletion(key_id).await {
+        Ok(result) => {
+            emit_key_cancel_deletion_result(&result, formatter);
+            ExitCode::Success
+        }
+        Err(error) => emit_kms_error(
+            "Failed to cancel KMS key deletion",
+            &error,
+            false,
+            formatter,
+        ),
+    }
+}
+
+fn build_create_request(args: &KmsKeyCreateArgs) -> Result<KmsCreateKeyRequest> {
+    let name = args
+        .name
+        .as_deref()
+        .map(|name| validated_nonempty("KMS key name", name).map(str::to_string))
+        .transpose()?;
+    let description = args
+        .description
+        .as_deref()
+        .map(|description| validated_text("KMS key description", description).map(str::to_string))
+        .transpose()?;
+    let mut tags = BTreeMap::new();
+    for tag in &args.tags {
+        let (key, value) = tag
+            .split_once('=')
+            .ok_or_else(|| Error::InvalidPath("KMS tags must use KEY=VALUE syntax".to_string()))?;
+        let key = validated_nonempty("KMS tag key", key)?;
+        let value = validated_text("KMS tag value", value)?;
+        if key == "name" {
+            return Err(Error::InvalidPath(
+                "The KMS tag key 'name' is reserved; use --name".to_string(),
+            ));
+        }
+        if tags.insert(key.to_string(), value.to_string()).is_some() {
+            return Err(Error::InvalidPath(format!("Duplicate KMS tag key: {key}")));
+        }
+    }
+    Ok(KmsCreateKeyRequest {
+        name,
+        description,
+        tags,
+    })
+}
+
+fn build_delete_request(args: &KmsKeyDeleteArgs) -> Result<KmsDeleteKeyRequest> {
+    let key_id = validated_nonempty("KMS key id", &args.key_id)?;
+    if !args.yes {
+        return Err(Error::InvalidPath(
+            "KMS key deletion requires --yes".to_string(),
+        ));
+    }
+    if args.immediate && !args.confirm_immediate {
+        return Err(Error::InvalidPath(
+            "Immediate KMS key deletion requires --confirm-immediate".to_string(),
+        ));
+    }
+    Ok(KmsDeleteKeyRequest {
+        key_id: key_id.to_string(),
+        pending_window_in_days: (!args.immediate).then_some(args.pending_window_days.unwrap_or(7)),
+        force_immediate: args.immediate,
+    })
+}
+
+fn validated_nonempty<'a>(label: &str, value: &'a str) -> Result<&'a str> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(Error::InvalidPath(format!("{label} cannot be empty")));
+    }
+    validated_text(label, value)
+}
+
+fn validated_text<'a>(label: &str, value: &'a str) -> Result<&'a str> {
+    if value.chars().any(char::is_control) {
+        return Err(Error::InvalidPath(format!(
+            "{label} cannot contain control characters"
+        )));
+    }
+    Ok(value)
+}
+
+fn emit_key_create_result(result: &KmsCreateKeyResult, formatter: &Formatter) {
+    if formatter.is_json() {
+        formatter.json(&KmsSuccessOutput {
+            schema_version: 3,
+            output_type: "kms",
+            status: "success",
+            data: KmsKeyCreateData {
+                operation: "key_create",
+                key_id: &result.key_id,
+                key: result.key.as_ref(),
+            },
+        });
+    } else {
+        formatter.println(&format!(
+            "Created KMS key {}",
+            formatter.sanitize_text(&result.key_id)
+        ));
+    }
+}
+
+fn emit_key_delete_result(result: &KmsDeleteKeyResult, formatter: &Formatter) {
+    if formatter.is_json() {
+        formatter.json(&KmsSuccessOutput {
+            schema_version: 3,
+            output_type: "kms",
+            status: "success",
+            data: KmsKeyDeleteData {
+                operation: "key_delete",
+                key_id: &result.key_id,
+                deletion_date: result.deletion_date.as_deref(),
+                immediate: result.immediate,
+            },
+        });
+    } else if result.immediate {
+        formatter.println(&format!(
+            "Deleted KMS key {} immediately",
+            formatter.sanitize_text(&result.key_id)
+        ));
+    } else {
+        formatter.println(&format!(
+            "Scheduled deletion for KMS key {} at {}",
+            formatter.sanitize_text(&result.key_id),
+            formatter.sanitize_text(result.deletion_date.as_deref().unwrap_or("server default"))
+        ));
+    }
+}
+
+fn emit_key_cancel_deletion_result(result: &KmsCancelKeyDeletionResult, formatter: &Formatter) {
+    if formatter.is_json() {
+        formatter.json(&KmsSuccessOutput {
+            schema_version: 3,
+            output_type: "kms",
+            status: "success",
+            data: KmsKeyCancelDeletionData {
+                operation: "key_cancel_deletion",
+                key_id: &result.key_id,
+                key: result.key.as_ref(),
+            },
+        });
+    } else {
+        formatter.println(&format!(
+            "Cancelled deletion for KMS key {}",
+            formatter.sanitize_text(&result.key_id)
+        ));
     }
 }
 

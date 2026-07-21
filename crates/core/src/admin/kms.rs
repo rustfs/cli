@@ -108,12 +108,53 @@ pub struct KmsKeyPage {
     pub next_marker: Option<String>,
 }
 
+/// Metadata used to create a KMS key without exposing key material.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KmsCreateKeyRequest {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub tags: BTreeMap<String, String>,
+}
+
+/// Result returned after creating a KMS key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KmsCreateKeyResult {
+    pub key_id: String,
+    pub key: Option<KmsKey>,
+}
+
+/// Request to schedule or immediately delete a KMS key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KmsDeleteKeyRequest {
+    pub key_id: String,
+    pub pending_window_in_days: Option<u32>,
+    pub force_immediate: bool,
+}
+
+/// Result returned after requesting KMS key deletion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KmsDeleteKeyResult {
+    pub key_id: String,
+    pub deletion_date: Option<String>,
+    pub immediate: bool,
+}
+
+/// Result returned after cancelling scheduled KMS key deletion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KmsCancelKeyDeletionResult {
+    pub key_id: String,
+    pub key: Option<KmsKey>,
+}
+
 /// RustFS KMS administration operations.
 #[async_trait]
 pub trait KmsApi: Send + Sync {
     async fn kms_status(&self) -> Result<KmsStatus>;
     async fn kms_list_keys(&self, limit: u32, marker: Option<&str>) -> Result<KmsKeyPage>;
     async fn kms_describe_key(&self, key_id: &str) -> Result<KmsKey>;
+    async fn kms_create_key(&self, request: &KmsCreateKeyRequest) -> Result<KmsCreateKeyResult>;
+    async fn kms_delete_key(&self, request: &KmsDeleteKeyRequest) -> Result<KmsDeleteKeyResult>;
+    async fn kms_cancel_key_deletion(&self, key_id: &str) -> Result<KmsCancelKeyDeletionResult>;
 }
 
 #[cfg(test)]

@@ -366,11 +366,52 @@
         "key": { "$ref": "#/definitions/kmsKey" }
       }
     },
+    "kmsKeyCreateData": {
+      "type": "object",
+      "required": ["operation", "key_id", "key"],
+      "properties": {
+        "operation": { "const": "key_create" },
+        "key_id": { "type": "string", "minLength": 1 },
+        "key": {
+          "oneOf": [
+            { "$ref": "#/definitions/kmsKey" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "kmsKeyDeleteData": {
+      "type": "object",
+      "required": ["operation", "key_id", "deletion_date", "immediate"],
+      "properties": {
+        "operation": { "const": "key_delete" },
+        "key_id": { "type": "string", "minLength": 1 },
+        "deletion_date": { "$ref": "#/definitions/nullableString" },
+        "immediate": { "type": "boolean" }
+      }
+    },
+    "kmsKeyCancelDeletionData": {
+      "type": "object",
+      "required": ["operation", "key_id", "key"],
+      "properties": {
+        "operation": { "const": "key_cancel_deletion" },
+        "key_id": { "type": "string", "minLength": 1 },
+        "key": {
+          "oneOf": [
+            { "$ref": "#/definitions/kmsKey" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
     "kmsData": {
       "oneOf": [
         { "$ref": "#/definitions/kmsServiceStatusData" },
         { "$ref": "#/definitions/kmsKeyListData" },
-        { "$ref": "#/definitions/kmsKeyStatusData" }
+        { "$ref": "#/definitions/kmsKeyStatusData" },
+        { "$ref": "#/definitions/kmsKeyCreateData" },
+        { "$ref": "#/definitions/kmsKeyDeleteData" },
+        { "$ref": "#/definitions/kmsKeyCancelDeletionData" }
       ]
     },
     "adminOperation": {

@@ -2,7 +2,7 @@
 
 ## Purpose
 
-The `rc admin` operation manages the RustFS Admin API, including scanner and storage diagnostics, bounded realtime metrics, read-only KMS inspection, cluster information, healing, pools, expansion, decommissioning, rebalance workflows, IAM users, policies, groups, service accounts, site replication, and service control.
+The `rc admin` operation manages the RustFS Admin API, including scanner and storage diagnostics, bounded realtime metrics, KMS inspection and key lifecycle management, cluster information, healing, pools, expansion, decommissioning, rebalance workflows, IAM users, policies, groups, service accounts, site replication, and service control.
 
 `rc admin` does not implement the MinIO Admin API. MinIO aliases remain available to S3 data commands, but MinIO administrative operations require a MinIO-compatible admin client.
 
@@ -16,6 +16,10 @@ rc admin metrics <ALIAS> [OPTIONS]
 rc admin kms status <ALIAS>
 rc admin kms key list <ALIAS> [--limit N] [--marker TOKEN]
 rc admin kms key status <ALIAS> [KEY_ID]
+rc admin kms key create <ALIAS> [--name NAME] [--description TEXT] [--tag KEY=VALUE]...
+rc admin kms key delete <ALIAS> <KEY_ID> [--pending-window-days 7..30] --yes
+rc admin kms key delete <ALIAS> <KEY_ID> --immediate --yes --confirm-immediate
+rc admin kms key cancel-deletion <ALIAS> <KEY_ID>
 rc admin heal <status|start|stop> <ALIAS> [OPTIONS]
 rc admin pool <list|status> <ALIAS> [POOL] [OPTIONS]
 rc admin expand <start|status|stop> <ALIAS>
@@ -39,7 +43,7 @@ rc admin replicate remove <ALIAS> <--all|--site <NAME>>
 | `info` | Display cluster, server, or disk information. |
 | `scanner` | Inspect scanner health, freshness, and cycle state. |
 | `metrics` | Query bounded realtime metrics as normalized JSON Lines or raw server records. |
-| `kms` | Inspect KMS service health, safe configuration summaries, and key lifecycle state. |
+| `kms` | Inspect KMS state and manage safe native key lifecycle operations. |
 | `heal` | Start, stop, or inspect healing operations. |
 | `pool` | List pools and inspect pool status. |
 | `expand` | Manage post-expansion data rebalancing. Alias: `scale`. |
@@ -73,12 +77,15 @@ Collect two scanner and disk metric snapshots:
 rc --json admin metrics local --scope scanner,disk --samples 2 --interval 3s --by-host --by-disk
 ```
 
-Inspect KMS service state, list keys, and inspect the configured default key:
+Inspect KMS state and manage a key lifecycle:
 
 ```bash
 rc admin kms status local
 rc admin kms key list local --limit 100
 rc admin kms key status local
+rc admin kms key create local --name archive --description "Archive key" --tag environment=prod
+rc admin kms key delete local <KEY_ID> --pending-window-days 7 --yes
+rc admin kms key cancel-deletion local <KEY_ID>
 ```
 
 Start a deep heal for a prefix:
@@ -199,19 +206,25 @@ Normalized metrics always use one compact v3 JSON object per line, including num
 
 Permission failures return the authentication exit code. A missing observability route returns `unsupported_feature`, allowing automation to distinguish an older RustFS server from missing credentials. Malformed and oversized responses fail without emitting partial normalized records.
 
-## KMS Inspection Workflow
+## KMS Key Lifecycle Workflow
 
-The KMS commands in this release are read-only and target the native RustFS beta.10 Admin API. They do not implement the MinIO KMS admin protocol.
+The KMS commands target the native RustFS beta.10 Admin API. They do not implement the MinIO KMS admin protocol.
 
 | Command | Description |
 | --- | --- |
 | `rc admin kms status <ALIAS>` | Show `not-configured`, `configured`, `running`, `error`, or `unknown` service state plus a non-secret configuration summary. |
 | `rc admin kms key list <ALIAS> [--limit N] [--marker TOKEN]` | List native RustFS KMS keys with pagination. The limit range is `1..=1000`. |
 | `rc admin kms key status <ALIAS> [KEY_ID]` | Show key metadata and lifecycle state. When `KEY_ID` is omitted, use the configured default key ID. |
+| `rc admin kms key create <ALIAS> [--name NAME] [--description TEXT] [--tag KEY=VALUE]...` | Create a key. Names are sent through RustFS's reserved `name` tag. Tags reject malformed, duplicate, reserved-name, and control-character input. |
+| `rc admin kms key delete <ALIAS> <KEY_ID> [--pending-window-days 7..30] --yes` | Schedule deletion. The pending window defaults to seven days and `--yes` is mandatory. |
+| `rc admin kms key delete <ALIAS> <KEY_ID> --immediate --yes --confirm-immediate` | Permanently delete a key with two explicit non-interactive acknowledgements. Immediate deletion cannot be cancelled. |
+| `rc admin kms key cancel-deletion <ALIAS> <KEY_ID>` | Cancel a previously scheduled deletion. |
 
 An unconfigured KMS service is a successful status result with `state=not-configured`; it is not treated as a network failure. Permission failures return the authentication exit code. Missing status or list routes return `unsupported_feature`, while a missing explicitly requested key returns `not_found`.
 
 Human output includes service state, backend family, health, default key ID, cache state, and key metadata. JSON output uses the v3 `kms` family. Configuration responses are normalized instead of passed through: Vault tokens, AppRole secret IDs, local master keys, plaintext data keys, and ciphertext blobs are never part of the KMS inspection output.
+
+Mutation responses use `key_create`, `key_delete`, and `key_cancel_deletion` operations in the v3 `kms` family. Server error messages are classified into stable permission, missing-key, conflict, unavailable, rejected-request, and malformed-response failures without echoing response bodies. Create and cancellation results deserialize only lifecycle metadata; unknown key-material fields are ignored. These commands do not configure, start, or stop the KMS service and never request or export data keys.
 
 `kms key status` describes native RustFS key lifecycle metadata. It does not claim compatibility with the `mc admin kms key status` encryption/decryption probe. RustFS beta.10 has no direct decrypt-test Admin API or KMS-specific metrics selector, and `rc` intentionally does not expose the legacy `generate-data-key` response because that response contains plaintext data-key material.
 

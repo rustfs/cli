@@ -39,7 +39,7 @@ pub enum AdminCommands {
     /// Query bounded RustFS realtime metrics
     Metrics(metrics::MetricsArgs),
 
-    /// Inspect RustFS KMS service and key state
+    /// Inspect KMS state and manage key lifecycle operations
     #[command(subcommand)]
     Kms(kms::KmsCommands),
 
@@ -315,6 +315,64 @@ mod tests {
                 assert_eq!(args.key_id.as_deref(), Some("archive/key"));
             }
             _ => panic!("Unexpected KMS key status command"),
+        }
+
+        let create = TestCli::parse_from([
+            "rc",
+            "kms",
+            "key",
+            "create",
+            "local",
+            "--name",
+            "archive",
+            "--description",
+            "Archive key",
+            "--tag",
+            "environment=prod",
+        ]);
+        match create.command {
+            AdminCommands::Kms(kms::KmsCommands::Key(kms::KmsKeyCommands::Create(args))) => {
+                assert_eq!(args.name.as_deref(), Some("archive"));
+                assert_eq!(args.tags, vec!["environment=prod"]);
+            }
+            _ => panic!("Unexpected KMS key create command"),
+        }
+
+        let delete = TestCli::parse_from([
+            "rc",
+            "kms",
+            "key",
+            "delete",
+            "local",
+            "archive/key",
+            "--immediate",
+            "--yes",
+            "--confirm-immediate",
+        ]);
+        match delete.command {
+            AdminCommands::Kms(kms::KmsCommands::Key(kms::KmsKeyCommands::Delete(args))) => {
+                assert!(args.immediate);
+                assert!(args.yes);
+                assert!(args.confirm_immediate);
+            }
+            _ => panic!("Unexpected KMS key delete command"),
+        }
+
+        let cancel = TestCli::parse_from([
+            "rc",
+            "kms",
+            "key",
+            "cancel-deletion",
+            "local",
+            "archive/key",
+        ]);
+        match cancel.command {
+            AdminCommands::Kms(kms::KmsCommands::Key(kms::KmsKeyCommands::CancelDeletion(
+                args,
+            ))) => {
+                assert_eq!(args.key_id, "archive/key");
+            }
+            _ => panic!("Unexpected KMS key cancel-deletion command"),
         }
     }
 

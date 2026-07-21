@@ -10,6 +10,8 @@ pub struct CapturedAdminRequest {
     #[allow(dead_code)]
     pub method: String,
     pub target: String,
+    #[allow(dead_code)]
+    pub body: Vec<u8>,
 }
 
 pub fn rc_binary() -> PathBuf {
@@ -50,13 +52,42 @@ fn read_admin_request(stream: &mut TcpStream) -> CapturedAdminRequest {
         }
     }
 
-    let request = String::from_utf8(request).expect("admin request should be UTF-8");
-    let request_line = request.lines().next().expect("request line");
+    let header_end = request
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|position| position + 4)
+        .expect("admin request should contain headers");
+    let headers = String::from_utf8(request[..header_end].to_vec())
+        .expect("admin request headers should be UTF-8");
+    let content_length = headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().expect("valid content length"))
+        })
+        .unwrap_or(0);
+    while request.len() - header_end < content_length {
+        let bytes_read = stream.read(&mut buffer).expect("read admin request body");
+        assert!(
+            bytes_read > 0,
+            "client closed connection before request body"
+        );
+        request.extend_from_slice(&buffer[..bytes_read]);
+    }
+
+    let request_line = headers.lines().next().expect("request line");
     let mut parts = request_line.split_whitespace();
     let method = parts.next().expect("request method").to_string();
     let target = parts.next().expect("request target").to_string();
 
-    CapturedAdminRequest { method, target }
+    let body = request[header_end..header_end + content_length].to_vec();
+
+    CapturedAdminRequest {
+        method,
+        target,
+        body,
+    }
 }
 
 // Each integration-test binary compiles this shared module independently, so a

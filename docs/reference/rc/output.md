@@ -47,6 +47,6 @@ When migrating:
 5. For watch output, validate and process each JSON Lines record independently.
 6. For normalized metrics, retain labels and per-sample `collected_at` timestamps; do not infer one timestamp for the entire stream.
 7. Ignore unknown object properties while continuing to require documented fields and types.
-8. For KMS inspection, treat `not-configured` as a successful service state and never expect secret configuration or data-key fields.
+8. For KMS operations, treat `not-configured` as a successful service state, dispatch lifecycle results by `key_create`, `key_delete`, or `key_cancel_deletion`, and never expect secret configuration or data-key fields.
 
 The golden fixtures under `crates/cli/tests/fixtures/output_v3/` provide success, empty, and error examples for every v3 family.

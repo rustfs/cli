@@ -25,8 +25,9 @@ pub use cluster::{
     UsageInfo,
 };
 pub use kms::{
-    KmsApi, KmsBackendKind, KmsCacheSummary, KmsConfigSummary, KmsKey, KmsKeyPage, KmsKeyState,
-    KmsKeyUsage, KmsServiceState, KmsStatus,
+    KmsApi, KmsBackendKind, KmsCacheSummary, KmsCancelKeyDeletionResult, KmsConfigSummary,
+    KmsCreateKeyRequest, KmsCreateKeyResult, KmsDeleteKeyRequest, KmsDeleteKeyResult, KmsKey,
+    KmsKeyPage, KmsKeyState, KmsKeyUsage, KmsServiceState, KmsStatus,
 };
 pub use observability::{
     MAX_METRICS_LINE_BYTES, MAX_METRICS_RESPONSE_BYTES, MAX_METRICS_SAMPLES, MetricGroup,

@@ -15,14 +15,15 @@ use rc_core::admin::{
     CapabilityReport, ClusterInfo, ClusterSnapshotMetadata, ClusterSnapshotSummary,
     CreateServiceAccountRequest, DecommissionPoolStatus, DecommissionStatus, ExtensionsCatalog,
     Group, GroupStatus, HealRuntimeState, HealScanMode, HealStartRequest, HealStatus,
-    HealTaskRequest, KmsApi, KmsBackendKind, KmsCacheSummary, KmsConfigSummary, KmsKey, KmsKeyPage,
-    KmsKeyState, KmsKeyUsage, KmsServiceState, KmsStatus, MAX_METRICS_LINE_BYTES,
-    MAX_METRICS_RESPONSE_BYTES, MAX_METRICS_SAMPLES, MetricsBatch, MetricsQuery, ObservabilityApi,
-    PeerSiteSpec, Policy, PolicyEntity, PolicyInfo, PoolStatus, PoolTarget, RealtimeMetrics,
-    RebalanceStartResult, RebalanceStatus, RuntimeCapabilitiesSnapshot, RuntimeCapabilityStatus,
-    ScannerStatus, ServiceAccount, ServiceAccountCreateResponse, ServiceActionResult,
-    SiteRemoveSpec, SiteStatusOptions, StorageInfo, UpdateGroupMembersRequest,
-    UpdateServiceAccountRequest, User, UserStatus,
+    HealTaskRequest, KmsApi, KmsBackendKind, KmsCacheSummary, KmsCancelKeyDeletionResult,
+    KmsConfigSummary, KmsCreateKeyRequest, KmsCreateKeyResult, KmsDeleteKeyRequest,
+    KmsDeleteKeyResult, KmsKey, KmsKeyPage, KmsKeyState, KmsKeyUsage, KmsServiceState, KmsStatus,
+    MAX_METRICS_LINE_BYTES, MAX_METRICS_RESPONSE_BYTES, MAX_METRICS_SAMPLES, MetricsBatch,
+    MetricsQuery, ObservabilityApi, PeerSiteSpec, Policy, PolicyEntity, PolicyInfo, PoolStatus,
+    PoolTarget, RealtimeMetrics, RebalanceStartResult, RebalanceStatus,
+    RuntimeCapabilitiesSnapshot, RuntimeCapabilityStatus, ScannerStatus, ServiceAccount,
+    ServiceAccountCreateResponse, ServiceActionResult, SiteRemoveSpec, SiteStatusOptions,
+    StorageInfo, UpdateGroupMembersRequest, UpdateServiceAccountRequest, User, UserStatus,
 };
 use rc_core::{Alias, Error, Result};
 use reqwest::header::{CONTENT_TYPE, HOST, HeaderMap, HeaderName, HeaderValue};
@@ -1201,6 +1202,58 @@ struct KmsDescribeKeyResponse {
     key_metadata: Option<KmsKeyResponse>,
 }
 
+#[derive(Debug, Serialize)]
+struct KmsCreateKeyBody<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<&'a str>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    tags: BTreeMap<&'a str, &'a str>,
+}
+
+#[derive(Debug, Deserialize)]
+struct KmsCreateKeyResponse {
+    success: bool,
+    message: String,
+    #[serde(default)]
+    key_id: Option<String>,
+    #[serde(default)]
+    key_metadata: Option<KmsKeyResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct KmsDeleteKeyBody<'a> {
+    key_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pending_window_in_days: Option<u32>,
+    #[serde(skip_serializing_if = "is_false")]
+    force_immediate: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct KmsDeleteKeyResponse {
+    success: bool,
+    message: String,
+    #[serde(default)]
+    key_id: Option<String>,
+    #[serde(default)]
+    deletion_date: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct KmsCancelKeyDeletionBody<'a> {
+    key_id: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+struct KmsCancelKeyDeletionResponse {
+    success: bool,
+    message: String,
+    #[serde(default)]
+    key_id: Option<String>,
+    #[serde(default)]
+    key_metadata: Option<KmsKeyResponse>,
+}
+
 #[derive(Debug, Deserialize)]
 struct KmsKeyResponse {
     key_id: String,
@@ -1368,6 +1421,46 @@ fn kms_key_usage(value: Option<&str>) -> KmsKeyUsage {
     }
 }
 
+fn kms_mutation_error(operation: &str, message: &str) -> Error {
+    let normalized = message.to_ascii_lowercase();
+    if normalized.contains("already exists") || normalized.contains("conflict") {
+        Error::Conflict(format!("KMS key {operation} conflicts with existing state"))
+    } else if normalized.contains("not found") || normalized.contains("does not exist") {
+        Error::NotFound(format!("KMS key {operation} target was not found"))
+    } else if normalized.contains("not initialized")
+        || normalized.contains("not running")
+        || normalized.contains("unavailable")
+    {
+        Error::Network("KMS service is unavailable".to_string())
+    } else {
+        Error::General(format!("KMS key {operation} request was rejected"))
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
+fn sanitize_kms_mutation_error(operation: &str, error: Error) -> Error {
+    match error {
+        Error::Auth(_) => Error::Auth("KMS mutation permission was denied".to_string()),
+        Error::NotFound(_) => Error::NotFound(format!("KMS key {operation} target was not found")),
+        Error::Conflict(_) => {
+            Error::Conflict(format!("KMS key {operation} conflicts with existing state"))
+        }
+        Error::Network(diagnostic) => {
+            let classified = kms_mutation_error(operation, &diagnostic);
+            match classified {
+                Error::Conflict(_) | Error::NotFound(_) => classified,
+                _ => Error::Network("KMS service is unavailable".to_string()),
+            }
+        }
+        Error::Json(error) => Error::Json(error),
+        Error::InvalidPath(_) | Error::Config(_) => error,
+        error => kms_mutation_error(operation, &error.to_string()),
+    }
+}
+
 #[async_trait]
 impl KmsApi for AdminClient {
     async fn kms_status(&self) -> Result<KmsStatus> {
@@ -1417,6 +1510,107 @@ impl KmsApi for AdminClient {
             .key_metadata
             .map(Into::into)
             .ok_or_else(|| Error::Network("KMS describe response omitted key metadata".to_string()))
+    }
+
+    async fn kms_create_key(&self, request: &KmsCreateKeyRequest) -> Result<KmsCreateKeyResult> {
+        if request.tags.contains_key("name") {
+            return Err(Error::InvalidPath(
+                "The KMS tag key 'name' is reserved; use the name field".to_string(),
+            ));
+        }
+        let mut tags = request
+            .tags
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect::<BTreeMap<_, _>>();
+        if let Some(name) = request.name.as_deref() {
+            tags.insert("name", name);
+        }
+        let body = serde_json::to_vec(&KmsCreateKeyBody {
+            description: request.description.as_deref(),
+            tags,
+        })
+        .map_err(Error::Json)?;
+        let response: KmsCreateKeyResponse = self
+            .request(Method::POST, "/kms/keys", None, Some(&body))
+            .await
+            .map_err(|error| sanitize_kms_mutation_error("creation", error))?;
+        if !response.success {
+            return Err(kms_mutation_error("creation", &response.message));
+        }
+        let key = response.key_metadata.map(Into::into);
+        let key_id = response
+            .key_id
+            .or_else(|| key.as_ref().map(|key: &KmsKey| key.key_id.clone()))
+            .ok_or_else(|| {
+                Error::Network("KMS create response omitted the key identifier".to_string())
+            })?;
+        Ok(KmsCreateKeyResult { key_id, key })
+    }
+
+    async fn kms_delete_key(&self, request: &KmsDeleteKeyRequest) -> Result<KmsDeleteKeyResult> {
+        if request.key_id.trim().is_empty() {
+            return Err(Error::InvalidPath("KMS key id cannot be empty".to_string()));
+        }
+        if request.force_immediate && request.pending_window_in_days.is_some() {
+            return Err(Error::InvalidPath(
+                "Immediate KMS deletion cannot include a pending window".to_string(),
+            ));
+        }
+        if request
+            .pending_window_in_days
+            .is_some_and(|days| !(7..=30).contains(&days))
+        {
+            return Err(Error::InvalidPath(
+                "KMS deletion pending window must be between 7 and 30 days".to_string(),
+            ));
+        }
+        let body = serde_json::to_vec(&KmsDeleteKeyBody {
+            key_id: &request.key_id,
+            pending_window_in_days: request.pending_window_in_days,
+            force_immediate: request.force_immediate,
+        })
+        .map_err(Error::Json)?;
+        let response: KmsDeleteKeyResponse = self
+            .request(Method::DELETE, "/kms/keys/delete", None, Some(&body))
+            .await
+            .map_err(|error| sanitize_kms_mutation_error("deletion", error))?;
+        if !response.success {
+            return Err(kms_mutation_error("deletion", &response.message));
+        }
+        let key_id = response.key_id.ok_or_else(|| {
+            Error::Network("KMS delete response omitted the key identifier".to_string())
+        })?;
+        Ok(KmsDeleteKeyResult {
+            key_id,
+            deletion_date: response.deletion_date,
+            immediate: request.force_immediate,
+        })
+    }
+
+    async fn kms_cancel_key_deletion(&self, key_id: &str) -> Result<KmsCancelKeyDeletionResult> {
+        if key_id.trim().is_empty() {
+            return Err(Error::InvalidPath("KMS key id cannot be empty".to_string()));
+        }
+        let body = serde_json::to_vec(&KmsCancelKeyDeletionBody { key_id }).map_err(Error::Json)?;
+        let response: KmsCancelKeyDeletionResponse = self
+            .request(Method::POST, "/kms/keys/cancel-deletion", None, Some(&body))
+            .await
+            .map_err(|error| sanitize_kms_mutation_error("deletion cancellation", error))?;
+        if !response.success {
+            return Err(kms_mutation_error(
+                "deletion cancellation",
+                &response.message,
+            ));
+        }
+        let key = response.key_metadata.map(Into::into);
+        let key_id = response
+            .key_id
+            .or_else(|| key.as_ref().map(|key: &KmsKey| key.key_id.clone()))
+            .ok_or_else(|| {
+                Error::Network("KMS cancellation response omitted the key identifier".to_string())
+            })?;
+        Ok(KmsCancelKeyDeletionResult { key_id, key })
     }
 }
 
@@ -3956,6 +4150,142 @@ mod tests {
             "/rustfs/admin/v3/kms/keys/archive%2Fkey%20one"
         );
         handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn kms_create_key_posts_name_as_reserved_tag_and_ignores_key_material() {
+        let body = r#"{"success":true,"message":"created","key_id":"key-123","key_metadata":{"key_id":"key-123","key_state":"Enabled","key_usage":"EncryptDecrypt","tags":{"name":"archive"},"plaintext_key":"MUST_NOT_APPEAR"},"plaintext_key":"MUST_NOT_APPEAR"}"#;
+        let (endpoint, receiver, handle) = start_admin_test_server("200 OK", body);
+        let client = admin_client_for_endpoint(&endpoint);
+        let request = KmsCreateKeyRequest {
+            name: Some("archive".to_string()),
+            description: Some("Archive key".to_string()),
+            tags: BTreeMap::from([("environment".to_string(), "prod".to_string())]),
+        };
+
+        let result = client
+            .kms_create_key(&request)
+            .await
+            .expect("KMS key should be created");
+
+        assert_eq!(result.key_id, "key-123");
+        assert_eq!(
+            result
+                .key
+                .as_ref()
+                .and_then(|key| key.tags.get("name"))
+                .map(String::as_str),
+            Some("archive")
+        );
+        assert!(!format!("{result:?}").contains("MUST_NOT_APPEAR"));
+        let captured = receiver.recv().expect("captured request");
+        assert_eq!(captured.method, "POST");
+        assert_eq!(captured.target, "/rustfs/admin/v3/kms/keys");
+        let request_body: serde_json::Value =
+            serde_json::from_slice(&captured.body).expect("create request should be JSON");
+        assert_eq!(request_body["description"], "Archive key");
+        assert_eq!(request_body["tags"]["name"], "archive");
+        assert_eq!(request_body["tags"]["environment"], "prod");
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn kms_delete_and_cancel_use_native_lifecycle_routes() {
+        let responses = vec![
+            (
+                "200 OK",
+                r#"{"success":true,"message":"scheduled","key_id":"key-123","deletion_date":"2026-07-28T00:00:00Z"}"#,
+            ),
+            (
+                "200 OK",
+                r#"{"success":true,"message":"cancelled","key_id":"key-123","key_metadata":{"key_id":"key-123","key_state":"Enabled","key_usage":"EncryptDecrypt","tags":{}}}"#,
+            ),
+        ];
+        let (endpoint, receiver, handle) = start_admin_sequence_server(responses);
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let deleted = client
+            .kms_delete_key(&KmsDeleteKeyRequest {
+                key_id: "key-123".to_string(),
+                pending_window_in_days: Some(7),
+                force_immediate: false,
+            })
+            .await
+            .expect("KMS deletion should be scheduled");
+        assert_eq!(
+            deleted.deletion_date.as_deref(),
+            Some("2026-07-28T00:00:00Z")
+        );
+        assert!(!deleted.immediate);
+
+        let cancelled = client
+            .kms_cancel_key_deletion("key-123")
+            .await
+            .expect("KMS deletion should be cancelled");
+        assert_eq!(cancelled.key_id, "key-123");
+
+        let delete_request = receiver.recv().expect("captured delete request");
+        assert_eq!(delete_request.method, "DELETE");
+        assert_eq!(delete_request.target, "/rustfs/admin/v3/kms/keys/delete");
+        let delete_body: serde_json::Value =
+            serde_json::from_slice(&delete_request.body).expect("delete request should be JSON");
+        assert_eq!(delete_body["pending_window_in_days"], 7);
+        assert!(delete_body.get("force_immediate").is_none());
+
+        let cancel_request = receiver.recv().expect("captured cancel request");
+        assert_eq!(cancel_request.method, "POST");
+        assert_eq!(
+            cancel_request.target,
+            "/rustfs/admin/v3/kms/keys/cancel-deletion"
+        );
+        let cancel_body: serde_json::Value =
+            serde_json::from_slice(&cancel_request.body).expect("cancel request should be JSON");
+        assert_eq!(cancel_body["key_id"], "key-123");
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn kms_mutation_errors_are_typed_and_do_not_echo_server_details() {
+        for (status, body, expected) in [
+            (
+                "200 OK",
+                r#"{"success":false,"message":"key already exists: MUST_NOT_APPEAR"}"#,
+                "conflict",
+            ),
+            (
+                "500 Internal Server Error",
+                r#"{"success":false,"message":"key already exists: MUST_NOT_APPEAR"}"#,
+                "conflict",
+            ),
+            (
+                "200 OK",
+                r#"{"success":false,"message":"kms service is not running: MUST_NOT_APPEAR"}"#,
+                "network",
+            ),
+            (
+                "503 Service Unavailable",
+                r#"{"success":false,"message":"kms service is not running: MUST_NOT_APPEAR"}"#,
+                "network",
+            ),
+        ] {
+            let (endpoint, _receiver, handle) = start_admin_test_server(status, body);
+            let client = admin_client_for_endpoint(&endpoint);
+            let error = client
+                .kms_create_key(&KmsCreateKeyRequest {
+                    name: None,
+                    description: None,
+                    tags: BTreeMap::new(),
+                })
+                .await
+                .expect_err("mutation should fail");
+            match expected {
+                "conflict" => assert!(matches!(error, Error::Conflict(_))),
+                "network" => assert!(matches!(error, Error::Network(_))),
+                _ => panic!("unexpected expected error kind"),
+            }
+            assert!(!error.to_string().contains("MUST_NOT_APPEAR"));
+            handle.join().expect("server thread should finish");
+        }
     }
 
     #[tokio::test]
