@@ -10,6 +10,7 @@ mod expand;
 mod group;
 mod heal;
 mod info;
+mod kms;
 mod metrics;
 mod policy;
 mod pool;
@@ -37,6 +38,10 @@ pub enum AdminCommands {
 
     /// Query bounded RustFS realtime metrics
     Metrics(metrics::MetricsArgs),
+
+    /// Inspect RustFS KMS service and key state
+    #[command(subcommand)]
+    Kms(kms::KmsCommands),
 
     /// Inspect scanner health and freshness
     #[command(subcommand)]
@@ -102,6 +107,7 @@ pub async fn execute(cmd: AdminCommands, output_config: OutputConfig) -> ExitCod
     match cmd {
         AdminCommands::Capabilities(args) => capabilities::execute(args, &formatter).await,
         AdminCommands::Metrics(args) => metrics::execute(args, &formatter).await,
+        AdminCommands::Kms(kms_cmd) => kms::execute(kms_cmd, &formatter).await,
         AdminCommands::Scanner(scanner_cmd) => scanner::execute(scanner_cmd, &formatter).await,
         AdminCommands::Info(info_cmd) => info::execute(info_cmd, &formatter).await,
         AdminCommands::Heal(heal_cmd) => heal::execute(heal_cmd, &formatter).await,
@@ -277,6 +283,38 @@ mod tests {
                 assert!(args.refresh);
             }
             _ => panic!("Unexpected command parsing result"),
+        }
+    }
+
+    #[test]
+    fn test_parse_admin_kms_commands() {
+        let status = TestCli::parse_from(["rc", "kms", "status", "local"]);
+        match status.command {
+            AdminCommands::Kms(kms::KmsCommands::Status(args)) => {
+                assert_eq!(args.alias, "local");
+            }
+            _ => panic!("Unexpected KMS status command"),
+        }
+
+        let list = TestCli::parse_from([
+            "rc", "kms", "key", "list", "local", "--limit", "25", "--marker", "next/key",
+        ]);
+        match list.command {
+            AdminCommands::Kms(kms::KmsCommands::Key(kms::KmsKeyCommands::List(args))) => {
+                assert_eq!(args.alias, "local");
+                assert_eq!(args.limit, 25);
+                assert_eq!(args.marker.as_deref(), Some("next/key"));
+            }
+            _ => panic!("Unexpected KMS key list command"),
+        }
+
+        let key_status =
+            TestCli::parse_from(["rc", "kms", "key", "status", "local", "archive/key"]);
+        match key_status.command {
+            AdminCommands::Kms(kms::KmsCommands::Key(kms::KmsKeyCommands::Status(args))) => {
+                assert_eq!(args.key_id.as_deref(), Some("archive/key"));
+            }
+            _ => panic!("Unexpected KMS key status command"),
         }
     }
 

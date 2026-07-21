@@ -15,19 +15,21 @@ use rc_core::admin::{
     CapabilityReport, ClusterInfo, ClusterSnapshotMetadata, ClusterSnapshotSummary,
     CreateServiceAccountRequest, DecommissionPoolStatus, DecommissionStatus, ExtensionsCatalog,
     Group, GroupStatus, HealRuntimeState, HealScanMode, HealStartRequest, HealStatus,
-    HealTaskRequest, MAX_METRICS_LINE_BYTES, MAX_METRICS_RESPONSE_BYTES, MAX_METRICS_SAMPLES,
-    MetricsBatch, MetricsQuery, ObservabilityApi, PeerSiteSpec, Policy, PolicyEntity, PolicyInfo,
-    PoolStatus, PoolTarget, RealtimeMetrics, RebalanceStartResult, RebalanceStatus,
-    RuntimeCapabilitiesSnapshot, RuntimeCapabilityStatus, ScannerStatus, ServiceAccount,
-    ServiceAccountCreateResponse, ServiceActionResult, SiteRemoveSpec, SiteStatusOptions,
-    StorageInfo, UpdateGroupMembersRequest, UpdateServiceAccountRequest, User, UserStatus,
+    HealTaskRequest, KmsApi, KmsBackendKind, KmsCacheSummary, KmsConfigSummary, KmsKey, KmsKeyPage,
+    KmsKeyState, KmsKeyUsage, KmsServiceState, KmsStatus, MAX_METRICS_LINE_BYTES,
+    MAX_METRICS_RESPONSE_BYTES, MAX_METRICS_SAMPLES, MetricsBatch, MetricsQuery, ObservabilityApi,
+    PeerSiteSpec, Policy, PolicyEntity, PolicyInfo, PoolStatus, PoolTarget, RealtimeMetrics,
+    RebalanceStartResult, RebalanceStatus, RuntimeCapabilitiesSnapshot, RuntimeCapabilityStatus,
+    ScannerStatus, ServiceAccount, ServiceAccountCreateResponse, ServiceActionResult,
+    SiteRemoveSpec, SiteStatusOptions, StorageInfo, UpdateGroupMembersRequest,
+    UpdateServiceAccountRequest, User, UserStatus,
 };
 use rc_core::{Alias, Error, Result};
 use reqwest::header::{CONTENT_TYPE, HOST, HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Client, Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
@@ -1134,6 +1136,287 @@ fn add_known_server_capabilities(version: Option<&str>, capabilities: &mut Vec<C
             availability: CapabilityAvailability::Stubbed,
             reason: Some(reason.to_string()),
         });
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct KmsServiceStatusResponse {
+    status: serde_json::Value,
+    #[serde(default)]
+    backend_type: Option<String>,
+    #[serde(default)]
+    healthy: Option<bool>,
+    #[serde(default)]
+    config_summary: Option<KmsConfigSummaryResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+struct KmsConfigSummaryResponse {
+    backend_type: String,
+    #[serde(default)]
+    default_key_id: Option<String>,
+    #[serde(default)]
+    timeout_seconds: Option<u64>,
+    #[serde(default)]
+    retry_attempts: Option<u32>,
+    #[serde(default)]
+    enable_cache: bool,
+    #[serde(default)]
+    max_cached_keys: Option<u64>,
+    #[serde(default)]
+    cache_ttl_seconds: Option<u64>,
+    #[serde(default)]
+    cache_summary: Option<KmsCacheSummaryResponse>,
+    #[serde(default)]
+    backend_summary: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct KmsCacheSummaryResponse {
+    #[serde(default)]
+    max_keys: Option<u64>,
+    #[serde(default)]
+    ttl_seconds: Option<u64>,
+    #[serde(default)]
+    enable_metrics: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct KmsListKeysResponse {
+    success: bool,
+    message: String,
+    #[serde(default)]
+    keys: Vec<KmsKeyResponse>,
+    #[serde(default)]
+    truncated: bool,
+    #[serde(default)]
+    next_marker: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct KmsDescribeKeyResponse {
+    success: bool,
+    message: String,
+    #[serde(default)]
+    key_metadata: Option<KmsKeyResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+struct KmsKeyResponse {
+    key_id: String,
+    #[serde(default, alias = "key_state", alias = "status")]
+    state: Option<String>,
+    #[serde(default, alias = "key_usage")]
+    usage: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    algorithm: Option<String>,
+    #[serde(default)]
+    version: Option<u32>,
+    #[serde(default, alias = "creation_date")]
+    created_at: Option<String>,
+    #[serde(default)]
+    deletion_date: Option<String>,
+    #[serde(default)]
+    rotated_at: Option<String>,
+    #[serde(default)]
+    origin: Option<String>,
+    #[serde(default, alias = "key_manager")]
+    manager: Option<String>,
+    #[serde(default)]
+    tags: BTreeMap<String, String>,
+    #[serde(default)]
+    metadata: BTreeMap<String, String>,
+}
+
+impl From<KmsConfigSummaryResponse> for KmsConfigSummary {
+    fn from(response: KmsConfigSummaryResponse) -> Self {
+        let backend_details = response.backend_summary.as_object();
+        let string_detail = |name: &str| {
+            backend_details
+                .and_then(|details| details.get(name))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        };
+        let bool_detail = |name: &str| {
+            backend_details
+                .and_then(|details| details.get(name))
+                .and_then(serde_json::Value::as_bool)
+        };
+        let cache = response.cache_summary;
+
+        Self {
+            backend: kms_backend_kind(&response.backend_type),
+            default_key_id: response.default_key_id,
+            timeout_seconds: response.timeout_seconds,
+            retry_attempts: response.retry_attempts,
+            cache: KmsCacheSummary {
+                enabled: response.enable_cache,
+                max_keys: cache
+                    .as_ref()
+                    .and_then(|summary| summary.max_keys)
+                    .or(response.max_cached_keys),
+                ttl_seconds: cache
+                    .as_ref()
+                    .and_then(|summary| summary.ttl_seconds)
+                    .or(response.cache_ttl_seconds),
+                metrics_enabled: cache.and_then(|summary| summary.enable_metrics),
+            },
+            endpoint: string_detail("address").and_then(|address| safe_backend_endpoint(&address)),
+            auth_method: string_detail("auth_method_type"),
+            credentials_configured: bool_detail("has_stored_credentials"),
+            tls_verification_disabled: bool_detail("skip_tls_verify"),
+        }
+    }
+}
+
+impl From<KmsKeyResponse> for KmsKey {
+    fn from(mut response: KmsKeyResponse) -> Self {
+        response.metadata.append(&mut response.tags);
+        Self {
+            key_id: response.key_id,
+            state: kms_key_state(response.state.as_deref()),
+            usage: kms_key_usage(response.usage.as_deref()),
+            description: response.description,
+            algorithm: response.algorithm,
+            version: response.version,
+            created_at: response.created_at,
+            deletion_date: response.deletion_date,
+            rotated_at: response.rotated_at,
+            origin: response.origin,
+            manager: response.manager,
+            tags: response.metadata,
+        }
+    }
+}
+
+fn kms_backend_kind(value: &str) -> KmsBackendKind {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "local" => KmsBackendKind::Local,
+        "vault" | "vaultkv2" | "vault-kv2" | "vault_kv2" => KmsBackendKind::VaultKv2,
+        "vaulttransit" | "vault-transit" | "vault_transit" => KmsBackendKind::VaultTransit,
+        _ => KmsBackendKind::Unknown,
+    }
+}
+
+fn safe_backend_endpoint(value: &str) -> Option<String> {
+    let mut endpoint = url::Url::parse(value).ok()?;
+    endpoint.set_username("").ok()?;
+    endpoint.set_password(None).ok()?;
+    endpoint.set_query(None);
+    endpoint.set_fragment(None);
+    Some(endpoint.into())
+}
+
+fn kms_service_state(value: &serde_json::Value) -> (KmsServiceState, Option<String>) {
+    match value {
+        serde_json::Value::String(state) => {
+            let state = match state.trim().to_ascii_lowercase().as_str() {
+                "notconfigured" | "not-configured" | "not_configured" => {
+                    KmsServiceState::NotConfigured
+                }
+                "configured" => KmsServiceState::Configured,
+                "running" => KmsServiceState::Running,
+                "error" => KmsServiceState::Error,
+                _ => KmsServiceState::Unknown,
+            };
+            (state, None)
+        }
+        serde_json::Value::Object(status) => status
+            .get("Error")
+            .or_else(|| status.get("error"))
+            .and_then(serde_json::Value::as_str)
+            .map_or((KmsServiceState::Unknown, None), |_| {
+                (
+                    KmsServiceState::Error,
+                    Some("KMS service reported an error".to_string()),
+                )
+            }),
+        _ => (KmsServiceState::Unknown, None),
+    }
+}
+
+fn kms_key_state(value: Option<&str>) -> KmsKeyState {
+    match value
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "enabled" => KmsKeyState::Enabled,
+        "active" => KmsKeyState::Active,
+        "disabled" => KmsKeyState::Disabled,
+        "pendingdeletion" | "pending-deletion" | "pending_deletion" => KmsKeyState::PendingDeletion,
+        "pendingimport" | "pending-import" | "pending_import" => KmsKeyState::PendingImport,
+        "unavailable" => KmsKeyState::Unavailable,
+        "deleted" => KmsKeyState::Deleted,
+        _ => KmsKeyState::Unknown,
+    }
+}
+
+fn kms_key_usage(value: Option<&str>) -> KmsKeyUsage {
+    match value
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "encryptdecrypt" | "encrypt-decrypt" | "encrypt_decrypt" => KmsKeyUsage::EncryptDecrypt,
+        "signverify" | "sign-verify" | "sign_verify" => KmsKeyUsage::SignVerify,
+        _ => KmsKeyUsage::Unknown,
+    }
+}
+
+#[async_trait]
+impl KmsApi for AdminClient {
+    async fn kms_status(&self) -> Result<KmsStatus> {
+        let response: KmsServiceStatusResponse = self
+            .request(Method::GET, "/kms/service-status", None, None)
+            .await?;
+        let (state, error_message) = kms_service_state(&response.status);
+        let backend = response.backend_type.as_deref().map(kms_backend_kind);
+        Ok(KmsStatus {
+            state,
+            backend,
+            healthy: response.healthy,
+            error_message,
+            config: response.config_summary.map(Into::into),
+        })
+    }
+
+    async fn kms_list_keys(&self, limit: u32, marker: Option<&str>) -> Result<KmsKeyPage> {
+        let limit = limit.to_string();
+        let mut query = vec![("limit", limit.as_str())];
+        if let Some(marker) = marker {
+            query.push(("marker", marker));
+        }
+        let response: KmsListKeysResponse = self
+            .request(Method::GET, "/kms/keys", Some(&query), None)
+            .await?;
+        if !response.success {
+            return Err(Error::General(response.message));
+        }
+        Ok(KmsKeyPage {
+            keys: response.keys.into_iter().map(Into::into).collect(),
+            truncated: response.truncated,
+            next_marker: response.next_marker,
+        })
+    }
+
+    async fn kms_describe_key(&self, key_id: &str) -> Result<KmsKey> {
+        if key_id.trim().is_empty() {
+            return Err(Error::InvalidPath("KMS key id cannot be empty".to_string()));
+        }
+        let path = format!("/kms/keys/{}", urlencoding::encode(key_id));
+        let response: KmsDescribeKeyResponse = self.request(Method::GET, &path, None, None).await?;
+        if !response.success {
+            return Err(Error::General(response.message));
+        }
+        response
+            .key_metadata
+            .map(Into::into)
+            .ok_or_else(|| Error::Network("KMS describe response omitted key metadata".to_string()))
     }
 }
 
@@ -3556,6 +3839,147 @@ mod tests {
         assert_eq!(body["newDescription"], "Updated description");
         assert_eq!(body.as_object().expect("request object").len(), 2);
         handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn kms_status_uses_service_status_and_normalizes_safe_summary() {
+        let body = r#"{"status":"Running","backend_type":"VaultKV2","healthy":true,"config_summary":{"backend_type":"VaultKV2","default_key_id":"archive-key","timeout_seconds":30,"retry_attempts":3,"enable_cache":true,"max_cached_keys":1000,"cache_ttl_seconds":3600,"cache_summary":{"max_keys":500,"ttl_seconds":900,"enable_metrics":true},"backend_summary":{"backend_type":"vault-kv2","address":"https://user:secret@vault.example/path?token=hidden#fragment","auth_method_type":"approle","has_stored_credentials":true,"skip_tls_verify":false}}}"#;
+        let (endpoint, receiver, handle) = start_admin_test_server("200 OK", body);
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let status = client.kms_status().await.expect("KMS status should parse");
+
+        assert_eq!(status.state, KmsServiceState::Running);
+        assert_eq!(status.backend, Some(KmsBackendKind::VaultKv2));
+        assert_eq!(status.healthy, Some(true));
+        let config = status.config.as_ref().expect("safe config summary");
+        assert_eq!(config.default_key_id.as_deref(), Some("archive-key"));
+        assert_eq!(
+            config.endpoint.as_deref(),
+            Some("https://vault.example/path")
+        );
+        assert_eq!(config.auth_method.as_deref(), Some("approle"));
+        assert_eq!(config.credentials_configured, Some(true));
+        assert_eq!(config.cache.max_keys, Some(500));
+
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.target, "/rustfs/admin/v3/kms/service-status");
+        assert!(!format!("{status:?}").contains("token"));
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn kms_status_treats_unconfigured_as_a_stable_result() {
+        let body = r#"{"status":"NotConfigured","backend_type":null,"healthy":null,"config_summary":null}"#;
+        let (endpoint, _receiver, handle) = start_admin_test_server("200 OK", body);
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let status = client
+            .kms_status()
+            .await
+            .expect("unconfigured KMS should not be an error");
+
+        assert_eq!(status.state, KmsServiceState::NotConfigured);
+        assert_eq!(status.backend, None);
+        assert_eq!(status.healthy, None);
+        assert_eq!(status.config, None);
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn kms_status_redacts_server_error_details() {
+        let body = r#"{"status":{"Error":"vault token MUST_NOT_APPEAR was rejected"},"backend_type":"VaultKV2","healthy":false,"config_summary":null}"#;
+        let (endpoint, _receiver, handle) = start_admin_test_server("200 OK", body);
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let status = client.kms_status().await.expect("error state should parse");
+
+        assert_eq!(status.state, KmsServiceState::Error);
+        assert_eq!(
+            status.error_message.as_deref(),
+            Some("KMS service reported an error")
+        );
+        assert!(!format!("{status:?}").contains("MUST_NOT_APPEAR"));
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn kms_list_keys_encodes_pagination_and_normalizes_key_info() {
+        let body = r#"{"success":true,"message":"keys listed successfully","keys":[{"key_id":"archive/key","description":"Archive key","algorithm":"AES_256","usage":"EncryptDecrypt","status":"Active","version":2,"metadata":{"owner":"storage"},"tags":{"environment":"prod"},"created_at":"2026-07-21T00:00:00Z","rotated_at":null,"created_by":"admin"}],"truncated":true,"next_marker":"next/key"}"#;
+        let (endpoint, receiver, handle) = start_admin_test_server("200 OK", body);
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let page = client
+            .kms_list_keys(25, Some("marker/with space"))
+            .await
+            .expect("KMS key page should parse");
+
+        assert!(page.truncated);
+        assert_eq!(page.next_marker.as_deref(), Some("next/key"));
+        assert_eq!(page.keys.len(), 1);
+        assert_eq!(page.keys[0].state, KmsKeyState::Active);
+        assert_eq!(page.keys[0].usage, KmsKeyUsage::EncryptDecrypt);
+        assert_eq!(
+            page.keys[0].tags.get("owner").map(String::as_str),
+            Some("storage")
+        );
+        assert_eq!(
+            page.keys[0].tags.get("environment").map(String::as_str),
+            Some("prod")
+        );
+
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(
+            request.target,
+            "/rustfs/admin/v3/kms/keys?limit=25&marker=marker%2Fwith%20space"
+        );
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn kms_describe_key_encodes_path_segment() {
+        let body = r#"{"success":true,"message":"Key described successfully","key_metadata":{"key_id":"archive/key one","key_state":"Enabled","key_usage":"EncryptDecrypt","description":null,"creation_date":"2026-07-21T00:00:00Z","deletion_date":null,"origin":"AWS_KMS","key_manager":"CUSTOMER","tags":{}}}"#;
+        let (endpoint, receiver, handle) = start_admin_test_server("200 OK", body);
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let key = client
+            .kms_describe_key("archive/key one")
+            .await
+            .expect("KMS key should parse");
+
+        assert_eq!(key.key_id, "archive/key one");
+        assert_eq!(key.state, KmsKeyState::Enabled);
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(
+            request.target,
+            "/rustfs/admin/v3/kms/keys/archive%2Fkey%20one"
+        );
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn kms_status_preserves_auth_unavailable_and_malformed_failures() {
+        for (status, body, expected) in [
+            ("403 Forbidden", r#"{"Code":"AccessDenied"}"#, "auth"),
+            (
+                "503 Service Unavailable",
+                r#"{"message":"kms service is not running"}"#,
+                "network",
+            ),
+            ("200 OK", r#"{"status":"Running"#, "json"),
+        ] {
+            let (endpoint, _receiver, handle) = start_admin_test_server(status, body);
+            let client = admin_client_for_endpoint(&endpoint);
+            let error = client.kms_status().await.expect_err("response should fail");
+            match expected {
+                "auth" => assert!(matches!(error, Error::Auth(_))),
+                "network" => assert!(matches!(error, Error::Network(_))),
+                "json" => assert!(matches!(error, Error::Json(_))),
+                _ => panic!("unexpected expected error kind"),
+            }
+            handle.join().expect("server thread should finish");
+        }
     }
 
     #[test]

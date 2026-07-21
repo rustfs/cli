@@ -5,6 +5,7 @@
 
 mod capabilities;
 mod cluster;
+mod kms;
 mod observability;
 mod site;
 pub mod tier;
@@ -22,6 +23,10 @@ pub use cluster::{
     PoolDecommissionInfo, PoolErasureSetInfo, PoolStatus, PoolTarget, RebalanceCleanupWarnings,
     RebalancePoolProgress, RebalancePoolStatus, RebalanceStartResult, RebalanceStatus, ServerInfo,
     UsageInfo,
+};
+pub use kms::{
+    KmsApi, KmsBackendKind, KmsCacheSummary, KmsConfigSummary, KmsKey, KmsKeyPage, KmsKeyState,
+    KmsKeyUsage, KmsServiceState, KmsStatus,
 };
 pub use observability::{
     MAX_METRICS_LINE_BYTES, MAX_METRICS_RESPONSE_BYTES, MAX_METRICS_SAMPLES, MetricGroup,

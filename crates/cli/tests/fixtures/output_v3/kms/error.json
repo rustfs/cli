@@ -1,0 +1,1 @@
+{"schema_version":3,"type":"kms","status":"error","error":{"type":"auth_error","message":"Failed to get KMS status: permission denied","retryable":false,"server":null,"suggestion":"Verify credentials and required admin permissions, then retry."}}

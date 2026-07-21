@@ -33,6 +33,7 @@
         "metrics",
         "scanner_status",
         "storage_info",
+        "kms",
         "admin_operations"
       ]
     },
@@ -293,6 +294,85 @@
         "disks": { "type": "array", "items": { "type": "object" } }
       }
     },
+    "kmsCacheSummary": {
+      "type": "object",
+      "required": ["enabled", "max_keys", "ttl_seconds", "metrics_enabled"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "max_keys": { "type": ["integer", "null"], "minimum": 0 },
+        "ttl_seconds": { "type": ["integer", "null"], "minimum": 0 },
+        "metrics_enabled": { "type": ["boolean", "null"] }
+      }
+    },
+    "kmsConfigSummary": {
+      "type": ["object", "null"],
+      "required": ["backend", "default_key_id", "timeout_seconds", "retry_attempts", "cache", "endpoint", "auth_method", "credentials_configured", "tls_verification_disabled"],
+      "properties": {
+        "backend": { "type": "string", "enum": ["local", "vault-kv2", "vault-transit", "unknown"] },
+        "default_key_id": { "$ref": "#/definitions/nullableString" },
+        "timeout_seconds": { "type": ["integer", "null"], "minimum": 0 },
+        "retry_attempts": { "type": ["integer", "null"], "minimum": 0 },
+        "cache": { "$ref": "#/definitions/kmsCacheSummary" },
+        "endpoint": { "$ref": "#/definitions/nullableString" },
+        "auth_method": { "$ref": "#/definitions/nullableString" },
+        "credentials_configured": { "type": ["boolean", "null"] },
+        "tls_verification_disabled": { "type": ["boolean", "null"] }
+      }
+    },
+    "kmsServiceStatusData": {
+      "type": "object",
+      "required": ["operation", "state", "backend", "healthy", "error_message", "config"],
+      "properties": {
+        "operation": { "const": "status" },
+        "state": { "type": "string", "enum": ["not-configured", "configured", "running", "error", "unknown"] },
+        "backend": { "type": ["string", "null"], "enum": ["local", "vault-kv2", "vault-transit", "unknown", null] },
+        "healthy": { "type": ["boolean", "null"] },
+        "error_message": { "$ref": "#/definitions/nullableString" },
+        "config": { "$ref": "#/definitions/kmsConfigSummary" }
+      }
+    },
+    "kmsKey": {
+      "type": "object",
+      "required": ["key_id", "state", "usage", "description", "algorithm", "version", "created_at", "deletion_date", "rotated_at", "origin", "manager", "tags"],
+      "properties": {
+        "key_id": { "type": "string", "minLength": 1 },
+        "state": { "type": "string", "enum": ["enabled", "active", "disabled", "pending-deletion", "pending-import", "unavailable", "deleted", "unknown"] },
+        "usage": { "type": "string", "enum": ["encrypt-decrypt", "sign-verify", "unknown"] },
+        "description": { "$ref": "#/definitions/nullableString" },
+        "algorithm": { "$ref": "#/definitions/nullableString" },
+        "version": { "type": ["integer", "null"], "minimum": 0 },
+        "created_at": { "$ref": "#/definitions/nullableString" },
+        "deletion_date": { "$ref": "#/definitions/nullableString" },
+        "rotated_at": { "$ref": "#/definitions/nullableString" },
+        "origin": { "$ref": "#/definitions/nullableString" },
+        "manager": { "$ref": "#/definitions/nullableString" },
+        "tags": { "type": "object", "additionalProperties": { "type": "string" } }
+      }
+    },
+    "kmsKeyListData": {
+      "type": "object",
+      "required": ["operation", "keys", "pagination"],
+      "properties": {
+        "operation": { "const": "key_list" },
+        "keys": { "type": "array", "items": { "$ref": "#/definitions/kmsKey" } },
+        "pagination": { "$ref": "#/definitions/pagination" }
+      }
+    },
+    "kmsKeyStatusData": {
+      "type": "object",
+      "required": ["operation", "key"],
+      "properties": {
+        "operation": { "const": "key_status" },
+        "key": { "$ref": "#/definitions/kmsKey" }
+      }
+    },
+    "kmsData": {
+      "oneOf": [
+        { "$ref": "#/definitions/kmsServiceStatusData" },
+        { "$ref": "#/definitions/kmsKeyListData" },
+        { "$ref": "#/definitions/kmsKeyStatusData" }
+      ]
+    },
     "adminOperation": {
       "type": "object",
       "required": [
@@ -461,6 +541,17 @@
           "properties": {
             "type": { "const": "metrics" },
             "data": { "$ref": "#/definitions/metricsData" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/definitions/successEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "kms" },
+            "data": { "$ref": "#/definitions/kmsData" }
           }
         }
       ]
