@@ -1,0 +1,416 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/rustfs/cli/schemas/output_v3.json",
+  "title": "rc CLI Output Schema v3",
+  "description": "Forward-compatible JSON and JSON Lines record contract for rc command families introduced after output v2.",
+  "definitions": {
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "nullableTimestamp": {
+      "oneOf": [
+        { "$ref": "#/definitions/timestamp" },
+        { "type": "null" }
+      ]
+    },
+    "nullableString": {
+      "type": ["string", "null"]
+    },
+    "nullableBytes": {
+      "type": ["integer", "null"],
+      "minimum": 0
+    },
+    "family": {
+      "type": "string",
+      "enum": [
+        "capabilities",
+        "versioned_objects",
+        "locks",
+        "multipart_uploads",
+        "watch_event",
+        "usage",
+        "metrics",
+        "admin_operations"
+      ]
+    },
+    "pagination": {
+      "type": "object",
+      "required": ["truncated", "continuation_token"],
+      "properties": {
+        "truncated": { "type": "boolean" },
+        "continuation_token": { "$ref": "#/definitions/nullableString" }
+      }
+    },
+    "meta": {
+      "type": "object",
+      "properties": {
+        "request_id": { "$ref": "#/definitions/nullableString" },
+        "server_version": { "$ref": "#/definitions/nullableString" },
+        "generated_at": { "$ref": "#/definitions/nullableTimestamp" }
+      }
+    },
+    "successEnvelope": {
+      "type": "object",
+      "required": ["schema_version", "type", "status", "data"],
+      "properties": {
+        "schema_version": { "const": 3 },
+        "type": { "$ref": "#/definitions/family" },
+        "status": { "const": "success" },
+        "data": { "type": "object" },
+        "meta": { "$ref": "#/definitions/meta" }
+      }
+    },
+    "capability": {
+      "type": "object",
+      "required": ["name", "scope", "support"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "scope": { "type": "string", "minLength": 1 },
+        "support": {
+          "type": "string",
+          "enum": ["supported", "unsupported", "stub", "disabled", "unknown"]
+        },
+        "reason": { "$ref": "#/definitions/nullableString" }
+      }
+    },
+    "capabilitiesData": {
+      "type": "object",
+      "required": ["server", "api_version", "capabilities"],
+      "properties": {
+        "server": { "type": "string", "minLength": 1 },
+        "api_version": { "$ref": "#/definitions/nullableString" },
+        "capabilities": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/capability" }
+        }
+      }
+    },
+    "objectVersion": {
+      "type": "object",
+      "required": [
+        "bucket", "key", "version_id", "is_latest", "delete_marker",
+        "size_bytes", "last_modified", "etag", "storage_class"
+      ],
+      "properties": {
+        "bucket": { "type": "string", "minLength": 1 },
+        "key": { "type": "string" },
+        "version_id": { "$ref": "#/definitions/nullableString" },
+        "is_latest": { "type": "boolean" },
+        "delete_marker": { "type": "boolean" },
+        "size_bytes": { "$ref": "#/definitions/nullableBytes" },
+        "last_modified": { "$ref": "#/definitions/nullableTimestamp" },
+        "etag": { "$ref": "#/definitions/nullableString" },
+        "storage_class": { "$ref": "#/definitions/nullableString" }
+      }
+    },
+    "versionedObjectsData": {
+      "type": "object",
+      "required": ["items", "pagination"],
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/objectVersion" }
+        },
+        "pagination": { "$ref": "#/definitions/pagination" }
+      }
+    },
+    "retention": {
+      "type": ["object", "null"],
+      "required": ["mode", "retain_until"],
+      "properties": {
+        "mode": { "type": "string", "enum": ["governance", "compliance"] },
+        "retain_until": { "$ref": "#/definitions/timestamp" }
+      }
+    },
+    "lockState": {
+      "type": "object",
+      "required": [
+        "bucket", "key", "version_id", "object_lock_enabled", "retention",
+        "legal_hold"
+      ],
+      "properties": {
+        "bucket": { "type": "string", "minLength": 1 },
+        "key": { "type": "string" },
+        "version_id": { "$ref": "#/definitions/nullableString" },
+        "object_lock_enabled": { "type": "boolean" },
+        "retention": { "$ref": "#/definitions/retention" },
+        "legal_hold": { "type": ["boolean", "null"] }
+      }
+    },
+    "locksData": {
+      "type": "object",
+      "required": ["items"],
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/lockState" }
+        }
+      }
+    },
+    "multipartUpload": {
+      "type": "object",
+      "required": [
+        "bucket", "key", "upload_id", "initiated", "size_bytes", "storage_class"
+      ],
+      "properties": {
+        "bucket": { "type": "string", "minLength": 1 },
+        "key": { "type": "string" },
+        "upload_id": { "type": "string", "minLength": 1 },
+        "initiated": { "$ref": "#/definitions/nullableTimestamp" },
+        "size_bytes": { "$ref": "#/definitions/nullableBytes" },
+        "storage_class": { "$ref": "#/definitions/nullableString" }
+      }
+    },
+    "multipartUploadsData": {
+      "type": "object",
+      "required": ["items", "pagination"],
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/multipartUpload" }
+        },
+        "pagination": { "$ref": "#/definitions/pagination" }
+      }
+    },
+    "watchEvent": {
+      "type": ["object", "null"],
+      "required": [
+        "event_id", "event_name", "bucket", "key", "version_id",
+        "size_bytes", "etag", "event_time"
+      ],
+      "properties": {
+        "event_id": { "$ref": "#/definitions/nullableString" },
+        "event_name": { "type": "string", "minLength": 1 },
+        "bucket": { "type": "string", "minLength": 1 },
+        "key": { "type": "string" },
+        "version_id": { "$ref": "#/definitions/nullableString" },
+        "size_bytes": { "$ref": "#/definitions/nullableBytes" },
+        "etag": { "$ref": "#/definitions/nullableString" },
+        "event_time": { "$ref": "#/definitions/timestamp" }
+      }
+    },
+    "watchData": {
+      "type": "object",
+      "required": ["event", "keepalive"],
+      "properties": {
+        "event": { "$ref": "#/definitions/watchEvent" },
+        "keepalive": { "type": "boolean" }
+      }
+    },
+    "usageData": {
+      "type": "object",
+      "required": [
+        "scope", "path", "total_bytes", "object_count", "version_count",
+        "delete_marker_count", "buckets"
+      ],
+      "properties": {
+        "scope": { "type": "string", "enum": ["cluster", "bucket", "prefix"] },
+        "path": { "$ref": "#/definitions/nullableString" },
+        "total_bytes": { "$ref": "#/definitions/nullableBytes" },
+        "object_count": { "type": ["integer", "null"], "minimum": 0 },
+        "version_count": { "type": ["integer", "null"], "minimum": 0 },
+        "delete_marker_count": { "type": ["integer", "null"], "minimum": 0 },
+        "buckets": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "total_bytes", "object_count"],
+            "properties": {
+              "name": { "type": "string", "minLength": 1 },
+              "total_bytes": { "$ref": "#/definitions/nullableBytes" },
+              "object_count": { "type": ["integer", "null"], "minimum": 0 }
+            }
+          }
+        }
+      }
+    },
+    "metricSample": {
+      "type": "object",
+      "required": ["name", "value", "unit", "labels"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "value": { "type": "number" },
+        "unit": { "$ref": "#/definitions/nullableString" },
+        "labels": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        }
+      }
+    },
+    "metricsData": {
+      "type": "object",
+      "required": ["scope", "collected_at", "samples"],
+      "properties": {
+        "scope": { "type": "string", "minLength": 1 },
+        "collected_at": { "$ref": "#/definitions/timestamp" },
+        "samples": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/metricSample" }
+        }
+      }
+    },
+    "adminOperation": {
+      "type": "object",
+      "required": [
+        "operation", "resource", "state", "operation_id", "changed", "result"
+      ],
+      "properties": {
+        "operation": { "type": "string", "minLength": 1 },
+        "resource": { "type": "string", "minLength": 1 },
+        "state": {
+          "type": "string",
+          "enum": ["pending", "running", "succeeded", "failed", "cancelled", "unknown"]
+        },
+        "operation_id": { "$ref": "#/definitions/nullableString" },
+        "changed": { "type": "boolean" },
+        "result": { "type": ["object", "null"] }
+      }
+    },
+    "adminOperationsData": {
+      "type": "object",
+      "required": ["operations"],
+      "properties": {
+        "operations": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/adminOperation" }
+        }
+      }
+    },
+    "unsupportedFeatureError": {
+      "type": "object",
+      "required": ["type", "message", "retryable", "capability", "server"],
+      "properties": {
+        "type": { "const": "unsupported_feature" },
+        "message": { "type": "string", "minLength": 1 },
+        "retryable": { "const": false },
+        "capability": { "type": "string", "minLength": 1 },
+        "server": { "$ref": "#/definitions/nullableString" },
+        "suggestion": { "$ref": "#/definitions/nullableString" }
+      }
+    },
+    "standardError": {
+      "type": "object",
+      "required": ["type", "message", "retryable"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "general_error", "usage_error", "network_error", "auth_error",
+            "not_found", "conflict", "interrupted"
+          ]
+        },
+        "message": { "type": "string", "minLength": 1 },
+        "retryable": { "type": "boolean" },
+        "suggestion": { "$ref": "#/definitions/nullableString" }
+      }
+    },
+    "errorOutput": {
+      "type": "object",
+      "required": ["schema_version", "type", "status", "error"],
+      "properties": {
+        "schema_version": { "const": 3 },
+        "type": { "$ref": "#/definitions/family" },
+        "status": { "const": "error" },
+        "error": {
+          "oneOf": [
+            { "$ref": "#/definitions/unsupportedFeatureError" },
+            { "$ref": "#/definitions/standardError" }
+          ]
+        },
+        "meta": { "$ref": "#/definitions/meta" }
+      }
+    }
+  },
+  "oneOf": [
+    {
+      "allOf": [
+        { "$ref": "#/definitions/successEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "capabilities" },
+            "data": { "$ref": "#/definitions/capabilitiesData" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/definitions/successEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "versioned_objects" },
+            "data": { "$ref": "#/definitions/versionedObjectsData" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/definitions/successEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "locks" },
+            "data": { "$ref": "#/definitions/locksData" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/definitions/successEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "multipart_uploads" },
+            "data": { "$ref": "#/definitions/multipartUploadsData" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/definitions/successEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "watch_event" },
+            "data": { "$ref": "#/definitions/watchData" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/definitions/successEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "usage" },
+            "data": { "$ref": "#/definitions/usageData" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/definitions/successEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "metrics" },
+            "data": { "$ref": "#/definitions/metricsData" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/definitions/successEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "admin_operations" },
+            "data": { "$ref": "#/definitions/adminOperationsData" }
+          }
+        }
+      ]
+    },
+    { "$ref": "#/definitions/errorOutput" }
+  ]
+}

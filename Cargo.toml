@@ -78,6 +78,7 @@ urlencoding = "2.1"
 tempfile = "3.24"
 mockall = "0.14"
 insta = { version = "1.46", features = ["json"] }
+jsonschema = { version = "0.48", default-features = false }
 
 [profile.release]
 lto = true

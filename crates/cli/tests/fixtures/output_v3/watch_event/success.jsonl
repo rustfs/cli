@@ -1,0 +1,2 @@
+{"schema_version":3,"type":"watch_event","status":"success","data":{"event":{"event_id":"evt-1","event_name":"s3:ObjectCreated:Put","bucket":"photos","key":"image.jpg","version_id":"v1","size_bytes":2048,"etag":"abc123","event_time":"2026-07-21T04:00:00Z"},"keepalive":false}}
+{"schema_version":3,"type":"watch_event","status":"success","data":{"event":{"event_id":"evt-2","event_name":"s3:ObjectRemoved:DeleteMarkerCreated","bucket":"photos","key":"old.jpg","version_id":"v2","size_bytes":null,"etag":null,"event_time":"2026-07-21T04:01:00Z"},"keepalive":false}}

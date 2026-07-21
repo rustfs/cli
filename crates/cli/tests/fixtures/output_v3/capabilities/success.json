@@ -1,0 +1,1 @@
+{"schema_version":3,"type":"capabilities","status":"success","data":{"server":"rustfs","api_version":"v4","capabilities":[{"name":"listen_notification","scope":"bucket","support":"supported","reason":null}]},"meta":{"request_id":"req-1","server_version":"1.0.0-beta.10","generated_at":"2026-07-21T04:00:00Z"}}

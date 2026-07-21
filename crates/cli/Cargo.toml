@@ -64,3 +64,4 @@ golden = []
 [dev-dependencies]
 tempfile.workspace = true
 insta.workspace = true
+jsonschema.workspace = true
