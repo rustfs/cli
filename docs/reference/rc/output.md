@@ -16,8 +16,9 @@ Every v3 record contains:
 
 - `schema_version`, always the integer `3`;
 - `type`, identifying the command family;
-- `status`, either `success` or `error`;
-- `data` for successful records, or `error` for failed records;
+- `status`, normally `success` or `error`; multipart cleanup may use `partial` when
+  successful aborts and per-upload failures must be returned together;
+- `data` for successful and partial records, or `error` for failed records;
 - optional `meta` with request and server context.
 
 Byte counts are non-negative JSON integers and timestamps use RFC 3339 date-time strings. A field is nullable only when the schema explicitly permits `null`. Server-owned fields that are unavailable on a particular RustFS version are represented as `null`, not omitted, when the field is required by the family contract.
@@ -33,6 +34,11 @@ Streaming commands emit JSON Lines. Each non-empty line is one complete v3 recor
 ## Errors
 
 Errors use the same family-specific `type` as successful output. An unsupported server capability has the typed error `unsupported_feature`, including the capability name and nullable server version. Other errors use the stable error kinds defined by the schema.
+
+Multipart cleanup keeps every attempted upload under `data.results`. A `partial` record includes
+both successful `aborted` entries and `failed` entries with typed per-upload errors, so retry logic
+does not need to discard work that already completed. Dry runs use `success` with
+`state: "would_abort"` and never mutate the server.
 
 ## Migrating from v1 or v2
 

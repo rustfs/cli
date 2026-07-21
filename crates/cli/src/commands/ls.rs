@@ -3,9 +3,10 @@
 //! Lists buckets when given an alias only, or lists objects when given a bucket path.
 
 use clap::Args;
+use comfy_table::{ContentArrangement, Table};
 use rc_core::{
-    AliasManager, Error, ListOptions, ObjectInfo, ObjectStore as _, ObjectVersionListResult,
-    RemotePath,
+    AliasManager, Error, ListOptions, MultipartUploadListOptions, ObjectInfo, ObjectStore as _,
+    ObjectVersionListResult, RemotePath,
 };
 use rc_s3::S3Client;
 use serde::Serialize;
@@ -13,6 +14,8 @@ use std::collections::HashMap;
 
 use crate::exit_code::ExitCode;
 use crate::output::{Formatter, OutputConfig};
+
+use super::multipart::{collect_multipart_uploads, emit_multipart_error, output_multipart_listing};
 
 /// List buckets or objects
 #[derive(Args, Debug)]
@@ -28,7 +31,7 @@ pub struct LsArgs {
     #[arg(long)]
     pub versions: bool,
 
-    /// Include incomplete uploads
+    /// List incomplete uploads for one exact object key
     #[arg(long)]
     pub incomplete: bool,
 
@@ -93,10 +96,7 @@ pub async fn execute(args: LsArgs, output_config: OutputConfig) -> ExitCode {
     let formatter = Formatter::new(output_config);
 
     if args.incomplete {
-        return formatter.fail(
-            ExitCode::UnsupportedFeature,
-            "--incomplete is not implemented",
-        );
+        return execute_incomplete(&args, &formatter).await;
     }
 
     // Parse the path
@@ -155,6 +155,179 @@ pub async fn execute(args: LsArgs, output_config: OutputConfig) -> ExitCode {
 
     // List objects
     list_objects(&client, &path, &args, &formatter).await
+}
+
+async fn execute_incomplete(args: &LsArgs, formatter: &Formatter) -> ExitCode {
+    if args.versions {
+        return emit_multipart_error(
+            formatter,
+            ExitCode::UsageError,
+            "--incomplete and --versions cannot be used together",
+            "list_multipart_uploads",
+        );
+    }
+    if args.recursive {
+        return unsupported_multipart_prefix(formatter);
+    }
+
+    let (alias_name, bucket, key) = match parse_incomplete_ls_path(&args.path) {
+        Ok(path) => path,
+        Err((ExitCode::UnsupportedFeature, _)) => return unsupported_multipart_prefix(formatter),
+        Err((code, message)) => {
+            return emit_multipart_error(formatter, code, message, "list_multipart_uploads");
+        }
+    };
+
+    let alias_manager = match AliasManager::new() {
+        Ok(manager) => manager,
+        Err(error) => {
+            return emit_multipart_error(
+                formatter,
+                ExitCode::GeneralError,
+                format!("Failed to load aliases: {error}"),
+                "list_multipart_uploads",
+            );
+        }
+    };
+    let alias = match alias_manager.get(&alias_name) {
+        Ok(alias) => alias,
+        Err(_) => {
+            return emit_multipart_error(
+                formatter,
+                ExitCode::NotFound,
+                format!("Alias '{alias_name}' not found"),
+                "list_multipart_uploads",
+            );
+        }
+    };
+    let client = match S3Client::new(alias).await {
+        Ok(client) => client,
+        Err(error) => {
+            return emit_multipart_error(
+                formatter,
+                ExitCode::NetworkError,
+                format!("Failed to create S3 client: {error}"),
+                "list_multipart_uploads",
+            );
+        }
+    };
+
+    list_incomplete_uploads(&client, &bucket, &key, args.summarize, formatter).await
+}
+
+fn unsupported_multipart_prefix(formatter: &Formatter) -> ExitCode {
+    emit_multipart_error(
+        formatter,
+        ExitCode::UnsupportedFeature,
+        "Bucket-wide and recursive incomplete upload listings are disabled because RustFS 1.0.0-beta.10 only lists one exact object key; see rustfs/backlog#1384",
+        "list_multipart_uploads_prefix",
+    )
+}
+
+async fn list_incomplete_uploads(
+    client: &S3Client,
+    bucket: &str,
+    key: &str,
+    summarize: bool,
+    formatter: &Formatter,
+) -> ExitCode {
+    let options = MultipartUploadListOptions {
+        prefix: Some(key.to_string()),
+        max_uploads: Some(1000),
+        ..Default::default()
+    };
+    let mut uploads = match collect_multipart_uploads(options, |page_options| {
+        client.list_multipart_uploads(bucket, page_options)
+    })
+    .await
+    {
+        Ok(uploads) => uploads,
+        Err(error) => {
+            let exit_code = multipart_listing_exit_code(&error);
+            return emit_multipart_error(
+                formatter,
+                exit_code,
+                format!("Failed to list incomplete multipart uploads: {error}"),
+                "list_multipart_uploads",
+            );
+        }
+    };
+    uploads.retain(|upload| upload.key == key);
+
+    if formatter.is_quiet() {
+        return ExitCode::Success;
+    }
+
+    if formatter.is_json() {
+        output_multipart_listing(formatter, &uploads, summarize);
+        return ExitCode::Success;
+    }
+
+    if !uploads.is_empty() {
+        let now = jiff::Timestamp::now();
+        let mut table = Table::new();
+        table.set_content_arrangement(ContentArrangement::Dynamic);
+        table.set_header(vec![
+            "INITIATED",
+            "AGE",
+            "UPLOAD ID",
+            "INITIATOR",
+            "STORAGE CLASS",
+            "KEY",
+        ]);
+        for upload in &uploads {
+            let initiated = upload
+                .initiated
+                .map(|value| value.strftime("%Y-%m-%d %H:%M:%S").to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let age = upload
+                .initiated
+                .map(|value| format_upload_age(value, now))
+                .unwrap_or_else(|| "-".to_string());
+            let initiator = upload
+                .initiator
+                .as_ref()
+                .and_then(|identity| identity.display_name.as_deref().or(identity.id.as_deref()))
+                .unwrap_or("-");
+            table.add_row(vec![
+                formatter.sanitize_text(&initiated),
+                age,
+                formatter.sanitize_text(&upload.upload_id),
+                formatter.sanitize_text(initiator),
+                formatter.sanitize_text(upload.storage_class.as_deref().unwrap_or("-")),
+                formatter.sanitize_text(&upload.key),
+            ]);
+        }
+        formatter.println(&table.to_string());
+    }
+
+    if summarize {
+        formatter.println(&format!("Total: {} incomplete upload(s)", uploads.len()));
+    }
+    ExitCode::Success
+}
+
+fn multipart_listing_exit_code(error: &Error) -> ExitCode {
+    match error {
+        Error::Auth(_) => ExitCode::AuthError,
+        Error::NotFound(_) => ExitCode::NotFound,
+        Error::Network(_) | Error::Io(_) => ExitCode::NetworkError,
+        Error::UnsupportedFeature(_) => ExitCode::UnsupportedFeature,
+        _ => ExitCode::GeneralError,
+    }
+}
+
+fn format_upload_age(initiated: jiff::Timestamp, now: jiff::Timestamp) -> String {
+    let seconds = now.as_second().saturating_sub(initiated.as_second()).max(0) as u64;
+    if seconds >= 86_400 {
+        format!("{}d{}h", seconds / 86_400, (seconds % 86_400) / 3_600)
+    } else if seconds >= 3_600 {
+        format!("{}h{}m", seconds / 3_600, (seconds % 3_600) / 60)
+    } else if seconds >= 60 {
+        format!("{}m{}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds}s")
+    }
 }
 
 async fn list_object_versions(
@@ -611,6 +784,33 @@ fn alias_listing_mode(bucket: Option<&String>, recursive: bool) -> Option<AliasL
     }
 }
 
+/// Parse the exact object form required by RustFS beta.10 multipart listing.
+fn parse_incomplete_ls_path(path: &str) -> Result<(String, String, String), (ExitCode, String)> {
+    if path.is_empty() {
+        return Err((ExitCode::UsageError, "Path cannot be empty".to_string()));
+    }
+
+    let parts: Vec<&str> = path.splitn(3, '/').collect();
+    if parts.len() < 2 || parts[0].is_empty() || parts[1].is_empty() {
+        return Err((
+            ExitCode::UsageError,
+            "--incomplete requires an exact object path in the form alias/bucket/key".to_string(),
+        ));
+    }
+    if parts.len() < 3 || parts[2].is_empty() || path.ends_with('/') {
+        return Err((
+            ExitCode::UnsupportedFeature,
+            "Bucket-wide and prefix multipart listing is unavailable".to_string(),
+        ));
+    }
+
+    Ok((
+        parts[0].to_string(),
+        parts[1].to_string(),
+        parts[2].to_string(),
+    ))
+}
+
 /// Parse ls path into (alias, bucket, prefix)
 fn parse_ls_path(path: &str) -> Result<(String, Option<String>, Option<String>), String> {
     let path = path.trim_end_matches('/');
@@ -636,7 +836,23 @@ fn parse_ls_path(path: &str) -> Result<(String, Option<String>, Option<String>),
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rc_core::ObjectVersion;
+    use rc_core::{MultipartUpload, MultipartUploadListResult, ObjectVersion};
+    use std::collections::VecDeque;
+
+    fn incomplete_upload(key: &str, upload_id: &str) -> MultipartUpload {
+        MultipartUpload {
+            bucket: "bucket".to_string(),
+            key: key.to_string(),
+            upload_id: upload_id.to_string(),
+            initiated: None,
+            size_bytes: None,
+            storage_class: Some("STANDARD".to_string()),
+            initiator: None,
+            owner: None,
+            checksum_algorithm: None,
+            checksum_type: None,
+        }
+    }
 
     #[test]
     fn test_parse_ls_path_alias_only() {
@@ -673,6 +889,129 @@ mod tests {
     #[test]
     fn test_parse_ls_path_empty() {
         assert!(parse_ls_path("").is_err());
+    }
+
+    #[tokio::test]
+    async fn incomplete_listing_follows_both_markers_and_sorts_results() {
+        let mut pages = VecDeque::from([
+            MultipartUploadListResult {
+                uploads: vec![incomplete_upload("z.bin", "upload-2")],
+                common_prefixes: Vec::new(),
+                truncated: true,
+                next_key_marker: Some("z.bin".to_string()),
+                next_upload_id_marker: Some("upload-2".to_string()),
+            },
+            MultipartUploadListResult {
+                uploads: vec![
+                    incomplete_upload("a.bin", "upload-3"),
+                    incomplete_upload("a.bin", "upload-1"),
+                ],
+                common_prefixes: Vec::new(),
+                truncated: false,
+                next_key_marker: None,
+                next_upload_id_marker: None,
+            },
+        ]);
+        let mut requested = Vec::new();
+
+        let uploads = collect_multipart_uploads(
+            MultipartUploadListOptions {
+                prefix: Some("logs/".to_string()),
+                max_uploads: Some(1),
+                ..Default::default()
+            },
+            |options| {
+                requested.push(options);
+                std::future::ready(Ok(pages.pop_front().expect("test page should exist")))
+            },
+        )
+        .await
+        .expect("all pages should be collected");
+
+        assert_eq!(requested.len(), 2);
+        assert_eq!(requested[1].key_marker.as_deref(), Some("z.bin"));
+        assert_eq!(requested[1].upload_id_marker.as_deref(), Some("upload-2"));
+        let identities: Vec<(&str, &str)> = uploads
+            .iter()
+            .map(|upload| (upload.key.as_str(), upload.upload_id.as_str()))
+            .collect();
+        assert_eq!(
+            identities,
+            vec![
+                ("a.bin", "upload-1"),
+                ("a.bin", "upload-3"),
+                ("z.bin", "upload-2")
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_listing_rejects_non_advancing_pagination() {
+        let result = collect_multipart_uploads(
+            MultipartUploadListOptions {
+                key_marker: Some("same-key".to_string()),
+                upload_id_marker: Some("same-upload".to_string()),
+                ..Default::default()
+            },
+            |_| {
+                std::future::ready(Ok(MultipartUploadListResult {
+                    uploads: Vec::new(),
+                    common_prefixes: Vec::new(),
+                    truncated: true,
+                    next_key_marker: Some("same-key".to_string()),
+                    next_upload_id_marker: Some("same-upload".to_string()),
+                }))
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Err(Error::Network(_))));
+    }
+
+    #[test]
+    fn incomplete_path_preserves_an_exact_nested_object_key() {
+        let (alias, bucket, key) = parse_incomplete_ls_path("local/archive/2026/backup.tar")
+            .expect("exact object path should parse");
+
+        assert_eq!(alias, "local");
+        assert_eq!(bucket, "archive");
+        assert_eq!(key, "2026/backup.tar");
+    }
+
+    #[test]
+    fn incomplete_path_rejects_bucket_and_prefix_modes_for_rustfs_beta_10() {
+        for path in ["local/archive", "local/archive/logs/"] {
+            let result = parse_incomplete_ls_path(path);
+            assert!(matches!(result, Err((ExitCode::UnsupportedFeature, _))));
+        }
+    }
+
+    #[test]
+    fn incomplete_listing_maps_typed_errors_to_specific_exit_codes() {
+        assert_eq!(
+            multipart_listing_exit_code(&Error::Auth("denied".to_string())),
+            ExitCode::AuthError
+        );
+        assert_eq!(
+            multipart_listing_exit_code(&Error::NotFound("bucket".to_string())),
+            ExitCode::NotFound
+        );
+        assert_eq!(
+            multipart_listing_exit_code(&Error::Network("timeout".to_string())),
+            ExitCode::NetworkError
+        );
+    }
+
+    #[test]
+    fn incomplete_age_is_human_readable_and_never_negative() {
+        let initiated = "2026-07-20T00:00:00Z"
+            .parse()
+            .expect("test timestamp should parse");
+        let now = "2026-07-21T02:30:00Z"
+            .parse()
+            .expect("test timestamp should parse");
+        assert_eq!(format_upload_age(initiated, now), "1d2h");
+        assert_eq!(format_upload_age(now, initiated), "0s");
     }
 
     #[test]

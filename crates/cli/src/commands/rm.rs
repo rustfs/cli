@@ -3,13 +3,22 @@
 //! Removes one or more objects from a bucket.
 
 use clap::Args;
-use rc_core::{AliasManager, ListOptions, ObjectStore as _, RemotePath};
+use rc_core::{
+    AliasManager, Error, ListOptions, MultipartUpload, MultipartUploadListOptions,
+    ObjectStore as _, RemotePath,
+};
 use rc_s3::{DeleteRequestOptions, S3Client};
 use serde::Serialize;
 use std::collections::HashSet;
 
 use crate::exit_code::ExitCode;
 use crate::output::{Formatter, OutputConfig};
+
+use super::multipart::{
+    MultipartCleanupFailure, MultipartCleanupOptions, MultipartCleanupOutputItem,
+    MultipartCleanupResult, cleanup_multipart_uploads, collect_multipart_uploads,
+    emit_multipart_error, output_multipart_cleanup,
+};
 
 const RM_AFTER_HELP: &str = "\
 Examples:
@@ -37,7 +46,7 @@ pub struct RmArgs {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// Remove incomplete multipart uploads older than specified duration
+    /// Remove incomplete multipart uploads for exact object keys
     #[arg(long)]
     pub incomplete: bool,
 
@@ -63,14 +72,50 @@ struct RmOutput {
     total: usize,
 }
 
+#[derive(Debug)]
+struct RmIncompleteRecord {
+    target: String,
+    upload: MultipartUpload,
+}
+
+#[derive(Debug)]
+struct RmIncompleteFailure {
+    target: String,
+    upload: Option<MultipartUpload>,
+    error: String,
+    exit_code: ExitCode,
+    capability: &'static str,
+}
+
+#[derive(Debug)]
+struct IncompletePathResult {
+    alias: String,
+    cleanup: MultipartCleanupResult,
+}
+
 /// Execute the rm command
 pub async fn execute(args: RmArgs, output_config: OutputConfig) -> ExitCode {
     let formatter = Formatter::new(output_config);
 
-    if args.incomplete || args.versions || args.bypass {
+    if args.incomplete {
+        if args.versions || args.bypass || args.purge {
+            return emit_multipart_error(
+                &formatter,
+                ExitCode::UsageError,
+                "--incomplete cannot be combined with --versions, --bypass, or --purge",
+                "abort_multipart_upload",
+            );
+        }
+        if args.recursive {
+            return unsupported_recursive_multipart_cleanup(&formatter);
+        }
+        return execute_incomplete(&args, &formatter).await;
+    }
+
+    if args.versions || args.bypass {
         return formatter.fail(
             ExitCode::UnsupportedFeature,
-            "--incomplete, --versions, and --bypass are not implemented; refusing to continue with a silently ignored destructive option",
+            "--versions and --bypass are not implemented; refusing to continue with a silently ignored destructive option",
         );
     }
 
@@ -116,6 +161,284 @@ pub async fn execute(args: RmArgs, output_config: OutputConfig) -> ExitCode {
         ExitCode::GeneralError
     } else {
         ExitCode::Success
+    }
+}
+
+fn unsupported_recursive_multipart_cleanup(formatter: &Formatter) -> ExitCode {
+    emit_multipart_error(
+        formatter,
+        ExitCode::UnsupportedFeature,
+        "Recursive incomplete upload cleanup is disabled because RustFS 1.0.0-beta.10 only lists one exact object key; see rustfs/backlog#1384",
+        "list_multipart_uploads_prefix",
+    )
+}
+
+async fn execute_incomplete(args: &RmArgs, formatter: &Formatter) -> ExitCode {
+    let mut records = Vec::new();
+    let mut failures = Vec::new();
+
+    for path in &args.paths {
+        match process_incomplete_path(path, args).await {
+            Ok(result) => {
+                for upload in result.cleanup.completed {
+                    records.push(incomplete_record(&result.alias, upload));
+                }
+                for failure in result.cleanup.failed {
+                    failures.push(incomplete_upload_failure(&result.alias, failure));
+                }
+            }
+            Err(failure) => failures.push(failure),
+        }
+    }
+
+    records.sort_by(|left, right| {
+        left.target
+            .cmp(&right.target)
+            .then_with(|| left.upload.upload_id.cmp(&right.upload.upload_id))
+    });
+    failures.sort_by(|left, right| {
+        left.target
+            .cmp(&right.target)
+            .then_with(|| failure_upload_id(left).cmp(failure_upload_id(right)))
+    });
+    let exit_code = incomplete_cleanup_exit_code(records.len(), &failures);
+
+    if formatter.is_json() {
+        if failures.is_empty() && formatter.is_quiet() {
+            return exit_code;
+        }
+        if records.is_empty() && failures.len() == 1 && failures[0].upload.is_none() {
+            let failure = &failures[0];
+            return emit_multipart_error(
+                formatter,
+                failure.exit_code,
+                failure.error.clone(),
+                failure.capability,
+            );
+        }
+
+        let succeeded = records.len();
+        let failed = failures.len();
+        let mut results = records
+            .into_iter()
+            .map(|record| {
+                MultipartCleanupOutputItem::succeeded(record.target, record.upload, args.dry_run)
+            })
+            .collect::<Vec<_>>();
+        results.extend(failures.into_iter().map(|failure| {
+            MultipartCleanupOutputItem::failed(
+                failure.target,
+                failure.upload,
+                failure.exit_code,
+                failure.error,
+                failure.capability,
+            )
+        }));
+        output_multipart_cleanup(formatter, args.dry_run, results, succeeded, failed);
+        return exit_code;
+    }
+
+    for record in &records {
+        let target = formatter.style_file(&record.target);
+        let upload_id = formatter.sanitize_text(&record.upload.upload_id);
+        if args.dry_run {
+            formatter.println(&format!(
+                "Would abort incomplete upload: {target} (upload ID: {upload_id})"
+            ));
+        } else {
+            formatter.println(&format!(
+                "Aborted incomplete upload: {target} (upload ID: {upload_id})"
+            ));
+        }
+    }
+    for failure in &failures {
+        let upload_id = failure
+            .upload
+            .as_ref()
+            .map(|upload| {
+                format!(
+                    " (upload ID: {})",
+                    formatter.sanitize_text(&upload.upload_id)
+                )
+            })
+            .unwrap_or_default();
+        formatter.error_with_code(
+            failure.exit_code,
+            &format!(
+                "Failed to clean incomplete upload {}{}: {}",
+                formatter.sanitize_text(&failure.target),
+                upload_id,
+                failure.error
+            ),
+        );
+    }
+    if !args.dry_run && !records.is_empty() {
+        formatter.success(&format!(
+            "Aborted {} incomplete multipart upload(s).",
+            records.len()
+        ));
+    } else if records.is_empty() && failures.is_empty() && !args.force {
+        formatter.warning("No incomplete multipart uploads matched the requested target(s)");
+    }
+
+    exit_code
+}
+
+fn failure_upload_id(failure: &RmIncompleteFailure) -> &str {
+    failure
+        .upload
+        .as_ref()
+        .map(|upload| upload.upload_id.as_str())
+        .unwrap_or_default()
+}
+
+async fn process_incomplete_path(
+    path_str: &str,
+    args: &RmArgs,
+) -> Result<IncompletePathResult, RmIncompleteFailure> {
+    let (alias_name, bucket, key) = parse_rm_path(path_str).map_err(|error| {
+        incomplete_path_failure(
+            path_str,
+            error,
+            ExitCode::UsageError,
+            "abort_multipart_upload",
+        )
+    })?;
+    if key.is_empty() || key.ends_with('/') {
+        return Err(incomplete_path_failure(
+            path_str,
+            "Bucket-wide and prefix incomplete upload cleanup is disabled because RustFS 1.0.0-beta.10 only lists one exact object key; see rustfs/backlog#1384"
+                .to_string(),
+            ExitCode::UnsupportedFeature,
+            "list_multipart_uploads_prefix",
+        ));
+    }
+
+    let alias_manager = AliasManager::new().map_err(|error| {
+        incomplete_path_failure(
+            path_str,
+            format!("Failed to load aliases: {error}"),
+            ExitCode::GeneralError,
+            "abort_multipart_upload",
+        )
+    })?;
+    let alias = alias_manager.get(&alias_name).map_err(|_| {
+        incomplete_path_failure(
+            path_str,
+            format!("Alias '{alias_name}' not found"),
+            ExitCode::NotFound,
+            "abort_multipart_upload",
+        )
+    })?;
+    let client = S3Client::new(alias).await.map_err(|error| {
+        incomplete_path_failure(
+            path_str,
+            format!("Failed to create S3 client: {error}"),
+            ExitCode::NetworkError,
+            "abort_multipart_upload",
+        )
+    })?;
+
+    let list_options = MultipartUploadListOptions {
+        prefix: Some(key.clone()),
+        max_uploads: Some(1000),
+        ..Default::default()
+    };
+    let uploads = collect_multipart_uploads(list_options, |page_options| {
+        client.list_multipart_uploads(&bucket, page_options)
+    })
+    .await
+    .map_err(|error| {
+        let exit_code = multipart_error_exit_code(&error);
+        incomplete_path_failure(
+            path_str,
+            error.to_string(),
+            exit_code,
+            "list_multipart_uploads",
+        )
+    })?;
+    let selected = select_incomplete_uploads(uploads, &key);
+    let multipart_client = &client;
+    let cleanup = cleanup_multipart_uploads(
+        selected,
+        MultipartCleanupOptions::command_default(args.dry_run),
+        move |request| async move { multipart_client.abort_multipart_upload(&request).await },
+    )
+    .await;
+
+    Ok(IncompletePathResult {
+        alias: alias_name,
+        cleanup,
+    })
+}
+
+fn select_incomplete_uploads(
+    uploads: Vec<MultipartUpload>,
+    target_key: &str,
+) -> Vec<MultipartUpload> {
+    uploads
+        .into_iter()
+        .filter(|upload| upload.key == target_key)
+        .collect()
+}
+
+fn incomplete_record(alias: &str, upload: MultipartUpload) -> RmIncompleteRecord {
+    let target = format!("{alias}/{}/{}", upload.bucket, upload.key);
+    RmIncompleteRecord { target, upload }
+}
+
+fn incomplete_upload_failure(alias: &str, failure: MultipartCleanupFailure) -> RmIncompleteFailure {
+    let exit_code = multipart_error_exit_code(&failure.error);
+    let target = format!("{alias}/{}/{}", failure.upload.bucket, failure.upload.key);
+    RmIncompleteFailure {
+        target,
+        upload: Some(failure.upload),
+        error: failure.error.to_string(),
+        exit_code,
+        capability: "abort_multipart_upload",
+    }
+}
+
+fn incomplete_path_failure(
+    target: &str,
+    error: String,
+    exit_code: ExitCode,
+    capability: &'static str,
+) -> RmIncompleteFailure {
+    RmIncompleteFailure {
+        target: target.to_string(),
+        upload: None,
+        error,
+        exit_code,
+        capability,
+    }
+}
+
+fn multipart_error_exit_code(error: &Error) -> ExitCode {
+    match error {
+        Error::Auth(_) => ExitCode::AuthError,
+        Error::NotFound(_) | Error::AliasNotFound(_) => ExitCode::NotFound,
+        Error::Network(_) | Error::Io(_) => ExitCode::NetworkError,
+        Error::InvalidPath(_) | Error::Config(_) => ExitCode::UsageError,
+        Error::Conflict(_) => ExitCode::Conflict,
+        Error::UnsupportedFeature(_) => ExitCode::UnsupportedFeature,
+        _ => ExitCode::GeneralError,
+    }
+}
+
+fn incomplete_cleanup_exit_code(completed: usize, failures: &[RmIncompleteFailure]) -> ExitCode {
+    if failures.is_empty() {
+        return ExitCode::Success;
+    }
+    if completed > 0 {
+        return ExitCode::GeneralError;
+    }
+
+    let first = failures[0].exit_code;
+    if failures.iter().all(|failure| failure.exit_code == first) {
+        first
+    } else {
+        ExitCode::GeneralError
     }
 }
 
@@ -451,6 +774,21 @@ fn partition_delete_results(
 mod tests {
     use super::*;
 
+    fn incomplete_upload(key: &str, upload_id: &str) -> MultipartUpload {
+        MultipartUpload {
+            bucket: "bucket".to_string(),
+            key: key.to_string(),
+            upload_id: upload_id.to_string(),
+            initiated: None,
+            size_bytes: None,
+            storage_class: Some("STANDARD".to_string()),
+            initiator: None,
+            owner: None,
+            checksum_algorithm: None,
+            checksum_type: None,
+        }
+    }
+
     #[test]
     fn test_parse_rm_path_with_key() {
         let (alias, bucket, key) = parse_rm_path("myalias/mybucket/file.txt").unwrap();
@@ -496,6 +834,117 @@ mod tests {
         assert!(validate_removal_scope("prefix/", false).is_err());
         assert!(validate_removal_scope("prefix/", true).is_ok());
         assert!(validate_removal_scope("object.txt", false).is_ok());
+    }
+
+    #[test]
+    fn incomplete_exact_selection_does_not_widen_to_similar_keys() {
+        let selected = select_incomplete_uploads(
+            vec![
+                incomplete_upload("report.csv", "1"),
+                incomplete_upload("report.csv", "2"),
+                incomplete_upload("report.csv.tmp", "3"),
+            ],
+            "report.csv",
+        );
+
+        assert_eq!(selected.len(), 2);
+        assert!(selected.iter().all(|upload| upload.key == "report.csv"));
+    }
+
+    #[test]
+    fn incomplete_selection_never_treats_an_object_key_as_a_prefix() {
+        let selected = select_incomplete_uploads(
+            vec![
+                incomplete_upload("logs", "1"),
+                incomplete_upload("logs/a.bin", "2"),
+                incomplete_upload("other/c.bin", "3"),
+            ],
+            "logs",
+        );
+
+        let keys: Vec<&str> = selected.iter().map(|upload| upload.key.as_str()).collect();
+        assert_eq!(keys, vec!["logs"]);
+    }
+
+    #[test]
+    fn incomplete_cleanup_reports_specific_and_partial_exit_codes() {
+        let auth_failure = RmIncompleteFailure {
+            target: "test/bucket/a.bin".to_string(),
+            upload: Some(incomplete_upload("a.bin", "1")),
+            error: "AccessDenied".to_string(),
+            exit_code: ExitCode::AuthError,
+            capability: "abort_multipart_upload",
+        };
+        assert_eq!(
+            incomplete_cleanup_exit_code(0, std::slice::from_ref(&auth_failure)),
+            ExitCode::AuthError
+        );
+        assert_eq!(
+            incomplete_cleanup_exit_code(1, &[auth_failure]),
+            ExitCode::GeneralError
+        );
+    }
+
+    #[test]
+    fn incomplete_failure_keeps_the_full_upload_for_v3_partial_output() {
+        let failure = RmIncompleteFailure {
+            target: "test/bucket/b.bin".to_string(),
+            upload: Some(incomplete_upload("b.bin", "2")),
+            error: "AccessDenied".to_string(),
+            exit_code: ExitCode::AuthError,
+            capability: "abort_multipart_upload",
+        };
+
+        let upload = failure.upload.expect("failed upload should be retained");
+        assert_eq!(upload.key, "b.bin");
+        assert_eq!(upload.upload_id, "2");
+        assert_eq!(failure.exit_code, ExitCode::AuthError);
+    }
+
+    #[tokio::test]
+    async fn incomplete_conflicting_destructive_options_return_usage_error() {
+        let code = execute(
+            RmArgs {
+                paths: vec!["test/bucket/object".to_string()],
+                recursive: false,
+                force: false,
+                dry_run: false,
+                incomplete: true,
+                versions: true,
+                bypass: false,
+                purge: false,
+            },
+            OutputConfig {
+                quiet: true,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        assert_eq!(code, ExitCode::UsageError);
+    }
+
+    #[tokio::test]
+    async fn incomplete_recursive_cleanup_is_rejected_before_alias_resolution() {
+        let code = execute(
+            RmArgs {
+                paths: vec!["missing/bucket/logs/".to_string()],
+                recursive: true,
+                force: false,
+                dry_run: false,
+                incomplete: true,
+                versions: false,
+                bypass: false,
+                purge: false,
+            },
+            OutputConfig {
+                quiet: true,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        assert_eq!(code, ExitCode::UnsupportedFeature);
     }
 
     #[test]

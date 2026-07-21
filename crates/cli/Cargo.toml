@@ -22,6 +22,7 @@ rc-s3 = { workspace = true }
 
 # Async runtime
 tokio.workspace = true
+futures.workspace = true
 
 # CLI
 clap.workspace = true

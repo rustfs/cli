@@ -85,11 +85,16 @@ fn snapshot_payload_accepts_lf_and_crlf_delimiters() {
 }
 
 #[test]
-fn every_v3_family_has_valid_success_empty_and_error_fixtures() {
+fn every_v3_family_has_valid_contract_fixtures() {
     let validator = load_validator(3);
 
     for family in V3_FAMILIES {
-        for case in ["success", "empty", "error"] {
+        let cases: &[&str] = if *family == "multipart_uploads" {
+            &["success", "empty", "partial", "error"]
+        } else {
+            &["success", "empty", "error"]
+        };
+        for case in cases {
             let path = fixture_path(family, case);
             let contents = fs::read_to_string(&path)
                 .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
@@ -122,6 +127,20 @@ fn every_v3_family_has_valid_success_empty_and_error_fixtures() {
             }
         }
     }
+}
+
+#[test]
+fn multipart_partial_fixture_preserves_successes_and_per_upload_errors() {
+    let validator = load_validator(3);
+    let fixture = load_json(&fixture_path("multipart_uploads", "partial"));
+
+    assert_valid(&validator, &fixture, "multipart partial output");
+    assert_eq!(fixture["status"], "partial");
+    assert_eq!(fixture["data"]["summary"]["succeeded"], 1);
+    assert_eq!(fixture["data"]["summary"]["failed"], 1);
+    assert_eq!(fixture["data"]["results"][0]["state"], "aborted");
+    assert_eq!(fixture["data"]["results"][1]["state"], "failed");
+    assert_eq!(fixture["data"]["results"][1]["error"]["type"], "auth_error");
 }
 
 #[test]

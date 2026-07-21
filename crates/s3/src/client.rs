@@ -28,10 +28,12 @@ use http_body_util::StreamBody;
 use jiff::Timestamp;
 use quick_xml::de::from_str as from_xml_str;
 use rc_core::{
-    Alias, BucketEncryption, BucketNotification, Capabilities, CorsRule, Error, LifecycleRule,
-    ListOptions, ListResult, NotificationTarget, ObjectEncryptionRequest, ObjectInfo, ObjectStore,
-    ObjectVersion, ObjectVersionListResult, RemotePath, ReplicationConfiguration, RequestHeader,
-    Result, SelectOptions, global_request_headers,
+    AbortMultipartUploadRequest, Alias, BucketEncryption, BucketNotification, Capabilities,
+    CorsRule, Error, LifecycleRule, ListOptions, ListResult, MultipartIdentity, MultipartUpload,
+    MultipartUploadListOptions, MultipartUploadListResult, NotificationTarget,
+    ObjectEncryptionRequest, ObjectInfo, ObjectStore, ObjectVersion, ObjectVersionListResult,
+    RemotePath, ReplicationConfiguration, RequestHeader, Result, SelectOptions,
+    global_request_headers,
 };
 use reqwest::Method;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
@@ -2144,6 +2146,36 @@ fn validate_continuation_token(
     Ok(())
 }
 
+fn validate_multipart_upload_markers(
+    truncated: bool,
+    current_key_marker: Option<&str>,
+    current_upload_id_marker: Option<&str>,
+    next_key_marker: Option<&str>,
+    next_upload_id_marker: Option<&str>,
+) -> Result<()> {
+    if !truncated {
+        return Ok(());
+    }
+
+    if next_key_marker.is_none() || next_upload_id_marker.is_none() {
+        return Err(Error::Network(
+            "S3 returned a truncated multipart upload listing without a complete marker pair"
+                .to_string(),
+        ));
+    }
+
+    let did_not_advance =
+        current_key_marker == next_key_marker && current_upload_id_marker == next_upload_id_marker;
+    if did_not_advance {
+        return Err(Error::Network(
+            "S3 returned a truncated multipart upload listing without advancing its markers"
+                .to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
 #[async_trait]
 impl ObjectStore for S3Client {
     async fn list_buckets(&self) -> Result<Vec<ObjectInfo>> {
@@ -2256,6 +2288,168 @@ impl ObjectStore for S3Client {
             truncated,
             continuation_token,
         })
+    }
+
+    async fn list_multipart_uploads(
+        &self,
+        bucket: &str,
+        options: MultipartUploadListOptions,
+    ) -> Result<MultipartUploadListResult> {
+        let mut request = self.inner.list_multipart_uploads().bucket(bucket);
+        if let Some(prefix) = &options.prefix {
+            request = request.prefix(prefix);
+        }
+        if let Some(delimiter) = &options.delimiter {
+            request = request.delimiter(delimiter);
+        }
+        if let Some(key_marker) = &options.key_marker {
+            request = request.key_marker(key_marker);
+        }
+        if let Some(upload_id_marker) = &options.upload_id_marker {
+            request = request.upload_id_marker(upload_id_marker);
+        }
+        if let Some(max_uploads) = options.max_uploads {
+            request = request.max_uploads(max_uploads);
+        }
+
+        let response = request.send().await.map_err(|error| {
+            let message = Self::format_sdk_error(&error);
+            if let aws_sdk_s3::error::SdkError::ServiceError(service_error) = &error {
+                let status = service_error.raw().status().as_u16();
+                let code = service_error.err().code();
+                if matches!(status, 401 | 403) {
+                    return Error::Auth(message);
+                }
+                if status == 501 || matches!(code, Some("NotImplemented")) {
+                    return Error::UnsupportedFeature(message);
+                }
+                if status == 404 || matches!(code, Some("NoSuchBucket") | Some("NotFound")) {
+                    return Error::NotFound(format!("Bucket not found: {bucket}"));
+                }
+                return Error::Network(format!("{message} (HTTP {status})"));
+            }
+            Error::Network(message)
+        })?;
+
+        let truncated = response.is_truncated().unwrap_or(false);
+        let uploads = response
+            .uploads()
+            .iter()
+            .map(|upload| {
+                let key = upload.key().ok_or_else(|| {
+                    Error::Network(
+                        "S3 returned a multipart upload without an object key".to_string(),
+                    )
+                })?;
+                let upload_id = upload.upload_id().ok_or_else(|| {
+                    Error::Network(
+                        "S3 returned a multipart upload without an upload ID".to_string(),
+                    )
+                })?;
+                let initiator = upload.initiator().map(|identity| MultipartIdentity {
+                    id: identity.id().map(ToString::to_string),
+                    display_name: identity.display_name().map(ToString::to_string),
+                });
+                let owner = upload.owner().map(|identity| MultipartIdentity {
+                    id: identity.id().map(ToString::to_string),
+                    display_name: identity.display_name().map(ToString::to_string),
+                });
+
+                Ok(MultipartUpload {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                    upload_id: upload_id.to_string(),
+                    initiated: upload.initiated().and_then(|value| {
+                        Timestamp::new(value.secs(), value.subsec_nanos() as i32).ok()
+                    }),
+                    size_bytes: None,
+                    storage_class: upload
+                        .storage_class()
+                        .map(|value| value.as_str().to_string()),
+                    initiator,
+                    owner,
+                    checksum_algorithm: upload
+                        .checksum_algorithm()
+                        .map(|value| value.as_str().to_string()),
+                    checksum_type: upload
+                        .checksum_type()
+                        .map(|value| value.as_str().to_string()),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut next_key_marker = response.next_key_marker().map(ToString::to_string);
+        let mut next_upload_id_marker = response.next_upload_id_marker().map(ToString::to_string);
+        if truncated && next_key_marker.is_none() && next_upload_id_marker.is_none() {
+            // RustFS 1.0.0-beta.10 can omit both Next* fields on a truncated page. The S3
+            // ordering tuple of the last returned upload is safe only when both values exist.
+            if let Some(last_upload) = uploads
+                .last()
+                .filter(|upload| !upload.key.is_empty() && !upload.upload_id.is_empty())
+            {
+                next_key_marker = Some(last_upload.key.clone());
+                next_upload_id_marker = Some(last_upload.upload_id.clone());
+            }
+        }
+        validate_multipart_upload_markers(
+            truncated,
+            options.key_marker.as_deref(),
+            options.upload_id_marker.as_deref(),
+            next_key_marker.as_deref(),
+            next_upload_id_marker.as_deref(),
+        )?;
+
+        let common_prefixes = response
+            .common_prefixes()
+            .iter()
+            .filter_map(|prefix| prefix.prefix().map(ToString::to_string))
+            .collect();
+
+        Ok(MultipartUploadListResult {
+            uploads,
+            common_prefixes,
+            truncated,
+            next_key_marker,
+            next_upload_id_marker,
+        })
+    }
+
+    async fn abort_multipart_upload(&self, request: &AbortMultipartUploadRequest) -> Result<()> {
+        let result = self
+            .inner
+            .abort_multipart_upload()
+            .bucket(&request.bucket)
+            .key(&request.key)
+            .upload_id(&request.upload_id)
+            .send()
+            .await;
+
+        match result {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                let message = Self::format_sdk_error(&error);
+                if let aws_sdk_s3::error::SdkError::ServiceError(service_error) = &error {
+                    let status = service_error.raw().status().as_u16();
+                    let code = service_error.err().code();
+                    if matches!(status, 401 | 403) {
+                        return Err(Error::Auth(message));
+                    }
+                    if status == 404 && matches!(code, Some("NoSuchUpload")) {
+                        return Ok(());
+                    }
+                    if status == 501 || matches!(code, Some("NotImplemented")) {
+                        return Err(Error::UnsupportedFeature(message));
+                    }
+                    if status == 404 || matches!(code, Some("NoSuchBucket") | Some("NotFound")) {
+                        return Err(Error::NotFound(format!(
+                            "Multipart upload target not found: {}/{}",
+                            request.bucket, request.key
+                        )));
+                    }
+                    return Err(Error::Network(format!("{message} (HTTP {status})")));
+                }
+                Err(Error::Network(message))
+            }
+        }
     }
 
     async fn head_object(&self, path: &RemotePath) -> Result<ObjectInfo> {
@@ -4758,6 +4952,432 @@ mod tests {
         match result {
             Err(Error::Network(message)) => assert!(message.contains("InternalError")),
             other => panic!("Expected Network for delete failure, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_multipart_uploads_preserves_metadata_and_pagination_markers() {
+        let response = http::Response::builder()
+            .status(200)
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListMultipartUploadsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Bucket>bucket</Bucket>
+  <KeyMarker>logs/a.bin</KeyMarker>
+  <UploadIdMarker>upload-0</UploadIdMarker>
+  <NextKeyMarker>logs/b.bin</NextKeyMarker>
+  <NextUploadIdMarker>upload-2</NextUploadIdMarker>
+  <Prefix>logs/</Prefix>
+  <Delimiter>/</Delimiter>
+  <MaxUploads>25</MaxUploads>
+  <IsTruncated>true</IsTruncated>
+  <Upload>
+    <Key>logs/a.bin</Key>
+    <UploadId>upload-1</UploadId>
+    <Initiator><ID>user-1</ID><DisplayName>backup-agent</DisplayName></Initiator>
+    <Owner><ID>owner-1</ID><DisplayName>storage-owner</DisplayName></Owner>
+    <StorageClass>STANDARD</StorageClass>
+    <Initiated>2026-07-21T04:00:00.123Z</Initiated>
+    <ChecksumAlgorithm>CRC32C</ChecksumAlgorithm>
+    <ChecksumType>COMPOSITE</ChecksumType>
+  </Upload>
+  <CommonPrefixes><Prefix>logs/archive/</Prefix></CommonPrefixes>
+</ListMultipartUploadsResult>"#,
+            ))
+            .expect("build multipart listing response");
+        let (client, request_receiver) = test_s3_client(Some(response));
+
+        let result = client
+            .list_multipart_uploads(
+                "bucket",
+                MultipartUploadListOptions {
+                    prefix: Some("logs/".to_string()),
+                    delimiter: Some("/".to_string()),
+                    key_marker: Some("logs/a.bin".to_string()),
+                    upload_id_marker: Some("upload-0".to_string()),
+                    max_uploads: Some(25),
+                },
+            )
+            .await
+            .expect("list multipart uploads");
+
+        let request = request_receiver.expect_request();
+        let uri = request.uri().to_string();
+        assert_eq!(request.method(), http::Method::GET);
+        assert!(uri.contains("uploads"), "missing uploads query: {uri}");
+        assert!(
+            uri.contains("prefix=logs%2F"),
+            "missing prefix query: {uri}"
+        );
+        assert!(
+            uri.contains("delimiter=%2F"),
+            "missing delimiter query: {uri}"
+        );
+        assert!(
+            uri.contains("key-marker=logs%2Fa.bin"),
+            "missing key marker query: {uri}"
+        );
+        assert!(
+            uri.contains("upload-id-marker=upload-0"),
+            "missing upload marker query: {uri}"
+        );
+        assert!(uri.contains("max-uploads=25"), "missing max query: {uri}");
+
+        assert!(result.truncated);
+        assert_eq!(result.next_key_marker.as_deref(), Some("logs/b.bin"));
+        assert_eq!(result.next_upload_id_marker.as_deref(), Some("upload-2"));
+        assert_eq!(result.common_prefixes, vec!["logs/archive/"]);
+        assert_eq!(result.uploads.len(), 1);
+        let upload = &result.uploads[0];
+        assert_eq!(upload.bucket, "bucket");
+        assert_eq!(upload.key, "logs/a.bin");
+        assert_eq!(upload.upload_id, "upload-1");
+        assert_eq!(
+            upload.initiated.map(|value| value.to_string()).as_deref(),
+            Some("2026-07-21T04:00:00.123Z")
+        );
+        assert_eq!(upload.storage_class.as_deref(), Some("STANDARD"));
+        assert_eq!(
+            upload
+                .initiator
+                .as_ref()
+                .and_then(|value| value.id.as_deref()),
+            Some("user-1")
+        );
+        assert_eq!(upload.checksum_algorithm.as_deref(), Some("CRC32C"));
+        assert_eq!(upload.checksum_type.as_deref(), Some("COMPOSITE"));
+    }
+
+    #[tokio::test]
+    async fn list_multipart_uploads_maps_access_denied_to_auth_error() {
+        let response = http::Response::builder()
+            .status(403)
+            .header("x-amz-error-code", "AccessDenied")
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>"#,
+            ))
+            .expect("build access denied response");
+        let (client, _) = test_s3_client(Some(response));
+
+        let result = client
+            .list_multipart_uploads("bucket", MultipartUploadListOptions::default())
+            .await;
+
+        match result {
+            Err(Error::Auth(message)) => assert!(message.contains("AccessDenied")),
+            other => panic!("expected auth error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_multipart_uploads_maps_structured_not_implemented_before_404() {
+        let response = http::Response::builder()
+            .status(404)
+            .header("x-amz-error-code", "NotImplemented")
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>NotImplemented</Code><Message>Multipart listing is unavailable.</Message></Error>"#,
+            ))
+            .expect("build not implemented response");
+        let (client, _) = test_s3_client(Some(response));
+
+        let result = client
+            .list_multipart_uploads("bucket", MultipartUploadListOptions::default())
+            .await;
+
+        assert!(matches!(result, Err(Error::UnsupportedFeature(_))));
+    }
+
+    #[tokio::test]
+    async fn list_multipart_uploads_recovers_markers_omitted_by_rustfs_beta_10() {
+        let response = http::Response::builder()
+            .status(200)
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListMultipartUploadsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Bucket>bucket</Bucket>
+  <MaxUploads>1</MaxUploads>
+  <IsTruncated>true</IsTruncated>
+  <Upload>
+    <Key>object.bin</Key>
+    <UploadId>upload-1</UploadId>
+    <Initiated>2026-07-21T04:00:00.000Z</Initiated>
+  </Upload>
+</ListMultipartUploadsResult>"#,
+            ))
+            .expect("build RustFS multipart listing response");
+        let (client, request_receiver) = test_s3_client(Some(response));
+
+        let result = client
+            .list_multipart_uploads(
+                "bucket",
+                MultipartUploadListOptions {
+                    // RustFS beta.10 hashes this value as one exact object key rather than
+                    // traversing it as an S3 prefix (rustfs/backlog#1384).
+                    prefix: Some("object.bin".to_string()),
+                    max_uploads: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("recover pagination markers from the returned upload");
+
+        assert!(result.truncated);
+        assert_eq!(result.next_key_marker.as_deref(), Some("object.bin"));
+        assert_eq!(result.next_upload_id_marker.as_deref(), Some("upload-1"));
+        let request = request_receiver.expect_request();
+        assert!(request.uri().to_string().contains("prefix=object.bin"));
+    }
+
+    #[tokio::test]
+    async fn list_multipart_uploads_rejects_a_partial_marker_pair() {
+        for markers in [
+            "<NextKeyMarker>object.bin</NextKeyMarker>",
+            "<NextUploadIdMarker>upload-1</NextUploadIdMarker>",
+        ] {
+            let body = format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListMultipartUploadsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Bucket>bucket</Bucket>
+  <MaxUploads>1</MaxUploads>
+  <IsTruncated>true</IsTruncated>
+  {markers}
+  <Upload><Key>object.bin</Key><UploadId>upload-1</UploadId></Upload>
+</ListMultipartUploadsResult>"#
+            );
+            let response = http::Response::builder()
+                .status(200)
+                .body(SdkBody::from(body))
+                .expect("build partial marker response");
+            let (client, _) = test_s3_client(Some(response));
+
+            let result = client
+                .list_multipart_uploads("bucket", MultipartUploadListOptions::default())
+                .await;
+
+            match result {
+                Err(Error::Network(message)) => {
+                    assert!(message.contains("complete marker pair"));
+                }
+                other => panic!("expected incomplete marker error, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn list_multipart_uploads_does_not_invent_markers_without_a_safe_upload() {
+        let response = http::Response::builder()
+            .status(200)
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListMultipartUploadsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Bucket>bucket</Bucket>
+  <MaxUploads>1</MaxUploads>
+  <IsTruncated>true</IsTruncated>
+</ListMultipartUploadsResult>"#,
+            ))
+            .expect("build markerless empty response");
+        let (client, _) = test_s3_client(Some(response));
+
+        let result = client
+            .list_multipart_uploads("bucket", MultipartUploadListOptions::default())
+            .await;
+
+        match result {
+            Err(Error::Network(message)) => assert!(message.contains("complete marker pair")),
+            other => panic!("expected safe fallback rejection, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn abort_multipart_upload_sends_upload_identity() {
+        let response = http::Response::builder()
+            .status(204)
+            .body(SdkBody::from(""))
+            .expect("build abort multipart response");
+        let (client, request_receiver) = test_s3_client(Some(response));
+        let request = AbortMultipartUploadRequest {
+            bucket: "bucket".to_string(),
+            key: "logs/a file.bin".to_string(),
+            upload_id: "upload/1+2".to_string(),
+        };
+
+        client
+            .abort_multipart_upload(&request)
+            .await
+            .expect("abort multipart upload");
+
+        let captured = request_receiver.expect_request();
+        let uri = captured.uri().to_string();
+        assert_eq!(captured.method(), http::Method::DELETE);
+        assert!(
+            uri.contains("/bucket/logs/a%20file.bin"),
+            "missing encoded object key: {uri}"
+        );
+        assert!(
+            uri.contains("uploadId=upload%2F1%2B2"),
+            "missing encoded upload id: {uri}"
+        );
+    }
+
+    #[tokio::test]
+    async fn abort_multipart_upload_is_idempotent_for_missing_uploads() {
+        let response = http::Response::builder()
+            .status(404)
+            .header("x-amz-error-code", "NoSuchUpload")
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>NoSuchUpload</Code><Message>The upload does not exist.</Message></Error>"#,
+            ))
+            .expect("build missing multipart response");
+        let (client, _) = test_s3_client(Some(response));
+        let request = AbortMultipartUploadRequest {
+            bucket: "bucket".to_string(),
+            key: "logs/a.bin".to_string(),
+            upload_id: "already-aborted".to_string(),
+        };
+
+        client
+            .abort_multipart_upload(&request)
+            .await
+            .expect("repeated abort should be successful");
+    }
+
+    #[tokio::test]
+    async fn abort_multipart_upload_does_not_treat_a_generic_404_as_idempotent() {
+        let response = http::Response::builder()
+            .status(404)
+            .header("x-amz-error-code", "NoSuchBucket")
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>NoSuchBucket</Code><Message>The bucket does not exist.</Message></Error>"#,
+            ))
+            .expect("build missing bucket response");
+        let (client, _) = test_s3_client(Some(response));
+        let request = AbortMultipartUploadRequest {
+            bucket: "missing".to_string(),
+            key: "logs/a.bin".to_string(),
+            upload_id: "upload-1".to_string(),
+        };
+
+        let result = client.abort_multipart_upload(&request).await;
+
+        assert!(matches!(result, Err(Error::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn abort_multipart_upload_maps_access_denied_to_auth_error() {
+        let response = http::Response::builder()
+            .status(403)
+            .header("x-amz-error-code", "AccessDenied")
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>"#,
+            ))
+            .expect("build access denied multipart response");
+        let (client, _) = test_s3_client(Some(response));
+        let request = AbortMultipartUploadRequest {
+            bucket: "bucket".to_string(),
+            key: "logs/a.bin".to_string(),
+            upload_id: "upload-1".to_string(),
+        };
+
+        let result = client.abort_multipart_upload(&request).await;
+
+        match result {
+            Err(Error::Auth(message)) => assert!(message.contains("AccessDenied")),
+            other => panic!("expected auth error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn abort_multipart_upload_maps_structured_not_implemented_before_404() {
+        let response = http::Response::builder()
+            .status(404)
+            .header("x-amz-error-code", "NotImplemented")
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>NotImplemented</Code><Message>Multipart abort is unavailable.</Message></Error>"#,
+            ))
+            .expect("build not implemented multipart response");
+        let (client, _) = test_s3_client(Some(response));
+        let request = AbortMultipartUploadRequest {
+            bucket: "bucket".to_string(),
+            key: "logs/a.bin".to_string(),
+            upload_id: "upload-1".to_string(),
+        };
+
+        let result = client.abort_multipart_upload(&request).await;
+
+        assert!(matches!(result, Err(Error::UnsupportedFeature(_))));
+    }
+
+    #[tokio::test]
+    async fn abort_multipart_upload_prioritizes_auth_over_no_such_upload() {
+        let response = http::Response::builder()
+            .status(403)
+            .header("x-amz-error-code", "NoSuchUpload")
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>NoSuchUpload</Code><Message>Access is forbidden.</Message></Error>"#,
+            ))
+            .expect("build misleading forbidden response");
+        let (client, _) = test_s3_client(Some(response));
+        let request = AbortMultipartUploadRequest {
+            bucket: "bucket".to_string(),
+            key: "logs/a.bin".to_string(),
+            upload_id: "upload-1".to_string(),
+        };
+
+        let result = client.abort_multipart_upload(&request).await;
+
+        assert!(matches!(result, Err(Error::Auth(_))));
+    }
+
+    #[tokio::test]
+    async fn abort_multipart_upload_does_not_match_no_such_upload_in_message_text() {
+        let response = http::Response::builder()
+            .status(500)
+            .header("x-amz-error-code", "InternalError")
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>InternalError</Code><Message>NoSuchUpload appeared in diagnostic text.</Message></Error>"#,
+            ))
+            .expect("build diagnostic response");
+        let (client, _) = test_s3_client(Some(response));
+        let request = AbortMultipartUploadRequest {
+            bucket: "bucket".to_string(),
+            key: "logs/a.bin".to_string(),
+            upload_id: "upload-1".to_string(),
+        };
+
+        let result = client.abort_multipart_upload(&request).await;
+
+        assert!(matches!(result, Err(Error::Network(_))));
+    }
+
+    #[tokio::test]
+    async fn abort_multipart_upload_preserves_retryable_http_status() {
+        let response = http::Response::builder()
+            .status(503)
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>SlowDown</Code><Message>Reduce your request rate.</Message></Error>"#,
+            ))
+            .expect("build transient multipart response");
+        let (client, _) = test_s3_client(Some(response));
+        let request = AbortMultipartUploadRequest {
+            bucket: "bucket".to_string(),
+            key: "logs/a.bin".to_string(),
+            upload_id: "upload-1".to_string(),
+        };
+
+        let result = client.abort_multipart_upload(&request).await;
+
+        match result {
+            Err(Error::Network(message)) => assert!(message.contains("HTTP 503")),
+            other => panic!("expected retryable network error, got {other:?}"),
         }
     }
 

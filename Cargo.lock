@@ -2821,6 +2821,7 @@ dependencies = [
  "clap_complete",
  "comfy-table",
  "console",
+ "futures",
  "glob",
  "humansize",
  "indicatif",

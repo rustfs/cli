@@ -12,7 +12,7 @@ use tokio::io::AsyncWrite;
 
 use crate::cors::CorsRule;
 use crate::encryption::{BucketEncryption, ObjectEncryptionRequest};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::lifecycle::LifecycleRule;
 use crate::path::RemotePath;
 use crate::replication::ReplicationConfiguration;
@@ -182,6 +182,114 @@ pub struct ListOptions {
     pub recursive: bool,
 }
 
+/// S3 identity attached to an incomplete multipart upload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MultipartIdentity {
+    /// Stable account or principal identifier, when returned by the server.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+
+    /// Human-readable principal name, when returned by the server.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+}
+
+/// Metadata for an incomplete multipart upload.
+///
+/// `size_bytes` is nullable because the S3 list-multipart-uploads response does not expose the
+/// uploaded part total. Keeping the field in the typed record makes the representation compatible
+/// with richer backends and the output v3 mapping without issuing one request per upload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MultipartUpload {
+    /// Bucket containing the pending upload.
+    pub bucket: String,
+
+    /// Object key being uploaded.
+    pub key: String,
+
+    /// Server-assigned multipart upload identifier.
+    pub upload_id: String,
+
+    /// Time at which the upload was initiated, when returned by the server.
+    pub initiated: Option<Timestamp>,
+
+    /// Bytes uploaded so far, when the backend provides this value.
+    pub size_bytes: Option<i64>,
+
+    /// Requested storage class, when returned by the server.
+    pub storage_class: Option<String>,
+
+    /// Principal that initiated the upload.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initiator: Option<MultipartIdentity>,
+
+    /// Owner of the pending object.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<MultipartIdentity>,
+
+    /// Checksum algorithm selected when the upload was created.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checksum_algorithm: Option<String>,
+
+    /// Checksum aggregation type selected when the upload was created.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checksum_type: Option<String>,
+}
+
+/// Options for one page of incomplete multipart uploads.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MultipartUploadListOptions {
+    /// Only return object keys beginning with this prefix.
+    pub prefix: Option<String>,
+
+    /// Group keys containing this delimiter into common prefixes.
+    pub delimiter: Option<String>,
+
+    /// Key marker returned by the previous page.
+    pub key_marker: Option<String>,
+
+    /// Upload ID marker returned by the previous page.
+    pub upload_id_marker: Option<String>,
+
+    /// Maximum number of uploads and common prefixes to return.
+    pub max_uploads: Option<i32>,
+}
+
+/// Result of one incomplete multipart upload listing page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MultipartUploadListResult {
+    /// Uploads returned on this page.
+    pub uploads: Vec<MultipartUpload>,
+
+    /// Grouped prefixes returned when a delimiter was supplied.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub common_prefixes: Vec<String>,
+
+    /// Whether another page is available.
+    pub truncated: bool,
+
+    /// Key marker for the next page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_key_marker: Option<String>,
+
+    /// Upload ID marker for the next page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_upload_id_marker: Option<String>,
+}
+
+/// Identifies one incomplete multipart upload to abort.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AbortMultipartUploadRequest {
+    /// Bucket containing the upload.
+    pub bucket: String,
+
+    /// Object key being uploaded.
+    pub key: String,
+
+    /// Server-assigned multipart upload identifier.
+    pub upload_id: String,
+}
+
 /// Backend capability information
 #[derive(Debug, Clone, Default)]
 pub struct Capabilities {
@@ -258,6 +366,26 @@ pub trait ObjectStore: Send + Sync {
 
     /// List objects in a bucket or prefix
     async fn list_objects(&self, path: &RemotePath, options: ListOptions) -> Result<ListResult>;
+
+    /// List one page of incomplete multipart uploads.
+    async fn list_multipart_uploads(
+        &self,
+        bucket: &str,
+        options: MultipartUploadListOptions,
+    ) -> Result<MultipartUploadListResult> {
+        let _ = (bucket, options);
+        Err(Error::UnsupportedFeature(
+            "Multipart upload listing is not supported by this object store".to_string(),
+        ))
+    }
+
+    /// Abort one incomplete multipart upload.
+    async fn abort_multipart_upload(&self, request: &AbortMultipartUploadRequest) -> Result<()> {
+        let _ = request;
+        Err(Error::UnsupportedFeature(
+            "Multipart upload cleanup is not supported by this object store".to_string(),
+        ))
+    }
 
     /// Get object metadata
     async fn head_object(&self, path: &RemotePath) -> Result<ObjectInfo>;
@@ -486,5 +614,48 @@ mod tests {
         assert_eq!(metadata.len(), 2);
         assert_eq!(metadata.get("content-disposition").unwrap(), "attachment");
         assert_eq!(metadata.get("custom-key").unwrap(), "custom-value");
+    }
+
+    #[test]
+    fn multipart_upload_serializes_stable_identity_and_server_metadata() {
+        let upload = MultipartUpload {
+            bucket: "archive".to_string(),
+            key: "backups/data.tar".to_string(),
+            upload_id: "upload-123".to_string(),
+            initiated: Some(
+                "2026-07-21T04:00:00Z"
+                    .parse()
+                    .expect("test timestamp should be valid"),
+            ),
+            size_bytes: None,
+            storage_class: Some("STANDARD".to_string()),
+            initiator: Some(MultipartIdentity {
+                id: Some("user-1".to_string()),
+                display_name: Some("backup-agent".to_string()),
+            }),
+            owner: None,
+            checksum_algorithm: Some("CRC64NVME".to_string()),
+            checksum_type: Some("FULL_OBJECT".to_string()),
+        };
+
+        let value = serde_json::to_value(upload).expect("multipart upload should serialize");
+        assert_eq!(value["bucket"], "archive");
+        assert_eq!(value["key"], "backups/data.tar");
+        assert_eq!(value["upload_id"], "upload-123");
+        assert_eq!(value["initiated"], "2026-07-21T04:00:00Z");
+        assert!(value["size_bytes"].is_null());
+        assert_eq!(value["storage_class"], "STANDARD");
+        assert_eq!(value["initiator"]["id"], "user-1");
+    }
+
+    #[test]
+    fn multipart_list_options_default_to_the_first_unfiltered_page() {
+        let options = MultipartUploadListOptions::default();
+
+        assert!(options.prefix.is_none());
+        assert!(options.delimiter.is_none());
+        assert!(options.key_marker.is_none());
+        assert!(options.upload_id_marker.is_none());
+        assert!(options.max_uploads.is_none());
     }
 }
