@@ -149,7 +149,6 @@ fn kms_roundtrip_uses_sse_kms_verifies_and_permanently_cleans_up() {
     let output = Command::new(rc_binary())
         .args([
             "--json",
-            "--debug",
             "admin",
             "kms",
             "roundtrip",
@@ -218,6 +217,48 @@ fn kms_roundtrip_uses_sse_kms_verifies_and_permanently_cleans_up() {
         assert!(!stdout.contains(forbidden));
     }
     handle.join().expect("roundtrip server finished");
+}
+
+#[test]
+fn kms_roundtrip_debug_output_does_not_disclose_temporary_path() {
+    let config_dir = tempfile::tempdir().expect("create config dir");
+    let (endpoint, receiver, handle) = start_roundtrip_server();
+    let output = Command::new(rc_binary())
+        .args([
+            "--debug",
+            "admin",
+            "kms",
+            "roundtrip",
+            "myalias",
+            "diagnostic-bucket",
+            "--key-id",
+            "key-1",
+            "--yes",
+        ])
+        .env("RC_CONFIG_DIR", config_dir.path())
+        .env("RC_HOST_myalias", rc_host_alias(&endpoint))
+        .output()
+        .expect("run debug roundtrip command");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
+    let put = receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("captured debug PUT");
+    let _get = receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("captured debug GET");
+    let _delete = receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("captured debug DELETE");
+    assert!(!stdout.contains(&put.target));
+    assert!(!stderr.contains(&put.target));
+    handle.join().expect("debug roundtrip server finished");
 }
 
 #[test]
