@@ -27,7 +27,7 @@ use serde::Serialize;
 
 use crate::exit_code::ExitCode;
 use crate::output::{Formatter, OutputConfig};
-use rc_core::AliasManager;
+use rc_core::{Alias, AliasManager};
 use rc_s3::AdminClient;
 
 /// Admin subcommands for IAM and cluster management
@@ -217,6 +217,19 @@ fn normalize_admin_alias(alias_name: &str) -> &str {
 
 /// Helper to get AdminClient from an alias name
 pub fn get_admin_client(alias_name: &str, formatter: &Formatter) -> Result<AdminClient, ExitCode> {
+    let alias = get_admin_alias(alias_name, formatter)?;
+
+    match AdminClient::new(&alias) {
+        Ok(client) => Ok(client),
+        Err(e) => {
+            formatter.error(&format!("Failed to create admin client: {e}"));
+            Err(ExitCode::GeneralError)
+        }
+    }
+}
+
+/// Resolve an admin alias for commands that need both Admin and S3 adapters.
+pub fn get_admin_alias(alias_name: &str, formatter: &Formatter) -> Result<Alias, ExitCode> {
     let alias_lookup_name = normalize_admin_alias(alias_name);
 
     let alias_manager = match AliasManager::new() {
@@ -227,22 +240,14 @@ pub fn get_admin_client(alias_name: &str, formatter: &Formatter) -> Result<Admin
         }
     };
 
-    let alias = match alias_manager.get(alias_lookup_name) {
-        Ok(a) => a,
+    match alias_manager.get(alias_lookup_name) {
+        Ok(a) => Ok(a),
         Err(rc_core::Error::AliasNotFound(_)) => {
             formatter.error(&format!("Alias '{}' not found", alias_name));
-            return Err(ExitCode::NotFound);
+            Err(ExitCode::NotFound)
         }
         Err(e) => {
             formatter.error(&format!("Failed to get alias: {e}"));
-            return Err(ExitCode::GeneralError);
-        }
-    };
-
-    match AdminClient::new(&alias) {
-        Ok(client) => Ok(client),
-        Err(e) => {
-            formatter.error(&format!("Failed to create admin client: {e}"));
             Err(ExitCode::GeneralError)
         }
     }
@@ -294,6 +299,26 @@ mod tests {
                 assert_eq!(args.alias, "local");
             }
             _ => panic!("Unexpected KMS status command"),
+        }
+
+        let roundtrip = TestCli::parse_from([
+            "rc",
+            "kms",
+            "roundtrip",
+            "local",
+            "diagnostic-bucket",
+            "--key-id",
+            "archive-key",
+            "--yes",
+        ]);
+        match roundtrip.command {
+            AdminCommands::Kms(kms::KmsCommands::Roundtrip(args)) => {
+                assert_eq!(args.alias, "local");
+                assert_eq!(args.bucket, "diagnostic-bucket");
+                assert_eq!(args.key_id.as_deref(), Some("archive-key"));
+                assert!(args.yes);
+            }
+            _ => panic!("Unexpected KMS roundtrip command"),
         }
 
         let list = TestCli::parse_from([

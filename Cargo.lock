@@ -2581,6 +2581,7 @@ dependencies = [
  "async-trait",
  "dirs",
  "futures",
+ "getrandom 0.4.3",
  "humansize",
  "jiff",
  "mockall",

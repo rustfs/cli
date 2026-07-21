@@ -19,6 +19,7 @@ rc admin kms reconfigure <ALIAS> <--config-file PATH|--stdin>
 rc admin kms start <ALIAS>
 rc admin kms restart <ALIAS> --yes
 rc admin kms stop <ALIAS> --yes
+rc admin kms roundtrip <ALIAS> <BUCKET> [--key-id KEY_ID] --yes
 rc admin kms key list <ALIAS> [--limit N] [--marker TOKEN]
 rc admin kms key status <ALIAS> [KEY_ID]
 rc admin kms key create <ALIAS> [--name NAME] [--description TEXT] [--tag KEY=VALUE]...
@@ -225,6 +226,7 @@ The KMS commands target the native RustFS beta.10 Admin API. They do not impleme
 | `rc admin kms start <ALIAS>` | Start a configured KMS service. |
 | `rc admin kms restart <ALIAS> --yes` | Force a KMS service restart after explicit confirmation. |
 | `rc admin kms stop <ALIAS> --yes` | Stop KMS after explicit confirmation. |
+| `rc admin kms roundtrip <ALIAS> <BUCKET> [--key-id KEY_ID] --yes` | Verify a real SSE-KMS object write/read cycle in an explicit existing bucket, using the configured default key when `--key-id` is omitted. |
 | `rc admin kms key list <ALIAS> [--limit N] [--marker TOKEN]` | List native RustFS KMS keys with pagination. The limit range is `1..=1000`. |
 | `rc admin kms key status <ALIAS> [KEY_ID]` | Show key metadata and lifecycle state. When `KEY_ID` is omitted, use the configured default key ID. |
 | `rc admin kms key create <ALIAS> [--name NAME] [--description TEXT] [--tag KEY=VALUE]...` | Create a key. Names are sent through RustFS's reserved `name` tag. Tags reject malformed, duplicate, reserved-name, and control-character input. |
@@ -244,7 +246,9 @@ On Unix, `--config-file` accepts only a regular non-symlink file with no group o
 
 The v3 lifecycle success operations are `configure`, `reconfigure`, `start`, `restart`, and `stop`, each with the resulting service `state`. Unconfigured start is `not_found`; permission denial is `auth_error`; unavailable service/storage is `network_error`; malformed or rejected responses are `general_error`; missing lifecycle routes are `unsupported_feature`. Restart and stop refuse to contact the server unless `--yes` is present.
 
-`kms key status` describes native RustFS key lifecycle metadata. It does not claim compatibility with the `mc admin kms key status` encryption/decryption probe. RustFS beta.10 has no direct decrypt-test Admin API or KMS-specific metrics selector, and `rc` intentionally does not expose the legacy `generate-data-key` response because that response contains plaintext data-key material.
+`kms roundtrip` refuses to run without `--yes`. It generates exactly 4 KiB of random test content internally, writes one randomly named temporary object with explicit SSE-KMS headers, reads and compares the decrypted bytes without creating or reporting a digest, and always attempts permanent deletion even when write, read, or verification fails. The read is bounded to 4 KiB. Application-owned plaintext buffers are zeroized; the temporary object name, plaintext, ciphertext, digest, and generated key material never appear in debug, human, JSON, or error output. A successful v3 result reports only `bucket`, `key_id`, `passed`, `cleanup_passed`, and write/read/cleanup/total milliseconds. Cleanup failure is a distinct error, and a primary failure explicitly reports when cleanup also failed.
+
+`kms key status` describes native RustFS key lifecycle metadata. It does not claim compatibility with the `mc admin kms key status` encryption/decryption probe. The round-trip diagnostic uses only the S3 object API and does not call an Admin API key-generation route. RustFS beta.10 has no direct decrypt-test Admin API or KMS-specific metrics route/selector contract, so `rc` does not offer KMS-specific metrics and intentionally does not expose the legacy `generate-data-key` response because that response contains plaintext data-key material.
 
 `rc admin heal status <ALIAS>` reports aggregate background heal status. Manual heals started with `rc admin heal start` are token-scoped tasks; the start output includes a client token. Root recursive tasks are inspected or stopped with `--client-token`, while bucket or prefix tasks additionally pass `--bucket` and optional `--prefix`.
 

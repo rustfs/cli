@@ -36,6 +36,7 @@ url.workspace = true
 urlencoding.workspace = true
 humansize.workspace = true
 zeroize.workspace = true
+getrandom.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

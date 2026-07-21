@@ -3,10 +3,12 @@
 use clap::{Args, Subcommand};
 use rc_core::admin::{
     KmsApi, KmsBackendKind, KmsCancelKeyDeletionResult, KmsConfigureRequest, KmsCreateKeyRequest,
-    KmsCreateKeyResult, KmsDeleteKeyRequest, KmsDeleteKeyResult, KmsKey, KmsKeyPage, KmsKeyState,
-    KmsKeyUsage, KmsServiceState, KmsStatus,
+    KmsCreateKeyResult, KmsDeleteKeyRequest, KmsDeleteKeyResult, KmsDiagnosticStore, KmsKey,
+    KmsKeyPage, KmsKeyState, KmsKeyUsage, KmsRoundTripReport, KmsServiceState, KmsStatus,
+    run_kms_round_trip,
 };
 use rc_core::{Error, Result};
+use rc_s3::{AdminClient, S3Client};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -14,7 +16,7 @@ use std::io::{Read, stdin};
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
-use super::{emit_observability_error, get_admin_client};
+use super::{emit_observability_error, get_admin_alias, get_admin_client};
 use crate::exit_code::ExitCode;
 use crate::output::Formatter;
 
@@ -41,6 +43,9 @@ pub enum KmsCommands {
 
     /// Stop the KMS service after explicit confirmation
     Stop(KmsDisruptiveActionArgs),
+
+    /// Verify SSE-KMS write and read behavior with a temporary object
+    Roundtrip(KmsRoundtripArgs),
 }
 
 #[derive(Args, Debug)]
@@ -84,6 +89,23 @@ pub struct KmsDisruptiveActionArgs {
     pub alias: String,
 
     /// Confirm the disruptive service operation
+    #[arg(long)]
+    pub yes: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct KmsRoundtripArgs {
+    /// Alias name of the server
+    pub alias: String,
+
+    /// Existing bucket used for the temporary diagnostic object
+    pub bucket: String,
+
+    /// KMS key identifier; when omitted, use the configured default key
+    #[arg(long)]
+    pub key_id: Option<String>,
+
+    /// Confirm the temporary encrypted object mutation
     #[arg(long)]
     pub yes: bool,
 }
@@ -248,6 +270,13 @@ struct KmsLifecycleData<'a> {
     state: &'a KmsServiceState,
 }
 
+#[derive(Debug, Serialize)]
+struct KmsRoundTripData<'a> {
+    operation: &'static str,
+    #[serde(flatten)]
+    report: &'a KmsRoundTripReport,
+}
+
 const MAX_KMS_CONFIG_BYTES: u64 = 1024 * 1024;
 
 pub async fn execute(command: KmsCommands, formatter: &Formatter) -> ExitCode {
@@ -258,6 +287,7 @@ pub async fn execute(command: KmsCommands, formatter: &Formatter) -> ExitCode {
         KmsCommands::Start(args) => execute_start(args, formatter).await,
         KmsCommands::Restart(args) => execute_disruptive_control(args, true, formatter).await,
         KmsCommands::Stop(args) => execute_disruptive_control(args, false, formatter).await,
+        KmsCommands::Roundtrip(args) => execute_roundtrip(args, formatter).await,
         KmsCommands::Key(command) => match command {
             KmsKeyCommands::List(args) => execute_key_list(args, formatter).await,
             KmsKeyCommands::Status(args) => execute_key_status(args, formatter).await,
@@ -268,6 +298,147 @@ pub async fn execute(command: KmsCommands, formatter: &Formatter) -> ExitCode {
             }
         },
     }
+}
+
+async fn execute_roundtrip(args: KmsRoundtripArgs, formatter: &Formatter) -> ExitCode {
+    let (bucket, explicit_key_id) = match validate_roundtrip_args(&args) {
+        Ok(validated) => validated,
+        Err(error) => {
+            return emit_kms_error(
+                "Refused to run KMS round-trip diagnostic",
+                &error,
+                false,
+                formatter,
+            );
+        }
+    };
+    let alias = match get_admin_alias(&args.alias, formatter) {
+        Ok(alias) => alias,
+        Err(code) => return code,
+    };
+    let key_id = match explicit_key_id {
+        Some(key_id) => key_id,
+        None => {
+            let admin = match AdminClient::new(&alias) {
+                Ok(client) => client,
+                Err(_) => {
+                    return emit_kms_error(
+                        "Failed to resolve the default KMS key",
+                        &Error::General("Failed to create KMS administration client".to_string()),
+                        false,
+                        formatter,
+                    );
+                }
+            };
+            let status = match admin.kms_status().await {
+                Ok(status) => status,
+                Err(error) => {
+                    return emit_kms_error(
+                        "Failed to resolve the default KMS key",
+                        &error,
+                        false,
+                        formatter,
+                    );
+                }
+            };
+            match resolve_roundtrip_key_id(None, &status) {
+                Ok(key_id) => key_id,
+                Err(error) => {
+                    return emit_kms_error(
+                        "Failed to resolve the default KMS key",
+                        &error,
+                        false,
+                        formatter,
+                    );
+                }
+            }
+        }
+    };
+    let store = match S3Client::new(alias).await {
+        Ok(client) => client,
+        Err(_) => {
+            return emit_kms_error(
+                "Failed to run KMS round-trip diagnostic",
+                &Error::General("Failed to create KMS diagnostic storage client".to_string()),
+                false,
+                formatter,
+            );
+        }
+    };
+    execute_roundtrip_with_store(&bucket, &key_id, &store, formatter).await
+}
+
+async fn execute_roundtrip_with_store(
+    bucket: &str,
+    key_id: &str,
+    store: &dyn KmsDiagnosticStore,
+    formatter: &Formatter,
+) -> ExitCode {
+    match run_kms_round_trip(store, bucket, key_id).await {
+        Ok(report) => {
+            if formatter.is_json() {
+                formatter.json(&KmsSuccessOutput {
+                    schema_version: 3,
+                    output_type: "kms",
+                    status: "success",
+                    data: KmsRoundTripData {
+                        operation: "roundtrip",
+                        report: &report,
+                    },
+                });
+            } else {
+                formatter.println(&format!(
+                    "KMS round-trip passed for bucket {} with key {} in {} ms; cleanup passed",
+                    formatter.sanitize_text(&report.bucket),
+                    formatter.sanitize_text(&report.key_id),
+                    report.timings.total_ms
+                ));
+            }
+            ExitCode::Success
+        }
+        Err(error) => emit_kms_error(
+            "KMS round-trip diagnostic failed",
+            &error.into_core_error(),
+            false,
+            formatter,
+        ),
+    }
+}
+
+fn validate_roundtrip_args(args: &KmsRoundtripArgs) -> Result<(String, Option<String>)> {
+    if !args.yes {
+        return Err(Error::InvalidPath(
+            "KMS round-trip diagnostic requires --yes".to_string(),
+        ));
+    }
+    let bucket = validated_nonempty("KMS diagnostic bucket", &args.bucket)?;
+    if bucket.contains('/') {
+        return Err(Error::InvalidPath(
+            "KMS diagnostic target must be a bucket, not an object path".to_string(),
+        ));
+    }
+    let key_id = args
+        .key_id
+        .as_deref()
+        .map(|value| validated_nonempty("KMS key id", value).map(str::to_string))
+        .transpose()?;
+    Ok((bucket.to_string(), key_id))
+}
+
+fn resolve_roundtrip_key_id(explicit_key_id: Option<String>, status: &KmsStatus) -> Result<String> {
+    let key_id = explicit_key_id
+        .or_else(|| {
+            status
+                .config
+                .as_ref()
+                .and_then(|config| config.default_key_id.clone())
+        })
+        .ok_or_else(|| {
+            Error::NotFound(
+                "No key id was provided and KMS has no configured default key".to_string(),
+            )
+        })?;
+    Ok(validated_nonempty("KMS key id", &key_id)?.to_string())
 }
 
 async fn execute_status(args: KmsStatusArgs, formatter: &Formatter) -> ExitCode {
@@ -961,5 +1132,178 @@ fn key_usage_label(usage: &KmsKeyUsage) -> &'static str {
         KmsKeyUsage::EncryptDecrypt => "encrypt-decrypt",
         KmsKeyUsage::SignVerify => "sign-verify",
         KmsKeyUsage::Unknown => "unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use rc_core::RemotePath;
+    use std::sync::Mutex;
+
+    struct FakeDiagnosticStore {
+        permission_denied: bool,
+        uploaded: Mutex<Vec<u8>>,
+        cleanup_attempts: Mutex<u32>,
+    }
+
+    #[async_trait]
+    impl KmsDiagnosticStore for FakeDiagnosticStore {
+        async fn put_kms_diagnostic_object(
+            &self,
+            _path: &RemotePath,
+            content: Zeroizing<Vec<u8>>,
+            _key_id: &str,
+        ) -> Result<()> {
+            if self.permission_denied {
+                return Err(Error::Auth("SECRET_DETAIL".to_string()));
+            }
+            *self.uploaded.lock().expect("uploaded content lock") = content.to_vec();
+            Ok(())
+        }
+
+        async fn get_kms_diagnostic_object(
+            &self,
+            _path: &RemotePath,
+            _max_bytes: usize,
+        ) -> Result<Zeroizing<Vec<u8>>> {
+            Ok(Zeroizing::new(
+                self.uploaded.lock().expect("uploaded content lock").clone(),
+            ))
+        }
+
+        async fn delete_kms_diagnostic_object(&self, _path: &RemotePath) -> Result<()> {
+            *self.cleanup_attempts.lock().expect("cleanup counter lock") += 1;
+            Ok(())
+        }
+    }
+
+    fn fake_store(permission_denied: bool) -> FakeDiagnosticStore {
+        FakeDiagnosticStore {
+            permission_denied,
+            uploaded: Mutex::new(Vec::new()),
+            cleanup_attempts: Mutex::new(0),
+        }
+    }
+
+    #[tokio::test]
+    async fn roundtrip_command_has_success_and_auth_exit_codes() {
+        let formatter = Formatter::new(crate::output::OutputConfig {
+            quiet: true,
+            ..Default::default()
+        });
+        let success = fake_store(false);
+        assert_eq!(
+            execute_roundtrip_with_store("bucket", "key-1", &success, &formatter).await,
+            ExitCode::Success
+        );
+        assert_eq!(
+            *success
+                .cleanup_attempts
+                .lock()
+                .expect("cleanup counter lock"),
+            1
+        );
+
+        let denied = fake_store(true);
+        assert_eq!(
+            execute_roundtrip_with_store("bucket", "key-1", &denied, &formatter).await,
+            ExitCode::AuthError
+        );
+        assert_eq!(
+            *denied
+                .cleanup_attempts
+                .lock()
+                .expect("cleanup counter lock"),
+            1
+        );
+    }
+
+    #[test]
+    fn roundtrip_requires_confirmation_and_resolves_default_key() {
+        let args = KmsRoundtripArgs {
+            alias: "local".to_string(),
+            bucket: "diagnostic-bucket".to_string(),
+            key_id: None,
+            yes: false,
+        };
+        validate_roundtrip_args(&args).expect_err("missing confirmation should fail");
+
+        let status = KmsStatus {
+            state: KmsServiceState::Running,
+            backend: None,
+            healthy: Some(true),
+            error_message: None,
+            config: Some(rc_core::admin::KmsConfigSummary {
+                backend: KmsBackendKind::Local,
+                default_key_id: Some("default-key".to_string()),
+                timeout_seconds: None,
+                retry_attempts: None,
+                cache: rc_core::admin::KmsCacheSummary {
+                    enabled: false,
+                    max_keys: None,
+                    ttl_seconds: None,
+                    metrics_enabled: None,
+                },
+                endpoint: None,
+                auth_method: None,
+                credentials_configured: None,
+                tls_verification_disabled: None,
+            }),
+        };
+        assert_eq!(
+            resolve_roundtrip_key_id(None, &status).expect("default key should resolve"),
+            "default-key"
+        );
+    }
+
+    #[test]
+    fn roundtrip_json_matches_v3_and_contains_no_probe_artifacts() {
+        let report = KmsRoundTripReport {
+            bucket: "diagnostic-bucket".to_string(),
+            key_id: "key-1".to_string(),
+            passed: true,
+            cleanup_passed: true,
+            timings: rc_core::admin::KmsRoundTripTimings {
+                write_ms: 1,
+                read_ms: 2,
+                cleanup_ms: 3,
+                total_ms: 6,
+            },
+        };
+        let output = KmsSuccessOutput {
+            schema_version: 3,
+            output_type: "kms",
+            status: "success",
+            data: KmsRoundTripData {
+                operation: "roundtrip",
+                report: &report,
+            },
+        };
+        let value = serde_json::to_value(output).expect("roundtrip output should serialize");
+        let schema_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../schemas/output_v3.json");
+        let schema: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&schema_path).unwrap_or_else(|error| {
+                panic!("failed to read {}: {error}", schema_path.display())
+            }),
+        )
+        .expect("output v3 schema should parse");
+        let validator = jsonschema::validator_for(&schema).expect("output v3 should compile");
+        let errors = validator
+            .iter_errors(&value)
+            .map(|error| error.to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            errors.is_empty(),
+            "invalid v3 output: {}",
+            errors.join("\n")
+        );
+
+        let serialized = value.to_string();
+        for forbidden in ["object_name", "content", "ciphertext", "digest", "data_key"] {
+            assert!(!serialized.contains(forbidden));
+        }
     }
 }

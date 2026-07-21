@@ -27,6 +27,7 @@ use http_body::Frame;
 use http_body_util::StreamBody;
 use jiff::Timestamp;
 use quick_xml::de::from_str as from_xml_str;
+use rc_core::admin::KmsDiagnosticStore;
 use rc_core::{
     Alias, BucketEncryption, BucketNotification, Capabilities, CorsRule, Error, LifecycleRule,
     ListOptions, ListResult, NotificationTarget, ObjectEncryptionRequest, ObjectInfo, ObjectStore,
@@ -43,6 +44,7 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
+use zeroize::Zeroizing;
 
 /// Keep single-part uploads small to avoid backend incompatibilities with
 /// streaming aws-chunked payloads.
@@ -51,6 +53,14 @@ const S3_SERVICE_NAME: &str = "s3";
 const S3_REPLICATION_XML_NAMESPACE: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 const RUSTFS_FORCE_DELETE_HEADER: &str = "x-rustfs-force-delete";
 static DOWNLOAD_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+struct KmsDiagnosticObjectBody(Zeroizing<Vec<u8>>);
+
+impl AsRef<[u8]> for KmsDiagnosticObjectBody {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BucketPolicyErrorKind {
@@ -2142,6 +2152,106 @@ fn validate_continuation_token(
     }
 
     Ok(())
+}
+
+fn kms_diagnostic_sdk_error<E>(error: &aws_sdk_s3::error::SdkError<E>) -> Error {
+    let status = match error {
+        aws_sdk_s3::error::SdkError::ServiceError(service_error) => {
+            Some(service_error.raw().status().as_u16())
+        }
+        _ => None,
+    };
+    match status {
+        Some(401 | 403) => Error::Auth("KMS diagnostic object permission was denied".to_string()),
+        Some(404) => Error::NotFound("KMS diagnostic bucket was not found".to_string()),
+        Some(409 | 412) => {
+            Error::Conflict("KMS diagnostic object operation conflicted".to_string())
+        }
+        Some(400 | 422) => Error::General("KMS diagnostic object request was rejected".to_string()),
+        _ => Error::Network("KMS diagnostic object request failed".to_string()),
+    }
+}
+
+#[async_trait]
+impl KmsDiagnosticStore for S3Client {
+    async fn put_kms_diagnostic_object(
+        &self,
+        path: &RemotePath,
+        content: Zeroizing<Vec<u8>>,
+        key_id: &str,
+    ) -> Result<()> {
+        let body = aws_sdk_s3::primitives::ByteStream::from(Bytes::from_owner(
+            KmsDiagnosticObjectBody(content),
+        ));
+        self.inner
+            .put_object()
+            .bucket(&path.bucket)
+            .key(&path.key)
+            .body(body)
+            .server_side_encryption(aws_sdk_s3::types::ServerSideEncryption::AwsKms)
+            .ssekms_key_id(key_id)
+            .send()
+            .await
+            .map_err(|error| kms_diagnostic_sdk_error(&error))?;
+        Ok(())
+    }
+
+    async fn get_kms_diagnostic_object(
+        &self,
+        path: &RemotePath,
+        max_bytes: usize,
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        let response = self
+            .inner
+            .get_object()
+            .bucket(&path.bucket)
+            .key(&path.key)
+            .send()
+            .await
+            .map_err(|error| kms_diagnostic_sdk_error(&error))?;
+        if response
+            .content_length()
+            .and_then(|length| usize::try_from(length).ok())
+            .is_some_and(|length| length > max_bytes)
+        {
+            return Err(Error::General(
+                "KMS diagnostic object exceeded the bounded probe size".to_string(),
+            ));
+        }
+
+        let mut content = Zeroizing::new(Vec::with_capacity(max_bytes.min(64 * 1024)));
+        let mut body = response.body;
+        while let Some(chunk) = body
+            .try_next()
+            .await
+            .map_err(|_| Error::Network("Failed to read KMS diagnostic object".to_string()))?
+        {
+            if content.len().saturating_add(chunk.len()) > max_bytes {
+                return Err(Error::General(
+                    "KMS diagnostic object exceeded the bounded probe size".to_string(),
+                ));
+            }
+            content.extend_from_slice(&chunk);
+        }
+        Ok(content)
+    }
+
+    async fn delete_kms_diagnostic_object(&self, path: &RemotePath) -> Result<()> {
+        self.inner
+            .delete_object()
+            .bucket(&path.bucket)
+            .key(&path.key)
+            .customize()
+            .mutate_request(|request| {
+                request
+                    .headers_mut()
+                    .insert(RUSTFS_FORCE_DELETE_HEADER, "true");
+            })
+            .send()
+            .await
+            .map_err(|error| kms_diagnostic_sdk_error(&error))?;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -4656,6 +4766,98 @@ mod tests {
             request.headers().get("x-amz-server-side-encryption"),
             Some("AES256")
         );
+    }
+
+    #[tokio::test]
+    async fn kms_diagnostic_put_uses_sse_kms_and_sensitive_body() {
+        let response = http::Response::builder()
+            .status(200)
+            .body(SdkBody::from(""))
+            .expect("build put response");
+        let (client, request_receiver) = test_s3_client(Some(response));
+        let path = RemotePath::new("test", "bucket", "hidden-temporary-key");
+
+        KmsDiagnosticStore::put_kms_diagnostic_object(
+            &client,
+            &path,
+            Zeroizing::new(b"INTERNAL_PROBE_CONTENT".to_vec()),
+            "kms-key",
+        )
+        .await
+        .expect("diagnostic put should succeed");
+
+        let request = request_receiver.expect_request();
+        assert_eq!(
+            request.headers().get("x-amz-server-side-encryption"),
+            Some("aws:kms")
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("x-amz-server-side-encryption-aws-kms-key-id"),
+            Some("kms-key")
+        );
+        assert_eq!(
+            request.body().bytes().expect("request body bytes"),
+            b"INTERNAL_PROBE_CONTENT"
+        );
+    }
+
+    #[tokio::test]
+    async fn kms_diagnostic_get_is_bounded_and_delete_is_permanent() {
+        let oversized_response = http::Response::builder()
+            .status(200)
+            .header("content-length", "9")
+            .body(SdkBody::from("oversized"))
+            .expect("build get response");
+        let (get_client, get_receiver) = test_s3_client(Some(oversized_response));
+        let path = RemotePath::new("test", "bucket", "hidden-temporary-key");
+
+        let error = KmsDiagnosticStore::get_kms_diagnostic_object(&get_client, &path, 8)
+            .await
+            .expect_err("oversized diagnostic response should fail");
+        assert!(matches!(error, Error::General(_)));
+        assert!(!error.to_string().contains("hidden-temporary-key"));
+        get_receiver.expect_request();
+
+        let delete_response = http::Response::builder()
+            .status(204)
+            .body(SdkBody::from(""))
+            .expect("build delete response");
+        let (delete_client, delete_receiver) = test_s3_client(Some(delete_response));
+        KmsDiagnosticStore::delete_kms_diagnostic_object(&delete_client, &path)
+            .await
+            .expect("diagnostic cleanup should succeed");
+        let request = delete_receiver.expect_request();
+        assert_eq!(request.headers().get("x-rustfs-force-delete"), Some("true"));
+    }
+
+    #[tokio::test]
+    async fn kms_diagnostic_permission_errors_are_typed_and_redacted() {
+        let response = http::Response::builder()
+            .status(403)
+            .body(SdkBody::from("SECRET_SERVER_DETAIL_MUST_NOT_APPEAR"))
+            .expect("build forbidden response");
+        let (client, request_receiver) = test_s3_client(Some(response));
+        let path = RemotePath::new("test", "bucket", "hidden-temporary-key");
+
+        let error = KmsDiagnosticStore::put_kms_diagnostic_object(
+            &client,
+            &path,
+            Zeroizing::new(vec![1_u8; 8]),
+            "kms-key",
+        )
+        .await
+        .expect_err("permission denial should fail");
+
+        assert!(matches!(error, Error::Auth(_)));
+        assert!(
+            !error
+                .to_string()
+                .contains("SECRET_SERVER_DETAIL_MUST_NOT_APPEAR")
+        );
+        assert!(!error.to_string().contains("hidden-temporary-key"));
+        request_receiver.expect_request();
     }
 
     #[tokio::test]

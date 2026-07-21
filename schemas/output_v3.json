@@ -418,6 +418,28 @@
         }
       }
     },
+    "kmsRoundTripTimings": {
+      "type": "object",
+      "required": ["write_ms", "read_ms", "cleanup_ms", "total_ms"],
+      "properties": {
+        "write_ms": { "type": "integer", "minimum": 0 },
+        "read_ms": { "type": "integer", "minimum": 0 },
+        "cleanup_ms": { "type": "integer", "minimum": 0 },
+        "total_ms": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "kmsRoundTripData": {
+      "type": "object",
+      "required": ["operation", "bucket", "key_id", "passed", "cleanup_passed", "timings"],
+      "properties": {
+        "operation": { "const": "roundtrip" },
+        "bucket": { "type": "string", "minLength": 1 },
+        "key_id": { "type": "string", "minLength": 1 },
+        "passed": { "const": true },
+        "cleanup_passed": { "const": true },
+        "timings": { "$ref": "#/definitions/kmsRoundTripTimings" }
+      }
+    },
     "kmsData": {
       "oneOf": [
         { "$ref": "#/definitions/kmsServiceStatusData" },
@@ -426,7 +448,8 @@
         { "$ref": "#/definitions/kmsKeyCreateData" },
         { "$ref": "#/definitions/kmsKeyDeleteData" },
         { "$ref": "#/definitions/kmsKeyCancelDeletionData" },
-        { "$ref": "#/definitions/kmsLifecycleData" }
+        { "$ref": "#/definitions/kmsLifecycleData" },
+        { "$ref": "#/definitions/kmsRoundTripData" }
       ]
     },
     "adminOperation": {

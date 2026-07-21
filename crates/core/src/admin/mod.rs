@@ -6,6 +6,7 @@
 mod capabilities;
 mod cluster;
 mod kms;
+mod kms_diagnostic;
 mod observability;
 mod site;
 pub mod tier;
@@ -30,6 +31,10 @@ pub use kms::{
     KmsDeleteKeyResult, KmsKey, KmsKeyPage, KmsKeyState, KmsKeyUsage, KmsLocalConfigureRequest,
     KmsServiceState, KmsStatus, KmsVaultAuthMethod, KmsVaultKv2ConfigureRequest,
     KmsVaultTransitConfigureRequest,
+};
+pub use kms_diagnostic::{
+    KMS_DIAGNOSTIC_CONTENT_BYTES, KmsDiagnosticStore, KmsRoundTripError, KmsRoundTripErrorClass,
+    KmsRoundTripPhase, KmsRoundTripReport, KmsRoundTripTimings, run_kms_round_trip,
 };
 pub use observability::{
     MAX_METRICS_LINE_BYTES, MAX_METRICS_RESPONSE_BYTES, MAX_METRICS_SAMPLES, MetricGroup,
