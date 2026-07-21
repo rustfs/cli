@@ -69,6 +69,7 @@
         "scope": { "type": "string", "minLength": 1 },
         "support": {
           "type": "string",
+          "description": "Effective support: unsupported is a server-declared runtime state or version gate, while stub is reserved for registered but unimplemented routes.",
           "enum": ["supported", "unsupported", "stub", "disabled", "unknown"]
         },
         "reason": { "$ref": "#/definitions/nullableString" }

@@ -58,6 +58,9 @@ fn read_admin_request(stream: &mut TcpStream) -> CapturedAdminRequest {
     CapturedAdminRequest { method, target }
 }
 
+// Each integration-test binary compiles this shared module independently, so a
+// helper used by one binary can legitimately be unused by another.
+#[allow(dead_code)]
 pub fn start_admin_test_server(
     response_body: &'static str,
 ) -> (String, Receiver<CapturedAdminRequest>, JoinHandle<()>) {
@@ -93,6 +96,49 @@ pub fn start_admin_test_server(
         stream
             .write_all(response.as_bytes())
             .expect("write admin response");
+    });
+
+    (endpoint, receiver, handle)
+}
+
+#[allow(dead_code)]
+pub fn start_admin_sequence_test_server(
+    responses: Vec<(&'static str, &'static str)>,
+) -> (String, Receiver<CapturedAdminRequest>, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind admin test server");
+    listener
+        .set_nonblocking(true)
+        .expect("set admin test server nonblocking");
+    let endpoint = format!("http://{}", listener.local_addr().expect("server address"));
+    let (sender, receiver) = mpsc::channel();
+
+    let handle = thread::spawn(move || {
+        for (response_status, response_body) in responses {
+            let deadline = Instant::now() + Duration::from_secs(120);
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(accepted) => break accepted,
+                    Err(e) if e.kind() == ErrorKind::WouldBlock && Instant::now() < deadline => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("accept admin request: {e}"),
+                }
+            };
+            stream
+                .set_nonblocking(false)
+                .expect("set admin request stream blocking");
+            let request = read_admin_request(&mut stream);
+            sender.send(request).expect("send captured request");
+
+            let response = format!(
+                "HTTP/1.1 {response_status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write admin response");
+        }
     });
 
     (endpoint, receiver, handle)

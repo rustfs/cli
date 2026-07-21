@@ -3,11 +3,17 @@
 //! This module provides the AdminApi trait and types for managing
 //! IAM users, policies, groups, service accounts, and cluster operations.
 
+mod capabilities;
 mod cluster;
 mod site;
 pub mod tier;
 mod types;
 
+pub use capabilities::{
+    CapabilityAvailability, CapabilityEntry, CapabilityReport, ClusterSnapshotMetadata,
+    ClusterSnapshotSummary, ExtensionMetadata, ExtensionsCatalog, RuntimeCapabilitiesSnapshot,
+    RuntimeCapabilitiesSummary, RuntimeCapabilityState, RuntimeCapabilityStatus,
+};
 pub use cluster::{
     BackendInfo, BackendType, BucketsInfo, ClusterInfo, DecommissionPoolStatus, DecommissionStatus,
     DiskInfo, HealDriveInfo, HealDriveInfos, HealResultItem, HealRuntimeState, HealScanMode,
@@ -254,6 +260,13 @@ pub trait AdminApi: Send + Sync {
 
     /// Remove sites from the site replication cluster
     async fn site_replication_remove(&self, spec: &SiteRemoveSpec) -> Result<serde_json::Value>;
+}
+
+/// Read-only RustFS runtime capability discovery.
+#[async_trait]
+pub trait CapabilityApi: Send + Sync {
+    /// Discover capabilities, bypassing the process cache when `refresh` is true.
+    async fn discover_capabilities(&self, refresh: bool) -> Result<CapabilityReport>;
 }
 
 #[cfg(test)]

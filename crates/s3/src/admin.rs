@@ -10,12 +10,14 @@ use aws_sigv4::http_request::{
 };
 use aws_sigv4::sign::v4;
 use rc_core::admin::{
-    AccessKeyInfo, AdminApi, BucketQuota, ClusterInfo, CreateServiceAccountRequest,
-    DecommissionPoolStatus, DecommissionStatus, Group, GroupStatus, HealRuntimeState, HealScanMode,
-    HealStartRequest, HealStatus, HealTaskRequest, PeerSiteSpec, Policy, PolicyEntity, PolicyInfo,
-    PoolStatus, PoolTarget, RebalanceStartResult, RebalanceStatus, ServiceAccount,
-    ServiceAccountCreateResponse, ServiceActionResult, SiteRemoveSpec, SiteStatusOptions,
-    UpdateGroupMembersRequest, UpdateServiceAccountRequest, User, UserStatus,
+    AccessKeyInfo, AdminApi, BucketQuota, CapabilityApi, CapabilityAvailability, CapabilityEntry,
+    CapabilityReport, ClusterInfo, ClusterSnapshotMetadata, ClusterSnapshotSummary,
+    CreateServiceAccountRequest, DecommissionPoolStatus, DecommissionStatus, ExtensionsCatalog,
+    Group, GroupStatus, HealRuntimeState, HealScanMode, HealStartRequest, HealStatus,
+    HealTaskRequest, PeerSiteSpec, Policy, PolicyEntity, PolicyInfo, PoolStatus, PoolTarget,
+    RebalanceStartResult, RebalanceStatus, RuntimeCapabilitiesSnapshot, RuntimeCapabilityStatus,
+    ServiceAccount, ServiceAccountCreateResponse, ServiceActionResult, SiteRemoveSpec,
+    SiteStatusOptions, UpdateGroupMembersRequest, UpdateServiceAccountRequest, User, UserStatus,
 };
 use rc_core::{Alias, Error, Result};
 use reqwest::header::{CONTENT_TYPE, HOST, HeaderMap, HeaderName, HeaderValue};
@@ -23,7 +25,53 @@ use reqwest::{Client, Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CapabilityCacheKey {
+    endpoint: String,
+    region: String,
+    credential_fingerprint: String,
+    transport_security_fingerprint: String,
+}
+
+static CAPABILITY_CACHE: OnceLock<Mutex<HashMap<CapabilityCacheKey, CapabilityReport>>> =
+    OnceLock::new();
+
+fn capability_cache() -> &'static Mutex<HashMap<CapabilityCacheKey, CapabilityReport>> {
+    CAPABILITY_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn transport_security_fingerprint(
+    insecure: bool,
+    ca_bundle: Option<&[u8]>,
+    client_cert: Option<&[u8]>,
+    client_key: Option<&[u8]>,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"rc-admin-capability-cache-transport-v1\0");
+    hasher.update(b"native-roots-enabled\0webpki-roots-enabled\0");
+    hasher.update([u8::from(insecure)]);
+
+    for (label, input) in [
+        (b"ca-bundle".as_slice(), ca_bundle),
+        (b"client-certificate".as_slice(), client_cert),
+        (b"client-private-key".as_slice(), client_key),
+    ] {
+        hasher.update(label);
+        hasher.update([0]);
+        match input {
+            Some(bytes) => {
+                hasher.update([1]);
+                hasher.update(Sha256::digest(bytes));
+            }
+            None => hasher.update([0]),
+        }
+    }
+
+    hex::encode(hasher.finalize())
+}
 
 /// Admin API client for RustFS servers
 pub struct AdminClient {
@@ -33,6 +81,7 @@ pub struct AdminClient {
     secret_key: String,
     region: String,
     anonymous: bool,
+    transport_security_fingerprint: String,
 }
 
 impl AdminClient {
@@ -55,7 +104,7 @@ impl AdminClient {
                 .read_timeout(Duration::from_millis(timeout.read_ms));
         }
 
-        if let Some(bundle_path) = alias.ca_bundle.as_deref() {
+        let ca_bundle_pem = if let Some(bundle_path) = alias.ca_bundle.as_deref() {
             let pem = std::fs::read(bundle_path).map_err(|e| {
                 Error::Network(format!("Failed to read CA bundle '{bundle_path}': {e}"))
             })?;
@@ -69,12 +118,15 @@ impl AdminClient {
             for cert in certs {
                 builder = builder.add_root_certificate(cert);
             }
-        }
+            Some(pem)
+        } else {
+            None
+        };
 
-        if let (Some(cert_path), Some(key_path)) =
+        let client_identity_pem = if let (Some(cert_path), Some(key_path)) =
             (alias.client_cert.as_deref(), alias.client_key.as_deref())
         {
-            let mut identity_pem = std::fs::read(cert_path).map_err(|e| {
+            let cert_pem = std::fs::read(cert_path).map_err(|e| {
                 Error::Network(format!(
                     "Failed to read client certificate '{cert_path}': {e}"
                 ))
@@ -82,13 +134,28 @@ impl AdminClient {
             let key_pem = std::fs::read(key_path).map_err(|e| {
                 Error::Network(format!("Failed to read client key '{key_path}': {e}"))
             })?;
+            let mut identity_pem = cert_pem.clone();
             identity_pem.extend_from_slice(b"\n");
             identity_pem.extend_from_slice(&key_pem);
             let identity = reqwest::Identity::from_pem(&identity_pem).map_err(|e| {
                 Error::Network(format!("Invalid client certificate/key identity: {e}"))
             })?;
             builder = builder.use_rustls_tls().identity(identity);
-        }
+            Some((cert_pem, key_pem))
+        } else {
+            None
+        };
+
+        let transport_security_fingerprint = transport_security_fingerprint(
+            alias.insecure,
+            ca_bundle_pem.as_deref(),
+            client_identity_pem
+                .as_ref()
+                .map(|(certificate, _)| certificate.as_slice()),
+            client_identity_pem
+                .as_ref()
+                .map(|(_, private_key)| private_key.as_slice()),
+        );
 
         let http_client = builder
             .build()
@@ -101,12 +168,17 @@ impl AdminClient {
             secret_key: alias.secret_key.clone(),
             region: alias.region.clone(),
             anonymous: alias.anonymous,
+            transport_security_fingerprint,
         })
     }
 
     /// Build the base URL for admin API
     fn admin_url(&self, path: &str) -> String {
         format!("{}/rustfs/admin/v3{}", self.endpoint, path)
+    }
+
+    fn admin_v4_url(&self, path: &str) -> String {
+        format!("{}/rustfs/admin/v4{}", self.endpoint, path)
     }
 
     /// Calculate SHA256 hash of the body
@@ -209,8 +281,26 @@ impl AdminClient {
         query: Option<&[(&str, &str)]>,
         body: Option<&[u8]>,
     ) -> Result<T> {
-        let mut url = self.admin_url(path);
+        self.request_url(method, self.admin_url(path), query, body)
+            .await
+    }
 
+    async fn request_v4<T: for<'de> Deserialize<'de>>(
+        &self,
+        method: Method,
+        path: &str,
+    ) -> Result<T> {
+        self.request_url(method, self.admin_v4_url(path), None, None)
+            .await
+    }
+
+    async fn request_url<T: for<'de> Deserialize<'de>>(
+        &self,
+        method: Method,
+        mut url: String,
+        query: Option<&[(&str, &str)]>,
+        body: Option<&[u8]>,
+    ) -> Result<T> {
         if let Some(q) = query {
             let query_string: String = q
                 .iter()
@@ -335,14 +425,67 @@ impl AdminClient {
 
     /// Map HTTP status codes to appropriate errors
     fn map_error(&self, status: StatusCode, body: &str) -> Error {
+        if matches!(status, StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED) {
+            return Error::Auth(body.to_string());
+        }
+
+        // Route absence is authoritative even when a proxy or compatibility layer returns a
+        // stale structured error body. Capability discovery relies on 404 to identify servers
+        // that predate the Admin API v4 route.
+        if status == StatusCode::NOT_FOUND {
+            return Error::NotFound(body.to_string());
+        }
+
+        let structured_error = parse_admin_error(body);
+        if status == StatusCode::NOT_IMPLEMENTED
+            || structured_error
+                .as_ref()
+                .is_some_and(|error| error.code.as_deref() == Some("NotImplemented"))
+        {
+            return Error::UnsupportedFeature(
+                structured_error
+                    .and_then(|error| error.message)
+                    .unwrap_or_else(|| body.to_string()),
+            );
+        }
+
+        if structured_error
+            .as_ref()
+            .is_some_and(AdminErrorResponse::is_missing_credentials)
+        {
+            return Error::Auth(body.to_string());
+        }
+
         match status {
-            StatusCode::NOT_FOUND => Error::NotFound(body.to_string()),
-            StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED => Error::Auth(body.to_string()),
             StatusCode::CONFLICT => Error::Conflict(body.to_string()),
             StatusCode::BAD_REQUEST => Error::General(format!("Bad request: {body}")),
             _ => Error::Network(format!("HTTP {}: {}", status.as_u16(), body)),
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct AdminErrorResponse {
+    #[serde(default, alias = "Code")]
+    code: Option<String>,
+    #[serde(default, alias = "Message")]
+    message: Option<String>,
+}
+
+impl AdminErrorResponse {
+    fn is_missing_credentials(&self) -> bool {
+        self.code.as_deref() == Some("InvalidRequest")
+            && matches!(
+                self.message.as_deref().map(str::trim),
+                Some("get cred failed" | "authentication required" | "missing credentials")
+            )
+    }
+}
+
+fn parse_admin_error(body: &str) -> Option<AdminErrorResponse> {
+    serde_json::from_str(body)
+        .ok()
+        .or_else(|| quick_xml::de::from_str(body).ok())
 }
 
 /// Response wrapper for user list
@@ -707,6 +850,296 @@ struct ServerInfoResponse {
 #[derive(Debug, Deserialize)]
 struct PoolStatusResponse {
     pool: PoolStatus,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClusterSnapshotResponse {
+    snapshot: Option<ClusterSnapshotPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClusterSnapshotPayload {
+    summary: ClusterSnapshotSummary,
+    runtime_capabilities_path: String,
+    extensions_catalog_path: String,
+}
+
+impl AdminClient {
+    fn capability_cache_key(&self) -> CapabilityCacheKey {
+        let mut hasher = Sha256::new();
+        if self.anonymous {
+            hasher.update(b"anonymous");
+        } else {
+            hasher.update(b"authenticated\0");
+            hasher.update(self.access_key.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(self.secret_key.as_bytes());
+        }
+
+        CapabilityCacheKey {
+            endpoint: self.endpoint.clone(),
+            region: self.region.clone(),
+            credential_fingerprint: hex::encode(hasher.finalize()),
+            transport_security_fingerprint: self.transport_security_fingerprint.clone(),
+        }
+    }
+
+    fn cached_capabilities(&self) -> Result<Option<CapabilityReport>> {
+        capability_cache()
+            .lock()
+            .map(|cache| cache.get(&self.capability_cache_key()).cloned())
+            .map_err(|_| Error::General("Capability cache lock is poisoned".to_string()))
+    }
+
+    fn store_capabilities(&self, report: &CapabilityReport) -> Result<()> {
+        capability_cache()
+            .lock()
+            .map_err(|_| Error::General("Capability cache lock is poisoned".to_string()))?
+            .insert(self.capability_cache_key(), report.clone());
+        Ok(())
+    }
+
+    async fn discover_capabilities_uncached(&self) -> Result<CapabilityReport> {
+        let cluster_info = self.cluster_info().await?;
+        let server_version = cluster_info.servers.as_ref().and_then(|servers| {
+            servers
+                .iter()
+                .map(|server| server.version.trim())
+                .find(|version| !version.is_empty())
+                .map(str::to_string)
+        });
+
+        let runtime = match self
+            .request_v4::<RuntimeCapabilitiesSnapshot>(Method::GET, "/runtime/capabilities")
+            .await
+        {
+            Ok(runtime) => runtime,
+            Err(Error::NotFound(_)) => {
+                return Ok(version_gated_report(server_version));
+            }
+            Err(Error::UnsupportedFeature(reason)) => {
+                return Ok(stubbed_report(server_version, reason));
+            }
+            Err(error) => return Err(error),
+        };
+
+        let mut capabilities = runtime_summary_entries(&runtime);
+        let extensions = match self
+            .request_v4::<ExtensionsCatalog>(Method::GET, "/extensions/catalog")
+            .await
+        {
+            Ok(catalog) => {
+                capabilities.push(CapabilityEntry {
+                    name: "admin.extensions-catalog".to_string(),
+                    availability: CapabilityAvailability::Available,
+                    reason: None,
+                });
+                catalog.extensions
+            }
+            Err(Error::NotFound(_)) => {
+                capabilities.push(version_gated_entry(
+                    "admin.extensions-catalog",
+                    "The extensions catalog route is not available on this server version",
+                ));
+                Vec::new()
+            }
+            Err(Error::UnsupportedFeature(reason)) => {
+                capabilities.push(CapabilityEntry {
+                    name: "admin.extensions-catalog".to_string(),
+                    availability: CapabilityAvailability::Stubbed,
+                    reason: Some(reason),
+                });
+                Vec::new()
+            }
+            Err(error) => return Err(error),
+        };
+
+        let cluster = match self
+            .request_v4::<ClusterSnapshotResponse>(Method::GET, "/cluster/snapshot")
+            .await
+        {
+            Ok(response) => {
+                capabilities.push(CapabilityEntry {
+                    name: "admin.cluster-snapshot-route".to_string(),
+                    availability: CapabilityAvailability::Available,
+                    reason: response
+                        .snapshot
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.summary.runtime.reason.clone()),
+                });
+                response.snapshot.map_or(
+                    ClusterSnapshotMetadata {
+                        summary: None,
+                        runtime_capabilities_path: None,
+                        extensions_catalog_path: None,
+                    },
+                    |snapshot| ClusterSnapshotMetadata {
+                        summary: Some(snapshot.summary),
+                        runtime_capabilities_path: Some(snapshot.runtime_capabilities_path),
+                        extensions_catalog_path: Some(snapshot.extensions_catalog_path),
+                    },
+                )
+            }
+            Err(Error::NotFound(_)) => {
+                capabilities.push(version_gated_entry(
+                    "admin.cluster-snapshot-route",
+                    "The cluster snapshot route is not available on this server version",
+                ));
+                ClusterSnapshotMetadata {
+                    summary: None,
+                    runtime_capabilities_path: None,
+                    extensions_catalog_path: None,
+                }
+            }
+            Err(Error::UnsupportedFeature(reason)) => {
+                capabilities.push(CapabilityEntry {
+                    name: "admin.cluster-snapshot-route".to_string(),
+                    availability: CapabilityAvailability::Stubbed,
+                    reason: Some(reason),
+                });
+                ClusterSnapshotMetadata {
+                    summary: None,
+                    runtime_capabilities_path: None,
+                    extensions_catalog_path: None,
+                }
+            }
+            Err(error) => return Err(error),
+        };
+
+        add_known_server_capabilities(server_version.as_deref(), &mut capabilities);
+        capabilities.sort_by(|left, right| left.name.cmp(&right.name));
+
+        Ok(CapabilityReport {
+            server_version,
+            runtime_path: "/rustfs/admin/v4/runtime/capabilities".to_string(),
+            extensions_path: "/rustfs/admin/v4/extensions/catalog".to_string(),
+            cluster_snapshot_path: runtime.cluster_snapshot_path,
+            capabilities,
+            extensions,
+            cluster,
+        })
+    }
+}
+
+fn runtime_summary_entries(runtime: &RuntimeCapabilitiesSnapshot) -> Vec<CapabilityEntry> {
+    [
+        ("runtime.observability", &runtime.summary.observability),
+        (
+            "runtime.userspace-profiling",
+            &runtime.summary.userspace_profiling,
+        ),
+        ("runtime.memory-sampling", &runtime.summary.memory_sampling),
+        ("runtime.platform", &runtime.summary.platform),
+        ("runtime.topology", &runtime.summary.topology),
+        (
+            "runtime.cluster-snapshot",
+            &runtime.summary.cluster_snapshot,
+        ),
+    ]
+    .into_iter()
+    .map(|(name, status)| capability_entry(name, status))
+    .collect()
+}
+
+fn capability_entry(name: &str, status: &RuntimeCapabilityStatus) -> CapabilityEntry {
+    CapabilityEntry {
+        name: name.to_string(),
+        availability: status.availability(),
+        reason: status.reason.clone(),
+    }
+}
+
+fn version_gated_entry(name: &str, reason: &str) -> CapabilityEntry {
+    CapabilityEntry {
+        name: name.to_string(),
+        availability: CapabilityAvailability::VersionGated,
+        reason: Some(reason.to_string()),
+    }
+}
+
+fn version_gated_report(server_version: Option<String>) -> CapabilityReport {
+    let reason = "RustFS Admin API v4 capability discovery is not available on this server version";
+    CapabilityReport {
+        server_version,
+        runtime_path: "/rustfs/admin/v4/runtime/capabilities".to_string(),
+        extensions_path: "/rustfs/admin/v4/extensions/catalog".to_string(),
+        cluster_snapshot_path: "/rustfs/admin/v4/cluster/snapshot".to_string(),
+        capabilities: vec![version_gated_entry("admin.runtime-capabilities", reason)],
+        extensions: Vec::new(),
+        cluster: ClusterSnapshotMetadata {
+            summary: None,
+            runtime_capabilities_path: None,
+            extensions_catalog_path: None,
+        },
+    }
+}
+
+fn stubbed_report(server_version: Option<String>, reason: String) -> CapabilityReport {
+    CapabilityReport {
+        server_version,
+        runtime_path: "/rustfs/admin/v4/runtime/capabilities".to_string(),
+        extensions_path: "/rustfs/admin/v4/extensions/catalog".to_string(),
+        cluster_snapshot_path: "/rustfs/admin/v4/cluster/snapshot".to_string(),
+        capabilities: vec![CapabilityEntry {
+            name: "admin.runtime-capabilities".to_string(),
+            availability: CapabilityAvailability::Stubbed,
+            reason: Some(reason),
+        }],
+        extensions: Vec::new(),
+        cluster: ClusterSnapshotMetadata {
+            summary: None,
+            runtime_capabilities_path: None,
+            extensions_catalog_path: None,
+        },
+    }
+}
+
+fn add_known_server_capabilities(version: Option<&str>, capabilities: &mut Vec<CapabilityEntry>) {
+    if !version.is_some_and(|version| version.contains("1.0.0-beta.10")) {
+        return;
+    }
+
+    for (name, reason) in [
+        (
+            "admin.batch",
+            "RustFS beta.10 registers batch routes without a scheduler or worker",
+        ),
+        (
+            "admin.ldap-mutation",
+            "RustFS beta.10 returns NotImplemented for LDAP mutations",
+        ),
+        (
+            "admin.logs",
+            "RustFS beta.10 exposes keepalive only and has no live log buffer",
+        ),
+        (
+            "admin.trace",
+            "RustFS beta.10 has no trace subscriber implementation",
+        ),
+        (
+            "admin.update",
+            "RustFS beta.10 accepts update requests without applying an update",
+        ),
+    ] {
+        capabilities.push(CapabilityEntry {
+            name: name.to_string(),
+            availability: CapabilityAvailability::Stubbed,
+            reason: Some(reason.to_string()),
+        });
+    }
+}
+
+#[async_trait]
+impl CapabilityApi for AdminClient {
+    async fn discover_capabilities(&self, refresh: bool) -> Result<CapabilityReport> {
+        if !refresh && let Some(report) = self.cached_capabilities()? {
+            return Ok(report);
+        }
+
+        let report = self.discover_capabilities_uncached().await?;
+        self.store_capabilities(&report)?;
+        Ok(report)
+    }
 }
 
 #[async_trait]
@@ -1387,6 +1820,35 @@ mod tests {
         (endpoint, receiver, handle)
     }
 
+    fn start_admin_sequence_server(
+        responses: Vec<(&'static str, &'static str)>,
+    ) -> (
+        String,
+        mpsc::Receiver<CapturedAdminRequest>,
+        thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        let (sender, receiver) = mpsc::channel();
+
+        let handle = thread::spawn(move || {
+            for (response_status, response_body) in responses {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let request = read_admin_request(&mut stream);
+                sender.send(request).expect("send captured request");
+                let response = format!(
+                    "HTTP/1.1 {response_status}\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{response_body}",
+                    response_body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write HTTP response");
+            }
+        });
+
+        (endpoint, receiver, handle)
+    }
+
     fn admin_client_for_endpoint(endpoint: &str) -> AdminClient {
         let alias = Alias::new("test", endpoint, "access", "secret");
         AdminClient::new(&alias).expect("admin client should build")
@@ -1429,6 +1891,422 @@ mod tests {
             client.admin_url("/list-users"),
             "http://localhost:9000/rustfs/admin/v3/list-users"
         );
+    }
+
+    const CAPABILITY_INFO_RESPONSE: &str = r#"{"info":{"mode":"distributed","servers":[{"endpoint":"http://node1:9000","state":"online","version":"1.0.0-beta.10","drives":[]}]}}"#;
+    const RUNTIME_CAPABILITIES_RESPONSE: &str = r#"{"summary":{"observability":{"state":"supported"},"userspace_profiling":{"state":"disabled","reason":"disabled by configuration"},"memory_sampling":{"state":"unsupported","reason":"not available on this platform"},"platform":{"state":"supported"},"topology":{"state":"unknown","reason":"storage is initializing"},"cluster_snapshot":{"state":"supported"}},"cluster_snapshot_path":"/rustfs/admin/v4/cluster/snapshot","cluster_snapshot_summary":{"state":"supported"},"observability":{},"workload_admission":{},"topology":null,"topology_status":{"state":"unknown"}}"#;
+    const EXTENSIONS_RESPONSE: &str = r#"{"extensions":[{"schema_version":"rustfs.extension-schema.v1","extension_id":"ops.diagnostics","display_name":"Operations Diagnostics","provider":"rustfs","version":"1","kind":"ops_diagnostics","runtime":{"api_version":"v1","boundary":"builtin"},"capabilities":[],"disabled_by_default":false}],"runtime_capabilities":{},"cluster_snapshot":{},"external_plugin_flow":{}}"#;
+    const CLUSTER_SNAPSHOT_RESPONSE: &str = r#"{"snapshot":{"summary":{"runtime":{"state":"supported"},"topology":{"state":"supported"},"membership":{"state":"supported"},"peer_health":{"state":"supported"},"rpc_boundary":{"state":"supported"},"observability":{"state":"supported"},"workload_admission":{"state":"supported"},"actionable_pressure":{"state":"disabled"}},"runtime_capabilities_path":"/rustfs/admin/v4/runtime/capabilities","extensions_catalog_path":"/rustfs/admin/v4/extensions/catalog"}}"#;
+
+    #[tokio::test]
+    async fn capability_discovery_uses_v4_routes_and_classifies_beta10_stubs() {
+        let (endpoint, receiver, handle) = start_admin_sequence_server(vec![
+            ("200 OK", CAPABILITY_INFO_RESPONSE),
+            ("200 OK", RUNTIME_CAPABILITIES_RESPONSE),
+            ("200 OK", EXTENSIONS_RESPONSE),
+            ("200 OK", CLUSTER_SNAPSHOT_RESPONSE),
+        ]);
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let report = client
+            .discover_capabilities(false)
+            .await
+            .expect("capability discovery should succeed");
+        let second_client = admin_client_for_endpoint(&endpoint);
+        let cached = second_client
+            .discover_capabilities(false)
+            .await
+            .expect("process-shared cached discovery should succeed");
+
+        assert_eq!(cached, report);
+        assert_eq!(report.server_version.as_deref(), Some("1.0.0-beta.10"));
+        assert_eq!(report.extensions.len(), 1);
+        assert!(report.cluster.summary.is_some());
+        assert!(report.capabilities.iter().any(|capability| {
+            capability.name == "runtime.userspace-profiling"
+                && capability.availability == CapabilityAvailability::Disabled
+        }));
+        assert!(report.capabilities.iter().any(|capability| {
+            capability.name == "runtime.memory-sampling"
+                && capability.availability == CapabilityAvailability::Unsupported
+                && capability.reason.as_deref() == Some("not available on this platform")
+        }));
+        for name in [
+            "admin.batch",
+            "admin.ldap-mutation",
+            "admin.logs",
+            "admin.trace",
+            "admin.update",
+        ] {
+            assert!(report.capabilities.iter().any(|capability| {
+                capability.name == name
+                    && capability.availability == CapabilityAvailability::Stubbed
+            }));
+        }
+
+        let targets = (0..4)
+            .map(|_| receiver.recv().expect("captured request").target)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            targets,
+            vec![
+                "/rustfs/admin/v3/info",
+                "/rustfs/admin/v4/runtime/capabilities",
+                "/rustfs/admin/v4/extensions/catalog",
+                "/rustfs/admin/v4/cluster/snapshot",
+            ]
+        );
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn capability_discovery_refreshes_process_shared_cache() {
+        let responses = vec![
+            ("200 OK", CAPABILITY_INFO_RESPONSE),
+            ("200 OK", RUNTIME_CAPABILITIES_RESPONSE),
+            ("200 OK", EXTENSIONS_RESPONSE),
+            ("200 OK", CLUSTER_SNAPSHOT_RESPONSE),
+            ("200 OK", CAPABILITY_INFO_RESPONSE),
+            ("200 OK", RUNTIME_CAPABILITIES_RESPONSE),
+            ("200 OK", EXTENSIONS_RESPONSE),
+            ("200 OK", CLUSTER_SNAPSHOT_RESPONSE),
+        ];
+        let (endpoint, receiver, handle) = start_admin_sequence_server(responses);
+        let first_client = admin_client_for_endpoint(&endpoint);
+        first_client
+            .discover_capabilities(false)
+            .await
+            .expect("initial discovery should succeed");
+
+        let second_client = admin_client_for_endpoint(&endpoint);
+        second_client
+            .discover_capabilities(true)
+            .await
+            .expect("refresh should bypass the process-shared cache");
+
+        let targets = (0..8)
+            .map(|_| receiver.recv().expect("captured request").target)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            targets,
+            [
+                "/rustfs/admin/v3/info",
+                "/rustfs/admin/v4/runtime/capabilities",
+                "/rustfs/admin/v4/extensions/catalog",
+                "/rustfs/admin/v4/cluster/snapshot",
+            ]
+            .repeat(2)
+        );
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn capability_cache_isolates_tls_contexts_and_refreshes_within_each_context() {
+        let response_set = [
+            ("200 OK", CAPABILITY_INFO_RESPONSE),
+            ("200 OK", RUNTIME_CAPABILITIES_RESPONSE),
+            ("200 OK", EXTENSIONS_RESPONSE),
+            ("200 OK", CLUSTER_SNAPSHOT_RESPONSE),
+        ];
+        let responses = response_set.repeat(3);
+        let (endpoint, receiver, handle) = start_admin_sequence_server(responses);
+
+        let strict_client = admin_client_for_endpoint(&endpoint);
+        strict_client
+            .discover_capabilities(false)
+            .await
+            .expect("strict TLS context discovery should succeed");
+
+        let mut insecure_alias = Alias::new("test", &endpoint, "access", "secret");
+        insecure_alias.insecure = true;
+        let insecure_client =
+            AdminClient::new(&insecure_alias).expect("insecure admin client should build");
+        assert_ne!(
+            strict_client.capability_cache_key(),
+            insecure_client.capability_cache_key()
+        );
+        insecure_client
+            .discover_capabilities(false)
+            .await
+            .expect("a different TLS context must not reuse the strict cache entry");
+
+        let second_insecure_client =
+            AdminClient::new(&insecure_alias).expect("second insecure client should build");
+        second_insecure_client
+            .discover_capabilities(false)
+            .await
+            .expect("the same TLS context should reuse its cache entry");
+        second_insecure_client
+            .discover_capabilities(true)
+            .await
+            .expect("refresh should bypass the matching TLS context cache entry");
+
+        let targets = (0..12)
+            .map(|_| receiver.recv().expect("captured request").target)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            targets,
+            [
+                "/rustfs/admin/v3/info",
+                "/rustfs/admin/v4/runtime/capabilities",
+                "/rustfs/admin/v4/extensions/catalog",
+                "/rustfs/admin/v4/cluster/snapshot",
+            ]
+            .repeat(3)
+        );
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn capability_discovery_404_takes_precedence_over_not_implemented_body() {
+        let (endpoint, receiver, handle) = start_admin_sequence_server(vec![
+            ("200 OK", CAPABILITY_INFO_RESPONSE),
+            (
+                "404 Not Found",
+                r#"{"code":"NotImplemented","message":"route body must not override HTTP 404"}"#,
+            ),
+        ]);
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let report = client
+            .discover_capabilities(false)
+            .await
+            .expect("v4 absence should produce a report");
+
+        assert_eq!(report.capabilities.len(), 1);
+        assert_eq!(
+            report.capabilities[0].availability,
+            CapabilityAvailability::VersionGated
+        );
+        assert_eq!(
+            receiver.recv().expect("info request").target,
+            "/rustfs/admin/v3/info"
+        );
+        assert_eq!(
+            receiver.recv().expect("runtime request").target,
+            "/rustfs/admin/v4/runtime/capabilities"
+        );
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn capability_discovery_reports_http_501_as_stubbed() {
+        let (endpoint, receiver, handle) = start_admin_sequence_server(vec![
+            ("200 OK", CAPABILITY_INFO_RESPONSE),
+            (
+                "501 Not Implemented",
+                r#"{"code":"NotImplemented","message":"route is not implemented"}"#,
+            ),
+        ]);
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let report = client
+            .discover_capabilities(false)
+            .await
+            .expect("an explicit stub response should produce a report");
+
+        assert_eq!(report.capabilities.len(), 1);
+        assert_eq!(
+            report.capabilities[0].availability,
+            CapabilityAvailability::Stubbed
+        );
+        assert_eq!(
+            report.capabilities[0].reason.as_deref(),
+            Some("route is not implemented")
+        );
+        assert_eq!(
+            receiver.recv().expect("info request").target,
+            "/rustfs/admin/v3/info"
+        );
+        assert_eq!(
+            receiver.recv().expect("runtime request").target,
+            "/rustfs/admin/v4/runtime/capabilities"
+        );
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn capability_discovery_does_not_misclassify_permission_denial() {
+        let (endpoint, _receiver, handle) = start_admin_sequence_server(vec![
+            ("200 OK", CAPABILITY_INFO_RESPONSE),
+            ("403 Forbidden", r#"{"code":"AccessDenied"}"#),
+        ]);
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let error = client
+            .discover_capabilities(false)
+            .await
+            .expect_err("permission denial should fail discovery");
+
+        assert!(matches!(error, Error::Auth(_)));
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn capability_discovery_maps_rustfs_missing_credentials_to_auth() {
+        let (endpoint, _receiver, handle) = start_admin_sequence_server(vec![
+            ("200 OK", CAPABILITY_INFO_RESPONSE),
+            (
+                "400 Bad Request",
+                "<Error><Code>InvalidRequest</Code><Message>get cred failed</Message></Error>",
+            ),
+        ]);
+        let client = anonymous_admin_client_for_endpoint(&endpoint);
+
+        let error = client
+            .discover_capabilities(false)
+            .await
+            .expect_err("RustFS missing credentials should fail discovery");
+
+        assert!(matches!(error, Error::Auth(_)));
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn capability_discovery_rejects_malformed_runtime_response() {
+        let (endpoint, _receiver, handle) = start_admin_sequence_server(vec![
+            ("200 OK", CAPABILITY_INFO_RESPONSE),
+            ("200 OK", r#"{"summary":{}}"#),
+        ]);
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let error = client
+            .discover_capabilities(false)
+            .await
+            .expect_err("malformed response should fail discovery");
+
+        assert!(matches!(error, Error::Json(_)));
+        handle.join().expect("server thread should finish");
+    }
+
+    #[test]
+    fn not_implemented_admin_error_maps_to_unsupported_feature() {
+        let client = admin_client_for_endpoint("http://localhost:9000");
+        let error = client.map_error(
+            StatusCode::NOT_IMPLEMENTED,
+            r#"{"code":"NotImplemented","message":"route is not implemented"}"#,
+        );
+
+        assert!(matches!(error, Error::UnsupportedFeature(_)));
+    }
+
+    #[test]
+    fn structured_not_implemented_code_maps_to_unsupported_feature() {
+        let client = admin_client_for_endpoint("http://localhost:9000");
+        let error = client.map_error(
+            StatusCode::BAD_REQUEST,
+            "<Error><Code>NotImplemented</Code><Message>stub route</Message></Error>",
+        );
+
+        assert!(matches!(error, Error::UnsupportedFeature(message) if message == "stub route"));
+    }
+
+    #[test]
+    fn permission_status_takes_precedence_over_not_implemented_code() {
+        let client = admin_client_for_endpoint("http://localhost:9000");
+        let error = client.map_error(
+            StatusCode::FORBIDDEN,
+            r#"{"code":"NotImplemented","message":"Access denied"}"#,
+        );
+
+        assert!(matches!(error, Error::Auth(_)));
+    }
+
+    #[test]
+    fn not_found_status_takes_precedence_over_not_implemented_code() {
+        let client = admin_client_for_endpoint("http://localhost:9000");
+        let error = client.map_error(
+            StatusCode::NOT_FOUND,
+            r#"{"code":"NotImplemented","message":"route is not implemented"}"#,
+        );
+
+        assert!(matches!(error, Error::NotFound(_)));
+    }
+
+    #[test]
+    fn unstructured_not_implemented_text_does_not_change_error_class() {
+        let client = admin_client_for_endpoint("http://localhost:9000");
+        let error = client.map_error(
+            StatusCode::BAD_REQUEST,
+            "A proxy says NotImplemented but provides no structured error code",
+        );
+
+        assert!(matches!(error, Error::General(_)));
+    }
+
+    #[test]
+    fn rustfs_missing_credentials_invalid_request_maps_to_auth() {
+        let client = admin_client_for_endpoint("http://localhost:9000");
+        for body in [
+            "<Error><Code>InvalidRequest</Code><Message>get cred failed</Message></Error>",
+            r#"{"Code":"InvalidRequest","Message":"authentication required"}"#,
+        ] {
+            let error = client.map_error(StatusCode::BAD_REQUEST, body);
+            assert!(matches!(error, Error::Auth(_)));
+        }
+    }
+
+    #[test]
+    fn capability_cache_key_is_credential_scoped_without_plaintext_secrets() {
+        let first = admin_client_for_endpoint("http://localhost:9000");
+        let mut alias = Alias::new(
+            "test",
+            "http://localhost:9000",
+            "different-access",
+            "different-secret",
+        );
+        alias.region = first.region.clone();
+        let second = AdminClient::new(&alias).expect("admin client should build");
+
+        let first_key = first.capability_cache_key();
+        let second_key = second.capability_cache_key();
+        assert_ne!(first_key, second_key);
+        assert!(!first_key.credential_fingerprint.contains("secret"));
+        assert!(
+            !second_key
+                .credential_fingerprint
+                .contains("different-secret")
+        );
+    }
+
+    #[test]
+    fn transport_security_fingerprint_covers_tls_and_mtls_inputs_without_leaking_them() {
+        let baseline = transport_security_fingerprint(false, None, None, None);
+        let insecure = transport_security_fingerprint(true, None, None, None);
+        let custom_ca = transport_security_fingerprint(false, Some(b"private-ca-root"), None, None);
+        let client_identity = transport_security_fingerprint(
+            false,
+            Some(b"private-ca-root"),
+            Some(b"client-certificate"),
+            Some(b"PRIVATE-KEY-MARKER"),
+        );
+        let different_key = transport_security_fingerprint(
+            false,
+            Some(b"private-ca-root"),
+            Some(b"client-certificate"),
+            Some(b"DIFFERENT-PRIVATE-KEY"),
+        );
+
+        assert_ne!(baseline, insecure);
+        assert_ne!(baseline, custom_ca);
+        assert_ne!(custom_ca, client_identity);
+        assert_ne!(client_identity, different_key);
+        for fingerprint in [
+            baseline,
+            insecure,
+            custom_ca,
+            client_identity,
+            different_key,
+        ] {
+            assert_eq!(fingerprint.len(), 64);
+            assert!(
+                fingerprint
+                    .chars()
+                    .all(|character| character.is_ascii_hexdigit())
+            );
+            assert!(!fingerprint.contains("PRIVATE-KEY-MARKER"));
+            assert!(!fingerprint.contains("private-ca-root"));
+        }
     }
 
     #[test]
