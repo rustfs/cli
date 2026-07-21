@@ -520,8 +520,18 @@ mod tests {
 
     #[test]
     fn configure_requests_validate_all_native_backend_shapes() {
+        let local: KmsConfigureRequest = serde_json::from_value(serde_json::json!({
+            "backend_type": "Local",
+            "key_dir": std::env::temp_dir(),
+            "master_key": "local-secret",
+            "file_permissions": 384
+        }))
+        .expect("valid Local KMS configuration shape");
+        local
+            .validate(false)
+            .expect("secure Local KMS configuration");
+
         for raw in [
-            r#"{"backend_type":"Local","key_dir":"/var/lib/rustfs/kms","master_key":"local-secret","file_permissions":384}"#,
             r#"{"backend_type":"VaultKV2","address":"https://vault.example","auth_method":{"Token":{"token":"vault-secret"}},"mount_path":"transit","kv_mount":"secret","key_path_prefix":"rustfs/kms/keys"}"#,
             r#"{"backend_type":"VaultTransit","address":"https://vault.example","auth_method":{"AppRole":{"role_id":"role","secret_id":"secret"}},"mount_path":"transit"}"#,
         ] {
