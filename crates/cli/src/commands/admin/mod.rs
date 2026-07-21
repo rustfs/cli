@@ -5,6 +5,7 @@
 
 mod access_key;
 mod capabilities;
+mod config;
 mod decommission;
 mod expand;
 mod group;
@@ -30,6 +31,10 @@ use rc_s3::AdminClient;
 pub enum AdminCommands {
     /// Discover effective RustFS runtime capabilities
     Capabilities(capabilities::CapabilitiesArgs),
+
+    /// Manage RustFS server configuration
+    #[command(subcommand)]
+    Config(config::ConfigCommands),
 
     /// Display cluster information (servers, disks, usage)
     #[command(subcommand)]
@@ -90,6 +95,7 @@ pub async fn execute(cmd: AdminCommands, output_config: OutputConfig) -> ExitCod
 
     match cmd {
         AdminCommands::Capabilities(args) => capabilities::execute(args, &formatter).await,
+        AdminCommands::Config(config_cmd) => config::execute(config_cmd, &formatter).await,
         AdminCommands::Info(info_cmd) => info::execute(info_cmd, &formatter).await,
         AdminCommands::Heal(heal_cmd) => heal::execute(heal_cmd, &formatter).await,
         AdminCommands::Pool(pool_cmd) => pool::execute(pool_cmd, &formatter).await,
@@ -189,6 +195,42 @@ mod tests {
             AdminCommands::Capabilities(args) => {
                 assert_eq!(args.alias, "local");
                 assert!(args.refresh);
+            }
+            _ => panic!("Unexpected command parsing result"),
+        }
+    }
+
+    #[test]
+    fn test_parse_admin_config_set_dry_run() {
+        let cli = TestCli::parse_from([
+            "rc",
+            "config",
+            "set",
+            "local",
+            "scanner",
+            "speed=fast",
+            "--dry-run",
+        ]);
+
+        match cli.command {
+            AdminCommands::Config(config::ConfigCommands::Set(args)) => {
+                assert_eq!(args.alias, "local");
+                assert_eq!(args.scope, "scanner");
+                assert_eq!(args.assignments, vec!["speed=fast"]);
+                assert!(args.dry_run);
+            }
+            _ => panic!("Unexpected command parsing result"),
+        }
+    }
+
+    #[test]
+    fn test_parse_admin_config_restore_confirmation() {
+        let cli = TestCli::parse_from(["rc", "config", "restore", "local", "restore-123", "--yes"]);
+
+        match cli.command {
+            AdminCommands::Config(config::ConfigCommands::Restore(args)) => {
+                assert_eq!(args.restore_id, "restore-123");
+                assert!(args.yes);
             }
             _ => panic!("Unexpected command parsing result"),
         }

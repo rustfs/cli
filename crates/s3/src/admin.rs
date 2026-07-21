@@ -11,13 +11,15 @@ use aws_sigv4::http_request::{
 use aws_sigv4::sign::v4;
 use rc_core::admin::{
     AccessKeyInfo, AdminApi, BucketQuota, CapabilityApi, CapabilityAvailability, CapabilityEntry,
-    CapabilityReport, ClusterInfo, ClusterSnapshotMetadata, ClusterSnapshotSummary,
+    CapabilityReport, ClusterInfo, ClusterSnapshotMetadata, ClusterSnapshotSummary, ConfigApi,
+    ConfigDocument, ConfigHelp, ConfigHistoryEntry, ConfigMutationResult,
     CreateServiceAccountRequest, DecommissionPoolStatus, DecommissionStatus, ExtensionsCatalog,
     Group, GroupStatus, HealRuntimeState, HealScanMode, HealStartRequest, HealStatus,
-    HealTaskRequest, PeerSiteSpec, Policy, PolicyEntity, PolicyInfo, PoolStatus, PoolTarget,
-    RebalanceStartResult, RebalanceStatus, RuntimeCapabilitiesSnapshot, RuntimeCapabilityStatus,
-    ServiceAccount, ServiceAccountCreateResponse, ServiceActionResult, SiteRemoveSpec,
-    SiteStatusOptions, UpdateGroupMembersRequest, UpdateServiceAccountRequest, User, UserStatus,
+    HealTaskRequest, ModuleSwitches, PeerSiteSpec, Policy, PolicyEntity, PolicyInfo, PoolStatus,
+    PoolTarget, RebalanceStartResult, RebalanceStatus, RuntimeCapabilitiesSnapshot,
+    RuntimeCapabilityStatus, ServiceAccount, ServiceAccountCreateResponse, ServiceActionResult,
+    SiteRemoveSpec, SiteStatusOptions, UpdateGroupMembersRequest, UpdateServiceAccountRequest,
+    User, UserStatus,
 };
 use rc_core::{Alias, Error, Result};
 use reqwest::header::{CONTENT_TYPE, HOST, HeaderMap, HeaderName, HeaderValue};
@@ -415,6 +417,62 @@ impl AdminClient {
         Ok(())
     }
 
+    async fn config_request(
+        &self,
+        method: Method,
+        path: &str,
+        query: Option<&[(&str, &str)]>,
+        body: Option<&[u8]>,
+    ) -> Result<(HeaderMap, Vec<u8>)> {
+        let mut url = self.admin_url(path);
+        if let Some(query) = query {
+            let query_string = query
+                .iter()
+                .map(|(key, value)| {
+                    format!(
+                        "{}={}",
+                        urlencoding::encode(key),
+                        urlencoding::encode(value)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("&");
+            if !query_string.is_empty() {
+                url.push('?');
+                url.push_str(&query_string);
+            }
+        }
+
+        let body = body.unwrap_or_default();
+        let headers = self.request_headers(body)?;
+        let signed_headers = self.sign_request(&method, &url, &headers, body).await?;
+        let mut request = self.http_client.request(method, &url);
+        for (name, value) in &signed_headers {
+            request = request.header(name, value);
+        }
+        if !body.is_empty() {
+            request = request.body(body.to_vec());
+        }
+
+        let response = request
+            .send()
+            .await
+            .map_err(|error| Error::Network(format!("Configuration request failed: {error}")))?;
+        let status = response.status();
+        let headers = response.headers().clone();
+        let response_body = response
+            .bytes()
+            .await
+            .map_err(|error| {
+                Error::Network(format!("Failed to read configuration response: {error}"))
+            })?
+            .to_vec();
+        if !status.is_success() {
+            return Err(safe_config_error(status));
+        }
+        Ok((headers, response_body))
+    }
+
     /// Extract host from endpoint
     fn get_host(&self) -> String {
         self.endpoint
@@ -461,6 +519,30 @@ impl AdminClient {
             StatusCode::BAD_REQUEST => Error::General(format!("Bad request: {body}")),
             _ => Error::Network(format!("HTTP {}: {}", status.as_u16(), body)),
         }
+    }
+}
+
+fn safe_config_error(status: StatusCode) -> Error {
+    match status {
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+            Error::Auth("Server denied configuration access".to_string())
+        }
+        StatusCode::NOT_FOUND => Error::NotFound(
+            "Configuration API route or requested resource was not found".to_string(),
+        ),
+        StatusCode::CONFLICT | StatusCode::PRECONDITION_FAILED => {
+            Error::Conflict("Server configuration changed before mutation".to_string())
+        }
+        StatusCode::NOT_IMPLEMENTED => Error::UnsupportedFeature(
+            "Server does not implement this configuration operation".to_string(),
+        ),
+        StatusCode::BAD_REQUEST => Error::Config(
+            "Server rejected the configuration request; review `rc admin config help`".to_string(),
+        ),
+        _ => Error::Network(format!(
+            "Configuration request failed with HTTP {}",
+            status.as_u16()
+        )),
     }
 }
 
@@ -1140,6 +1222,157 @@ impl CapabilityApi for AdminClient {
         self.store_capabilities(&report)?;
         Ok(report)
     }
+}
+
+#[async_trait]
+impl ConfigApi for AdminClient {
+    async fn get_config(&self, selector: &str) -> Result<ConfigDocument> {
+        let (_, body) = self
+            .config_request(
+                Method::GET,
+                "/get-config-kv",
+                Some(&[("key", selector)]),
+                None,
+            )
+            .await?;
+        let content = String::from_utf8(body).map_err(|_| {
+            Error::General("Server returned invalid configuration text".to_string())
+        })?;
+        Ok(ConfigDocument { content })
+    }
+
+    async fn get_full_config(&self) -> Result<ConfigDocument> {
+        let (_, body) = self
+            .config_request(Method::GET, "/config", None, None)
+            .await?;
+        let content = String::from_utf8(body).map_err(|_| {
+            Error::General("Server returned invalid configuration text".to_string())
+        })?;
+        Ok(ConfigDocument { content })
+    }
+
+    async fn set_config(&self, directive: &str) -> Result<ConfigMutationResult> {
+        let (headers, _) = self
+            .config_request(
+                Method::PUT,
+                "/set-config-kv",
+                None,
+                Some(directive.as_bytes()),
+            )
+            .await?;
+        Ok(ConfigMutationResult {
+            applied_dynamically: config_applied(&headers),
+        })
+    }
+
+    async fn delete_config(&self, directive: &str) -> Result<ConfigMutationResult> {
+        let (headers, _) = self
+            .config_request(
+                Method::DELETE,
+                "/del-config-kv",
+                None,
+                Some(directive.as_bytes()),
+            )
+            .await?;
+        Ok(ConfigMutationResult {
+            applied_dynamically: config_applied(&headers),
+        })
+    }
+
+    async fn config_help(
+        &self,
+        subsystem: Option<&str>,
+        key: Option<&str>,
+        env_only: bool,
+    ) -> Result<ConfigHelp> {
+        let mut query = Vec::new();
+        if let Some(subsystem) = subsystem {
+            query.push(("subSys", subsystem));
+        }
+        if let Some(key) = key {
+            query.push(("key", key));
+        }
+        if env_only {
+            query.push(("env", "true"));
+        }
+        let (_, body) = self
+            .config_request(Method::GET, "/help-config-kv", Some(&query), None)
+            .await?;
+        serde_json::from_slice(&body)
+            .map_err(|_| Error::General("Server returned invalid configuration help".to_string()))
+    }
+
+    async fn config_history(&self, count: usize) -> Result<Vec<ConfigHistoryEntry>> {
+        let count = count.to_string();
+        let (_, body) = self
+            .config_request(
+                Method::GET,
+                "/list-config-history-kv",
+                Some(&[("count", count.as_str())]),
+                None,
+            )
+            .await?;
+        serde_json::from_slice(&body).map_err(|_| {
+            Error::General("Server returned invalid configuration history".to_string())
+        })
+    }
+
+    async fn restore_config(&self, restore_id: &str) -> Result<()> {
+        self.config_request(
+            Method::PUT,
+            "/restore-config-history-kv",
+            Some(&[("restoreId", restore_id)]),
+            None,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn import_config(&self, document: &ConfigDocument) -> Result<()> {
+        self.config_request(
+            Method::PUT,
+            "/config",
+            None,
+            Some(document.content.as_bytes()),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn get_module_switches(&self) -> Result<ModuleSwitches> {
+        let (_, body) = self
+            .config_request(Method::GET, "/module-switches", None, None)
+            .await
+            .map_err(|error| match error {
+                Error::NotFound(_) => Error::UnsupportedFeature(
+                    "Server does not advertise module switch operations".to_string(),
+                ),
+                other => other,
+            })?;
+        serde_json::from_slice(&body)
+            .map_err(|_| Error::General("Server returned invalid module switch state".to_string()))
+    }
+
+    async fn set_module_switches(&self, switches: &ModuleSwitches) -> Result<ModuleSwitches> {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "notify_enabled": switches.notify_enabled,
+            "audit_enabled": switches.audit_enabled,
+        }))
+        .map_err(|_| Error::General("Failed to encode module switch request".to_string()))?;
+        let (_, response) = self
+            .config_request(Method::PUT, "/module-switches", None, Some(&body))
+            .await?;
+        serde_json::from_slice(&response)
+            .map_err(|_| Error::General("Server returned invalid module switch state".to_string()))
+    }
+}
+
+fn config_applied(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-rustfs-config-applied")
+        .or_else(|| headers.get("x-minio-config-applied"))
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"))
 }
 
 #[async_trait]

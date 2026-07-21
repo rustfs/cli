@@ -22,6 +22,8 @@ rc admin policy <ls|create|info|rm|attach> ...
 rc admin group <ls|add|info|rm|enable|disable|add-members|rm-members> ...
 rc admin service-account <ls|create|info|rm> ...
 rc admin service <restart|stop|freeze|unfreeze> <ALIAS>
+rc admin config <get|set|delete|help|history|restore|export|import> ...
+rc admin config module-switch <get|set> ...
 rc admin replicate add <ALIAS> <ALIAS> [<ALIAS>...]
 rc admin replicate <info|status> <ALIAS> [OPTIONS]
 rc admin replicate remove <ALIAS> <--all|--site <NAME>>
@@ -42,6 +44,7 @@ rc admin replicate remove <ALIAS> <--all|--site <NAME>>
 | `group` | Manage IAM groups and group membership. |
 | `service-account` | Manage service accounts. |
 | `service` | Control the server process: restart, stop, freeze, unfreeze. |
+| `config` | Inspect, plan, export, and mutate RustFS server configuration. |
 | `replicate` | Manage site replication across clusters. |
 
 ## Examples
@@ -210,6 +213,29 @@ Use `rc admin pool list <ALIAS>` or `rc admin pool status <ALIAS>` to find pool 
 | `rc admin service unfreeze <ALIAS>` | Clear the service freeze flag. |
 
 The server response reports whether the action was `accepted` and whether it is `effective` on the current build. RustFS has no in-process supervisor, so `restart` and `stop` both perform a graceful stop; `restart` relies on the process manager to bring the server back up.
+
+## Server Configuration Workflow
+
+`rc admin config` manages the RustFS server configuration behind an alias. It does not modify the local `rc` alias configuration.
+
+| Command | Description |
+| --- | --- |
+| `rc admin config get <ALIAS> <SUBSYSTEM[:TARGET]>` | Read a subsystem or named target. Secret-bearing fields are redacted again by the client before output. |
+| `rc admin config set <ALIAS> <SUBSYSTEM[:TARGET]> <KEY=VALUE>... [--dry-run]` | Validate keys with server help, read the current state, calculate a redacted diff, and apply the directive unless `--dry-run` is set. |
+| `rc admin config delete <ALIAS> <SUBSYSTEM[:TARGET]> [KEY...] [--dry-run]` | Delete selected keys or the complete target after a redacted preflight diff. |
+| `rc admin config help <ALIAS> [SUBSYSTEM] [KEY] [--env]` | Show server-provided subsystem, key, or environment-variable help. |
+| `rc admin config history <ALIAS> [--count <N>]` | List recent history. History data is classified and redacted locally because server records can contain submitted values. |
+| `rc admin config restore <ALIAS> <RESTORE_ID> [--dry-run] --yes` | Preview or apply a history entry as a complete configuration replacement. |
+| `rc admin config export <ALIAS> --file <PATH>` | Create a new, owner-private, redacted configuration file. Existing files are never overwritten. |
+| `rc admin config import <ALIAS> --file <PATH> [--dry-run] --yes` | Validate and preview a complete configuration replacement from a file. Redacted secret placeholders are rejected. |
+| `rc admin config module-switch get <ALIAS>` | Show effective and persisted notification/audit module switches and their sources. |
+| `rc admin config module-switch set <ALIAS> [--notify on\|off] [--audit on\|off] [--dry-run]` | Update one or both persisted switches. Omitted switches retain their persisted value even when an environment override changes the effective value. |
+
+All set, delete, import, restore, and module-switch dry runs are client-side and do not send a mutation request. RustFS beta.10 does not expose a revision, ETag, or other optimistic concurrency token for these routes, so `rc` does not claim atomic compare-and-set protection.
+
+Full imports and restores require `--yes`. RustFS beta.10 history entries contain the submitted directive rather than a complete pre-change snapshot. The server currently rebuilds its configuration from that directive during restore, which can remove unrelated settings. `rc` shows this as a complete replacement and warns about the unsafe server behavior tracked in [rustfs/backlog#1398](https://github.com/rustfs/backlog/issues/1398); a history restore must not be treated as preservation-safe rollback.
+
+Exports are always redacted because secret values are not a portable client output contract. Replace any required secret values through an approved secret-management workflow before importing; `rc` rejects the `*redacted*` placeholder for secret-bearing fields.
 
 ## Site Replication Workflow
 
