@@ -1,0 +1,20 @@
+{
+  "schema_version": 3,
+  "type": "capabilities",
+  "status": "success",
+  "data": {
+    "server": "rustfs",
+    "api_version": "v4",
+    "capabilities": [
+      {
+        "name": "runtime.memory-sampling",
+        "scope": "runtime",
+        "support": "unsupported",
+        "reason": "not available on this platform"
+      }
+    ]
+  },
+  "meta": {
+    "server_version": "1.0.0-beta.10"
+  }
+}

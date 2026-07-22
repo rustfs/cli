@@ -126,6 +126,21 @@ rc share download local/bucket/file.txt --expire 24h
 rc tree local/bucket -L 3
 ```
 
+Bulk copies accept one or more sources followed by a directory or remote-prefix target:
+
+```bash
+rc cp ./january.csv ./february.csv local/reports/ --concurrency 8 --summary
+rc cp -r ./reports/ local/archive/ --include '*.csv' --exclude 'private-*' --newer-than 7d
+rc cp -r ./reports/ local/archive/ --rate-limit 10MiB/s --retry-attempts 5 --continue-on-error
+```
+
+When include rules are present, a path must match at least one of them. Exclude rules are applied
+after include rules and always win, regardless of flag order. Age filters compare source metadata in
+UTC: newer/older boundaries are strict, while `--rewind` includes the specified boundary. Rate,
+concurrency, and retry settings are shared across the full command. Any failed item leaves the
+aggregate command exit code non-zero even when `--continue-on-error` is used. An empty selection
+succeeds by default; pass `--fail-empty` when automation should receive a not-found exit code.
+
 ### Admin Operations (IAM)
 
 ```bash
@@ -311,6 +326,23 @@ rc admin heal status local --json
 rc admin rebalance status local --json
 ```
 
+### Operational Health and Usage
+
+```bash
+# Public liveness and dependency-readiness probes
+rc ping local
+rc ready local --timeout 2
+
+# Prefer the RustFS background-scanner snapshot
+rc du local
+
+# Explicitly permit a portable paginated S3 fallback
+rc du local/photos/2026/ --fallback --versions
+rc du local/photos --fallback --incomplete
+```
+
+`rc du` never starts the potentially expensive client scan after an unsupported or unauthorized admin request unless `--fallback` is present. See the [operational utilities reference](docs/reference/rc/ops.md) for count, staleness, and partial-result semantics.
+
 ## Command Overview
 
 For full command documentation, see the [`rc` command reference](docs/reference/rc/README.md).
@@ -342,7 +374,11 @@ For full command documentation, see the [`rc` command reference](docs/reference/
 | `quota`       | Manage bucket quota                                                          |
 | `ilm`         | Manage lifecycle rules, storage tiers, and object restore                    |
 | `replicate`   | Manage bucket replication                                                    |
+| `watch`       | Stream live RustFS object notifications                                      |
 | `completions` | Generate shell completion scripts                                            |
+| `ping`        | Check service liveness and round-trip latency                                |
+| `ready`       | Check service dependency readiness                                           |
+| `du`          | Report server-snapshot or explicitly permitted client-scan usage             |
 
 ### Admin Subcommands
 

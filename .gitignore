@@ -1,6 +1,7 @@
 # Build artifacts
 /target/
 **/*.rs.bk
+__pycache__/
 
 # IDE
 .idea/

@@ -22,6 +22,7 @@ rc-s3 = { workspace = true }
 
 # Async runtime
 tokio.workspace = true
+futures.workspace = true
 
 # CLI
 clap.workspace = true
@@ -48,6 +49,7 @@ console.workspace = true
 # Utilities
 jiff.workspace = true
 humansize.workspace = true
+humantime.workspace = true
 mime_guess.workspace = true
 glob.workspace = true
 shlex.workspace = true
@@ -62,6 +64,7 @@ integration = []
 golden = []
 
 [dev-dependencies]
+async-trait.workspace = true
 tempfile.workspace = true
 insta.workspace = true
 jsonschema.workspace = true

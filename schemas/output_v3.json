@@ -29,9 +29,12 @@
         "locks",
         "multipart_uploads",
         "watch_event",
+        "health",
         "usage",
         "metrics",
-        "admin_operations"
+        "admin_operations",
+        "replication",
+        "replication_operations"
       ]
     },
     "pagination": {
@@ -69,6 +72,7 @@
         "scope": { "type": "string", "minLength": 1 },
         "support": {
           "type": "string",
+          "description": "Effective support: unsupported is a server-declared runtime state or version gate, while stub is reserved for registered but unimplemented routes.",
           "enum": ["supported", "unsupported", "stub", "disabled", "unknown"]
         },
         "reason": { "$ref": "#/definitions/nullableString" }
@@ -378,6 +382,17 @@
         "pagination": { "$ref": "#/definitions/pagination" }
       }
     },
+    "watchSource": {
+      "type": "object",
+      "properties": {
+        "event_source": { "$ref": "#/definitions/nullableString" },
+        "region": { "$ref": "#/definitions/nullableString" },
+        "principal_id": { "$ref": "#/definitions/nullableString" },
+        "host": { "$ref": "#/definitions/nullableString" },
+        "port": { "$ref": "#/definitions/nullableString" },
+        "user_agent": { "$ref": "#/definitions/nullableString" }
+      }
+    },
     "watchEvent": {
       "type": ["object", "null"],
       "required": [
@@ -390,9 +405,16 @@
         "bucket": { "type": "string", "minLength": 1 },
         "key": { "type": "string" },
         "version_id": { "$ref": "#/definitions/nullableString" },
+        "delete_marker": { "type": "boolean" },
         "size_bytes": { "$ref": "#/definitions/nullableBytes" },
         "etag": { "$ref": "#/definitions/nullableString" },
-        "event_time": { "$ref": "#/definitions/timestamp" }
+        "event_time": { "$ref": "#/definitions/timestamp" },
+        "source": {
+          "oneOf": [
+            { "$ref": "#/definitions/watchSource" },
+            { "type": "null" }
+          ]
+        }
       }
     },
     "watchData": {
@@ -401,6 +423,24 @@
       "properties": {
         "event": { "$ref": "#/definitions/watchEvent" },
         "keepalive": { "type": "boolean" }
+      }
+    },
+    "healthData": {
+      "type": "object",
+      "required": [
+        "check", "alias", "endpoint", "path", "healthy", "status_code",
+        "latency_ms", "status", "service"
+      ],
+      "properties": {
+        "check": { "type": "string", "enum": ["liveness", "readiness"] },
+        "alias": { "type": "string", "minLength": 1 },
+        "endpoint": { "type": "string", "minLength": 1 },
+        "path": { "type": "string", "enum": ["/health", "/health/ready"] },
+        "healthy": { "type": "boolean" },
+        "status_code": { "type": "integer", "minimum": 100, "maximum": 599 },
+        "latency_ms": { "type": "integer", "minimum": 0 },
+        "status": { "$ref": "#/definitions/nullableString" },
+        "service": { "$ref": "#/definitions/nullableString" }
       }
     },
     "usageData": {
@@ -416,6 +456,27 @@
         "object_count": { "type": ["integer", "null"], "minimum": 0 },
         "version_count": { "type": ["integer", "null"], "minimum": 0 },
         "delete_marker_count": { "type": ["integer", "null"], "minimum": 0 },
+        "source": {
+          "type": "string",
+          "enum": ["server_snapshot", "client_scan"]
+        },
+        "snapshot_at": { "$ref": "#/definitions/nullableTimestamp" },
+        "snapshot_age_seconds": { "type": ["integer", "null"], "minimum": 0 },
+        "stale": { "type": "boolean" },
+        "incomplete_upload_count": { "type": ["integer", "null"], "minimum": 0 },
+        "incomplete_upload_bytes": { "$ref": "#/definitions/nullableBytes" },
+        "partial": { "type": "boolean" },
+        "failures": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["bucket", "message"],
+            "properties": {
+              "bucket": { "type": "string", "minLength": 1 },
+              "message": { "type": "string", "minLength": 1 }
+            }
+          }
+        },
         "buckets": {
           "type": "array",
           "items": {
@@ -424,7 +485,11 @@
             "properties": {
               "name": { "type": "string", "minLength": 1 },
               "total_bytes": { "$ref": "#/definitions/nullableBytes" },
-              "object_count": { "type": ["integer", "null"], "minimum": 0 }
+              "object_count": { "type": ["integer", "null"], "minimum": 0 },
+              "version_count": { "type": ["integer", "null"], "minimum": 0 },
+              "delete_marker_count": { "type": ["integer", "null"], "minimum": 0 },
+              "incomplete_upload_count": { "type": ["integer", "null"], "minimum": 0 },
+              "incomplete_upload_bytes": { "$ref": "#/definitions/nullableBytes" }
             }
           }
         }
@@ -481,6 +546,122 @@
           "items": { "$ref": "#/definitions/adminOperation" }
         }
       }
+    },
+    "replicationDiffEntry": {
+      "type": "object",
+      "required": [
+        "object", "version_id", "delete_marker", "size_bytes",
+        "replication_status", "last_modified", "extensions"
+      ],
+      "properties": {
+        "object": { "type": "string" },
+        "version_id": { "$ref": "#/definitions/nullableString" },
+        "delete_marker": { "type": "boolean" },
+        "size_bytes": { "type": "integer", "minimum": 0 },
+        "replication_status": { "type": "string", "minLength": 1 },
+        "last_modified": { "$ref": "#/definitions/nullableTimestamp" },
+        "extensions": { "type": "object" }
+      }
+    },
+    "replicationDiffScan": {
+      "type": "object",
+      "required": ["scanned_versions", "truncated", "resumable"],
+      "properties": {
+        "scanned_versions": { "type": "integer", "minimum": 0 },
+        "truncated": { "type": "boolean" },
+        "resumable": { "const": false }
+      }
+    },
+    "replicationData": {
+      "type": "object",
+      "required": [
+        "operation", "bucket", "prefix", "entries", "scan", "extensions"
+      ],
+      "properties": {
+        "operation": { "const": "diff" },
+        "bucket": { "type": "string", "minLength": 1 },
+        "prefix": { "$ref": "#/definitions/nullableString" },
+        "entries": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/replicationDiffEntry" }
+        },
+        "scan": { "$ref": "#/definitions/replicationDiffScan" },
+        "extensions": { "type": "object" }
+      }
+    },
+    "replicationTarget": {
+      "type": "object",
+      "required": [
+        "target_arn", "reset_id", "reset_before", "started_at",
+        "last_updated_at", "state", "server_state", "replicated_count",
+        "replicated_size", "failed_count", "failed_size", "current_bucket",
+        "current_object", "error"
+      ],
+      "properties": {
+        "target_arn": { "type": "string", "minLength": 1 },
+        "reset_id": { "type": "string" },
+        "reset_before": { "$ref": "#/definitions/nullableTimestamp" },
+        "started_at": { "$ref": "#/definitions/nullableTimestamp" },
+        "last_updated_at": { "$ref": "#/definitions/nullableTimestamp" },
+        "state": {
+          "type": ["string", "null"],
+          "enum": [
+            "not_started", "pending", "ongoing", "completed", "failed",
+            "canceled", "unknown", null
+          ]
+        },
+        "server_state": { "$ref": "#/definitions/nullableString" },
+        "replicated_count": { "type": ["integer", "null"], "minimum": 0 },
+        "replicated_size": { "$ref": "#/definitions/nullableBytes" },
+        "failed_count": { "type": ["integer", "null"], "minimum": 0 },
+        "failed_size": { "$ref": "#/definitions/nullableBytes" },
+        "current_bucket": { "$ref": "#/definitions/nullableString" },
+        "current_object": { "$ref": "#/definitions/nullableString" },
+        "error": { "$ref": "#/definitions/nullableString" }
+      }
+    },
+    "replicationStartTarget": {
+      "allOf": [
+        { "$ref": "#/definitions/replicationTarget" },
+        {
+          "properties": {
+            "reset_id": { "type": "string", "minLength": 1 }
+          }
+        }
+      ]
+    },
+    "replicationOperationsData": {
+      "type": "object",
+      "required": ["operation", "bucket", "valid", "targets"],
+      "properties": {
+        "operation": {
+          "type": "string",
+          "enum": ["check", "resync_start", "resync_status"]
+        },
+        "bucket": { "type": "string", "minLength": 1 },
+        "valid": { "type": ["boolean", "null"] },
+        "targets": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/replicationTarget" }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "operation": { "const": "resync_start" } }
+          },
+          "then": {
+            "properties": {
+              "targets": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 1,
+                "items": { "$ref": "#/definitions/replicationStartTarget" }
+              }
+            }
+          }
+        }
+      ]
     },
     "unsupportedFeatureError": {
       "type": "object",
@@ -602,6 +783,17 @@
         { "$ref": "#/definitions/successEnvelope" },
         {
           "properties": {
+            "type": { "const": "health" },
+            "data": { "$ref": "#/definitions/healthData" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/definitions/successEnvelope" },
+        {
+          "properties": {
             "type": { "const": "usage" },
             "data": { "$ref": "#/definitions/usageData" }
           }
@@ -626,6 +818,28 @@
           "properties": {
             "type": { "const": "admin_operations" },
             "data": { "$ref": "#/definitions/adminOperationsData" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/definitions/successEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "replication" },
+            "data": { "$ref": "#/definitions/replicationData" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/definitions/successEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "replication_operations" },
+            "data": { "$ref": "#/definitions/replicationOperationsData" }
           }
         }
       ]

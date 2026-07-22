@@ -122,19 +122,15 @@ async fn move_local_to_s3(
     use crate::commands::cp;
 
     // First, copy local to S3
-    let cp_args = cp::CpArgs {
-        source: src.to_string_lossy().to_string(),
-        target: format!("{}/{}/{}", dst.alias, dst.bucket, dst.key),
-        recursive: args.recursive,
-        preserve: false,
-        continue_on_error: args.continue_on_error,
-        overwrite: true,
-        dry_run: args.dry_run,
-        storage_class: None,
-        content_type: None,
-        enc_s3: args.enc_s3.clone(),
-        enc_kms: args.enc_kms.clone(),
-    };
+    let mut cp_args = cp::CpArgs::single(
+        src.to_string_lossy().to_string(),
+        format!("{}/{}/{}", dst.alias, dst.bucket, dst.key),
+    );
+    cp_args.recursive = args.recursive;
+    cp_args.continue_on_error = args.continue_on_error;
+    cp_args.dry_run = args.dry_run;
+    cp_args.enc_s3.clone_from(&args.enc_s3);
+    cp_args.enc_kms.clone_from(&args.enc_kms);
 
     let cp_result = cp::execute(
         cp_args,
@@ -182,19 +178,15 @@ async fn move_s3_to_local(
     }
 
     // First, copy S3 to local
-    let cp_args = cp::CpArgs {
-        source: format!("{}/{}/{}", src.alias, src.bucket, src.key),
-        target: dst.to_string_lossy().to_string(),
-        recursive: args.recursive,
-        preserve: false,
-        continue_on_error: args.continue_on_error,
-        overwrite: true,
-        dry_run: args.dry_run,
-        storage_class: None,
-        content_type: None,
-        enc_s3: args.enc_s3.clone(),
-        enc_kms: args.enc_kms.clone(),
-    };
+    let mut cp_args = cp::CpArgs::single(
+        format!("{}/{}/{}", src.alias, src.bucket, src.key),
+        dst.to_string_lossy().to_string(),
+    );
+    cp_args.recursive = args.recursive;
+    cp_args.continue_on_error = args.continue_on_error;
+    cp_args.dry_run = args.dry_run;
+    cp_args.enc_s3.clone_from(&args.enc_s3);
+    cp_args.enc_kms.clone_from(&args.enc_kms);
 
     let cp_result = cp::execute(
         cp_args,
@@ -304,19 +296,10 @@ async fn move_s3_prefix_to_local(
         continuation_token = result.continuation_token;
     }
 
-    let cp_args = cp::CpArgs {
-        source: src.to_string(),
-        target: dst.to_string_lossy().to_string(),
-        recursive: true,
-        preserve: false,
-        continue_on_error: args.continue_on_error,
-        overwrite: true,
-        dry_run: args.dry_run,
-        storage_class: None,
-        content_type: None,
-        enc_s3: Vec::new(),
-        enc_kms: Vec::new(),
-    };
+    let mut cp_args = cp::CpArgs::single(src.to_string(), dst.to_string_lossy().to_string());
+    cp_args.recursive = true;
+    cp_args.continue_on_error = args.continue_on_error;
+    cp_args.dry_run = args.dry_run;
     let mut errors = 0usize;
 
     for item in objects {
