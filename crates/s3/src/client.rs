@@ -50,6 +50,7 @@ const SINGLE_PUT_OBJECT_MAX_SIZE: u64 = crate::multipart::DEFAULT_PART_SIZE;
 const S3_SERVICE_NAME: &str = "s3";
 const S3_REPLICATION_XML_NAMESPACE: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 const RUSTFS_FORCE_DELETE_HEADER: &str = "x-rustfs-force-delete";
+const S3_BYPASS_GOVERNANCE_RETENTION_HEADER: &str = "x-amz-bypass-governance-retention";
 static DOWNLOAD_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -861,6 +862,8 @@ pub struct S3Client {
 pub struct DeleteRequestOptions {
     /// Ask RustFS to permanently delete data instead of creating delete markers.
     pub force_delete: bool,
+    /// Ask S3-compatible servers to bypass governance retention.
+    pub bypass_governance_retention: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1349,6 +1352,13 @@ impl S3Client {
                     .insert(RUSTFS_FORCE_DELETE_HEADER, "true");
             });
         }
+        if options.bypass_governance_retention {
+            request = request.mutate_request(|request| {
+                request
+                    .headers_mut()
+                    .insert(S3_BYPASS_GOVERNANCE_RETENTION_HEADER, "true");
+            });
+        }
 
         request.send().await.map_err(|e| {
             let err_str = Self::format_sdk_error(&e);
@@ -1416,6 +1426,13 @@ impl S3Client {
                 request
                     .headers_mut()
                     .insert(RUSTFS_FORCE_DELETE_HEADER, "true");
+            });
+        }
+        if options.bypass_governance_retention {
+            request = request.mutate_request(|request| {
+                request
+                    .headers_mut()
+                    .insert(S3_BYPASS_GOVERNANCE_RETENTION_HEADER, "true");
             });
         }
 
@@ -4473,11 +4490,39 @@ mod tests {
         let path = RemotePath::new("test", "bucket", "key.txt");
 
         let _ = client
-            .delete_object_with_options(&path, DeleteRequestOptions { force_delete: true })
+            .delete_object_with_options(
+                &path,
+                DeleteRequestOptions {
+                    force_delete: true,
+                    ..Default::default()
+                },
+            )
             .await;
 
         let request = request_receiver.expect_request();
         assert_eq!(request.headers().get("x-rustfs-force-delete"), Some("true"));
+    }
+
+    #[tokio::test]
+    async fn delete_object_with_bypass_sets_governance_header() {
+        let (client, request_receiver) = test_s3_client(None);
+        let path = RemotePath::new("test", "bucket", "key.txt");
+
+        let _ = client
+            .delete_object_with_options(
+                &path,
+                DeleteRequestOptions {
+                    bypass_governance_retention: true,
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        let request = request_receiver.expect_request();
+        assert_eq!(
+            request.headers().get("x-amz-bypass-governance-retention"),
+            Some("true")
+        );
     }
 
     #[tokio::test]
@@ -5104,12 +5149,44 @@ mod tests {
             .delete_objects_with_options(
                 "bucket",
                 vec!["key.txt".to_string()],
-                DeleteRequestOptions { force_delete: true },
+                DeleteRequestOptions {
+                    force_delete: true,
+                    ..Default::default()
+                },
             )
             .await;
 
         let request = request_receiver.expect_request();
         assert_eq!(request.headers().get("x-rustfs-force-delete"), Some("true"));
+    }
+
+    #[tokio::test]
+    async fn delete_objects_with_bypass_sets_governance_header() {
+        let response = http::Response::builder()
+            .status(200)
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/" />"#,
+            ))
+            .expect("build delete objects response");
+        let (client, request_receiver) = test_s3_client(Some(response));
+
+        let _ = client
+            .delete_objects_with_options(
+                "bucket",
+                vec!["key.txt".to_string()],
+                DeleteRequestOptions {
+                    bypass_governance_retention: true,
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        let request = request_receiver.expect_request();
+        assert_eq!(
+            request.headers().get("x-amz-bypass-governance-retention"),
+            Some("true")
+        );
     }
 
     #[tokio::test]
