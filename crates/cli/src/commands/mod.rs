@@ -22,6 +22,7 @@ mod completions;
 mod cors;
 pub mod cp;
 pub mod diff;
+mod du;
 mod encryption;
 mod event;
 mod find;
@@ -32,9 +33,12 @@ mod mb;
 mod mirror;
 mod mv;
 mod object;
+mod ops_output;
+mod ping;
 mod pipe;
 mod quota;
 mod rb;
+mod ready;
 mod replicate;
 mod rm;
 mod share;
@@ -43,6 +47,7 @@ mod stat;
 mod tag;
 mod tree;
 mod version;
+mod watch;
 
 /// rc - Rust S3 CLI Client
 ///
@@ -276,10 +281,19 @@ pub enum Commands {
     // Phase 6: Utilities
     /// Generate shell completion scripts
     Completions(completions::CompletionsArgs),
+
+    /// Summarize storage usage
+    Du(du::DuArgs),
+
+    /// Check service liveness and round-trip latency
+    Ping(ping::PingArgs),
+
+    /// Check whether required dependencies are ready
+    Ready(ready::ReadyArgs),
     // /// Manage object retention
     // Retention(retention::RetentionArgs),
-    // /// Watch for object events
-    // Watch(watch::WatchArgs),
+    /// Stream live object notifications
+    Watch(watch::WatchArgs),
 }
 
 /// Execute the CLI command and return an exit code
@@ -437,6 +451,18 @@ pub async fn execute(cli: Cli) -> ExitCode {
             replicate::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
         }
         Commands::Completions(args) => completions::execute(args),
+        Commands::Watch(args) => {
+            watch::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
+        Commands::Du(args) => {
+            du::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
+        Commands::Ping(args) => {
+            ping::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
+        Commands::Ready(args) => {
+            ready::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
     }
 }
 
@@ -591,6 +617,28 @@ mod tests {
                 .to_string()
                 .contains("Only x-amz-* custom request headers are supported")
         );
+    }
+
+    #[test]
+    fn cli_accepts_repeatable_watch_event_filters() {
+        let cli = Cli::try_parse_from([
+            "rc",
+            "watch",
+            "local/photos",
+            "--event",
+            "put,delete",
+            "--event",
+            "get",
+            "--prefix",
+            "incoming/",
+        ])
+        .expect("parse watch command");
+
+        let Commands::Watch(args) = cli.command else {
+            panic!("expected watch command");
+        };
+        assert_eq!(args.events, vec!["put,delete", "get"]);
+        assert_eq!(args.prefix.as_deref(), Some("incoming/"));
     }
 
     #[test]
@@ -929,6 +977,33 @@ mod tests {
     }
 
     #[test]
+    fn cli_accepts_bucket_replication_diff_prefix() {
+        let cli = Cli::try_parse_from([
+            "rc",
+            "bucket",
+            "replication",
+            "diff",
+            "local/my-bucket",
+            "--prefix",
+            "reports/2026/",
+        ])
+        .expect("parse bucket replication diff");
+
+        match cli.command {
+            Commands::Bucket(args) => match args.command {
+                bucket::BucketCommands::Replication(replicate::ReplicateArgs {
+                    command: replicate::ReplicateCommands::Diff(arg),
+                }) => {
+                    assert_eq!(arg.path, "local/my-bucket");
+                    assert_eq!(arg.prefix.as_deref(), Some("reports/2026/"));
+                }
+                other => panic!("expected bucket replication diff command, got {:?}", other),
+            },
+            other => panic!("expected bucket command, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn cli_accepts_bucket_replication_add_tls_flags() {
         let cli = Cli::try_parse_from([
             "rc",
@@ -954,6 +1029,103 @@ mod tests {
                 other => panic!("expected bucket replication add command, got {:?}", other),
             },
             other => panic!("expected bucket command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_bucket_replication_check_confirmation() {
+        let cli = Cli::try_parse_from([
+            "rc",
+            "bucket",
+            "replication",
+            "check",
+            "local/my-bucket",
+            "--yes",
+            "--force",
+        ])
+        .expect("parse bucket replication check");
+
+        match cli.command {
+            Commands::Bucket(args) => match args.command {
+                bucket::BucketCommands::Replication(replicate::ReplicateArgs {
+                    command: replicate::ReplicateCommands::Check(arg),
+                }) => {
+                    assert_eq!(arg.path, "local/my-bucket");
+                    assert!(arg.yes);
+                    assert!(arg.force);
+                }
+                other => panic!("expected bucket replication check command, got {other:?}"),
+            },
+            other => panic!("expected bucket command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_bucket_replication_resync_lifecycle() {
+        let start = Cli::try_parse_from([
+            "rc",
+            "bucket",
+            "replication",
+            "resync",
+            "start",
+            "local/my-bucket",
+            "--target-arn",
+            "arn:rustfs:replication::id:backup",
+            "--older-than",
+            "7d",
+            "--reset-id",
+            "caller-id",
+            "--yes",
+        ])
+        .expect("parse bucket replication resync start");
+
+        match start.command {
+            Commands::Bucket(args) => match args.command {
+                bucket::BucketCommands::Replication(replicate::ReplicateArgs {
+                    command:
+                        replicate::ReplicateCommands::Resync(replicate::ResyncCommands::Start(arg)),
+                }) => {
+                    assert_eq!(arg.path, "local/my-bucket");
+                    assert_eq!(
+                        arg.target_arn.as_deref(),
+                        Some("arn:rustfs:replication::id:backup")
+                    );
+                    assert_eq!(arg.older_than.as_deref(), Some("7d"));
+                    assert_eq!(arg.reset_id.as_deref(), Some("caller-id"));
+                    assert!(arg.yes);
+                }
+                other => panic!("expected bucket replication resync start, got {other:?}"),
+            },
+            other => panic!("expected bucket command, got {other:?}"),
+        }
+
+        let status = Cli::try_parse_from([
+            "rc",
+            "bucket",
+            "replication",
+            "resync",
+            "status",
+            "local/my-bucket",
+            "--target-arn",
+            "arn:rustfs:replication::id:backup",
+        ])
+        .expect("parse bucket replication resync status");
+
+        match status.command {
+            Commands::Bucket(args) => match args.command {
+                bucket::BucketCommands::Replication(replicate::ReplicateArgs {
+                    command:
+                        replicate::ReplicateCommands::Resync(replicate::ResyncCommands::Status(arg)),
+                }) => {
+                    assert_eq!(arg.path, "local/my-bucket");
+                    assert_eq!(
+                        arg.target_arn.as_deref(),
+                        Some("arn:rustfs:replication::id:backup")
+                    );
+                }
+                other => panic!("expected bucket replication resync status, got {other:?}"),
+            },
+            other => panic!("expected bucket command, got {other:?}"),
         }
     }
 

@@ -1,0 +1,20 @@
+{
+  "schema_version": 3,
+  "type": "capabilities",
+  "status": "success",
+  "data": {
+    "server": "rustfs",
+    "api_version": null,
+    "capabilities": [
+      {
+        "name": "admin.runtime-capabilities",
+        "scope": "admin",
+        "support": "unsupported",
+        "reason": "Admin API v4 is unavailable"
+      }
+    ]
+  },
+  "meta": {
+    "server_version": "1.0.0-beta.10"
+  }
+}
