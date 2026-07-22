@@ -23,6 +23,7 @@ rc-s3 = { workspace = true }
 # Async runtime
 tokio.workspace = true
 futures.workspace = true
+async-trait.workspace = true
 
 # CLI
 clap.workspace = true
@@ -51,6 +52,7 @@ jiff.workspace = true
 humansize.workspace = true
 humantime.workspace = true
 mime_guess.workspace = true
+tempfile.workspace = true
 glob.workspace = true
 shlex.workspace = true
 urlencoding.workspace = true

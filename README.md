@@ -107,8 +107,8 @@ rc rb local/my-bucket
 # Recursively copy directory
 rc cp -r ./local-dir/ local/bucket/remote-dir/
 
-# Mirror between S3 locations
-rc mirror local/bucket1/ local/bucket2/
+# Mirror between the local filesystem and RustFS
+rc mirror ./local-dir/ local/bucket/backup/
 
 # Find objects
 rc find local/bucket --name "*.txt" --newer 1d
@@ -363,7 +363,7 @@ For full command documentation, see the [`rc` command reference](docs/reference/
 | `find`        | Find objects                                                                 |
 | `anonymous`   | Manage anonymous access to buckets and objects                               |
 | `diff`        | Compare two locations                                                        |
-| `mirror`      | Mirror sync between S3 locations                                             |
+| `mirror`      | Mirror local and S3-compatible directory trees                               |
 | `tree`        | Tree view display                                                            |
 | `share`       | Generate presigned URLs                                                      |
 | `event`       | Manage bucket event notifications                                            |

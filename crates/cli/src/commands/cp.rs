@@ -741,7 +741,7 @@ fn build_transfer_controls(args: &CpArgs) -> Result<TransferControls, String> {
     Ok(controls)
 }
 
-fn parse_age_cutoff(value: &str, now: Timestamp) -> Result<Timestamp, String> {
+pub(super) fn parse_age_cutoff(value: &str, now: Timestamp) -> Result<Timestamp, String> {
     let value = value.trim();
     if value.is_empty() {
         return Err("Transfer age must not be empty".to_string());
@@ -779,7 +779,7 @@ fn parse_rewind_cutoff(value: &str, now: Timestamp) -> Result<Timestamp, String>
         .map_err(|error| format!("Invalid rewind value '{value}': {error}"))
 }
 
-fn parse_byte_rate(value: &str) -> Result<u64, String> {
+pub(super) fn parse_byte_rate(value: &str) -> Result<u64, String> {
     let normalized = value.trim().to_ascii_lowercase();
     let normalized = normalized
         .strip_suffix("/s")

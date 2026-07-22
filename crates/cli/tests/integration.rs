@@ -2136,6 +2136,21 @@ mod diff_operations {
 mod mirror_operations {
     use super::*;
 
+    fn upload_text_object(config_dir: &std::path::Path, bucket: &str, key: &str, content: &str) {
+        let temp_file = tempfile::NamedTempFile::new().expect("Failed to create temp file");
+        std::fs::write(temp_file.path(), content).expect("Failed to write test object");
+        let source = temp_file
+            .path()
+            .to_str()
+            .expect("Temp file path is valid UTF-8");
+        let output = run_rc(&["cp", source, &format!("test/{bucket}/{key}")], config_dir);
+        assert!(
+            output.status.success(),
+            "Failed to upload {key}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn test_mirror_between_buckets() {
         let (config_dir, bucket_name) = match setup_with_alias("mirror") {
@@ -2179,13 +2194,13 @@ mod mirror_operations {
                 "mirror",
                 &format!("test/{}/source/", bucket_name),
                 &format!("test/{}/", bucket_name2),
-                "--json",
             ],
             config_dir.path(),
         );
         assert!(
             output.status.success(),
-            "Failed to mirror: {}",
+            "Failed to mirror; stdout: {}; stderr: {}",
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
 
@@ -2256,13 +2271,13 @@ mod mirror_operations {
                 "mirror",
                 &format!("test/{}/source/", bucket_name),
                 &format!("test/{}/", target_bucket),
-                "--json",
             ],
             config_dir.path(),
         );
         assert!(
             output.status.success(),
-            "Failed to mirror objects: {}",
+            "Failed to mirror objects; stdout: {}; stderr: {}",
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
 
@@ -2286,6 +2301,105 @@ mod mirror_operations {
 
         cleanup_bucket(config_dir.path(), &bucket_name);
         cleanup_bucket(config_dir.path(), &target_bucket);
+    }
+
+    #[test]
+    fn test_mirror_local_tree_to_rustfs() {
+        let (config_dir, bucket_name) = match setup_with_alias("mirrorlocalremote") {
+            Some(v) => v,
+            None => panic!("S3 integration test setup failed"),
+        };
+        let source = tempfile::tempdir().expect("Failed to create local source");
+        std::fs::create_dir(source.path().join("nested")).expect("Failed to create nested source");
+        std::fs::write(source.path().join("root.txt"), b"root-data")
+            .expect("Failed to write root source");
+        std::fs::write(source.path().join("nested/file.txt"), b"nested-data")
+            .expect("Failed to write nested source");
+
+        let output = run_rc(
+            &[
+                "mirror",
+                source.path().to_str().expect("Source path is UTF-8"),
+                &format!("test/{}/local-mirror/", bucket_name),
+                "--summary",
+                "--json",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            output.status.success(),
+            "Failed to mirror local tree; stdout: {}; stderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let payload: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("Invalid mirror JSON output");
+        assert_eq!(payload["copied"], 2);
+        assert_eq!(payload["errors"], 0);
+
+        let output = run_rc(
+            &[
+                "cat",
+                &format!("test/{}/local-mirror/nested/file.txt", bucket_name),
+            ],
+            config_dir.path(),
+        );
+        assert!(output.status.success(), "Failed to read mirrored object");
+        assert_eq!(output.stdout, b"nested-data");
+
+        cleanup_bucket(config_dir.path(), &bucket_name);
+    }
+
+    #[test]
+    fn test_mirror_rustfs_tree_to_new_local_root() {
+        let (config_dir, bucket_name) = match setup_with_alias("mirrorremotelocal") {
+            Some(v) => v,
+            None => panic!("S3 integration test setup failed"),
+        };
+        upload_text_object(
+            config_dir.path(),
+            &bucket_name,
+            "remote-source/root.txt",
+            "root-data",
+        );
+        upload_text_object(
+            config_dir.path(),
+            &bucket_name,
+            "remote-source/nested/file.txt",
+            "nested-data",
+        );
+        let target_parent = tempfile::tempdir().expect("Failed to create target parent");
+        let target = target_parent.path().join("new/deep/restore");
+
+        let output = run_rc(
+            &[
+                "mirror",
+                &format!("test/{}/remote-source/", bucket_name),
+                target.to_str().expect("Target path is UTF-8"),
+                "--summary",
+                "--json",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            output.status.success(),
+            "Failed to mirror RustFS tree locally: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let payload: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("Invalid mirror JSON output");
+        assert_eq!(payload["copied"], 2);
+        assert_eq!(payload["errors"], 0);
+        assert_eq!(
+            std::fs::read(target.join("root.txt")).expect("Read local root object"),
+            b"root-data"
+        );
+        assert_eq!(
+            std::fs::read(target.join("nested/file.txt")).expect("Read nested local object"),
+            b"nested-data"
+        );
+
+        cleanup_bucket(config_dir.path(), &bucket_name);
     }
 }
 
@@ -4160,7 +4274,8 @@ mod option_behavior_operations {
         );
         assert!(
             output.status.success(),
-            "mirror --remove --parallel failed: {}",
+            "mirror --remove --parallel failed; stdout: {}; stderr: {}",
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -4202,7 +4317,7 @@ mod option_behavior_operations {
     }
 
     #[test]
-    fn test_mirror_parallel_zero_returns_usage_error() {
+    fn test_mirror_concurrency_zero_returns_usage_error() {
         let (config_dir, bucket_name) = match setup_with_alias("mirrorparallelzero") {
             Some(v) => v,
             None => panic!("S3 integration test setup failed"),
@@ -4223,7 +4338,7 @@ mod option_behavior_operations {
                 "mirror",
                 &format!("test/{}/", bucket_name),
                 &format!("test/{}/", target_bucket),
-                "--parallel",
+                "--concurrency",
                 "0",
                 "--json",
             ],
@@ -4231,11 +4346,11 @@ mod option_behavior_operations {
         );
         assert!(
             !output.status.success(),
-            "mirror --parallel 0 should fail with usage error"
+            "mirror --concurrency 0 should fail with usage error"
         );
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            stderr.contains("--parallel must be between 1 and 256"),
+            stderr.contains("Transfer concurrency must be between 1 and 256"),
             "Unexpected error output: {}",
             stderr
         );
