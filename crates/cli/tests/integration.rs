@@ -11,7 +11,7 @@
 //!     -e RUSTFS_ROOT_PASSWORD=secretkey \
 //!     -e RUSTFS_ACCESS_KEY=accesskey \
 //!     -e RUSTFS_SECRET_KEY=secretkey \
-//!     rustfs/rustfs:latest
+//!     rustfs/rustfs:1.0.0-beta.10
 //!
 //! # Run tests
 //! cargo test --features integration

@@ -1,0 +1,11 @@
+{
+  "schema_version": 3,
+  "type": "replication",
+  "status": "error",
+  "error": {
+    "type": "not_found",
+    "message": "Failed to scan replication diff: Not found: replication is not configured",
+    "retryable": false,
+    "suggestion": "Verify the bucket name and that replication is configured."
+  }
+}

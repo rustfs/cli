@@ -38,7 +38,7 @@ pub struct RmArgs {
     pub dry_run: bool,
 
     /// Remove incomplete multipart uploads older than specified duration
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub incomplete: bool,
 
     /// Include versions (requires versioning support)
@@ -67,10 +67,10 @@ struct RmOutput {
 pub async fn execute(args: RmArgs, output_config: OutputConfig) -> ExitCode {
     let formatter = Formatter::new(output_config);
 
-    if args.incomplete || args.versions || args.bypass {
+    if args.incomplete {
         return formatter.fail(
             ExitCode::UnsupportedFeature,
-            "--incomplete, --versions, and --bypass are not implemented; refusing to continue with a silently ignored destructive option",
+            "--incomplete is not implemented",
         );
     }
 
@@ -244,7 +244,7 @@ async fn delete_single(
     }
 }
 
-async fn delete_recursive(
+pub(crate) async fn delete_recursive(
     client: &S3Client,
     alias_name: &str,
     bucket: &str,
@@ -254,50 +254,11 @@ async fn delete_recursive(
 ) -> Result<Vec<String>, (ExitCode, Vec<String>)> {
     let path = RemotePath::new(alias_name, bucket, prefix);
 
-    // Collect all objects to delete
-    let mut keys_to_delete = Vec::new();
-    let mut continuation_token: Option<String> = None;
-
-    loop {
-        let options = ListOptions {
-            recursive: true,
-            max_keys: Some(1000),
-            continuation_token: continuation_token.clone(),
-            ..Default::default()
-        };
-
-        match client.list_objects(&path, options).await {
-            Ok(result) => {
-                for item in result.items {
-                    if !item.is_dir {
-                        keys_to_delete.push(item.key);
-                    }
-                }
-
-                if result.truncated {
-                    continuation_token = result.continuation_token;
-                } else {
-                    break;
-                }
-            }
-            Err(e) => {
-                let err_str = e.to_string();
-                if err_str.contains("NotFound") || err_str.contains("NoSuchBucket") {
-                    let code = formatter.fail_with_suggestion(
-                        ExitCode::NotFound,
-                        &format!("Bucket not found: {bucket}"),
-                        "Check the bucket path and retry the remove command.",
-                    );
-                    return Err((code, vec![]));
-                }
-                let code = formatter.fail(
-                    ExitCode::NetworkError,
-                    &format!("Failed to list objects: {e}"),
-                );
-                return Err((code, vec![]));
-            }
-        }
-    }
+    let keys_to_delete = if args.versions || args.purge {
+        list_version_keys(client, &path, bucket, formatter).await?
+    } else {
+        list_object_keys(client, &path, bucket, formatter).await?
+    };
 
     if keys_to_delete.is_empty() {
         if !args.force {
@@ -425,8 +386,108 @@ fn parse_rm_path(path: &str) -> Result<(String, String, String), String> {
 
 fn delete_request_options(args: &RmArgs) -> DeleteRequestOptions {
     DeleteRequestOptions {
-        force_delete: args.purge,
+        force_delete: args.purge || args.versions,
+        bypass_governance_retention: args.bypass,
     }
+}
+
+async fn list_object_keys(
+    client: &S3Client,
+    path: &RemotePath,
+    bucket: &str,
+    formatter: &Formatter,
+) -> Result<Vec<String>, (ExitCode, Vec<String>)> {
+    let mut keys_to_delete = Vec::new();
+    let mut continuation_token: Option<String> = None;
+
+    loop {
+        let options = ListOptions {
+            recursive: true,
+            max_keys: Some(1000),
+            continuation_token: continuation_token.clone(),
+            ..Default::default()
+        };
+
+        match client.list_objects(path, options).await {
+            Ok(result) => {
+                for item in result.items {
+                    if !item.is_dir {
+                        keys_to_delete.push(item.key);
+                    }
+                }
+
+                if result.truncated {
+                    continuation_token = result.continuation_token;
+                } else {
+                    break;
+                }
+            }
+            Err(e) => return Err(list_error(e, bucket, formatter)),
+        }
+    }
+
+    Ok(keys_to_delete)
+}
+
+async fn list_version_keys(
+    client: &S3Client,
+    path: &RemotePath,
+    bucket: &str,
+    formatter: &Formatter,
+) -> Result<Vec<String>, (ExitCode, Vec<String>)> {
+    let mut keys_to_delete = HashSet::new();
+    let mut key_marker: Option<String> = None;
+    let mut version_id_marker: Option<String> = None;
+
+    loop {
+        match client
+            .list_object_versions_page_with_markers(
+                path,
+                Some(1000),
+                key_marker.as_deref(),
+                version_id_marker.as_deref(),
+            )
+            .await
+        {
+            Ok(result) => {
+                for item in result.items {
+                    keys_to_delete.insert(item.key);
+                }
+
+                if result.truncated {
+                    key_marker = result.continuation_token;
+                    version_id_marker = result.version_id_marker;
+                } else {
+                    break;
+                }
+            }
+            Err(e) => return Err(list_error(e, bucket, formatter)),
+        }
+    }
+
+    Ok(keys_to_delete.into_iter().collect())
+}
+
+fn list_error(
+    error: rc_core::Error,
+    bucket: &str,
+    formatter: &Formatter,
+) -> (ExitCode, Vec<String>) {
+    let err_str = error.to_string();
+    if err_str.contains("NotFound") || err_str.contains("NoSuchBucket") {
+        let code = formatter.fail_with_suggestion(
+            ExitCode::NotFound,
+            &format!("Bucket not found: {bucket}"),
+            "Check the bucket path and retry the remove command.",
+        );
+        return (code, vec![]);
+    }
+
+    let code = formatter.fail(
+        ExitCode::NetworkError,
+        &format!("Failed to list objects: {error}"),
+    );
+    (code, vec![])
 }
 
 fn validate_removal_scope(key: &str, recursive: bool) -> Result<(), String> {
@@ -524,6 +585,40 @@ mod tests {
 
         let options = delete_request_options(&args);
         assert!(options.force_delete);
+    }
+
+    #[test]
+    fn test_delete_request_options_enable_force_delete_for_versions() {
+        let args = RmArgs {
+            paths: vec!["test/bucket/object.txt".to_string()],
+            recursive: false,
+            force: false,
+            dry_run: false,
+            incomplete: false,
+            versions: true,
+            bypass: false,
+            purge: false,
+        };
+
+        let options = delete_request_options(&args);
+        assert!(options.force_delete);
+    }
+
+    #[test]
+    fn test_delete_request_options_enable_governance_bypass() {
+        let args = RmArgs {
+            paths: vec!["test/bucket/object.txt".to_string()],
+            recursive: false,
+            force: false,
+            dry_run: false,
+            incomplete: false,
+            versions: false,
+            bypass: true,
+            purge: false,
+        };
+
+        let options = delete_request_options(&args);
+        assert!(options.bypass_governance_retention);
     }
 
     #[test]

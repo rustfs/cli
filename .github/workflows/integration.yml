@@ -32,17 +32,31 @@ jobs:
       - name: Run CLI help contract tests
         run: cargo test --package rustfs-cli --test help_contract
 
-  smoke-latest:
-    name: Smoke (RustFS latest)
+      - name: Validate RustFS compatibility contract
+        run: |
+          python3 -m unittest scripts/tests/test_rustfs_compatibility.py
+          python3 scripts/rustfs_compatibility.py --check-repository
+
+  smoke-compatibility:
+    name: Smoke (RustFS ${{ matrix.version }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - version: 1.0.0-beta.9
+            image: rustfs/rustfs:1.0.0-beta.9
+          - version: 1.0.0-beta.10
+            image: rustfs/rustfs:1.0.0-beta.10
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
-      - name: Start RustFS latest
+      - name: Start RustFS ${{ matrix.version }}
         run: |
+          docker pull "${{ matrix.image }}"
           docker run -d --name rustfs \
             -p 9000:9000 \
             -p 9001:9001 \
@@ -55,7 +69,17 @@ jobs:
             -e RUSTFS_ADDRESS=":9000" \
             -e RUSTFS_CONSOLE_ENABLE="true" \
             -e RUSTFS_CONSOLE_ADDRESS=":9001" \
-            rustfs/rustfs:latest
+            "${{ matrix.image }}"
+
+      - name: Prove selected RustFS image
+        run: |
+          set -euo pipefail
+          actual_image="$(docker inspect --format '{{.Config.Image}}' rustfs)"
+          image_id="$(docker inspect --format '{{.Image}}' rustfs)"
+          test "$actual_image" = "${{ matrix.image }}"
+          printf 'version=%s\nimage=%s\nimage_id=%s\n' \
+            "${{ matrix.version }}" "$actual_image" "$image_id" \
+            | tee rustfs-image.txt
 
       - name: Wait for RustFS
         run: |
@@ -75,6 +99,7 @@ jobs:
           set -euo pipefail
           TESTS=(
             "object_operations::test_upload_and_download_small_file"
+            "admin_operations::test_admin_info_cluster"
             "object_operations::test_move_recursive_prefix_s3_to_s3"
             "quota_operations::test_bucket_quota_set_info_clear"
             "option_behavior_operations::test_cp_dry_run_does_not_create_target_object"
@@ -96,12 +121,28 @@ jobs:
               --test-threads=1
           done
 
+      - name: Probe and report RustFS capabilities
+        run: |
+          image_id="$(docker inspect --format '{{.Image}}' rustfs)"
+          scripts/probe-rustfs-compatibility.sh \
+            "${{ matrix.version }}" \
+            "rustfs-compatibility-${{ matrix.version }}.json" \
+            "$image_id"
+
+      - name: Publish compatibility report
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: rustfs-compatibility-${{ matrix.version }}
+          path: |
+            rustfs-compatibility-${{ matrix.version }}.json
+            rustfs-image.txt
+
       - name: Show RustFS logs on failure
         if: failure()
         run: docker logs rustfs 2>&1 | tail -200
 
-  full-latest:
-    name: Full Integration (RustFS latest)
+  full-target:
+    name: Full Integration (RustFS 1.0.0-beta.10)
     runs-on: ubuntu-latest
     timeout-minutes: 90
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
@@ -110,8 +151,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
-      - name: Start RustFS latest
+      - name: Start RustFS 1.0.0-beta.10
         run: |
+          docker pull rustfs/rustfs:1.0.0-beta.10
           docker run -d --name rustfs \
             -p 9000:9000 \
             -p 9001:9001 \
@@ -124,7 +166,14 @@ jobs:
             -e RUSTFS_ADDRESS=":9000" \
             -e RUSTFS_CONSOLE_ENABLE="true" \
             -e RUSTFS_CONSOLE_ADDRESS=":9001" \
-            rustfs/rustfs:latest
+            rustfs/rustfs:1.0.0-beta.10
+
+      - name: Prove selected RustFS image
+        run: |
+          set -euo pipefail
+          actual_image="$(docker inspect --format '{{.Config.Image}}' rustfs)"
+          test "$actual_image" = "rustfs/rustfs:1.0.0-beta.10"
+          docker inspect --format 'image={{.Config.Image}} image_id={{.Image}}' rustfs
 
       - name: Wait for RustFS
         run: |
