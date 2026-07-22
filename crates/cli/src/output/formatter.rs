@@ -3,6 +3,8 @@
 //! Ensures consistent output formatting across all commands.
 //! JSON output follows the schema defined in schemas/output_v1.json.
 
+use std::io;
+
 use console::Style;
 use serde::Serialize;
 
@@ -20,6 +22,12 @@ const CONFLICT_SUGGESTION: &str =
     "Review the target resource state and retry with the appropriate overwrite or ignore flag.";
 const UNSUPPORTED_SUGGESTION: &str =
     "Retry with --force only if you want to bypass capability detection.";
+
+fn write_line(writer: &mut impl io::Write, message: &str) -> io::Result<()> {
+    writer.write_all(message.as_bytes())?;
+    writer.write_all(b"\n")?;
+    writer.flush()
+}
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 struct JsonErrorOutput {
@@ -471,6 +479,34 @@ impl Formatter {
         }
     }
 
+    /// Output one compact JSON Lines record to stdout.
+    pub fn json_line<T: Serialize>(&self, value: &T) {
+        if self.config.quiet {
+            return;
+        }
+        match serde_json::to_string(value) {
+            Ok(json) => println!("{json}"),
+            Err(e) => eprintln!("Error serializing output: {e}"),
+        }
+    }
+
+    /// Write one compact JSON Lines record to stdout and report output failures.
+    pub fn try_json_line<T: Serialize>(&self, value: &T) -> io::Result<()> {
+        if self.config.quiet {
+            return Ok(());
+        }
+        let json = serde_json::to_string(value).map_err(io::Error::other)?;
+        write_line(&mut io::stdout().lock(), &json)
+    }
+
+    /// Output one compact JSON Lines error record to stderr.
+    pub fn json_line_error<T: Serialize>(&self, value: &T) {
+        match serde_json::to_string(value) {
+            Ok(json) => eprintln!("{json}"),
+            Err(e) => eprintln!("Error serializing output: {e}"),
+        }
+    }
+
     /// Output a pre-built JSON error record on stderr.
     pub fn json_error<T: Serialize>(&self, value: &T) {
         match serde_json::to_string_pretty(value) {
@@ -486,6 +522,14 @@ impl Formatter {
         }
         println!("{message}");
     }
+
+    /// Print a line to stdout and report output failures.
+    pub fn try_println(&self, message: &str) -> io::Result<()> {
+        if self.config.quiet {
+            return Ok(());
+        }
+        write_line(&mut io::stdout().lock(), message)
+    }
 }
 
 impl Default for Formatter {
@@ -496,7 +540,21 @@ impl Default for Formatter {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{self, Write};
+
     use super::*;
+
+    struct BrokenPipeWriter;
+
+    impl Write for BrokenPipeWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "reader closed"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn test_formatter_default() {
@@ -504,6 +562,14 @@ mod tests {
         assert!(!formatter.is_json());
         assert!(!formatter.is_quiet());
         assert!(formatter.colors_enabled());
+    }
+
+    #[test]
+    fn line_writer_surfaces_broken_pipe_without_panicking() {
+        let error = write_line(&mut BrokenPipeWriter, "event")
+            .expect_err("closed stdout should be reported to the caller");
+
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
     }
 
     #[test]

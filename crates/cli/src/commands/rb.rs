@@ -7,6 +7,7 @@ use rc_core::{AliasManager, ObjectStore as _};
 use rc_s3::S3Client;
 use serde::Serialize;
 
+use super::rm::{self, RmArgs};
 use crate::exit_code::ExitCode;
 use crate::output::{Formatter, OutputConfig};
 
@@ -21,7 +22,7 @@ pub struct RbArgs {
     pub force: bool,
 
     /// Remove bucket even if it has incomplete multipart uploads
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub dangerous: bool,
 }
 
@@ -37,10 +38,10 @@ struct RbOutput {
 pub async fn execute(args: RbArgs, output_config: OutputConfig) -> ExitCode {
     let formatter = Formatter::new(output_config);
 
-    if args.force || args.dangerous {
+    if args.dangerous {
         return formatter.fail(
             ExitCode::UnsupportedFeature,
-            "--force and --dangerous are not implemented for bucket removal",
+            "--dangerous is not implemented for bucket removal",
         );
     }
 
@@ -89,6 +90,26 @@ pub async fn execute(args: RbArgs, output_config: OutputConfig) -> ExitCode {
         Err(e) => {
             formatter.error(&format!("Failed to check bucket existence: {e}"));
             return ExitCode::NetworkError;
+        }
+    }
+
+    if args.force {
+        let rm_args = RmArgs {
+            paths: vec![format!("{alias_name}/{bucket}")],
+            recursive: true,
+            force: true,
+            dry_run: false,
+            incomplete: false,
+            versions: true,
+            version_id: None,
+            bypass: false,
+            purge: true,
+        };
+
+        if let Err(error) =
+            rm::delete_recursive(&client, &alias_name, &bucket, "", &rm_args, &formatter).await
+        {
+            return error.code;
         }
     }
 

@@ -12,9 +12,12 @@ const V3_FAMILIES: &[&str] = &[
     "locks",
     "multipart_uploads",
     "watch_event",
+    "health",
     "usage",
     "metrics",
     "admin_operations",
+    "replication",
+    "replication_operations",
 ];
 
 fn repository_root() -> PathBuf {
@@ -254,6 +257,48 @@ fn v3_allows_unknown_server_fields() {
         serde_json::json!({ "route": "/minio/admin/v4/runtime/capabilities" });
 
     assert_valid(&validator, &value, "extended capabilities output");
+}
+
+#[test]
+fn replication_truncated_fixture_is_explicitly_non_resumable() {
+    let validator = load_validator(3);
+    let value = load_json(&fixture_path("replication", "truncated"));
+
+    assert_eq!(value["data"]["scan"]["truncated"], true);
+    assert_eq!(value["data"]["scan"]["resumable"], false);
+    assert_valid(&validator, &value, "truncated replication diff");
+}
+
+#[test]
+fn replication_status_allows_empty_reset_id_but_start_requires_exactly_one_target() {
+    let validator = load_validator(3);
+    let status = load_json(&fixture_path("replication_operations", "success"));
+    assert_eq!(status["data"]["targets"][0]["reset_id"], "");
+    assert_valid(&validator, &status, "status with persisted empty reset ID");
+
+    let mut start = status;
+    start["data"]["operation"] = Value::String("resync_start".to_string());
+    assert!(
+        !validator.is_valid(&start),
+        "start output must retain a nonempty server reset ID"
+    );
+    start["data"]["targets"][0]["reset_id"] = Value::String("server-id".to_string());
+    assert_valid(&validator, &start, "start with nonempty server reset ID");
+
+    let mut empty_targets = start.clone();
+    empty_targets["data"]["targets"] = serde_json::json!([]);
+    assert!(
+        !validator.is_valid(&empty_targets),
+        "start output must contain exactly one target"
+    );
+
+    let mut multiple_targets = start;
+    let target = multiple_targets["data"]["targets"][0].clone();
+    multiple_targets["data"]["targets"] = serde_json::json!([target.clone(), target]);
+    assert!(
+        !validator.is_valid(&multiple_targets),
+        "start output must not contain multiple targets"
+    );
 }
 
 #[test]

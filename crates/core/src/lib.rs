@@ -17,11 +17,14 @@ pub mod encryption;
 pub mod error;
 pub mod lifecycle;
 pub mod object_lock;
+pub mod ops;
 pub mod path;
 pub mod replication;
 pub mod retry;
 pub mod select;
 pub mod traits;
+pub mod transfer;
+pub mod watch;
 
 pub use alias::{
     Alias, AliasManager, RequestHeader, global_request_headers, set_global_request_headers,
@@ -39,10 +42,15 @@ pub use object_lock::{
     BucketObjectLockConfiguration, DefaultRetention, LegalHoldStatus, ObjectLockOptions,
     ObjectRetention, RetentionDuration, RetentionDurationUnit, RetentionMode,
 };
+pub use ops::{
+    HealthApi, HealthProbe, HealthReport, UsageBucket, UsageFailure, UsageReport, UsageScanApi,
+    UsageScanRequest, UsageScope, UsageSnapshotApi, UsageSource,
+};
 pub use path::{ParsedPath, RemotePath, parse_object_path, parse_path};
 pub use replication::{
     BucketTarget, BucketTargetCredentials, ReplicationConfiguration, ReplicationDestination,
-    ReplicationRule, ReplicationRuleStatus,
+    ReplicationResyncStartOptions, ReplicationResyncStartResult, ReplicationResyncState,
+    ReplicationResyncStatus, ReplicationResyncTargetStatus, ReplicationRule, ReplicationRuleStatus,
 };
 pub use retry::{RetryBuilder, is_retryable_error, retry_with_backoff};
 pub use select::{
@@ -57,3 +65,8 @@ pub use traits::{
     NotificationTarget, ObjectInfo, ObjectReadOptions, ObjectStore, ObjectVersion,
     ObjectVersionIdentifier, ObjectVersionListResult,
 };
+pub use transfer::{
+    TransferCandidate, TransferControls, TransferExecutor, TransferOutcome, TransferOutcomeState,
+    TransferPlan, TransferReport, TransferSelection, TransferSummary,
+};
+pub use watch::{WatchApi, WatchEvent, WatchFrame, WatchRequest, WatchSource, WatchStream};

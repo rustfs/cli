@@ -46,7 +46,7 @@ pub struct RmArgs {
     pub dry_run: bool,
 
     /// Remove incomplete multipart uploads older than specified duration
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub incomplete: bool,
 
     /// Remove all matching object versions and delete markers
@@ -78,7 +78,7 @@ struct RmOutput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct RemovalRecord {
+pub(crate) struct RemovalRecord {
     path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     version_id: Option<String>,
@@ -111,8 +111,8 @@ struct RemovalFailureRecord {
 }
 
 #[derive(Debug)]
-struct RemovalError {
-    code: ExitCode,
+pub(crate) struct RemovalError {
+    pub(crate) code: ExitCode,
     removed: Vec<RemovalRecord>,
     failed: Vec<RemovalFailureRecord>,
 }
@@ -568,7 +568,7 @@ async fn delete_single(
     }
 }
 
-async fn delete_recursive(
+pub(crate) async fn delete_recursive(
     client: &S3Client,
     alias_name: &str,
     bucket: &str,
@@ -580,52 +580,62 @@ async fn delete_recursive(
 
     // Collect all objects to delete
     let mut keys_to_delete = Vec::new();
-    let mut continuation_token: Option<String> = None;
+    if args.purge {
+        match list_versions_for_removal(client, &path, true).await {
+            Ok(versions) => {
+                let mut unique_keys = versions
+                    .into_iter()
+                    .map(|version| version.key)
+                    .collect::<HashSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                unique_keys.sort();
+                keys_to_delete = unique_keys;
+            }
+            Err(error) => {
+                let code = exit_code_for_core_error(&error);
+                let message = format!("Failed to list object versions: {error}");
+                report_rm_error(formatter, args, code, &message, None);
+                return Err(RemovalError::failed(
+                    code,
+                    removal_failure(path.to_string(), None, code, message),
+                ));
+            }
+        }
+    } else {
+        let mut continuation_token: Option<String> = None;
+        loop {
+            let options = ListOptions {
+                recursive: true,
+                max_keys: Some(1000),
+                continuation_token: continuation_token.clone(),
+                ..Default::default()
+            };
 
-    loop {
-        let options = ListOptions {
-            recursive: true,
-            max_keys: Some(1000),
-            continuation_token: continuation_token.clone(),
-            ..Default::default()
-        };
-
-        match client.list_objects(&path, options).await {
-            Ok(result) => {
-                for item in result.items {
-                    if !item.is_dir {
-                        keys_to_delete.push(item.key);
+            match client.list_objects(&path, options).await {
+                Ok(result) => {
+                    keys_to_delete.extend(
+                        result
+                            .items
+                            .into_iter()
+                            .filter(|item| !item.is_dir)
+                            .map(|item| item.key),
+                    );
+                    if result.truncated {
+                        continuation_token = result.continuation_token;
+                    } else {
+                        break;
                     }
                 }
-
-                if result.truncated {
-                    continuation_token = result.continuation_token;
-                } else {
-                    break;
-                }
-            }
-            Err(e) => {
-                let err_str = e.to_string();
-                if err_str.contains("NotFound") || err_str.contains("NoSuchBucket") {
-                    let message = format!("Bucket not found: {bucket}");
-                    let code = report_rm_error(
-                        formatter,
-                        args,
-                        ExitCode::NotFound,
-                        &message,
-                        Some("Check the bucket path and retry the remove command."),
-                    );
+                Err(error) => {
+                    let code = exit_code_for_core_error(&error);
+                    let message = format!("Failed to list objects: {error}");
+                    report_rm_error(formatter, args, code, &message, None);
                     return Err(RemovalError::failed(
                         code,
                         removal_failure(path.to_string(), None, code, message),
                     ));
                 }
-                let message = format!("Failed to list objects: {e}");
-                let code = report_rm_error(formatter, args, ExitCode::NetworkError, &message, None);
-                return Err(RemovalError::failed(
-                    code,
-                    removal_failure(path.to_string(), None, code, message),
-                ));
             }
         }
     }
@@ -1204,6 +1214,42 @@ mod tests {
 
         let options = delete_request_options(&args);
         assert!(options.force_delete);
+    }
+
+    #[test]
+    fn test_delete_request_options_do_not_force_delete_for_versions() {
+        let args = RmArgs {
+            paths: vec!["test/bucket/object.txt".to_string()],
+            recursive: false,
+            force: false,
+            dry_run: false,
+            incomplete: false,
+            versions: true,
+            version_id: None,
+            bypass: false,
+            purge: false,
+        };
+
+        let options = delete_request_options(&args);
+        assert!(!options.force_delete);
+    }
+
+    #[test]
+    fn test_delete_request_options_enable_governance_bypass() {
+        let args = RmArgs {
+            paths: vec!["test/bucket/object.txt".to_string()],
+            recursive: false,
+            force: false,
+            dry_run: false,
+            incomplete: false,
+            versions: false,
+            version_id: None,
+            bypass: true,
+            purge: false,
+        };
+
+        let options = delete_request_options(&args);
+        assert!(options.bypass_governance);
     }
 
     #[test]

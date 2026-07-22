@@ -34,15 +34,17 @@ use rc_core::{
     LegalHoldStatus, LifecycleRule, ListObjectVersionsOptions, ListOptions, ListResult,
     NotificationTarget, ObjectEncryptionRequest, ObjectInfo, ObjectLockOptions, ObjectReadOptions,
     ObjectRetention, ObjectStore, ObjectVersion, ObjectVersionIdentifier, ObjectVersionListResult,
-    RemotePath, ReplicationConfiguration, RequestHeader, Result, RetentionDuration,
-    RetentionDurationUnit, RetentionMode, SelectOptions, global_request_headers,
+    RemotePath, ReplicationConfiguration, ReplicationResyncStartOptions,
+    ReplicationResyncStartResult, ReplicationResyncState, ReplicationResyncStatus,
+    ReplicationResyncTargetStatus, RequestHeader, Result, RetentionDuration, RetentionDurationUnit,
+    RetentionMode, SelectOptions, global_request_headers,
 };
 use reqwest::Method;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::str::FromStr;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWrite;
@@ -54,7 +56,21 @@ const SINGLE_PUT_OBJECT_MAX_SIZE: u64 = crate::multipart::DEFAULT_PART_SIZE;
 const S3_SERVICE_NAME: &str = "s3";
 const S3_REPLICATION_XML_NAMESPACE: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 const RUSTFS_FORCE_DELETE_HEADER: &str = "x-rustfs-force-delete";
-static DOWNLOAD_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+const REPLICATION_EXTENSION_BODY_LIMIT: u64 = 1024 * 1024;
+
+#[derive(Debug, Clone, Copy)]
+enum ObjectWritePrecondition<'a> {
+    None,
+    IfAbsent,
+    IfMatch(&'a str),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PathUploadOptions<'a> {
+    content_type: Option<&'a str>,
+    encryption: Option<&'a ObjectEncryptionRequest>,
+    precondition: ObjectWritePrecondition<'a>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BucketPolicyErrorKind {
@@ -257,6 +273,50 @@ struct ReplicationDestinationXml {
 #[serde(rename_all = "PascalCase")]
 struct ReplicationStatusXml {
     status: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ReplicationResyncResponseDto {
+    #[serde(default)]
+    targets: Vec<ReplicationResyncTargetDto>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ReplicationResyncTargetDto {
+    arn: String,
+    #[serde(rename = "ResetID")]
+    reset_id: String,
+    #[serde(default)]
+    reset_before_date: Option<String>,
+    #[serde(default)]
+    start_time: Option<String>,
+    #[serde(default)]
+    end_time: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    replicated_count: Option<i64>,
+    #[serde(default)]
+    replicated_size: Option<i64>,
+    #[serde(default)]
+    failed_count: Option<i64>,
+    #[serde(default)]
+    failed_size: Option<i64>,
+    #[serde(default)]
+    bucket: Option<String>,
+    #[serde(default)]
+    object: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct S3ExtensionErrorDto {
+    code: String,
+    message: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1124,6 +1184,31 @@ impl S3Client {
         &self.inner
     }
 
+    pub(crate) fn watch_alias(&self) -> &Alias {
+        &self.alias
+    }
+
+    pub(crate) fn watch_http_client(&self) -> &reqwest::Client {
+        &self.xml_http_client
+    }
+
+    pub(crate) fn watch_request_headers(&self) -> &[RequestHeader] {
+        &self.request_headers
+    }
+
+    pub(crate) fn watch_request_host(&self, url: &reqwest::Url) -> Result<String> {
+        self.request_host(url)
+    }
+
+    pub(crate) async fn sign_watch_request(
+        &self,
+        method: &Method,
+        url: &str,
+        headers: &HeaderMap,
+    ) -> Result<HeaderMap> {
+        self.sign_xml_request(method, url, headers, &[]).await
+    }
+
     /// List a single page of object versions and return pagination metadata.
     pub async fn list_object_versions_page(
         &self,
@@ -1323,37 +1408,27 @@ impl S3Client {
                 destination.display()
             ))
         })?;
-        let sequence = DOWNLOAD_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let temporary = parent.join(format!(
-            ".{}.rc-part-{}-{sequence}",
-            file_name.to_string_lossy(),
-            std::process::id()
-        ));
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-            .await
+        let temporary_file = tempfile::Builder::new()
+            .prefix(&format!(".{}.rc-part-", file_name.to_string_lossy()))
+            .tempfile_in(parent)
             .map_err(|error| {
                 Error::General(format!(
-                    "create temporary download '{}': {error}",
-                    temporary.display()
+                    "create temporary download in '{}': {error}",
+                    parent.display()
                 ))
             })?;
+        let (file, temporary) = temporary_file.into_parts();
+        let mut file = tokio::fs::File::from_std(file);
         let mut body = response.body;
         let mut bytes_downloaded = 0u64;
 
         while let Some(chunk) = match body.try_next().await {
             Ok(chunk) => chunk,
             Err(error) => {
-                drop(file);
-                let _ = tokio::fs::remove_file(&temporary).await;
                 return Err(Error::Network(error.to_string()));
             }
         } {
             if let Err(error) = file.write_all(&chunk).await {
-                drop(file);
-                let _ = tokio::fs::remove_file(&temporary).await;
                 return Err(Error::General(format!(
                     "write download destination '{}': {error}",
                     destination.display()
@@ -1364,8 +1439,6 @@ impl S3Client {
         }
 
         if let Err(error) = file.flush().await {
-            drop(file);
-            let _ = tokio::fs::remove_file(&temporary).await;
             return Err(Error::General(format!(
                 "flush download destination '{}': {error}",
                 destination.display()
@@ -1373,23 +1446,13 @@ impl S3Client {
         }
 
         drop(file);
-        let rename_result = tokio::fs::rename(&temporary, destination).await;
-        #[cfg(windows)]
-        let rename_result = match rename_result {
-            Ok(()) => Ok(()),
-            Err(_) if tokio::fs::try_exists(destination).await.unwrap_or(false) => {
-                tokio::fs::remove_file(destination).await?;
-                tokio::fs::rename(&temporary, destination).await
-            }
-            Err(error) => Err(error),
-        };
-        if let Err(error) = rename_result {
-            let _ = tokio::fs::remove_file(&temporary).await;
-            return Err(Error::General(format!(
-                "replace download destination '{}': {error}",
-                destination.display()
-            )));
-        }
+        temporary.persist(destination).map_err(|error| {
+            Error::General(format!(
+                "atomically replace download destination '{}': {}",
+                destination.display(),
+                error.error
+            ))
+        })?;
 
         Ok(bytes_downloaded)
     }
@@ -1563,7 +1626,6 @@ impl S3Client {
                     .insert(RUSTFS_FORCE_DELETE_HEADER, "true");
             });
         }
-
         let response = request.send().await.map_err(|error| {
             Self::map_object_request_error(&error, path, options.version_id.as_deref())
         })?;
@@ -1670,7 +1732,6 @@ impl S3Client {
                     .insert(RUSTFS_FORCE_DELETE_HEADER, "true");
             });
         }
-
         let first = &objects[0];
         let error_path = RemotePath::new(&self.alias.name, bucket, &first.key);
         let response = request.send().await.map_err(|error| {
@@ -1711,19 +1772,24 @@ impl S3Client {
     }
 
     /// Format AWS SDK error into a detailed error message
-    fn format_sdk_error<E: std::fmt::Display>(error: &aws_sdk_s3::error::SdkError<E>) -> String {
+    fn format_sdk_error<E>(error: &aws_sdk_s3::error::SdkError<E>) -> String
+    where
+        E: std::fmt::Display + ProvideErrorMetadata,
+    {
         match error {
             aws_sdk_s3::error::SdkError::ServiceError(service_err) => {
                 let err = service_err.err();
                 let meta = service_err.raw();
-                let mut msg = format!("Service error: {}", err);
-                // Try to extract additional error information from headers
-                if let Some(code) = meta.headers().get("x-amz-error-code")
-                    && let Ok(code_str) = std::str::from_utf8(code.as_bytes())
-                {
-                    msg.push_str(&format!(" (code: {})", code_str));
+                let header_code = meta
+                    .headers()
+                    .get("x-amz-error-code")
+                    .and_then(|value| std::str::from_utf8(value.as_bytes()).ok());
+                let code = err.code().or(header_code);
+                let mut details = vec![format!("status: {}", meta.status().as_u16())];
+                if let Some(code) = code {
+                    details.push(format!("code: {code}"));
                 }
-                msg
+                format!("Service error: {err} ({})", details.join(", "))
             }
             aws_sdk_s3::error::SdkError::ConstructionFailure(err) => {
                 format!("Request construction failed: {:?}", err)
@@ -2047,6 +2113,217 @@ impl S3Client {
 
         url.set_query(Some("replication="));
         Ok(url)
+    }
+
+    fn replication_extension_url(
+        &self,
+        bucket: &str,
+        marker: &str,
+        query: &[(&str, String)],
+    ) -> Result<reqwest::Url> {
+        let mut url =
+            reqwest::Url::parse(self.alias.endpoint.trim_end_matches('/')).map_err(|error| {
+                Error::Network(format!(
+                    "Invalid endpoint '{}': {error}",
+                    self.alias.endpoint
+                ))
+            })?;
+        {
+            let mut segments = url.path_segments_mut().map_err(|_| {
+                Error::Network(format!(
+                    "Endpoint '{}' does not support path-style bucket operations",
+                    self.alias.endpoint
+                ))
+            })?;
+            segments.pop_if_empty();
+            segments.push(bucket);
+        }
+
+        url.set_query(Some(marker));
+        if !query.is_empty() {
+            let mut serializer = url.query_pairs_mut();
+            for (name, value) in query {
+                serializer.append_pair(name, value);
+            }
+        }
+        Ok(url)
+    }
+
+    async fn signed_replication_extension_request(
+        &self,
+        method: Method,
+        url: reqwest::Url,
+    ) -> Result<Vec<u8>> {
+        let body = [];
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-amz-content-sha256",
+            HeaderValue::from_str(&Self::sha256_hash(&body))
+                .map_err(|error| Error::Auth(format!("Invalid content hash header: {error}")))?,
+        );
+        headers.insert(
+            "host",
+            HeaderValue::from_str(&self.request_host(&url)?)
+                .map_err(|error| Error::Auth(format!("Invalid host header: {error}")))?,
+        );
+        for header in &self.request_headers {
+            let name = HeaderName::from_bytes(header.name.as_bytes())
+                .map_err(|error| Error::Auth(format!("Invalid custom header name: {error}")))?;
+            let value = HeaderValue::from_str(&header.value)
+                .map_err(|error| Error::Auth(format!("Invalid custom header value: {error}")))?;
+            headers.insert(name, value);
+        }
+
+        let signed_headers = self
+            .sign_xml_request(&method, url.as_str(), &headers, &body)
+            .await?;
+        let mut request = self.xml_http_client.request(method, url);
+        for (name, value) in &signed_headers {
+            request = request.header(name, value);
+        }
+
+        let response = request
+            .send()
+            .await
+            .map_err(|error| Error::Network(format!("Replication request failed: {error}")))?;
+        let status = response.status();
+        if response
+            .content_length()
+            .is_some_and(|length| length > REPLICATION_EXTENSION_BODY_LIMIT)
+        {
+            return Err(Error::General(format!(
+                "Replication response exceeds the {} byte limit",
+                REPLICATION_EXTENSION_BODY_LIMIT
+            )));
+        }
+
+        let mut bytes = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.try_next().await.map_err(|error| {
+            Error::Network(format!("Failed to read replication response: {error}"))
+        })? {
+            let next_len = bytes.len().saturating_add(chunk.len());
+            if next_len as u64 > REPLICATION_EXTENSION_BODY_LIMIT {
+                return Err(Error::General(format!(
+                    "Replication response exceeds the {} byte limit",
+                    REPLICATION_EXTENSION_BODY_LIMIT
+                )));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+
+        if !status.is_success() {
+            return Err(self.map_replication_extension_error(status, &bytes));
+        }
+        Ok(bytes)
+    }
+
+    fn map_replication_extension_error(&self, status: reqwest::StatusCode, body: &[u8]) -> Error {
+        let text = String::from_utf8_lossy(body);
+        let parsed = from_xml_str::<S3ExtensionErrorDto>(&text).ok();
+        let code = parsed.as_ref().map(|error| error.code.as_str());
+        let detail = parsed
+            .as_ref()
+            .map(|error| error.message.trim())
+            .filter(|message| !message.is_empty())
+            .unwrap_or_else(|| text.trim());
+        let mut message = if detail.is_empty() {
+            format!("HTTP {}", status.as_u16())
+        } else if let Some(code) = code {
+            format!("{code}: {detail}")
+        } else {
+            format!("HTTP {}: {detail}", status.as_u16())
+        };
+        for sensitive in [&self.alias.access_key, &self.alias.secret_key] {
+            if !sensitive.is_empty() {
+                message = message.replace(sensitive, "[REDACTED]");
+            }
+        }
+
+        if status == reqwest::StatusCode::UNAUTHORIZED
+            || status == reqwest::StatusCode::FORBIDDEN
+            || matches!(code, Some("AccessDenied" | "Unauthorized" | "Forbidden"))
+        {
+            Error::Auth(message)
+        } else if status == reqwest::StatusCode::NOT_IMPLEMENTED
+            || status == reqwest::StatusCode::METHOD_NOT_ALLOWED
+            || matches!(code, Some("NotImplemented" | "MethodNotAllowed"))
+        {
+            Error::UnsupportedFeature(message)
+        } else if matches!(
+            code,
+            Some(
+                "NoSuchBucket"
+                    | "ReplicationConfigurationNotFoundError"
+                    | "ReplicationConfigurationNotFound"
+            )
+        ) {
+            Error::NotFound(message)
+        } else if status == reqwest::StatusCode::NOT_FOUND {
+            Error::UnsupportedFeature(message)
+        } else if status == reqwest::StatusCode::CONFLICT
+            || status == reqwest::StatusCode::BAD_REQUEST
+            || matches!(code, Some("InvalidRequest" | "InvalidBucketState"))
+        {
+            Error::Conflict(message)
+        } else if status.is_server_error() {
+            Error::Network(message)
+        } else {
+            Error::General(message)
+        }
+    }
+
+    fn parse_replication_timestamp(
+        value: Option<String>,
+        field: &str,
+    ) -> Result<Option<jiff::Timestamp>> {
+        value
+            .map(|value| {
+                jiff::Timestamp::from_str(&value).map_err(|error| {
+                    Error::General(format!("Malformed replication {field}: {error}"))
+                })
+            })
+            .transpose()
+    }
+
+    fn convert_resync_status_target(
+        target: ReplicationResyncTargetDto,
+    ) -> Result<ReplicationResyncTargetStatus> {
+        if target.arn.is_empty() {
+            return Err(Error::General(
+                "Malformed replication status target: missing ARN".to_string(),
+            ));
+        }
+        let server_state = target.status.unwrap_or_default();
+        let state = ReplicationResyncState::from_server(&server_state);
+        let nonnegative = |value: Option<i64>, field: &str| {
+            u64::try_from(value.unwrap_or_default()).map_err(|_| {
+                Error::General(format!("Malformed replication status: negative {field}"))
+            })
+        };
+
+        Ok(ReplicationResyncTargetStatus {
+            target_arn: target.arn,
+            reset_id: target.reset_id,
+            reset_before: Self::parse_replication_timestamp(
+                target.reset_before_date,
+                "reset-before timestamp",
+            )?,
+            started_at: Self::parse_replication_timestamp(target.start_time, "start timestamp")?,
+            last_updated_at: Self::parse_replication_timestamp(
+                target.end_time,
+                "last-update timestamp",
+            )?,
+            state,
+            server_state,
+            replicated_count: nonnegative(target.replicated_count, "replicated count")?,
+            replicated_size: nonnegative(target.replicated_size, "replicated size")?,
+            failed_count: nonnegative(target.failed_count, "failed count")?,
+            failed_size: nonnegative(target.failed_size, "failed size")?,
+            current_bucket: target.bucket.filter(|value| !value.is_empty()),
+            current_object: target.object.filter(|value| !value.is_empty()),
+            error: target.error.filter(|value| !value.is_empty()),
+        })
     }
 
     fn cors_url(&self, bucket: &str) -> Result<reqwest::Url> {
@@ -2394,9 +2671,8 @@ impl S3Client {
         &self,
         path: &RemotePath,
         file_path: &std::path::Path,
-        content_type: Option<&str>,
         file_size: u64,
-        encryption: Option<&ObjectEncryptionRequest>,
+        options: PathUploadOptions<'_>,
     ) -> Result<ObjectInfo> {
         let data = tokio::fs::read(file_path)
             .await
@@ -2409,17 +2685,28 @@ impl S3Client {
                 .bucket(&path.bucket)
                 .key(&path.key)
                 .body(body),
-            encryption,
+            options.encryption,
         );
 
-        if let Some(ct) = content_type {
+        if let Some(ct) = options.content_type {
             request = request.content_type(ct);
         }
+        request = match options.precondition {
+            ObjectWritePrecondition::None => request,
+            ObjectWritePrecondition::IfAbsent => request.if_none_match("*"),
+            ObjectWritePrecondition::IfMatch(etag) => request.if_match(etag),
+        };
 
-        let response = request
-            .send()
-            .await
-            .map_err(|e| Error::Network(e.to_string()))?;
+        let response = request.send().await.map_err(|error| {
+            if !matches!(options.precondition, ObjectWritePrecondition::None)
+                && let aws_sdk_s3::error::SdkError::ServiceError(service_error) = &error
+                && matches!(service_error.raw().status().as_u16(), 409 | 412)
+            {
+                Error::Conflict(format!("Object changed before upload: {path}"))
+            } else {
+                Error::Network(Self::format_sdk_error(&error))
+            }
+        })?;
 
         let mut info = ObjectInfo::file(&path.key, file_size as i64);
         if let Some(etag) = response.e_tag() {
@@ -2446,9 +2733,8 @@ impl S3Client {
         &self,
         path: &RemotePath,
         file_path: &std::path::Path,
-        content_type: Option<&str>,
         file_size: u64,
-        encryption: Option<&ObjectEncryptionRequest>,
+        options: PathUploadOptions<'_>,
         on_progress: impl Fn(u64) + Send,
     ) -> Result<ObjectInfo> {
         use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
@@ -2470,7 +2756,7 @@ impl S3Client {
             .bucket(&path.bucket)
             .key(&path.key);
 
-        create_request = match encryption {
+        create_request = match options.encryption {
             Some(ObjectEncryptionRequest::SseS3) => create_request
                 .server_side_encryption(aws_sdk_s3::types::ServerSideEncryption::Aes256),
             Some(ObjectEncryptionRequest::SseKms { key_id }) => create_request
@@ -2479,7 +2765,7 @@ impl S3Client {
             None => create_request,
         };
 
-        if let Some(ct) = content_type {
+        if let Some(ct) = options.content_type {
             create_request = create_request.content_type(ct);
         }
 
@@ -2508,7 +2794,10 @@ impl S3Client {
                     return Err(error);
                 }
             };
-            if bytes_read == 0 {
+            // A conditional zero-byte write still needs a multipart completion
+            // request, because RustFS evaluates destination preconditions there.
+            // S3 permits the final part to be smaller than the minimum part size.
+            if bytes_read == 0 && !(file_size == 0 && part_number == 1) {
                 break;
             }
 
@@ -2570,23 +2859,38 @@ impl S3Client {
         let completed_upload = CompletedMultipartUpload::builder()
             .set_parts(Some(completed_parts))
             .build();
-        let complete_result = self
+        let mut complete_request = self
             .inner
             .complete_multipart_upload()
             .bucket(&path.bucket)
             .key(&path.key)
             .upload_id(&upload_id)
-            .multipart_upload(completed_upload)
-            .send()
-            .await;
+            .multipart_upload(completed_upload);
+        complete_request = match options.precondition {
+            ObjectWritePrecondition::None => complete_request,
+            ObjectWritePrecondition::IfAbsent => complete_request.if_none_match("*"),
+            ObjectWritePrecondition::IfMatch(etag) => complete_request.if_match(etag),
+        };
+        let complete_result = complete_request.send().await;
 
         let complete_response = match complete_result {
             Ok(response) => response,
-            Err(e) => {
+            Err(error) => {
                 tracing::debug!(upload_id = %upload_id, "Attempting to abort multipart upload after completion failure");
                 self.abort_multipart_upload_best_effort(path, &upload_id)
                     .await;
-                return Err(Error::Network(format!("complete multipart upload: {e}")));
+                if !matches!(options.precondition, ObjectWritePrecondition::None)
+                    && let aws_sdk_s3::error::SdkError::ServiceError(service_error) = &error
+                    && matches!(service_error.raw().status().as_u16(), 409 | 412)
+                {
+                    return Err(Error::Conflict(format!(
+                        "Object changed before upload: {path}"
+                    )));
+                }
+                return Err(Error::Network(format!(
+                    "complete multipart upload: {}",
+                    Self::format_sdk_error(&error)
+                )));
             }
         };
 
@@ -2614,6 +2918,71 @@ impl S3Client {
         encryption: Option<&ObjectEncryptionRequest>,
         on_progress: impl Fn(u64) + Send,
     ) -> Result<ObjectInfo> {
+        self.put_object_from_path_with_condition(
+            path,
+            file_path,
+            content_type,
+            encryption,
+            ObjectWritePrecondition::None,
+            on_progress,
+        )
+        .await
+    }
+
+    /// Upload a local file path only when the destination object does not exist.
+    ///
+    /// The precondition is applied to `PutObject` for single-part uploads and to
+    /// `CompleteMultipartUpload` for multipart uploads, so a concurrent writer
+    /// cannot be overwritten between mirror planning and completion.
+    pub async fn put_object_from_path_if_absent(
+        &self,
+        path: &RemotePath,
+        file_path: &std::path::Path,
+        content_type: Option<&str>,
+        encryption: Option<&ObjectEncryptionRequest>,
+        on_progress: impl Fn(u64) + Send,
+    ) -> Result<ObjectInfo> {
+        self.put_object_from_path_with_condition(
+            path,
+            file_path,
+            content_type,
+            encryption,
+            ObjectWritePrecondition::IfAbsent,
+            on_progress,
+        )
+        .await
+    }
+
+    /// Upload a local file path only when the destination still has `etag`.
+    pub async fn put_object_from_path_if_match(
+        &self,
+        path: &RemotePath,
+        file_path: &std::path::Path,
+        content_type: Option<&str>,
+        encryption: Option<&ObjectEncryptionRequest>,
+        etag: &str,
+        on_progress: impl Fn(u64) + Send,
+    ) -> Result<ObjectInfo> {
+        self.put_object_from_path_with_condition(
+            path,
+            file_path,
+            content_type,
+            encryption,
+            ObjectWritePrecondition::IfMatch(etag),
+            on_progress,
+        )
+        .await
+    }
+
+    async fn put_object_from_path_with_condition(
+        &self,
+        path: &RemotePath,
+        file_path: &std::path::Path,
+        content_type: Option<&str>,
+        encryption: Option<&ObjectEncryptionRequest>,
+        precondition: ObjectWritePrecondition<'_>,
+        on_progress: impl Fn(u64) + Send,
+    ) -> Result<ObjectInfo> {
         let metadata = tokio::fs::metadata(file_path).await.map_err(|e| {
             Error::General(format!("read metadata for '{}': {e}", file_path.display()))
         })?;
@@ -2625,25 +2994,23 @@ impl S3Client {
         }
 
         let file_size = metadata.len();
-        if Self::should_use_multipart(file_size) {
-            self.put_object_multipart_from_path(
-                path,
-                file_path,
-                content_type,
-                file_size,
-                encryption,
-                on_progress,
-            )
-            .await
+        let options = PathUploadOptions {
+            content_type,
+            encryption,
+            precondition,
+        };
+        // RustFS evaluates write preconditions for multipart completion. Keep
+        // ordinary small uploads on PutObject, but route conditional path writes
+        // through multipart so mirror retains compare-and-swap semantics on the
+        // currently deployed service.
+        if Self::should_use_multipart(file_size)
+            || !matches!(precondition, ObjectWritePrecondition::None)
+        {
+            self.put_object_multipart_from_path(path, file_path, file_size, options, on_progress)
+                .await
         } else {
-            self.put_object_single_part_from_path(
-                path,
-                file_path,
-                content_type,
-                file_size,
-                encryption,
-            )
-            .await
+            self.put_object_single_part_from_path(path, file_path, file_size, options)
+                .await
         }
     }
 }
@@ -2745,7 +3112,11 @@ impl ObjectStore for S3Client {
 
         let response = request.send().await.map_err(|e| {
             let err_str = Self::format_sdk_error(&e);
-            if err_str.contains("NotFound") || err_str.contains("NoSuchBucket") {
+            if let aws_sdk_s3::error::SdkError::ServiceError(service_error) = &e
+                && matches!(service_error.raw().status().as_u16(), 401 | 403)
+            {
+                Error::Auth(err_str)
+            } else if err_str.contains("NotFound") || err_str.contains("NoSuchBucket") {
                 Error::NotFound(format!("Bucket not found: {}", path.bucket))
             } else {
                 Error::Network(err_str)
@@ -4197,6 +4568,90 @@ impl ObjectStore for S3Client {
         Ok(())
     }
 
+    async fn check_bucket_replication(&self, bucket: &str) -> Result<()> {
+        let url = self.replication_extension_url(bucket, "replication-check", &[])?;
+        let body = self
+            .signed_replication_extension_request(Method::GET, url)
+            .await?;
+        if !body.is_empty() {
+            return Err(Error::General(
+                "Malformed replication check response: expected an empty body".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn start_bucket_replication_resync(
+        &self,
+        bucket: &str,
+        options: ReplicationResyncStartOptions,
+    ) -> Result<ReplicationResyncStartResult> {
+        let mut query = Vec::new();
+        if let Some(target_arn) = options.target_arn {
+            query.push(("arn", target_arn));
+        }
+        if let Some(older_than) = options.older_than {
+            query.push((
+                "older-than",
+                humantime::format_duration(older_than).to_string(),
+            ));
+        }
+        if let Some(reset_id) = options.reset_id {
+            query.push(("reset-id", reset_id));
+        }
+        let url = self.replication_extension_url(bucket, "replication-reset", &query)?;
+        let body = self
+            .signed_replication_extension_request(Method::PUT, url)
+            .await?;
+        let mut response: ReplicationResyncResponseDto =
+            serde_json::from_slice(&body).map_err(|error| {
+                Error::General(format!("Malformed replication start response: {error}"))
+            })?;
+        if response.targets.len() != 1 {
+            return Err(Error::General(format!(
+                "Malformed replication start response: expected one target, got {}",
+                response.targets.len()
+            )));
+        }
+        let target = response
+            .targets
+            .pop()
+            .expect("one target was verified before removing it");
+        if target.arn.is_empty() || target.reset_id.is_empty() {
+            return Err(Error::General(
+                "Malformed replication start response: missing ARN or reset ID".to_string(),
+            ));
+        }
+        Ok(ReplicationResyncStartResult {
+            target_arn: target.arn,
+            reset_id: target.reset_id,
+        })
+    }
+
+    async fn bucket_replication_resync_status(
+        &self,
+        bucket: &str,
+        target_arn: Option<&str>,
+    ) -> Result<ReplicationResyncStatus> {
+        let query = target_arn
+            .map(|target_arn| vec![("arn", target_arn.to_string())])
+            .unwrap_or_default();
+        let url = self.replication_extension_url(bucket, "replication-reset-status", &query)?;
+        let body = self
+            .signed_replication_extension_request(Method::GET, url)
+            .await?;
+        let response: ReplicationResyncResponseDto =
+            serde_json::from_slice(&body).map_err(|error| {
+                Error::General(format!("Malformed replication status response: {error}"))
+            })?;
+        let targets = response
+            .targets
+            .into_iter()
+            .map(Self::convert_resync_status_target)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(ReplicationResyncStatus { targets })
+    }
+
     async fn select_object_content(
         &self,
         path: &RemotePath,
@@ -4210,7 +4665,9 @@ impl ObjectStore for S3Client {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aws_smithy_http_client::test_util::{CaptureRequestReceiver, capture_request};
+    use aws_smithy_http_client::test_util::{
+        CaptureRequestReceiver, ReplayEvent, StaticReplayClient, capture_request,
+    };
     use std::collections::HashMap;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
@@ -4271,15 +4728,78 @@ mod tests {
         let config = config_builder.build();
 
         let alias = Alias::new("test", endpoint, "access-key", "secret-key");
+        let xml_http_client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("build redirect-disabled XML test client");
         let client = S3Client {
             inner: aws_sdk_s3::Client::from_conf(config),
             presign_inner: aws_sdk_s3::Client::from_conf(presign_config),
-            xml_http_client: reqwest::Client::new(),
+            xml_http_client,
             alias,
             request_headers,
         };
 
         (client, request_receiver)
+    }
+
+    fn test_s3_client_with_response_sequence(
+        responses: Vec<http::Response<SdkBody>>,
+    ) -> (S3Client, StaticReplayClient) {
+        let events = responses
+            .into_iter()
+            .enumerate()
+            .map(|(index, response)| {
+                let request = http::Request::builder()
+                    .uri(format!("https://example.com/expected-{index}"))
+                    .body(SdkBody::empty())
+                    .expect("build replay request");
+                ReplayEvent::new(request, response)
+            })
+            .collect();
+        let replay = StaticReplayClient::new(events);
+        let credentials = Credentials::new(
+            "access-key",
+            "secret-key",
+            None,
+            None,
+            "rc-test-credentials",
+        );
+        let config = aws_sdk_s3::config::Builder::new()
+            .credentials_provider(credentials)
+            .endpoint_url("https://example.com")
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .force_path_style(true)
+            .retry_config(aws_smithy_types::retry::RetryConfig::disabled())
+            .behavior_version_latest()
+            .http_client(replay.clone())
+            .build();
+        let alias = Alias::new("test", "https://example.com", "access-key", "secret-key");
+        let client = S3Client {
+            inner: aws_sdk_s3::Client::from_conf(config.clone()),
+            presign_inner: aws_sdk_s3::Client::from_conf(config),
+            xml_http_client: reqwest::Client::new(),
+            alias,
+            request_headers: Vec::new(),
+        };
+        (client, replay)
+    }
+
+    #[tokio::test]
+    async fn head_object_maps_bare_http_404_to_not_found() {
+        let response = http::Response::builder()
+            .status(404)
+            .body(SdkBody::empty())
+            .expect("build head object response");
+        let (client, _) = test_s3_client(Some(response));
+        let path = RemotePath::new("test", "bucket", "missing.txt");
+
+        let result = client.head_object(&path).await;
+
+        assert!(
+            matches!(result, Err(Error::NotFound(_))),
+            "unexpected result: {result:?}"
+        );
     }
 
     fn read_xml_request(stream: &mut TcpStream) -> CapturedXmlRequest {
@@ -4367,6 +4887,120 @@ mod tests {
             stream
                 .write_all(response.as_bytes())
                 .expect("write HTTP response");
+        });
+
+        (endpoint, receiver, handle)
+    }
+
+    fn start_replication_extension_test_server(
+        response: Vec<u8>,
+    ) -> (
+        String,
+        mpsc::Receiver<CapturedXmlRequest>,
+        thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        let (sender, receiver) = mpsc::channel();
+
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("set request timeout");
+            let request = read_xml_request(&mut stream);
+            sender.send(request).expect("send captured request");
+            stream.write_all(&response).expect("write response");
+        });
+
+        (endpoint, receiver, handle)
+    }
+
+    fn start_repeated_replication_extension_test_server(
+        response: Vec<u8>,
+        request_count: usize,
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+
+        let handle = thread::spawn(move || {
+            for _ in 0..request_count {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .expect("set request timeout");
+                let _ = read_xml_request(&mut stream);
+                stream.write_all(&response).expect("write response");
+            }
+        });
+
+        (endpoint, handle)
+    }
+
+    fn start_counting_replication_extension_test_server(
+        first_response: Vec<u8>,
+    ) -> (String, mpsc::Receiver<usize>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        listener
+            .set_nonblocking(true)
+            .expect("configure nonblocking listener");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        let (sender, receiver) = mpsc::channel();
+
+        let handle = thread::spawn(move || {
+            let first_deadline = Instant::now() + Duration::from_secs(5);
+            let mut first_stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < first_deadline,
+                            "timed out waiting for request"
+                        );
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept request: {error}"),
+                }
+            };
+            first_stream
+                .set_nonblocking(false)
+                .expect("configure blocking request stream");
+            let _ = read_xml_request(&mut first_stream);
+            first_stream
+                .write_all(&first_response)
+                .expect("write first response");
+            drop(first_stream);
+
+            let mut request_count = 1;
+            let follow_up_deadline = Instant::now() + Duration::from_millis(500);
+            while Instant::now() < follow_up_deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        request_count += 1;
+                        stream
+                            .set_nonblocking(false)
+                            .expect("configure blocking follow-up stream");
+                        let _ = read_xml_request(&mut stream);
+                        let success_body =
+                            br#"{"Targets":[{"Arn":"arn:target","ResetID":"server-id"}]}"#;
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                            success_body.len()
+                        );
+                        stream
+                            .write_all(response.as_bytes())
+                            .expect("write follow-up response headers");
+                        stream
+                            .write_all(success_body)
+                            .expect("write follow-up response body");
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept follow-up request: {error}"),
+                }
+            }
+            sender.send(request_count).expect("send request count");
         });
 
         (endpoint, receiver, handle)
@@ -5342,7 +5976,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn conditional_mirror_writes_and_deletes_set_precondition_headers() {
+    async fn conditional_buffer_writes_and_deletes_set_precondition_headers() {
         let put_response = http::Response::builder()
             .status(200)
             .body(SdkBody::from(""))
@@ -5368,6 +6002,249 @@ mod tests {
             .expect("conditional delete");
         let delete_request = delete_request_receiver.expect_request();
         assert_eq!(delete_request.headers().get("if-match"), Some("etag-value"));
+    }
+
+    #[tokio::test]
+    async fn conditional_path_writes_complete_with_precondition_headers() {
+        let complete_response = || {
+            http::Response::builder()
+                .status(200)
+                .header("content-type", "application/xml")
+                .body(SdkBody::from(
+                    r#"<CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>bucket</Bucket><Key>key.txt</Key><ETag>"final-etag"</ETag></CompleteMultipartUploadResult>"#,
+                ))
+                .expect("build multipart complete response")
+        };
+        let path = RemotePath::new("test", "bucket", "key.txt");
+        let mut source = tempfile::NamedTempFile::new().expect("create upload source");
+        source.write_all(b"path-data").expect("write upload source");
+
+        let (path_upload_client, path_upload_replay) = test_s3_client_with_response_sequence(vec![
+            multipart_create_response(),
+            multipart_part_response(),
+            complete_response(),
+        ]);
+        path_upload_client
+            .put_object_from_path_if_absent(&path, source.path(), None, None, |_| {})
+            .await
+            .expect("conditional path upload");
+        let path_upload_requests = path_upload_replay.actual_requests().collect::<Vec<_>>();
+        assert_eq!(path_upload_requests.len(), 3);
+        assert_eq!(
+            path_upload_requests[2].headers().get("if-none-match"),
+            Some("*")
+        );
+
+        let (matched_upload_client, matched_upload_replay) =
+            test_s3_client_with_response_sequence(vec![
+                multipart_create_response(),
+                multipart_part_response(),
+                complete_response(),
+            ]);
+        matched_upload_client
+            .put_object_from_path_if_match(
+                &path,
+                source.path(),
+                None,
+                None,
+                "expected-etag",
+                |_| {},
+            )
+            .await
+            .expect("matched path upload");
+        let matched_upload_requests = matched_upload_replay.actual_requests().collect::<Vec<_>>();
+        assert_eq!(matched_upload_requests.len(), 3);
+        assert_eq!(
+            matched_upload_requests[2].headers().get("if-match"),
+            Some("expected-etag")
+        );
+    }
+
+    #[tokio::test]
+    async fn conditional_empty_path_write_uploads_one_empty_part() {
+        let complete_response = http::Response::builder()
+            .status(200)
+            .header("content-type", "application/xml")
+            .body(SdkBody::from(
+                r#"<CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>bucket</Bucket><Key>empty.txt</Key><ETag>"final-etag"</ETag></CompleteMultipartUploadResult>"#,
+            ))
+            .expect("build multipart complete response");
+        let (client, replay) = test_s3_client_with_response_sequence(vec![
+            multipart_create_response(),
+            multipart_part_response(),
+            complete_response,
+        ]);
+        let path = RemotePath::new("test", "bucket", "empty.txt");
+        let source = tempfile::NamedTempFile::new().expect("create empty upload source");
+
+        client
+            .put_object_from_path_if_absent(&path, source.path(), None, None, |_| {})
+            .await
+            .expect("conditional empty path upload");
+
+        let requests = replay.actual_requests().collect::<Vec<_>>();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[1].uri().contains("partNumber=1"));
+        assert_eq!(requests[2].headers().get("if-none-match"), Some("*"));
+    }
+
+    fn multipart_create_response() -> http::Response<SdkBody> {
+        http::Response::builder()
+            .status(200)
+            .header("content-type", "application/xml")
+            .body(SdkBody::from(
+                r#"<InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>bucket</Bucket><Key>key.txt</Key><UploadId>upload-id</UploadId></InitiateMultipartUploadResult>"#,
+            ))
+            .expect("build multipart create response")
+    }
+
+    fn multipart_part_response() -> http::Response<SdkBody> {
+        http::Response::builder()
+            .status(200)
+            .header("etag", "\"part-etag\"")
+            .body(SdkBody::empty())
+            .expect("build multipart part response")
+    }
+
+    #[tokio::test]
+    async fn conditional_multipart_completion_sets_if_none_match() {
+        let complete_response = http::Response::builder()
+            .status(200)
+            .header("content-type", "application/xml")
+            .body(SdkBody::from(
+                r#"<CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>bucket</Bucket><Key>key.txt</Key><ETag>"final-etag"</ETag></CompleteMultipartUploadResult>"#,
+            ))
+            .expect("build multipart complete response");
+        let (client, replay) = test_s3_client_with_response_sequence(vec![
+            multipart_create_response(),
+            multipart_part_response(),
+            complete_response,
+        ]);
+        let path = RemotePath::new("test", "bucket", "key.txt");
+        let mut source = tempfile::NamedTempFile::new().expect("create multipart source");
+        source.write_all(b"data").expect("write multipart source");
+
+        client
+            .put_object_multipart_from_path(
+                &path,
+                source.path(),
+                4,
+                PathUploadOptions {
+                    content_type: Some("text/plain"),
+                    encryption: None,
+                    precondition: ObjectWritePrecondition::IfAbsent,
+                },
+                |_| {},
+            )
+            .await
+            .expect("complete conditional multipart upload");
+
+        let requests = replay.actual_requests().collect::<Vec<_>>();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[2].headers().get("if-none-match"), Some("*"));
+        assert!(requests[2].uri().contains("uploadId=upload-id"));
+    }
+
+    #[tokio::test]
+    async fn conditional_multipart_conflicts_are_mapped_and_aborted() {
+        for (status, code) in [
+            (409_u16, "ConditionalRequestConflict"),
+            (412_u16, "PreconditionFailed"),
+        ] {
+            let complete_response = http::Response::builder()
+                .status(status)
+                .header("content-type", "application/xml")
+                .header("x-amz-error-code", code)
+                .body(SdkBody::from(format!(
+                    "<Error><Code>{code}</Code><Message>conditional write failed</Message></Error>"
+                )))
+                .expect("build multipart conflict response");
+            let abort_response = http::Response::builder()
+                .status(204)
+                .body(SdkBody::empty())
+                .expect("build multipart abort response");
+            let (client, replay) = test_s3_client_with_response_sequence(vec![
+                multipart_create_response(),
+                multipart_part_response(),
+                complete_response,
+                abort_response,
+            ]);
+            let path = RemotePath::new("test", "bucket", "key.txt");
+            let mut source = tempfile::NamedTempFile::new().expect("create multipart source");
+            source.write_all(b"data").expect("write multipart source");
+
+            let result = client
+                .put_object_multipart_from_path(
+                    &path,
+                    source.path(),
+                    4,
+                    PathUploadOptions {
+                        content_type: None,
+                        encryption: None,
+                        precondition: ObjectWritePrecondition::IfMatch("expected-etag"),
+                    },
+                    |_| {},
+                )
+                .await;
+
+            assert!(matches!(result, Err(Error::Conflict(_))), "status {status}");
+            let requests = replay.actual_requests().collect::<Vec<_>>();
+            assert_eq!(requests.len(), 4, "status {status}");
+            assert_eq!(
+                requests[2].headers().get("if-match"),
+                Some("expected-etag"),
+                "status {status}"
+            );
+            assert_eq!(requests[3].method(), "DELETE", "status {status}");
+            assert!(
+                requests[3].uri().contains("uploadId=upload-id"),
+                "status {status}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn conditional_multipart_service_errors_preserve_response_metadata() {
+        let complete_response = http::Response::builder()
+            .status(500)
+            .header("content-type", "application/xml")
+            .body(SdkBody::from(
+                "<Error><Code>InternalError</Code><Message>conditional completion failed</Message></Error>",
+            ))
+            .expect("build multipart service error response");
+        let abort_response = http::Response::builder()
+            .status(204)
+            .body(SdkBody::empty())
+            .expect("build multipart abort response");
+        let (client, _) = test_s3_client_with_response_sequence(vec![
+            multipart_create_response(),
+            multipart_part_response(),
+            complete_response,
+            abort_response,
+        ]);
+        let path = RemotePath::new("test", "bucket", "key.txt");
+        let mut source = tempfile::NamedTempFile::new().expect("create multipart source");
+        source.write_all(b"data").expect("write multipart source");
+
+        let result = client
+            .put_object_multipart_from_path(
+                &path,
+                source.path(),
+                4,
+                PathUploadOptions {
+                    content_type: None,
+                    encryption: None,
+                    precondition: ObjectWritePrecondition::IfAbsent,
+                },
+                |_| {},
+            )
+            .await;
+
+        let Err(Error::Network(message)) = result else {
+            panic!("expected a network error");
+        };
+        assert!(message.contains("status: 500"), "{message}");
+        assert!(message.contains("code: InternalError"), "{message}");
     }
 
     #[tokio::test]
@@ -5639,6 +6516,422 @@ mod tests {
                 .contains("x-amz-bucket-encrypt-enabled")
         );
         server_handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn replication_check_uses_signed_empty_s3_extension_request() {
+        let (endpoint, receiver, handle) = start_replication_extension_test_server(
+            b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_vec(),
+        );
+        let (client, _) = test_s3_client_with_endpoint(&endpoint, None);
+
+        client
+            .check_bucket_replication("source-bucket")
+            .await
+            .expect("replication check should succeed");
+
+        let request = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("capture replication check");
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.target, "/source-bucket?replication-check");
+        assert_eq!(
+            header_value(&request.headers, "x-amz-content-sha256"),
+            Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+        );
+        assert!(
+            header_value(&request.headers, "authorization")
+                .expect("signed request")
+                .contains("/us-east-1/s3/aws4_request")
+        );
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn replication_resync_start_encodes_options_and_preserves_server_id() {
+        let body = br#"{"Targets":[{"Arn":"arn:rustfs:replication::id:dest bucket","ResetID":"server-id"}]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes()
+        .into_iter()
+        .chain(body.iter().copied())
+        .collect();
+        let (endpoint, receiver, handle) = start_replication_extension_test_server(response);
+        let (client, _) = test_s3_client_with_endpoint(&endpoint, None);
+
+        let result = client
+            .start_bucket_replication_resync(
+                "source-bucket",
+                ReplicationResyncStartOptions {
+                    target_arn: Some("arn:rustfs:replication::id:dest bucket".to_string()),
+                    older_than: Some(Duration::from_secs(3600)),
+                    reset_id: None,
+                },
+            )
+            .await
+            .expect("start resync");
+
+        assert_eq!(result.target_arn, "arn:rustfs:replication::id:dest bucket");
+        assert_eq!(result.reset_id, "server-id");
+        let request = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("capture resync start");
+        assert_eq!(request.method, "PUT");
+        assert_eq!(
+            request.target,
+            "/source-bucket?replication-reset&arn=arn%3Arustfs%3Areplication%3A%3Aid%3Adest+bucket&older-than=1h"
+        );
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn replication_resync_start_encodes_caller_reset_id() {
+        let body = br#"{"Targets":[{"Arn":"arn:target","ResetID":"caller id"}]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes()
+        .into_iter()
+        .chain(body.iter().copied())
+        .collect();
+        let (endpoint, receiver, handle) = start_replication_extension_test_server(response);
+        let (client, _) = test_s3_client_with_endpoint(&endpoint, None);
+
+        let result = client
+            .start_bucket_replication_resync(
+                "source-bucket",
+                ReplicationResyncStartOptions {
+                    target_arn: Some("arn:target".to_string()),
+                    older_than: None,
+                    reset_id: Some("caller id".to_string()),
+                },
+            )
+            .await
+            .expect("start resync with caller ID");
+
+        assert_eq!(result.reset_id, "caller id");
+        let request = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("capture resync start");
+        assert_eq!(
+            request.target,
+            "/source-bucket?replication-reset&arn=arn%3Atarget&reset-id=caller+id"
+        );
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn replication_resync_start_does_not_retry_put_after_server_error() {
+        let response =
+            b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                .to_vec();
+        let (endpoint, count_receiver, handle) =
+            start_counting_replication_extension_test_server(response);
+        let (client, _) = test_s3_client_with_endpoint(&endpoint, None);
+
+        let result = client
+            .start_bucket_replication_resync(
+                "source-bucket",
+                ReplicationResyncStartOptions::default(),
+            )
+            .await;
+        let request_count = count_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("receive PUT request count");
+
+        assert_eq!(request_count, 1, "PUT must not be retried");
+        assert!(matches!(result, Err(Error::Network(_))));
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn replication_resync_start_does_not_follow_redirects() {
+        let response = b"HTTP/1.1 307 Temporary Redirect\r\nlocation: /redirected\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            .to_vec();
+        let (endpoint, count_receiver, handle) =
+            start_counting_replication_extension_test_server(response);
+        let (client, _) = test_s3_client_with_endpoint(&endpoint, None);
+
+        let result = client
+            .start_bucket_replication_resync(
+                "source-bucket",
+                ReplicationResyncStartOptions::default(),
+            )
+            .await;
+        let request_count = count_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("receive PUT request count");
+
+        assert_eq!(request_count, 1, "signed PUT must not follow redirects");
+        assert!(matches!(result, Err(Error::General(_))));
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn replication_resync_status_preserves_partial_target_state() {
+        let body = br#"{"Targets":[{"Arn":"arn:target","ResetID":"reset-1","ResetBeforeDate":"2026-07-01T00:00:00Z","StartTime":"2026-07-02T00:00:00Z","EndTime":"2026-07-02T00:01:00Z","Status":"Failed","ReplicatedCount":3,"ReplicatedSize":30,"FailedCount":2,"FailedSize":20,"Bucket":"source-bucket","Object":"last.txt","Error":"target unavailable"}]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes()
+        .into_iter()
+        .chain(body.iter().copied())
+        .collect();
+        let (endpoint, receiver, handle) = start_replication_extension_test_server(response);
+        let (client, _) = test_s3_client_with_endpoint(&endpoint, None);
+
+        let status = client
+            .bucket_replication_resync_status("source-bucket", Some("arn:target"))
+            .await
+            .expect("read status");
+
+        assert_eq!(status.targets.len(), 1);
+        let target = &status.targets[0];
+        assert_eq!(target.state, ReplicationResyncState::Failed);
+        assert_eq!(target.failed_count, 2);
+        assert_eq!(target.current_object.as_deref(), Some("last.txt"));
+        assert_eq!(target.error.as_deref(), Some("target unavailable"));
+        let request = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("capture status request");
+        assert_eq!(
+            request.target,
+            "/source-bucket?replication-reset-status&arn=arn%3Atarget"
+        );
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn replication_resync_status_retains_multiple_unfiltered_targets() {
+        let body = br#"{"Targets":[{"Arn":"arn:a","ResetID":"reset-a","Status":"Pending"},{"Arn":"arn:b","ResetID":"reset-b","Status":"Completed","ReplicatedCount":2}]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes()
+        .into_iter()
+        .chain(body.iter().copied())
+        .collect();
+        let (endpoint, receiver, handle) = start_replication_extension_test_server(response);
+        let (client, _) = test_s3_client_with_endpoint(&endpoint, None);
+
+        let status = client
+            .bucket_replication_resync_status("source-bucket", None)
+            .await
+            .expect("read all target statuses");
+
+        assert_eq!(status.targets.len(), 2);
+        assert_eq!(status.targets[0].target_arn, "arn:a");
+        assert_eq!(status.targets[1].target_arn, "arn:b");
+        assert_eq!(status.targets[1].replicated_count, 2);
+        let request = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("capture unfiltered status request");
+        assert_eq!(request.target, "/source-bucket?replication-reset-status");
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn replication_resync_status_is_readable_from_fresh_clients() {
+        let body = br#"{"Targets":[{"Arn":"arn:target","ResetID":"reset-1","Status":"Ongoing","ReplicatedCount":3}]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes()
+        .into_iter()
+        .chain(body.iter().copied())
+        .collect();
+        let (endpoint, handle) = start_repeated_replication_extension_test_server(response, 2);
+
+        let (first_client, _) = test_s3_client_with_endpoint(&endpoint, None);
+        let first = first_client
+            .bucket_replication_resync_status("source-bucket", None)
+            .await
+            .expect("first client reads persisted status");
+        drop(first_client);
+
+        let (fresh_client, _) = test_s3_client_with_endpoint(&endpoint, None);
+        let fresh = fresh_client
+            .bucket_replication_resync_status("source-bucket", None)
+            .await
+            .expect("fresh client reads persisted status");
+
+        assert_eq!(fresh, first);
+        assert_eq!(fresh.targets[0].state, ReplicationResyncState::Ongoing);
+        handle.join().expect("server thread should finish");
+    }
+
+    #[test]
+    fn replication_resync_status_preserves_empty_and_future_states() {
+        let target = |status: &str| ReplicationResyncTargetDto {
+            arn: "arn:target".to_string(),
+            reset_id: "reset-1".to_string(),
+            reset_before_date: None,
+            start_time: None,
+            end_time: None,
+            status: Some(status.to_string()),
+            replicated_count: Some(0),
+            replicated_size: Some(0),
+            failed_count: Some(0),
+            failed_size: Some(0),
+            bucket: None,
+            object: None,
+            error: None,
+        };
+
+        let empty = S3Client::convert_resync_status_target(target(""))
+            .expect("empty server state is legitimate");
+        let mut missing_status_target = target("Pending");
+        missing_status_target.status = None;
+        let missing = S3Client::convert_resync_status_target(missing_status_target)
+            .expect("omitted server state uses its documented default");
+        let mut empty_reset_id_target = target("Pending");
+        empty_reset_id_target.reset_id.clear();
+        let empty_reset_id = S3Client::convert_resync_status_target(empty_reset_id_target)
+            .expect("persisted status may have an empty reset ID");
+        let future = S3Client::convert_resync_status_target(target("FutureState"))
+            .expect("future server state is preserved");
+
+        assert_eq!(empty.state, ReplicationResyncState::NotStarted);
+        assert_eq!(empty.server_state, "");
+        assert_eq!(missing.state, ReplicationResyncState::NotStarted);
+        assert_eq!(missing.server_state, "");
+        assert_eq!(empty_reset_id.reset_id, "");
+        assert_eq!(future.state, ReplicationResyncState::Unknown);
+        assert_eq!(future.server_state, "FutureState");
+    }
+
+    #[test]
+    fn replication_resync_status_rejects_negative_counters() {
+        let target = ReplicationResyncTargetDto {
+            arn: "arn:target".to_string(),
+            reset_id: "reset-1".to_string(),
+            reset_before_date: None,
+            start_time: None,
+            end_time: None,
+            status: Some("Pending".to_string()),
+            replicated_count: Some(-1),
+            replicated_size: Some(0),
+            failed_count: Some(0),
+            failed_size: Some(0),
+            bucket: None,
+            object: None,
+            error: None,
+        };
+
+        let error = S3Client::convert_resync_status_target(target)
+            .expect_err("negative count must be malformed");
+        assert!(matches!(error, Error::General(_)));
+    }
+
+    #[tokio::test]
+    async fn replication_extension_rejects_declared_oversized_body() {
+        let response =
+            b"HTTP/1.1 200 OK\r\ncontent-length: 1048577\r\nconnection: close\r\n\r\n".to_vec();
+        let (endpoint, _receiver, handle) = start_replication_extension_test_server(response);
+        let (client, _) = test_s3_client_with_endpoint(&endpoint, None);
+
+        let error = client
+            .bucket_replication_resync_status("source-bucket", None)
+            .await
+            .expect_err("oversized response must fail");
+
+        assert!(matches!(error, Error::General(_)));
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn replication_extension_rejects_chunked_oversized_body() {
+        let body = vec![b'x'; REPLICATION_EXTENSION_BODY_LIMIT as usize + 1];
+        let mut response =
+            b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n".to_vec();
+        response.extend_from_slice(format!("{:x}\r\n", body.len()).as_bytes());
+        response.extend_from_slice(&body);
+        response.extend_from_slice(b"\r\n0\r\n\r\n");
+        let (endpoint, _receiver, handle) = start_replication_extension_test_server(response);
+        let (client, _) = test_s3_client_with_endpoint(&endpoint, None);
+
+        let error = client
+            .bucket_replication_resync_status("source-bucket", None)
+            .await
+            .expect_err("chunked oversized response must fail");
+
+        assert!(matches!(error, Error::General(_)));
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn replication_check_rejects_nonempty_success_body() {
+        let response =
+            b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok".to_vec();
+        let (endpoint, _receiver, handle) = start_replication_extension_test_server(response);
+        let (client, _) = test_s3_client_with_endpoint(&endpoint, None);
+
+        let error = client
+            .check_bucket_replication("source-bucket")
+            .await
+            .expect_err("nonempty check response must fail");
+
+        assert!(matches!(error, Error::General(_)));
+        handle.join().expect("server thread should finish");
+    }
+
+    #[test]
+    fn replication_extension_maps_typed_errors_and_redacts_credentials() {
+        let (client, _) = test_s3_client(None);
+        let access_denied = client.map_replication_extension_error(
+            reqwest::StatusCode::FORBIDDEN,
+            b"<Error><Code>AccessDenied</Code><Message>access-key secret-key denied</Message></Error>",
+        );
+        let invalid_request = client.map_replication_extension_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            b"<Error><Code>InvalidRequest</Code><Message>target versioning disabled</Message></Error>",
+        );
+        let missing = client.map_replication_extension_error(
+            reqwest::StatusCode::NOT_FOUND,
+            b"<Error><Code>ReplicationConfigurationNotFoundError</Code><Message>missing</Message></Error>",
+        );
+        let missing_bucket = client.map_replication_extension_error(
+            reqwest::StatusCode::NOT_FOUND,
+            b"<Error><Code>NoSuchBucket</Code><Message>missing bucket</Message></Error>",
+        );
+        let missing_route =
+            client.map_replication_extension_error(reqwest::StatusCode::NOT_FOUND, b"not found");
+        let method_not_allowed = client.map_replication_extension_error(
+            reqwest::StatusCode::METHOD_NOT_ALLOWED,
+            b"method not allowed",
+        );
+        let unsupported = client.map_replication_extension_error(
+            reqwest::StatusCode::NOT_IMPLEMENTED,
+            b"<Error><Code>NotImplemented</Code><Message>unsupported</Message></Error>",
+        );
+        let server_error = client.map_replication_extension_error(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            b"temporarily unavailable",
+        );
+
+        assert!(matches!(access_denied, Error::Auth(_)));
+        let message = access_denied.to_string();
+        assert!(!message.contains("access-key"));
+        assert!(!message.contains("secret-key"));
+        assert!(message.contains("[REDACTED]"));
+        assert!(matches!(invalid_request, Error::Conflict(_)));
+        assert!(
+            invalid_request
+                .to_string()
+                .contains("target versioning disabled")
+        );
+        assert!(matches!(missing, Error::NotFound(_)));
+        assert!(matches!(missing_bucket, Error::NotFound(_)));
+        assert!(matches!(missing_route, Error::UnsupportedFeature(_)));
+        assert!(matches!(method_not_allowed, Error::UnsupportedFeature(_)));
+        assert!(matches!(unsupported, Error::UnsupportedFeature(_)));
+        assert!(matches!(server_error, Error::Network(_)));
     }
 
     #[tokio::test]
@@ -5961,6 +7254,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_object_versions_page_maps_permission_denied_to_auth() {
+        let response = http::Response::builder()
+            .status(403)
+            .header("x-amz-error-code", "AccessDenied")
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>AccessDenied</Code><Message>Access denied.</Message></Error>"#,
+            ))
+            .expect("build access denied response");
+        let (client, _request_receiver) = test_s3_client(Some(response));
+        let path = RemotePath::new("test", "bucket", "");
+
+        let result = client.list_object_versions_page(&path, Some(1000)).await;
+
+        assert!(matches!(result, Err(Error::Auth(_))));
+    }
+
+    #[tokio::test]
+    async fn list_objects_maps_permission_denied_to_auth() {
+        let response = http::Response::builder()
+            .status(403)
+            .header("x-amz-error-code", "AccessDenied")
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>AccessDenied</Code><Message>Access denied.</Message></Error>"#,
+            ))
+            .expect("build access denied response");
+        let (client, _request_receiver) = test_s3_client(Some(response));
+        let path = RemotePath::new("test", "bucket", "");
+
+        let result = client
+            .list_objects(
+                &path,
+                ListOptions {
+                    recursive: true,
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        assert!(matches!(result, Err(Error::Auth(_))));
+    }
+
+    #[tokio::test]
     async fn list_buckets_preserves_service_error_code() {
         let response = http::Response::builder()
             .status(403)
@@ -6151,6 +7488,35 @@ mod tests {
 
         let request = request_receiver.expect_request();
         assert_eq!(request.headers().get("x-rustfs-force-delete"), Some("true"));
+    }
+
+    #[tokio::test]
+    async fn delete_objects_with_bypass_sets_governance_header() {
+        let response = http::Response::builder()
+            .status(200)
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/" />"#,
+            ))
+            .expect("build delete objects response");
+        let (client, request_receiver) = test_s3_client(Some(response));
+
+        let _ = client
+            .delete_objects_with_options(
+                "bucket",
+                vec!["key.txt".to_string()],
+                DeleteRequestOptions {
+                    bypass_governance: true,
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        let request = request_receiver.expect_request();
+        assert_eq!(
+            request.headers().get("x-amz-bypass-governance-retention"),
+            Some("true")
+        );
     }
 
     #[tokio::test]
