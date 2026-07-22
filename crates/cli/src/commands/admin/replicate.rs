@@ -5,6 +5,7 @@
 //! configured alias names; their endpoints and credentials are resolved
 //! from the local alias store.
 
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -17,7 +18,8 @@ use crate::exit_code::ExitCode;
 use crate::output::Formatter;
 use rc_core::admin::{
     AdminApi, PeerSiteSpec, ReplicateEditStatus, SiteRemoveSpec, SiteReplicationInfo,
-    SiteReplicationPeer, SiteStatusOptions, validate_site_replication_ca_bundle,
+    SiteReplicationPeer, SiteReplicationResyncOperation, SiteReplicationResyncStatus,
+    SiteStatusOptions, validate_site_replication_ca_bundle,
 };
 use rc_core::{AliasManager, Error};
 use rc_s3::AdminClient;
@@ -33,6 +35,9 @@ pub enum ReplicateCommands {
 
     /// Safely edit one exact site replication peer
     Edit(EditArgs),
+
+    /// Manage persisted site resync operation snapshots
+    Resync(ResyncArgs),
 
     /// Show site replication status
     Status(StatusArgs),
@@ -94,6 +99,48 @@ pub struct EditArgs {
 }
 
 #[derive(clap::Args, Debug)]
+pub struct ResyncArgs {
+    #[command(subcommand)]
+    pub command: ResyncCommands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ResyncCommands {
+    /// Start resync for one exact peer and retain the mutation snapshot
+    Start(ResyncMutationArgs),
+
+    /// Read the persisted snapshot from the last start or cancel request
+    Status(ResyncStatusArgs),
+
+    /// Cancel resync for one exact peer and retain the mutation snapshot
+    Cancel(ResyncMutationArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ResyncMutationArgs {
+    /// Alias name of the server
+    pub alias: String,
+
+    /// Exact deployment ID or unique exact site name
+    #[arg(long)]
+    pub site: String,
+
+    /// Confirm the resync mutation
+    #[arg(long)]
+    pub yes: bool,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ResyncStatusArgs {
+    /// Alias name of the server
+    pub alias: String,
+
+    /// Exact deployment ID or unique exact site name
+    #[arg(long)]
+    pub site: String,
+}
+
+#[derive(clap::Args, Debug)]
 pub struct StatusArgs {
     /// Alias name of the server
     pub alias: String,
@@ -139,6 +186,7 @@ pub async fn execute(cmd: ReplicateCommands, formatter: &Formatter) -> ExitCode 
         ReplicateCommands::Add(args) => execute_add(args, formatter).await,
         ReplicateCommands::Info(args) => execute_info(args, formatter).await,
         ReplicateCommands::Edit(args) => execute_edit(args, formatter).await,
+        ReplicateCommands::Resync(args) => execute_resync(args, formatter).await,
         ReplicateCommands::Status(args) => execute_status(args, formatter).await,
         ReplicateCommands::Remove(args) => execute_remove(args, formatter).await,
     }
@@ -398,7 +446,228 @@ async fn execute_edit(args: EditArgs, formatter: &Formatter) -> ExitCode {
             }
             ExitCode::Success
         }
-        Err(error) => emit_admin_error(formatter, &error, "site_replication_edit", true),
+        Err(error) => emit_admin_error(
+            formatter,
+            &error,
+            "site_replication_edit",
+            mutation_was_attempted(true, &error),
+        ),
+    }
+}
+
+async fn execute_resync(args: ResyncArgs, formatter: &Formatter) -> ExitCode {
+    match args.command {
+        ResyncCommands::Start(args) => {
+            execute_resync_mutation(args, SiteReplicationResyncOperation::Start, formatter).await
+        }
+        ResyncCommands::Status(args) => execute_resync_status(args, formatter).await,
+        ResyncCommands::Cancel(args) => {
+            execute_resync_mutation(args, SiteReplicationResyncOperation::Cancel, formatter).await
+        }
+    }
+}
+
+async fn execute_resync_mutation(
+    args: ResyncMutationArgs,
+    operation: SiteReplicationResyncOperation,
+    formatter: &Formatter,
+) -> ExitCode {
+    let operation_name = resync_operation_name(operation);
+    if !args.yes {
+        return emit_admin_message_error(
+            formatter,
+            ExitCode::UsageError,
+            operation_name,
+            true,
+            format!(
+                "Site replication resync {} requires --yes confirmation",
+                operation.as_str()
+            ),
+        );
+    }
+    execute_resync_request(&args.alias, &args.site, operation, formatter).await
+}
+
+async fn execute_resync_status(args: ResyncStatusArgs, formatter: &Formatter) -> ExitCode {
+    execute_resync_request(
+        &args.alias,
+        &args.site,
+        SiteReplicationResyncOperation::Status,
+        formatter,
+    )
+    .await
+}
+
+async fn execute_resync_request(
+    alias_name: &str,
+    selector: &str,
+    operation: SiteReplicationResyncOperation,
+    formatter: &Formatter,
+) -> ExitCode {
+    let operation_name = resync_operation_name(operation);
+    let mutation = operation.is_mutation();
+    if selector.trim().is_empty() {
+        return emit_admin_message_error(
+            formatter,
+            ExitCode::UsageError,
+            operation_name,
+            false,
+            "Site selector must not be empty".to_string(),
+        );
+    }
+    let (client, local_endpoint) = match load_admin_client_with_endpoint(alias_name) {
+        Ok(context) => context,
+        Err(error) => {
+            return emit_admin_error(formatter, &error, operation_name, false);
+        }
+    };
+    let info = match client.site_replication_info().await {
+        Ok(info) => info,
+        Err(error) => {
+            return emit_admin_error(formatter, &error, operation_name, false);
+        }
+    };
+    let selected = match info.resolve_peer(selector) {
+        Ok(peer) => peer,
+        Err(error) => {
+            return emit_admin_error(formatter, &error, operation_name, false);
+        }
+    };
+    let endpoint = match selected
+        .endpoint()
+        .filter(|endpoint| !endpoint.trim().is_empty())
+        .map(validate_site_endpoint)
+        .transpose()
+    {
+        Ok(Some(endpoint)) => endpoint,
+        Ok(None) | Err(_) => {
+            return emit_admin_message_error(
+                formatter,
+                ExitCode::Conflict,
+                operation_name,
+                false,
+                "Selected site has no valid endpoint".to_string(),
+            );
+        }
+    };
+    if mutation && validate_site_endpoint(&local_endpoint).is_ok_and(|local| local == endpoint) {
+        return emit_admin_message_error(
+            formatter,
+            ExitCode::Conflict,
+            operation_name,
+            false,
+            "Cannot resync a site replication peer to itself".to_string(),
+        );
+    }
+
+    // RustFS expects the complete PeerInfo object. In legacy snapshots the
+    // endpoint may be stored as `endpoints`; inserting the singular field lets
+    // current servers consume it while all opaque fields remain intact.
+    let mut peer = selected.clone();
+    peer.set_endpoint(endpoint);
+    let resource = selected
+        .deployment_id()
+        .filter(|deployment_id| !deployment_id.trim().is_empty())
+        .unwrap_or_else(|| peer.endpoint().unwrap_or(selector))
+        .to_string();
+    match client.site_replication_resync(operation, &peer).await {
+        Ok(status) => emit_resync_status(formatter, operation, operation_name, resource, status),
+        Err(error) => {
+            let mutation_attempted = mutation_was_attempted(mutation, &error);
+            emit_admin_error(formatter, &error, operation_name, mutation_attempted)
+        }
+    }
+}
+
+fn mutation_was_attempted(mutation: bool, error: &Error) -> bool {
+    mutation && !matches!(error, Error::RequestRejected(_))
+}
+
+const fn resync_operation_name(operation: SiteReplicationResyncOperation) -> &'static str {
+    match operation {
+        SiteReplicationResyncOperation::Start => "site_replication_resync_start",
+        SiteReplicationResyncOperation::Status => "site_replication_resync_status",
+        SiteReplicationResyncOperation::Cancel => "site_replication_resync_cancel",
+    }
+}
+
+fn emit_resync_status(
+    formatter: &Formatter,
+    requested: SiteReplicationResyncOperation,
+    operation_name: &'static str,
+    resource: String,
+    status: SiteReplicationResyncStatus,
+) -> ExitCode {
+    if requested == SiteReplicationResyncOperation::Status && status.is_not_found() {
+        return emit_admin_message_error(
+            formatter,
+            ExitCode::Conflict,
+            operation_name,
+            false,
+            "No persisted resync operation snapshot exists for the selected site".to_string(),
+        );
+    }
+
+    let failed = status.has_failure();
+    let state = if requested == SiteReplicationResyncOperation::Status {
+        "unknown"
+    } else if failed {
+        "failed"
+    } else {
+        "succeeded"
+    };
+    let operation_id = (!status.resync_id.is_empty()).then(|| status.resync_id.clone());
+    let result = SafeSiteReplicationResyncResult::new(requested, &status);
+    if formatter.is_json() {
+        formatter.json(&admin_operation_output(
+            operation_name,
+            resource,
+            state,
+            operation_id,
+            requested.is_mutation(),
+            result,
+        ));
+    } else {
+        let snapshot = if requested == SiteReplicationResyncOperation::Status {
+            "persisted last-operation snapshot"
+        } else {
+            "mutation response snapshot"
+        };
+        formatter.println(&format!(
+            "Site resync {snapshot} for {}: operation={}, status={}, lifecycle=unknown",
+            formatter.sanitize_text(&resource),
+            formatter.sanitize_text(&status.operation),
+            formatter.sanitize_text(&status.status)
+        ));
+        if !status.resync_id.is_empty() {
+            formatter.println(&format!(
+                "  Operation ID: {}",
+                formatter.sanitize_text(&status.resync_id)
+            ));
+        }
+        if !status.error_detail.is_empty() {
+            formatter.println(&format!(
+                "  Error detail: {}",
+                formatter.sanitize_text(&status.error_detail)
+            ));
+        }
+        for bucket in &status.buckets {
+            formatter.println(&format!(
+                "  {}  {}{}",
+                formatter.sanitize_text(&bucket.bucket),
+                formatter.sanitize_text(&bucket.status),
+                if bucket.error_detail.is_empty() {
+                    String::new()
+                } else {
+                    format!("  {}", formatter.sanitize_text(&bucket.error_detail))
+                }
+            ));
+        }
+    }
+    if failed {
+        ExitCode::GeneralError
+    } else {
+        ExitCode::Success
     }
 }
 
@@ -406,6 +675,13 @@ fn load_admin_client(alias_name: &str) -> Result<AdminClient, Error> {
     let alias_manager = AliasManager::new()?;
     let alias = alias_manager.get(normalize_admin_alias(alias_name))?;
     AdminClient::new(&alias)
+}
+
+fn load_admin_client_with_endpoint(alias_name: &str) -> Result<(AdminClient, String), Error> {
+    let alias_manager = AliasManager::new()?;
+    let alias = alias_manager.get(normalize_admin_alias(alias_name))?;
+    let endpoint = alias.endpoint.clone();
+    Ok((AdminClient::new(&alias)?, endpoint))
 }
 
 fn validate_site_endpoint(endpoint: &str) -> Result<String, Error> {
@@ -537,6 +813,17 @@ fn admin_success_output<T: Serialize>(
     changed: bool,
     result: T,
 ) -> AdminOperationsSuccess<T> {
+    admin_operation_output(operation, resource, "succeeded", None, changed, result)
+}
+
+fn admin_operation_output<T: Serialize>(
+    operation: &'static str,
+    resource: String,
+    state: &'static str,
+    operation_id: Option<String>,
+    changed: bool,
+    result: T,
+) -> AdminOperationsSuccess<T> {
     AdminOperationsSuccess {
         schema_version: 3,
         output_type: "admin_operations",
@@ -545,8 +832,8 @@ fn admin_success_output<T: Serialize>(
             operations: vec![AdminOperation {
                 operation,
                 resource,
-                state: "succeeded",
-                operation_id: None,
+                state,
+                operation_id,
                 changed,
                 result,
             }],
@@ -672,6 +959,111 @@ impl SafeSiteReplicationEditResult {
     }
 }
 
+#[derive(Serialize)]
+struct SafeSiteReplicationResyncResult {
+    snapshot_kind: &'static str,
+    lifecycle_state: &'static str,
+    server_operation: String,
+    server_status: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    error_detail: String,
+    buckets: Vec<SafeSiteReplicationResyncBucket>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    future: BTreeMap<String, Value>,
+}
+
+impl SafeSiteReplicationResyncResult {
+    fn new(
+        requested: SiteReplicationResyncOperation,
+        status: &SiteReplicationResyncStatus,
+    ) -> Self {
+        Self {
+            snapshot_kind: if requested == SiteReplicationResyncOperation::Status {
+                "persisted_last_operation"
+            } else {
+                "mutation_response"
+            },
+            lifecycle_state: "unknown",
+            server_operation: status.operation.clone(),
+            server_status: status.status.clone(),
+            error_detail: status.error_detail.clone(),
+            buckets: status
+                .buckets
+                .iter()
+                .map(SafeSiteReplicationResyncBucket::from)
+                .collect(),
+            future: safe_resync_future_fields(&status.extensions),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct SafeSiteReplicationResyncBucket {
+    bucket: String,
+    status: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    error_detail: String,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    future: BTreeMap<String, Value>,
+}
+
+impl From<&rc_core::admin::SiteReplicationResyncBucketStatus> for SafeSiteReplicationResyncBucket {
+    fn from(bucket: &rc_core::admin::SiteReplicationResyncBucketStatus) -> Self {
+        Self {
+            bucket: bucket.bucket.clone(),
+            status: bucket.status.clone(),
+            error_detail: bucket.error_detail.clone(),
+            future: safe_resync_future_fields(&bucket.extensions),
+        }
+    }
+}
+
+fn safe_resync_future_fields(fields: &BTreeMap<String, Value>) -> BTreeMap<String, Value> {
+    fields
+        .iter()
+        .filter(|(name, _)| safe_resync_future_field_name(name))
+        .filter_map(|(name, value)| {
+            safe_resync_future_value(value).map(|value| (name.clone(), value))
+        })
+        .collect()
+}
+
+fn safe_resync_future_value(value: &Value) -> Option<Value> {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => Some(value.clone()),
+        Value::Array(values) => Some(Value::Array(
+            values.iter().filter_map(safe_resync_future_value).collect(),
+        )),
+        Value::Object(fields) => Some(Value::Object(
+            fields
+                .iter()
+                .filter(|(name, _)| safe_resync_future_field_name(name))
+                .filter_map(|(name, value)| {
+                    safe_resync_future_value(value).map(|value| (name.clone(), value))
+                })
+                .collect(),
+        )),
+    }
+}
+
+fn safe_resync_future_field_name(name: &str) -> bool {
+    matches!(
+        name,
+        "createdAt"
+            | "startedAt"
+            | "updatedAt"
+            | "completedAt"
+            | "generation"
+            | "progress"
+            | "total"
+            | "completed"
+            | "failed"
+            | "pending"
+            | "state"
+            | "phase"
+    )
+}
+
 fn info_resource(info: &SiteReplicationInfo, alias: &str) -> String {
     if info.name.is_empty() {
         alias.to_string()
@@ -758,7 +1150,7 @@ fn admin_error_output(
             suggestion: Some("Upgrade RustFS or verify server support for this operation."),
         })
     } else {
-        let (error_type, retryable, suggestion) = admin_error_metadata(code, mutation);
+        let (error_type, retryable, suggestion) = admin_error_metadata(code, operation, mutation);
         AdminErrorOutput::Standard(StandardAdminError {
             error_type,
             message,
@@ -774,15 +1166,29 @@ fn admin_error_output(
     }
 }
 
-const fn admin_error_metadata(
+fn admin_error_metadata(
     code: ExitCode,
+    operation: &str,
     mutation: bool,
 ) -> (&'static str, bool, Option<&'static str>) {
+    let resync = operation.starts_with("site_replication_resync_");
     match code {
+        ExitCode::UsageError if resync => (
+            "usage_error",
+            false,
+            Some("Run the command with --help and verify its site selector and confirmation."),
+        ),
         ExitCode::UsageError => (
             "usage_error",
             false,
             Some("Run the command with --help and verify its edit options."),
+        ),
+        ExitCode::NetworkError if mutation && resync => (
+            "network_error",
+            false,
+            Some(
+                "The resync mutation outcome may be unknown; inspect the persisted snapshot and storage state before retrying.",
+            ),
         ),
         ExitCode::NetworkError if mutation => (
             "network_error",
@@ -813,6 +1219,13 @@ const fn admin_error_metadata(
             "interrupted",
             false,
             Some("Inspect site replication state before retrying."),
+        ),
+        ExitCode::GeneralError if mutation && resync => (
+            "general_error",
+            false,
+            Some(
+                "The mutation response was rejected; inspect the persisted snapshot and storage state before retrying.",
+            ),
         ),
         ExitCode::Success | ExitCode::GeneralError | ExitCode::UnsupportedFeature => {
             ("general_error", false, None)
@@ -945,6 +1358,12 @@ mod tests {
         include_str!("../../../tests/fixtures/output_v3/admin/site_replication_edit_error.json");
     const INFO_ERROR_GOLDEN: &str =
         include_str!("../../../tests/fixtures/output_v3/admin/site_replication_info_error.json");
+    const RESYNC_START_SUCCESS_GOLDEN: &str = include_str!(
+        "../../../tests/fixtures/output_v3/admin/site_replication_resync_start_success.json"
+    );
+    const RESYNC_STATUS_PARTIAL_GOLDEN: &str = include_str!(
+        "../../../tests/fixtures/output_v3/admin/site_replication_resync_status_partial.json"
+    );
 
     #[test]
     fn edit_endpoint_must_be_a_safe_http_origin() {
@@ -1111,6 +1530,76 @@ mod tests {
             assert_eq!(actual, expected);
             assert_valid_v3(&actual);
         }
+    }
+
+    #[test]
+    fn resync_outputs_match_v3_schema_and_drop_unsafe_future_fields() {
+        let started: SiteReplicationResyncStatus = serde_json::from_value(serde_json::json!({
+            "op": "start",
+            "id": "resync-123",
+            "status": "success",
+            "buckets": [{"bucket": "photos", "status": "started"}],
+            "generation": 7,
+            "sessionToken": "MUST-NOT-PRINT"
+        }))
+        .expect("valid start snapshot");
+        let start_output = serde_json::to_value(admin_operation_output(
+            "site_replication_resync_start",
+            "deployment-2".into(),
+            "succeeded",
+            Some(started.resync_id.clone()),
+            true,
+            SafeSiteReplicationResyncResult::new(SiteReplicationResyncOperation::Start, &started),
+        ))
+        .expect("start output serializes");
+
+        let partial: SiteReplicationResyncStatus = serde_json::from_value(serde_json::json!({
+            "op": "start",
+            "id": "resync-partial",
+            "status": "success",
+            "buckets": [
+                {"bucket": "photos", "status": "started", "updatedAt": "2026-07-22T00:00:00Z"},
+                {"bucket": "archive", "status": "failed", "errorDetail": "target unavailable", "accessToken": "MUST-NOT-PRINT"}
+            ],
+            "errorDetail": "partial failure in starting site resync",
+            "updatedAt": "2026-07-22T00:00:01Z",
+            "secretKey": "MUST-NOT-PRINT"
+        }))
+        .expect("valid partial snapshot");
+        let partial_output = serde_json::to_value(admin_operation_output(
+            "site_replication_resync_status",
+            "deployment-2".into(),
+            "unknown",
+            Some(partial.resync_id.clone()),
+            false,
+            SafeSiteReplicationResyncResult::new(SiteReplicationResyncOperation::Status, &partial),
+        ))
+        .expect("status output serializes");
+
+        for (actual, expected) in [
+            (start_output, golden(RESYNC_START_SUCCESS_GOLDEN)),
+            (partial_output, golden(RESYNC_STATUS_PARTIAL_GOLDEN)),
+        ] {
+            assert_eq!(actual, expected);
+            assert_valid_v3(&actual);
+            assert!(!actual.to_string().contains("MUST-NOT-PRINT"));
+        }
+    }
+
+    #[test]
+    fn resync_local_request_rejection_is_not_reported_as_an_attempted_mutation() {
+        assert!(!mutation_was_attempted(
+            true,
+            &Error::RequestRejected("request too large".to_string())
+        ));
+        assert!(mutation_was_attempted(
+            true,
+            &Error::Network("connection lost".to_string())
+        ));
+        assert!(!mutation_was_attempted(
+            false,
+            &Error::Network("connection lost".to_string())
+        ));
     }
 
     fn output_v3_validator() -> Validator {

@@ -168,6 +168,11 @@ impl Serialize for SiteReplicationPeer {
 impl SiteReplicationPeer {
     pub fn endpoint(&self) -> Option<&str> {
         self.string_field("endpoint")
+            .filter(|endpoint| !endpoint.is_empty())
+            .or_else(|| {
+                self.string_field("endpoints")
+                    .filter(|endpoint| !endpoint.is_empty())
+            })
     }
 
     pub fn name(&self) -> Option<&str> {
@@ -333,6 +338,148 @@ impl SiteReplicationInfo {
         }
         Ok(peer)
     }
+}
+
+/// Operation accepted by `site-replication/resync/op`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SiteReplicationResyncOperation {
+    Start,
+    Status,
+    Cancel,
+}
+
+impl SiteReplicationResyncOperation {
+    /// Exact query value expected by the RustFS admin route.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Status => "status",
+            Self::Cancel => "cancel",
+        }
+    }
+
+    /// Whether this operation changes server-side resync state.
+    pub const fn is_mutation(self) -> bool {
+        matches!(self, Self::Start | Self::Cancel)
+    }
+}
+
+/// Per-bucket result returned by a site replication resync operation.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct SiteReplicationResyncBucketStatus {
+    #[serde(default)]
+    pub bucket: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(rename = "errorDetail", default)]
+    pub error_detail: String,
+    #[serde(flatten)]
+    pub extensions: BTreeMap<String, Value>,
+}
+
+impl SiteReplicationResyncBucketStatus {
+    /// Detect a failed bucket even when the server's status summary is stale.
+    pub fn has_failure(&self) -> bool {
+        status_is_failed(&self.status) || !self.error_detail.trim().is_empty()
+    }
+}
+
+impl fmt::Debug for SiteReplicationResyncBucketStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SiteReplicationResyncBucketStatus")
+            .field("has_bucket", &!self.bucket.is_empty())
+            .field("has_status", &!self.status.is_empty())
+            .field("has_error_detail", &!self.error_detail.is_empty())
+            .field("extension_count", &self.extensions.len())
+            .finish()
+    }
+}
+
+/// Typed response from `site-replication/resync/op`.
+#[derive(Clone, Serialize, Deserialize, Default)]
+pub struct SiteReplicationResyncStatus {
+    #[serde(rename = "op", default)]
+    pub operation: String,
+    #[serde(rename = "id", default)]
+    pub resync_id: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub buckets: Vec<SiteReplicationResyncBucketStatus>,
+    #[serde(rename = "errorDetail", default)]
+    pub error_detail: String,
+    #[serde(flatten)]
+    pub extensions: BTreeMap<String, Value>,
+    #[serde(skip)]
+    semantic_failure: Option<bool>,
+    #[serde(skip)]
+    semantic_not_found: bool,
+}
+
+impl SiteReplicationResyncStatus {
+    /// Freeze protocol semantics before credentials are redacted for output.
+    ///
+    /// Once captured, the semantic result intentionally remains stable even if
+    /// the public wire fields are replaced by their safe output projections.
+    pub fn capture_semantics(&mut self) {
+        self.semantic_failure = Some(self.compute_failure());
+        self.semantic_not_found = self.status.trim().eq_ignore_ascii_case("not-found");
+    }
+
+    /// Detect overall and partial failures without trusting a success summary.
+    pub fn has_failure(&self) -> bool {
+        self.semantic_failure
+            .unwrap_or_else(|| self.compute_failure())
+    }
+
+    /// Detect the wire-level no-snapshot marker after output sanitization.
+    pub fn is_not_found(&self) -> bool {
+        self.semantic_not_found || self.status.trim().eq_ignore_ascii_case("not-found")
+    }
+
+    fn compute_failure(&self) -> bool {
+        !status_is_success(&self.status)
+            || !self.error_detail.trim().is_empty()
+            || self
+                .buckets
+                .iter()
+                .any(SiteReplicationResyncBucketStatus::has_failure)
+    }
+}
+
+impl PartialEq for SiteReplicationResyncStatus {
+    fn eq(&self, other: &Self) -> bool {
+        self.operation == other.operation
+            && self.resync_id == other.resync_id
+            && self.status == other.status
+            && self.buckets == other.buckets
+            && self.error_detail == other.error_detail
+            && self.extensions == other.extensions
+    }
+}
+
+impl fmt::Debug for SiteReplicationResyncStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SiteReplicationResyncStatus")
+            .field("has_operation", &!self.operation.is_empty())
+            .field("has_resync_id", &!self.resync_id.is_empty())
+            .field("has_status", &!self.status.is_empty())
+            .field("bucket_count", &self.buckets.len())
+            .field("has_error_detail", &!self.error_detail.is_empty())
+            .field("extension_count", &self.extensions.len())
+            .finish()
+    }
+}
+
+fn status_is_failed(status: &str) -> bool {
+    status.trim().eq_ignore_ascii_case("failed")
+}
+
+fn status_is_success(status: &str) -> bool {
+    status.trim().eq_ignore_ascii_case("success")
 }
 
 /// Typed response from `site-replication/edit`.
@@ -516,6 +663,36 @@ mod tests {
     }
 
     #[test]
+    fn peer_endpoint_falls_back_to_legacy_string_without_overriding_singular_endpoint() {
+        let legacy: SiteReplicationPeer = serde_json::from_value(serde_json::json!({
+            "endpoints": "https://legacy.example.test"
+        }))
+        .expect("legacy peer fixture");
+        let both: SiteReplicationPeer = serde_json::from_value(serde_json::json!({
+            "endpoint": "https://current.example.test",
+            "endpoints": "https://legacy.example.test"
+        }))
+        .expect("current peer fixture");
+        let empty_current: SiteReplicationPeer = serde_json::from_value(serde_json::json!({
+            "endpoint": "",
+            "endpoints": "https://legacy.example.test"
+        }))
+        .expect("empty current endpoint fixture");
+        let malformed_legacy: SiteReplicationPeer = serde_json::from_value(serde_json::json!({
+            "endpoints": ["https://legacy.example.test"]
+        }))
+        .expect("opaque legacy peer fixture");
+
+        assert_eq!(legacy.endpoint(), Some("https://legacy.example.test"));
+        assert_eq!(both.endpoint(), Some("https://current.example.test"));
+        assert_eq!(
+            empty_current.endpoint(),
+            Some("https://legacy.example.test")
+        );
+        assert_eq!(malformed_legacy.endpoint(), None);
+    }
+
+    #[test]
     fn peer_debug_reports_ca_presence_without_exposing_certificate() {
         let info: SiteReplicationInfo =
             serde_json::from_str(SITE_INFO).expect("valid site information fixture");
@@ -610,6 +787,175 @@ mod tests {
         let debug = format!("{status:?}");
         assert!(!debug.contains("updated"));
         assert!(!debug.contains("preserved"));
+    }
+
+    #[test]
+    fn resync_operations_use_exact_wire_values_and_classify_mutations() {
+        for (operation, wire, mutation) in [
+            (SiteReplicationResyncOperation::Start, "start", true),
+            (SiteReplicationResyncOperation::Status, "status", false),
+            (SiteReplicationResyncOperation::Cancel, "cancel", true),
+        ] {
+            assert_eq!(operation.as_str(), wire);
+            assert_eq!(operation.is_mutation(), mutation);
+            assert_eq!(
+                serde_json::to_value(operation).expect("operation is serializable"),
+                wire
+            );
+            assert_eq!(
+                serde_json::from_value::<SiteReplicationResyncOperation>(Value::String(
+                    wire.to_string()
+                ))
+                .expect("operation is deserializable"),
+                operation
+            );
+        }
+    }
+
+    #[test]
+    fn resync_status_preserves_exact_fields_and_unknown_extensions() {
+        let status: SiteReplicationResyncStatus = serde_json::from_value(serde_json::json!({
+            "op": "start",
+            "id": "resync-id",
+            "status": "success",
+            "buckets": [{
+                "bucket": "photos",
+                "status": "started",
+                "errorDetail": "",
+                "futureBucket": {"attempt": 2}
+            }],
+            "errorDetail": "",
+            "futureResponse": {"revision": 7}
+        }))
+        .expect("valid site resync status");
+
+        assert_eq!(status.operation, "start");
+        assert_eq!(status.resync_id, "resync-id");
+        assert_eq!(status.status, "success");
+        assert_eq!(status.buckets[0].bucket, "photos");
+        assert_eq!(status.buckets[0].status, "started");
+        assert_eq!(status.buckets[0].extensions["futureBucket"]["attempt"], 2);
+        assert_eq!(status.extensions["futureResponse"]["revision"], 7);
+
+        let wire = serde_json::to_value(status).expect("status is serializable");
+        assert_eq!(wire["op"], "start");
+        assert_eq!(wire["id"], "resync-id");
+        assert_eq!(wire["buckets"][0]["errorDetail"], "");
+        assert_eq!(wire["futureResponse"]["revision"], 7);
+    }
+
+    #[test]
+    fn resync_status_wire_equality_ignores_frozen_output_semantics() {
+        let mut status: SiteReplicationResyncStatus = serde_json::from_value(serde_json::json!({
+            "op": "status",
+            "status": "not-found"
+        }))
+        .expect("valid site resync status");
+        status.capture_semantics();
+        status.status = "[REDACTED]".to_string();
+
+        assert!(status.is_not_found());
+        assert!(status.has_failure());
+        let wire = serde_json::to_vec(&status).expect("status is serializable");
+        let round_trip: SiteReplicationResyncStatus =
+            serde_json::from_slice(&wire).expect("status is deserializable");
+        assert_eq!(status, round_trip);
+    }
+
+    #[test]
+    fn resync_status_debug_never_prints_arbitrary_server_strings() {
+        let status: SiteReplicationResyncStatus = serde_json::from_value(serde_json::json!({
+            "op": "SECRET-OPERATION",
+            "id": "SECRET-RESYNC-ID",
+            "status": "SECRET-STATUS",
+            "buckets": [{
+                "bucket": "SECRET-BUCKET",
+                "status": "SECRET-BUCKET-STATUS",
+                "errorDetail": "SECRET-BUCKET-ERROR",
+                "SECRET-BUCKET-EXTENSION": "SECRET-BUCKET-VALUE"
+            }],
+            "errorDetail": "SECRET-ERROR",
+            "SECRET-EXTENSION": "SECRET-VALUE"
+        }))
+        .expect("valid sensitive status fixture");
+
+        let status_debug = format!("{status:?}");
+        let bucket_debug = format!("{:?}", status.buckets[0]);
+        for secret in [
+            "SECRET-OPERATION",
+            "SECRET-RESYNC-ID",
+            "SECRET-STATUS",
+            "SECRET-BUCKET",
+            "SECRET-BUCKET-STATUS",
+            "SECRET-BUCKET-ERROR",
+            "SECRET-BUCKET-EXTENSION",
+            "SECRET-BUCKET-VALUE",
+            "SECRET-ERROR",
+            "SECRET-EXTENSION",
+            "SECRET-VALUE",
+        ] {
+            assert!(!status_debug.contains(secret));
+            assert!(!bucket_debug.contains(secret));
+        }
+        assert!(status_debug.contains("bucket_count: 1"));
+        assert!(bucket_debug.contains("has_error_detail: true"));
+    }
+
+    #[test]
+    fn resync_status_detects_overall_and_partial_bucket_failures() {
+        let success_bucket = SiteReplicationResyncBucketStatus {
+            bucket: "photos".into(),
+            status: "started".into(),
+            ..Default::default()
+        };
+        let success = SiteReplicationResyncStatus {
+            status: "success".into(),
+            buckets: vec![success_bucket.clone()],
+            ..Default::default()
+        };
+        assert!(!success.has_failure());
+
+        let overall_failed = SiteReplicationResyncStatus {
+            status: "FAILED".into(),
+            ..Default::default()
+        };
+        assert!(overall_failed.has_failure());
+
+        let partial_overall = SiteReplicationResyncStatus {
+            status: "partial".into(),
+            ..Default::default()
+        };
+        assert!(partial_overall.has_failure());
+
+        let overall_error = SiteReplicationResyncStatus {
+            status: "success".into(),
+            error_detail: "partial failure".into(),
+            ..Default::default()
+        };
+        assert!(overall_error.has_failure());
+
+        let failed_bucket = SiteReplicationResyncStatus {
+            status: "success".into(),
+            buckets: vec![SiteReplicationResyncBucketStatus {
+                status: "failed".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(failed_bucket.has_failure());
+
+        let bucket_error = SiteReplicationResyncStatus {
+            status: "success".into(),
+            buckets: vec![SiteReplicationResyncBucketStatus {
+                status: "started".into(),
+                error_detail: "target rejected bucket".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(bucket_error.has_failure());
+        assert!(bucket_error.buckets[0].has_failure());
+        assert!(!success_bucket.has_failure());
     }
 
     #[test]
