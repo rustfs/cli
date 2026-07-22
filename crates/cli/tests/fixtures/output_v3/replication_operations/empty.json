@@ -1,0 +1,1 @@
+{"schema_version":3,"type":"replication_operations","status":"success","data":{"operation":"resync_status","bucket":"archive","valid":null,"targets":[]}}

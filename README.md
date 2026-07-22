@@ -401,6 +401,8 @@ rc ls local/bucket
 
 ### JSON Format
 
+The versioned schemas and migration guidance are documented in the [JSON output contracts](docs/reference/rc/output.md). Existing command output remains on its documented v1 or v2 contract; new command families adopt v3 explicitly.
+
 ```bash
 rc ls local/bucket --json
 ```

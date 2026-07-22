@@ -1,0 +1,1 @@
+{"schema_version":3,"type":"metrics","status":"error","error":{"type":"unsupported_feature","message":"Metrics are unavailable","retryable":false,"capability":"metrics","server":null,"suggestion":null}}

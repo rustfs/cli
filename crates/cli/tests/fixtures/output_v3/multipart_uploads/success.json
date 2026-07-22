@@ -1,0 +1,1 @@
+{"schema_version":3,"type":"multipart_uploads","status":"success","data":{"items":[{"bucket":"archive","key":"backup.tar","upload_id":"upload-1","initiated":"2026-07-21T04:00:00Z","size_bytes":5242880,"storage_class":"STANDARD"}],"pagination":{"truncated":false,"continuation_token":null}}}

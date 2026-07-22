@@ -1,0 +1,1 @@
+{"schema_version":3,"type":"usage","status":"error","error":{"type":"unsupported_feature","message":"Server-assisted usage reporting is unavailable","retryable":false,"capability":"data_usage","server":null,"suggestion":"Use the S3 listing fallback."}}

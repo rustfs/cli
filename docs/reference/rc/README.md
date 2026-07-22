@@ -48,6 +48,8 @@ Remote paths use `ALIAS/BUCKET/KEY` form. An alias-only path such as `local/` re
 
 ## Output Modes
 
+For the versioned machine-readable contracts and migration guidance, see [JSON output contracts](output.md).
+
 Global options shown in command syntax use the same meaning everywhere:
 
 | Option | Description |
