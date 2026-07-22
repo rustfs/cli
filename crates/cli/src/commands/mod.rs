@@ -1136,9 +1136,9 @@ mod tests {
                 assert_eq!(args.include, ["*.csv"]);
                 assert_eq!(args.exclude, ["private-*"]);
                 assert_eq!(args.newer_than.as_deref(), Some("1h"));
-                assert_eq!(args.concurrency, 8);
+                assert_eq!(args.concurrency, Some(8));
                 assert_eq!(args.rate_limit.as_deref(), Some("10MiB/s"));
-                assert_eq!(args.retry_attempts, 5);
+                assert_eq!(args.retry_attempts, Some(5));
                 assert!(args.continue_on_error);
                 assert!(args.summary);
             }
