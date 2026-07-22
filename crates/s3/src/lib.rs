@@ -7,6 +7,7 @@
 pub mod admin;
 pub mod client;
 pub mod multipart;
+mod ops;
 mod select;
 mod watch;
 

@@ -233,6 +233,7 @@ fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a s
 fn response_for(request: &CapturedRequest) -> String {
     match request.method.as_str() {
         "GET" if request.path.contains("list-type=2") => xml_response(200, list_objects_body()),
+        "GET" if request.path.contains("versions") => xml_response(200, list_versions_body()),
         "DELETE" => xml_response(204, ""),
         "POST" if request.path.contains("delete") => xml_response(200, delete_objects_body()),
         _ => xml_response(500, "<Error><Code>UnexpectedRequest</Code></Error>"),
@@ -277,6 +278,42 @@ fn list_objects_body() -> &'static str {
 </ListBucketResult>"#
 }
 
+fn list_versions_body() -> &'static str {
+    r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListVersionsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>bucket</Name>
+  <Prefix>purge-prefix/</Prefix>
+  <KeyMarker></KeyMarker>
+  <VersionIdMarker></VersionIdMarker>
+  <MaxKeys>1000</MaxKeys>
+  <IsTruncated>false</IsTruncated>
+  <Version>
+    <Key>purge-prefix/a.txt</Key>
+    <VersionId>v1</VersionId>
+    <IsLatest>false</IsLatest>
+    <LastModified>2026-05-01T00:00:00.000Z</LastModified>
+    <ETag>&quot;etag-a&quot;</ETag>
+    <Size>1</Size>
+    <StorageClass>STANDARD</StorageClass>
+  </Version>
+  <DeleteMarker>
+    <Key>purge-prefix/a.txt</Key>
+    <VersionId>v2</VersionId>
+    <IsLatest>true</IsLatest>
+    <LastModified>2026-05-01T00:00:01.000Z</LastModified>
+  </DeleteMarker>
+  <Version>
+    <Key>purge-prefix/nested/b.txt</Key>
+    <VersionId>v3</VersionId>
+    <IsLatest>true</IsLatest>
+    <LastModified>2026-05-01T00:00:00.000Z</LastModified>
+    <ETag>&quot;etag-b&quot;</ETag>
+    <Size>1</Size>
+    <StorageClass>STANDARD</StorageClass>
+  </Version>
+</ListVersionsResult>"#
+}
+
 fn delete_objects_body() -> &'static str {
     r#"<?xml version="1.0" encoding="UTF-8"?>
 <DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
@@ -319,12 +356,12 @@ fn rm_recursive_purge_deletes_each_key_with_force_header() {
     let requests = server.captured_requests();
     let list_requests: Vec<_> = requests
         .iter()
-        .filter(|request| request.method == "GET" && request.path.contains("list-type=2"))
+        .filter(|request| request.method == "GET" && request.path.contains("versions"))
         .collect();
     assert_eq!(list_requests.len(), 1, "requests: {requests:#?}");
     assert!(
         list_requests[0].path.contains("prefix=purge-prefix%2F"),
-        "list request should include the recursive prefix: {requests:#?}"
+        "version list request should include the recursive prefix: {requests:#?}"
     );
 
     let delete_requests: Vec<_> = requests

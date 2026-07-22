@@ -285,14 +285,14 @@ mod tests {
     use serde_json::Value;
     use std::path::Path;
 
-    use crate::output::OutputConfig;
-
     use super::*;
+    use crate::output::OutputConfig;
 
     #[test]
     fn listen_notification_capability_uses_bucket_scope() {
         assert_eq!(capability_scope("listen_notification"), "bucket");
     }
+
     const SUCCESS_GOLDEN: &str =
         include_str!("../../../tests/fixtures/output_v3/capabilities/runtime_success.json");
     const VERSION_GATED_GOLDEN: &str =

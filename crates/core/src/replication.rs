@@ -5,6 +5,80 @@
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::time::Duration;
+
+/// Options for starting a RustFS bucket replication resync.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReplicationResyncStartOptions {
+    /// Select a configured replication target. The server may infer the only target.
+    pub target_arn: Option<String>,
+    /// Only resync objects older than this duration.
+    pub older_than: Option<Duration>,
+    /// Caller-supplied operation identifier. The server generates one when omitted.
+    pub reset_id: Option<String>,
+}
+
+/// A target accepted by a bucket replication resync start request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicationResyncStartResult {
+    pub target_arn: String,
+    pub reset_id: String,
+}
+
+/// Server state for a bucket replication resync target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplicationResyncState {
+    NotStarted,
+    Pending,
+    Ongoing,
+    Completed,
+    Failed,
+    Canceled,
+    Unknown,
+}
+
+impl ReplicationResyncState {
+    pub fn from_server(value: &str) -> Self {
+        match value {
+            "" => Self::NotStarted,
+            "Pending" => Self::Pending,
+            "Ongoing" => Self::Ongoing,
+            "Completed" => Self::Completed,
+            "Failed" => Self::Failed,
+            "Canceled" => Self::Canceled,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// Status for one configured replication target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicationResyncTargetStatus {
+    pub target_arn: String,
+    pub reset_id: String,
+    pub reset_before: Option<jiff::Timestamp>,
+    pub started_at: Option<jiff::Timestamp>,
+    /// RustFS beta.10 calls this `EndTime`, but populates it from last-update time.
+    pub last_updated_at: Option<jiff::Timestamp>,
+    pub state: ReplicationResyncState,
+    /// Exact state string returned by the server, including future values.
+    pub server_state: String,
+    pub replicated_count: u64,
+    pub replicated_size: u64,
+    pub failed_count: u64,
+    pub failed_size: u64,
+    pub current_bucket: Option<String>,
+    pub current_object: Option<String>,
+    /// Optional server detail. RustFS beta.10 does not reliably persist this field.
+    pub error: Option<String>,
+}
+
+/// Current server-side bucket replication resync state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ReplicationResyncStatus {
+    pub targets: Vec<ReplicationResyncTargetStatus>,
+}
 
 // ==================== S3 Replication Config Types ====================
 
@@ -196,6 +270,38 @@ mod tests {
             ReplicationRuleStatus::Enabled
         );
         assert!("invalid".parse::<ReplicationRuleStatus>().is_err());
+    }
+
+    #[test]
+    fn resync_state_preserves_empty_and_future_wire_values() {
+        assert_eq!(
+            ReplicationResyncState::from_server("Ongoing"),
+            ReplicationResyncState::Ongoing
+        );
+        assert_eq!(
+            ReplicationResyncState::from_server(""),
+            ReplicationResyncState::NotStarted
+        );
+        assert_eq!(
+            ReplicationResyncState::from_server("FutureState"),
+            ReplicationResyncState::Unknown
+        );
+    }
+
+    #[test]
+    fn resync_start_options_distinguish_server_and_caller_ids() {
+        let generated = ReplicationResyncStartOptions {
+            target_arn: Some("arn:rustfs:replication::id:dest".to_string()),
+            older_than: Some(Duration::from_secs(3600)),
+            reset_id: None,
+        };
+        let explicit = ReplicationResyncStartOptions {
+            reset_id: Some("reset-1".to_string()),
+            ..generated.clone()
+        };
+
+        assert_eq!(generated.reset_id, None);
+        assert_eq!(explicit.reset_id.as_deref(), Some("reset-1"));
     }
 
     #[test]

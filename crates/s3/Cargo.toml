@@ -36,6 +36,7 @@ tracing.workspace = true
 
 # Utilities
 jiff.workspace = true
+humantime.workspace = true
 bytes.workspace = true
 url.workspace = true
 
