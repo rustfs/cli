@@ -488,6 +488,26 @@ fn nested_subcommand_help_contract() {
             ],
         },
         HelpCase {
+            args: &["admin", "replicate", "resync"],
+            usage: "Usage: rc admin replicate resync [OPTIONS] <COMMAND>",
+            expected_tokens: &["start", "status", "cancel"],
+        },
+        HelpCase {
+            args: &["admin", "replicate", "resync", "start"],
+            usage: "Usage: rc admin replicate resync start [OPTIONS] --site <SITE> <ALIAS>",
+            expected_tokens: &["--site", "--yes"],
+        },
+        HelpCase {
+            args: &["admin", "replicate", "resync", "status"],
+            usage: "Usage: rc admin replicate resync status [OPTIONS] --site <SITE> <ALIAS>",
+            expected_tokens: &["--site"],
+        },
+        HelpCase {
+            args: &["admin", "replicate", "resync", "cancel"],
+            usage: "Usage: rc admin replicate resync cancel [OPTIONS] --site <SITE> <ALIAS>",
+            expected_tokens: &["--site", "--yes"],
+        },
+        HelpCase {
             args: &["admin", "heal", "status"],
             usage: "Usage: rc admin heal status [OPTIONS] <ALIAS>",
             expected_tokens: &["--bucket", "--prefix", "--client-token"],

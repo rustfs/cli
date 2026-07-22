@@ -26,7 +26,8 @@ pub use site::{
     MAX_SITE_REPLICATION_CA_CERT_BYTES, MAX_SITE_REPLICATION_ERROR_RESPONSE_BYTES,
     MAX_SITE_REPLICATION_REQUEST_BYTES, MAX_SITE_REPLICATION_SUCCESS_RESPONSE_BYTES, PeerSiteSpec,
     ReplicateEditStatus, ServiceActionResult, SiteRemoveSpec, SiteReplicationInfo,
-    SiteReplicationPeer, SiteStatusOptions, validate_site_replication_ca_bundle,
+    SiteReplicationPeer, SiteReplicationResyncBucketStatus, SiteReplicationResyncOperation,
+    SiteReplicationResyncStatus, SiteStatusOptions, validate_site_replication_ca_bundle,
 };
 pub use tier::{
     TierAliyun, TierAzure, TierConfig, TierCreds, TierGCS, TierHuaweicloud, TierMinIO, TierR2,
@@ -259,6 +260,13 @@ pub trait AdminApi: Send + Sync {
         &self,
         peer: &SiteReplicationPeer,
     ) -> Result<ReplicateEditStatus>;
+
+    /// Start, inspect, or cancel a resync toward one complete peer snapshot
+    async fn site_replication_resync(
+        &self,
+        operation: SiteReplicationResyncOperation,
+        peer: &SiteReplicationPeer,
+    ) -> Result<SiteReplicationResyncStatus>;
 
     /// Add peer sites to the site replication cluster
     async fn site_replication_add(&self, sites: &[PeerSiteSpec]) -> Result<serde_json::Value>;

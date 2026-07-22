@@ -25,6 +25,8 @@ rc admin service <restart|stop|freeze|unfreeze> <ALIAS>
 rc admin replicate add <ALIAS> <ALIAS> [<ALIAS>...]
 rc admin replicate <info|status> <ALIAS> [OPTIONS]
 rc admin replicate edit <ALIAS> --site <DEPLOYMENT_ID|NAME> [EDIT OPTIONS] --yes
+rc admin replicate resync <start|cancel> <ALIAS> --site <DEPLOYMENT_ID|NAME> --yes
+rc admin replicate resync status <ALIAS> --site <DEPLOYMENT_ID|NAME>
 rc admin replicate remove <ALIAS> <--all|--site <NAME>>
 ```
 
@@ -132,6 +134,8 @@ Link two sites for site replication and check the result:
 rc admin replicate add site1 site2
 rc admin replicate info site1
 rc admin replicate edit site1 --site <DEPLOYMENT_ID> --name edge-eu --yes
+rc admin replicate resync start site1 --site edge-eu --yes
+rc admin replicate resync status site1 --site edge-eu
 rc admin replicate status site1
 ```
 
@@ -222,6 +226,9 @@ The server response reports whether the action was `accepted` and whether it is 
 | `rc admin replicate add <ALIAS> <ALIAS> [<ALIAS>...]` | Link two or more sites into a site replication cluster. The first alias receives the request. |
 | `rc admin replicate info <ALIAS>` | Show the current site replication configuration. |
 | `rc admin replicate edit <ALIAS> --site <DEPLOYMENT_ID\|NAME> [EDIT OPTIONS] --yes` | Read the complete peer document, select one exact peer, apply a bounded edit, and write the peer document back. |
+| `rc admin replicate resync start <ALIAS> --site <DEPLOYMENT_ID\|NAME> --yes` | Request a site resync and return the mutation response snapshot. |
+| `rc admin replicate resync status <ALIAS> --site <DEPLOYMENT_ID\|NAME>` | Return the last persisted start or cancel snapshot. This is not live worker status. |
+| `rc admin replicate resync cancel <ALIAS> --site <DEPLOYMENT_ID\|NAME> --yes` | Request cancellation and return the mutation response snapshot. |
 | `rc admin replicate status <ALIAS> [OPTIONS]` | Show replication status. Without flags the buckets, users, groups, and policies summaries are requested. |
 | `rc admin replicate remove <ALIAS> --all` | Dissolve the entire site replication cluster. |
 | `rc admin replicate remove <ALIAS> --site <NAME>` | Remove one or more named sites. Repeat `--site` per name. |
@@ -252,6 +259,14 @@ The server response reports whether the action was `accepted` and whether it is 
 At least one edit option must produce an effective semantic change. Endpoint origins are canonicalized for comparison, while an omitted `skipTlsVerify` is treated as `false` and an omitted `caCertPem` is treated as empty. The command rejects a final HTTP peer state when `skipTlsVerify=true` or a non-empty custom CA remains. This permits an atomic HTTPS-to-HTTP conversion only when the same command clears the active TLS values.
 
 The complete selected peer object is retained privately and sent back with opaque future fields unchanged during the read-modify-write operation, but those fields are never printed. `info` and `edit` output use explicit safe projections: service-account access keys, CA contents, opaque future fields, and arbitrary server status strings are never printed. Successful JSON output uses output schema v3 with the `admin_operations` family. Mutating network failures are reported as non-retryable in JSON because the server outcome may be unknown; inspect `info` before deciding whether to retry.
+
+`resync start` and `resync cancel` require `--yes` before alias lookup or network access. All three resync commands select a deployment ID first, otherwise a unique exact site name. Their output retains the operation ID, ordered bucket snapshots, and error details. A failed bucket or non-empty error detail produces General exit `1` while still emitting the complete result. A missing persisted snapshot produces Conflict exit `6`.
+
+The current RustFS `resync status` endpoint returns the persisted result of the last successful start or cancel handler invocation; it does not inspect live workers. Every output therefore reports an unknown lifecycle state. Start operations can overlap, cancel is not idempotent, and bucket side effects are not atomic with snapshot persistence. A mutation timeout, malformed success response, or oversized success response has an unknown outcome and must not be retried blindly. See [Site Replication Resync Snapshots](../../site-replication-resync.md) for response bounds and the complete server limitations.
+
+### BREAKING resync contract migration
+
+The resync subcommands are additive and do not change existing command invocations. They use the existing output-v3 `admin_operations` envelope, so no JSON schema-version migration is required. The protected behavior contract is updated to make snapshot-only semantics explicit: automation must treat `result.lifecycle_state` as `unknown`, use `result.server_operation` only as the persisted operation type, and must not interpret `status` output as live progress. This PR must be marked `BREAKING` because it changes the protected CLI behavior contract.
 
 ### BREAKING output migration
 
