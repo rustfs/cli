@@ -4,7 +4,7 @@
 
 use clap::Args;
 use rc_core::{AliasManager, ListOptions, ObjectStore as _, RemotePath};
-use rc_s3::{DeleteRequestOptions, S3Client};
+use rc_s3::{DeleteObjectTarget, DeleteRequestOptions, S3Client};
 use serde::Serialize;
 use std::collections::HashSet;
 
@@ -195,6 +195,10 @@ async fn delete_single(
     args: &RmArgs,
     formatter: &Formatter,
 ) -> Result<Vec<String>, (ExitCode, Vec<String>)> {
+    if args.versions {
+        return delete_versions(client, alias_name, bucket, key, true, args, formatter).await;
+    }
+
     let path = RemotePath::new(alias_name, bucket, key);
     let full_path = format!("{alias_name}/{bucket}/{key}");
 
@@ -254,7 +258,11 @@ pub(crate) async fn delete_recursive(
 ) -> Result<Vec<String>, (ExitCode, Vec<String>)> {
     let path = RemotePath::new(alias_name, bucket, prefix);
 
-    let keys_to_delete = if args.versions || args.purge {
+    if args.versions {
+        return delete_versions(client, alias_name, bucket, prefix, false, args, formatter).await;
+    }
+
+    let keys_to_delete = if args.purge {
         list_version_keys(client, &path, bucket, formatter).await?
     } else {
         list_object_keys(client, &path, bucket, formatter).await?
@@ -386,9 +394,167 @@ fn parse_rm_path(path: &str) -> Result<(String, String, String), String> {
 
 fn delete_request_options(args: &RmArgs) -> DeleteRequestOptions {
     DeleteRequestOptions {
-        force_delete: args.purge || args.versions,
+        force_delete: args.purge,
         bypass_governance_retention: args.bypass,
     }
+}
+
+async fn delete_versions(
+    client: &S3Client,
+    alias_name: &str,
+    bucket: &str,
+    prefix: &str,
+    exact_key: bool,
+    args: &RmArgs,
+    formatter: &Formatter,
+) -> Result<Vec<String>, (ExitCode, Vec<String>)> {
+    let path = RemotePath::new(alias_name, bucket, prefix);
+    let targets = list_version_targets(client, &path, bucket, exact_key, formatter).await?;
+
+    if targets.is_empty() {
+        if !args.force {
+            formatter.warning(&format!(
+                "No object versions found matching: {alias_name}/{bucket}/{prefix}"
+            ));
+        }
+        return Ok(vec![]);
+    }
+
+    if args.dry_run {
+        let paths = targets
+            .iter()
+            .map(|target| version_target_path(alias_name, bucket, target))
+            .collect::<Vec<_>>();
+        for path in &paths {
+            formatter.println(&format!("Would remove: {}", formatter.style_file(path)));
+        }
+        return Ok(paths);
+    }
+
+    let mut deleted_paths = Vec::new();
+    for chunk in targets.chunks(1000) {
+        let requested = chunk.to_vec();
+        let deleted = match client
+            .delete_object_targets_with_options(
+                bucket,
+                requested.clone(),
+                delete_request_options(args),
+            )
+            .await
+        {
+            Ok(deleted) => deleted,
+            Err(error) => {
+                formatter.error_with_code(
+                    ExitCode::GeneralError,
+                    &format!("Failed to delete version batch: {error}"),
+                );
+                let failed = requested
+                    .iter()
+                    .map(|target| version_target_path(alias_name, bucket, target))
+                    .collect();
+                return Err((ExitCode::GeneralError, failed));
+            }
+        };
+
+        let (confirmed, failed) = partition_version_delete_results(&requested, deleted);
+        for target in confirmed {
+            let path = version_target_path(alias_name, bucket, &target);
+            if !formatter.is_json() {
+                formatter.println(&format!("Removed: {}", formatter.style_file(&path)));
+            }
+            deleted_paths.push(path);
+        }
+
+        if !failed.is_empty() {
+            let failed = failed
+                .iter()
+                .map(|target| version_target_path(alias_name, bucket, target))
+                .collect();
+            return Err((ExitCode::GeneralError, failed));
+        }
+    }
+
+    Ok(deleted_paths)
+}
+
+async fn list_version_targets(
+    client: &S3Client,
+    path: &RemotePath,
+    bucket: &str,
+    exact_key: bool,
+    formatter: &Formatter,
+) -> Result<Vec<DeleteObjectTarget>, (ExitCode, Vec<String>)> {
+    let mut targets = Vec::new();
+    let mut key_marker: Option<String> = None;
+    let mut version_id_marker: Option<String> = None;
+    let mut seen_markers = HashSet::new();
+    let mut seen_targets = HashSet::new();
+
+    loop {
+        let result = client
+            .list_object_versions_page_with_markers(
+                path,
+                Some(1000),
+                key_marker.as_deref(),
+                version_id_marker.as_deref(),
+            )
+            .await
+            .map_err(|error| list_error(error, bucket, formatter))?;
+
+        for target in result
+            .items
+            .into_iter()
+            .filter(|item| !exact_key || item.key == path.key)
+            .map(|item| DeleteObjectTarget::version(item.key, item.version_id))
+        {
+            if !seen_targets.insert(target.clone()) {
+                let code = formatter.fail(
+                    ExitCode::GeneralError,
+                    "Object version listing returned a duplicate target",
+                );
+                return Err((code, vec![]));
+            }
+            targets.push(target);
+        }
+
+        if !result.truncated {
+            break;
+        }
+
+        let next_markers = (result.continuation_token, result.version_id_marker);
+        if next_markers.0.is_none() || !seen_markers.insert(next_markers.clone()) {
+            let code = formatter.fail(
+                ExitCode::GeneralError,
+                "Object version pagination did not advance safely",
+            );
+            return Err((code, vec![]));
+        }
+        key_marker = next_markers.0;
+        version_id_marker = next_markers.1;
+    }
+
+    Ok(targets)
+}
+
+fn version_target_path(alias_name: &str, bucket: &str, target: &DeleteObjectTarget) -> String {
+    match &target.version_id {
+        Some(version_id) => format!(
+            "{alias_name}/{bucket}/{}?versionId={version_id}",
+            target.key
+        ),
+        None => format!("{alias_name}/{bucket}/{}", target.key),
+    }
+}
+
+fn partition_version_delete_results(
+    requested: &[DeleteObjectTarget],
+    deleted: Vec<DeleteObjectTarget>,
+) -> (Vec<DeleteObjectTarget>, Vec<DeleteObjectTarget>) {
+    let deleted = deleted.into_iter().collect::<HashSet<_>>();
+    requested
+        .iter()
+        .cloned()
+        .partition(|target| deleted.contains(target))
 }
 
 async fn list_object_keys(
@@ -571,6 +737,36 @@ mod tests {
     }
 
     #[test]
+    fn version_delete_results_distinguish_versions_of_the_same_key() {
+        let requested = vec![
+            DeleteObjectTarget::version("object.txt", "v1"),
+            DeleteObjectTarget::version("object.txt", "v2"),
+        ];
+        let deleted = vec![DeleteObjectTarget::version("object.txt", "v2")];
+
+        let (confirmed, failed) = partition_version_delete_results(&requested, deleted);
+
+        assert_eq!(
+            confirmed,
+            vec![DeleteObjectTarget::version("object.txt", "v2")]
+        );
+        assert_eq!(
+            failed,
+            vec![DeleteObjectTarget::version("object.txt", "v1")]
+        );
+    }
+
+    #[test]
+    fn version_output_path_identifies_the_deleted_version() {
+        let target = DeleteObjectTarget::version("object.txt", "version-id");
+
+        assert_eq!(
+            version_target_path("local", "bucket", &target),
+            "local/bucket/object.txt?versionId=version-id"
+        );
+    }
+
+    #[test]
     fn test_delete_request_options_enable_force_delete_for_purge() {
         let args = RmArgs {
             paths: vec!["test/bucket/object.txt".to_string()],
@@ -588,7 +784,7 @@ mod tests {
     }
 
     #[test]
-    fn test_delete_request_options_enable_force_delete_for_versions() {
+    fn test_delete_request_options_do_not_force_delete_versions() {
         let args = RmArgs {
             paths: vec!["test/bucket/object.txt".to_string()],
             recursive: false,
@@ -601,7 +797,7 @@ mod tests {
         };
 
         let options = delete_request_options(&args);
-        assert!(options.force_delete);
+        assert!(!options.force_delete);
     }
 
     #[test]

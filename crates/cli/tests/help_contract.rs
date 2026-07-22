@@ -111,6 +111,16 @@ fn binary_version_matches_package_version() {
 }
 
 #[test]
+fn bucket_remove_help_hides_blocked_cleanup_options() {
+    let output = run_rc(&["rb", "--help"]);
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("--force"));
+    assert!(!stdout.contains("--dangerous"));
+}
+
+#[test]
 fn top_level_command_help_contract() {
     let cases = [
         HelpCase {
@@ -267,7 +277,7 @@ fn top_level_command_help_contract() {
         HelpCase {
             args: &["rb"],
             usage: "Usage: rc rb [OPTIONS] <TARGET>",
-            expected_tokens: &["--force"],
+            expected_tokens: &[],
         },
         HelpCase {
             args: &["cat"],

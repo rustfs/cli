@@ -14,6 +14,7 @@ struct CapturedRequest {
     method: String,
     path: String,
     headers: Vec<(String, String)>,
+    body: Vec<u8>,
 }
 
 impl CapturedRequest {
@@ -149,12 +150,15 @@ fn read_request(stream: &mut TcpStream) -> Option<CapturedRequest> {
         .map(|(key, value)| (key.to_ascii_lowercase(), value.trim().to_string()))
         .collect();
 
-    drain_request_body(stream, &mut buffer, header_end + 4, &headers)?;
+    let body_start = header_end + 4;
+    drain_request_body(stream, &mut buffer, body_start, &headers)?;
+    let body = buffer[body_start..].to_vec();
 
     Some(CapturedRequest {
         method,
         path,
         headers,
+        body,
     })
 }
 
@@ -317,9 +321,56 @@ fn list_versions_body() -> &'static str {
 fn delete_objects_body() -> &'static str {
     r#"<?xml version="1.0" encoding="UTF-8"?>
 <DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
-  <Deleted><Key>purge-prefix/a.txt</Key></Deleted>
-  <Deleted><Key>purge-prefix/nested/b.txt</Key></Deleted>
+  <Deleted><Key>purge-prefix/a.txt</Key><VersionId>v1</VersionId></Deleted>
+  <Deleted>
+    <Key>purge-prefix/a.txt</Key>
+    <DeleteMarker>true</DeleteMarker>
+    <DeleteMarkerVersionId>v2</DeleteMarkerVersionId>
+  </Deleted>
+  <Deleted><Key>purge-prefix/nested/b.txt</Key><VersionId>v3</VersionId></Deleted>
 </DeleteResult>"#
+}
+
+#[test]
+fn rm_recursive_versions_deletes_explicit_versions_without_force_header() {
+    let server = TestServer::start();
+    let config_dir = tempfile::tempdir().expect("create config dir");
+
+    let output = Command::new(rc_binary())
+        .args([
+            "--json",
+            "rm",
+            "--recursive",
+            "--versions",
+            "test/bucket/purge-prefix/",
+        ])
+        .env("AWS_EC2_METADATA_DISABLED", "true")
+        .env("RC_CONFIG_DIR", config_dir.path())
+        .env("RC_HOST_test", server.endpoint_with_credentials())
+        .output()
+        .expect("run rc command");
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let requests = server.captured_requests();
+    let delete_requests: Vec<_> = requests
+        .iter()
+        .filter(|request| request.method == "POST" && request.path.contains("delete"))
+        .collect();
+    assert_eq!(delete_requests.len(), 1, "requests: {requests:#?}");
+
+    let request = delete_requests[0];
+    let body = String::from_utf8_lossy(&request.body);
+    assert!(body.contains("<Key>purge-prefix/a.txt</Key>"));
+    assert!(body.contains("<VersionId>v1</VersionId>"));
+    assert!(body.contains("<VersionId>v2</VersionId>"));
+    assert!(body.contains("<VersionId>v3</VersionId>"));
+    assert!(request.header("x-rustfs-force-delete").is_none());
 }
 
 #[test]

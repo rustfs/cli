@@ -866,6 +866,29 @@ pub struct DeleteRequestOptions {
     pub bypass_governance_retention: bool,
 }
 
+/// An object or a specific object version to delete.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DeleteObjectTarget {
+    pub key: String,
+    pub version_id: Option<String>,
+}
+
+impl DeleteObjectTarget {
+    pub fn key(key: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            version_id: None,
+        }
+    }
+
+    pub fn version(key: impl Into<String>, version_id: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            version_id: Some(version_id.into()),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct CustomHeaderInterceptor {
     headers: Vec<RequestHeader>,
@@ -1394,20 +1417,39 @@ impl S3Client {
         keys: Vec<String>,
         options: DeleteRequestOptions,
     ) -> Result<Vec<String>> {
+        let targets = keys
+            .into_iter()
+            .map(DeleteObjectTarget::key)
+            .collect::<Vec<_>>();
+        let deleted = self
+            .delete_object_targets_with_options(bucket, targets, options)
+            .await?;
+        Ok(deleted.into_iter().map(|target| target.key).collect())
+    }
+
+    /// Delete multiple objects or explicit object versions.
+    pub async fn delete_object_targets_with_options(
+        &self,
+        bucket: &str,
+        targets: Vec<DeleteObjectTarget>,
+        options: DeleteRequestOptions,
+    ) -> Result<Vec<DeleteObjectTarget>> {
         use aws_sdk_s3::types::{Delete, ObjectIdentifier};
 
-        if keys.is_empty() {
+        if targets.is_empty() {
             return Ok(vec![]);
         }
 
-        let objects: Vec<ObjectIdentifier> =
-            keys.iter()
-                .map(|key| {
-                    ObjectIdentifier::builder().key(key).build().map_err(|e| {
-                        Error::General(format!("invalid delete object identifier: {e}"))
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
+        let objects: Vec<ObjectIdentifier> = targets
+            .iter()
+            .map(|target| {
+                ObjectIdentifier::builder()
+                    .key(&target.key)
+                    .set_version_id(target.version_id.clone())
+                    .build()
+                    .map_err(|e| Error::General(format!("invalid delete object identifier: {e}")))
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         let delete = Delete::builder()
             .set_objects(Some(objects))
@@ -1441,10 +1483,18 @@ impl S3Client {
             .await
             .map_err(|e| Error::Network(e.to_string()))?;
 
-        let deleted: Vec<String> = response
+        let deleted: Vec<DeleteObjectTarget> = response
             .deleted()
             .iter()
-            .filter_map(|d| d.key().map(|k| k.to_string()))
+            .filter_map(|deleted| {
+                deleted.key().map(|key| DeleteObjectTarget {
+                    key: key.to_string(),
+                    version_id: deleted
+                        .version_id()
+                        .or_else(|| deleted.delete_marker_version_id())
+                        .map(ToString::to_string),
+                })
+            })
             .collect();
 
         if !response.errors().is_empty() {
@@ -5187,6 +5237,46 @@ mod tests {
             request.headers().get("x-amz-bypass-governance-retention"),
             Some("true")
         );
+    }
+
+    #[tokio::test]
+    async fn delete_object_targets_preserve_version_ids_without_force_header() {
+        let response = http::Response::builder()
+            .status(200)
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Deleted><Key>key.txt</Key><VersionId>v1</VersionId></Deleted>
+  <Deleted>
+    <Key>key.txt</Key>
+    <DeleteMarker>true</DeleteMarker>
+    <DeleteMarkerVersionId>v2</DeleteMarkerVersionId>
+  </Deleted>
+</DeleteResult>"#,
+            ))
+            .expect("build delete objects response");
+        let (client, request_receiver) = test_s3_client(Some(response));
+        let targets = vec![
+            DeleteObjectTarget::version("key.txt", "v1"),
+            DeleteObjectTarget::version("key.txt", "v2"),
+        ];
+
+        let deleted = client
+            .delete_object_targets_with_options(
+                "bucket",
+                targets.clone(),
+                DeleteRequestOptions::default(),
+            )
+            .await
+            .expect("version delete should succeed");
+
+        let request = request_receiver.expect_request();
+        let body = request.body().bytes().expect("request body bytes");
+        let body = std::str::from_utf8(body).expect("request body is utf8");
+        assert!(body.contains("<VersionId>v1</VersionId>"));
+        assert!(body.contains("<VersionId>v2</VersionId>"));
+        assert!(request.headers().get("x-rustfs-force-delete").is_none());
+        assert_eq!(deleted, targets);
     }
 
     #[tokio::test]
