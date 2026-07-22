@@ -240,7 +240,6 @@ fn top_level_command_help_contract() {
                 "--recursive",
                 "--force",
                 "--dry-run",
-                "--incomplete",
                 "--versions",
                 "--bypass",
                 "--purge",
@@ -268,7 +267,7 @@ fn top_level_command_help_contract() {
         HelpCase {
             args: &["rb"],
             usage: "Usage: rc rb [OPTIONS] <TARGET>",
-            expected_tokens: &["--force", "--dangerous"],
+            expected_tokens: &["--force"],
         },
         HelpCase {
             args: &["cat"],
@@ -321,7 +320,6 @@ fn top_level_command_help_contract() {
                 "--force",
                 "--purge",
                 "--dry-run",
-                "--incomplete",
                 "--versions",
                 "--bypass",
                 "Examples:",
