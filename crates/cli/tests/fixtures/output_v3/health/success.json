@@ -1,0 +1,1 @@
+{"schema_version":3,"type":"health","status":"success","data":{"check":"liveness","alias":"local","endpoint":"http://127.0.0.1:9000","path":"/health","healthy":true,"status_code":200,"latency_ms":3,"status":"ok","service":"rustfs-endpoint"},"meta":{"server_version":"1.0.0-beta.10"}}

@@ -147,6 +147,10 @@ fn top_level_command_help_contract() {
                 "retention",
                 "legalhold",
                 "completions",
+                "watch",
+                "du",
+                "ping",
+                "ready",
             ],
         },
         HelpCase {
@@ -260,7 +264,6 @@ fn top_level_command_help_contract() {
                 "--recursive",
                 "--force",
                 "--dry-run",
-                "--incomplete",
                 "--versions",
                 "--version-id",
                 "--bypass",
@@ -289,7 +292,7 @@ fn top_level_command_help_contract() {
         HelpCase {
             args: &["rb"],
             usage: "Usage: rc rb [OPTIONS] <TARGET>",
-            expected_tokens: &["--force", "--dangerous"],
+            expected_tokens: &["--force"],
         },
         HelpCase {
             args: &["cat"],
@@ -308,7 +311,7 @@ fn top_level_command_help_contract() {
         },
         HelpCase {
             args: &["cp"],
-            usage: "Usage: rc cp [OPTIONS] <SOURCE> <TARGET>",
+            usage: "Usage: rc cp [OPTIONS] <SOURCE>... <TARGET>",
             expected_tokens: &[
                 "--recursive",
                 "--preserve",
@@ -319,6 +322,16 @@ fn top_level_command_help_contract() {
                 "--content-type",
                 "--enc-s3",
                 "--enc-kms",
+                "--include",
+                "--exclude",
+                "--newer-than",
+                "--older-than",
+                "--rewind",
+                "--concurrency",
+                "--rate-limit",
+                "--retry-attempts",
+                "--fail-empty",
+                "--summary",
                 "Examples:",
                 "rc object copy ./report.json local/my-bucket/reports/",
             ],
@@ -342,7 +355,6 @@ fn top_level_command_help_contract() {
                 "--force",
                 "--purge",
                 "--dry-run",
-                "--incomplete",
                 "--versions",
                 "--version-id",
                 "--bypass",
@@ -378,7 +390,24 @@ fn top_level_command_help_contract() {
         HelpCase {
             args: &["mirror"],
             usage: "Usage: rc mirror [OPTIONS] <SOURCE> <TARGET>",
-            expected_tokens: &["--remove", "--overwrite", "--dry-run", "--parallel"],
+            expected_tokens: &[
+                "--remove",
+                "--overwrite",
+                "--include",
+                "--exclude",
+                "--newer-than",
+                "--older-than",
+                "--continue-on-error",
+                "--skip-errors",
+                "--dry-run",
+                "--concurrency",
+                "--parallel",
+                "--rate-limit",
+                "--retry-attempts",
+                "--retry-initial-backoff-ms",
+                "--retry-max-backoff-ms",
+                "--summary",
+            ],
         },
         HelpCase {
             args: &["tree"],
@@ -447,6 +476,41 @@ fn top_level_command_help_contract() {
             usage: "Usage: rc completions [OPTIONS] <SHELL>",
             expected_tokens: &["[possible values: bash, elvish, fish, powershell, zsh]"],
         },
+        HelpCase {
+            args: &["watch"],
+            usage: "Usage: rc watch [OPTIONS] <PATH>",
+            expected_tokens: &[
+                "--event",
+                "--prefix",
+                "--suffix",
+                "--ping",
+                "--reconnect-attempts",
+                "--reconnect-delay-ms",
+                "--reconnect-max-delay-ms",
+                "Examples:",
+                "rc watch local/",
+            ],
+        },
+        HelpCase {
+            args: &["ping"],
+            usage: "Usage: rc ping [OPTIONS] <ALIAS>",
+            expected_tokens: &["--timeout", "service liveness", "round-trip latency"],
+        },
+        HelpCase {
+            args: &["ready"],
+            usage: "Usage: rc ready [OPTIONS] <ALIAS>",
+            expected_tokens: &["--timeout", "required dependencies"],
+        },
+        HelpCase {
+            args: &["du"],
+            usage: "Usage: rc du [OPTIONS] <TARGET>",
+            expected_tokens: &[
+                "--fallback",
+                "--versions",
+                "--incomplete",
+                "client-side S3 scan",
+            ],
+        },
     ];
 
     for case in cases {
@@ -494,6 +558,40 @@ fn nested_subcommand_help_contract() {
             args: &["admin", "info", "disk"],
             usage: "Usage: rc admin info disk [OPTIONS] <ALIAS>",
             expected_tokens: &["--offline", "--healing"],
+        },
+        HelpCase {
+            args: &["admin", "replicate", "edit"],
+            usage: "Usage: rc admin replicate edit [OPTIONS] --site <SITE> <ALIAS>",
+            expected_tokens: &[
+                "--site",
+                "--endpoint",
+                "--name",
+                "--skip-tls-verify",
+                "--verify-tls",
+                "--ca-cert",
+                "--clear-ca-cert",
+                "--yes",
+            ],
+        },
+        HelpCase {
+            args: &["admin", "replicate", "resync"],
+            usage: "Usage: rc admin replicate resync [OPTIONS] <COMMAND>",
+            expected_tokens: &["start", "status", "cancel"],
+        },
+        HelpCase {
+            args: &["admin", "replicate", "resync", "start"],
+            usage: "Usage: rc admin replicate resync start [OPTIONS] --site <SITE> <ALIAS>",
+            expected_tokens: &["--site", "--yes"],
+        },
+        HelpCase {
+            args: &["admin", "replicate", "resync", "status"],
+            usage: "Usage: rc admin replicate resync status [OPTIONS] --site <SITE> <ALIAS>",
+            expected_tokens: &["--site"],
+        },
+        HelpCase {
+            args: &["admin", "replicate", "resync", "cancel"],
+            usage: "Usage: rc admin replicate resync cancel [OPTIONS] --site <SITE> <ALIAS>",
+            expected_tokens: &["--site", "--yes"],
         },
         HelpCase {
             args: &["admin", "heal", "status"],
@@ -628,6 +726,40 @@ fn nested_subcommand_help_contract() {
             ],
         },
         HelpCase {
+            args: &["bucket", "replication", "check"],
+            usage: "Usage: rc bucket replication check [OPTIONS] <PATH>",
+            expected_tokens: &[
+                "--yes",
+                "--force",
+                "active remote write/delete validation probe",
+            ],
+        },
+        HelpCase {
+            args: &["bucket", "replication", "resync"],
+            usage: "Usage: rc bucket replication resync [OPTIONS] <COMMAND>",
+            expected_tokens: &["start", "status"],
+        },
+        HelpCase {
+            args: &["bucket", "replication", "resync", "start"],
+            usage: "Usage: rc bucket replication resync start [OPTIONS] <PATH>",
+            expected_tokens: &[
+                "--target-arn",
+                "--older-than",
+                "--reset-id",
+                "--yes",
+                "--force",
+            ],
+        },
+        HelpCase {
+            args: &["bucket", "replication", "resync", "status"],
+            usage: "Usage: rc bucket replication resync status [OPTIONS] <PATH>",
+            expected_tokens: &[
+                "--target-arn",
+                "--force",
+                "persisted server-side resync status",
+            ],
+        },
+        HelpCase {
             args: &["bucket", "event", "add"],
             usage: "Usage: rc bucket event add [OPTIONS] <PATH> <ARN>",
             expected_tokens: &[
@@ -658,7 +790,7 @@ fn nested_subcommand_help_contract() {
         },
         HelpCase {
             args: &["object", "copy"],
-            usage: "Usage: rc object copy [OPTIONS] <SOURCE> <TARGET>",
+            usage: "Usage: rc object copy [OPTIONS] <SOURCE>... <TARGET>",
             expected_tokens: &[
                 "--recursive",
                 "--preserve",
@@ -667,6 +799,16 @@ fn nested_subcommand_help_contract() {
                 "--dry-run",
                 "--storage-class",
                 "--content-type",
+                "--include",
+                "--exclude",
+                "--newer-than",
+                "--older-than",
+                "--rewind",
+                "--concurrency",
+                "--rate-limit",
+                "--retry-attempts",
+                "--fail-empty",
+                "--summary",
                 "Examples:",
                 "rc object copy ./report.json local/my-bucket/reports/",
             ],
