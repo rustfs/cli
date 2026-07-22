@@ -15,7 +15,10 @@ use crate::encryption::{BucketEncryption, ObjectEncryptionRequest};
 use crate::error::Result;
 use crate::lifecycle::LifecycleRule;
 use crate::path::RemotePath;
-use crate::replication::ReplicationConfiguration;
+use crate::replication::{
+    ReplicationConfiguration, ReplicationResyncStartOptions, ReplicationResyncStartResult,
+    ReplicationResyncStatus,
+};
 use crate::select::SelectOptions;
 
 /// Metadata for an object version
@@ -418,6 +421,23 @@ pub trait ObjectStore: Send + Sync {
 
     /// Delete bucket replication configuration.
     async fn delete_bucket_replication(&self, bucket: &str) -> Result<()>;
+
+    /// Actively validate configured replication targets.
+    async fn check_bucket_replication(&self, bucket: &str) -> Result<()>;
+
+    /// Start a server-side bucket replication resync.
+    async fn start_bucket_replication_resync(
+        &self,
+        bucket: &str,
+        options: ReplicationResyncStartOptions,
+    ) -> Result<ReplicationResyncStartResult>;
+
+    /// Read persisted server-side bucket replication resync status.
+    async fn bucket_replication_resync_status(
+        &self,
+        bucket: &str,
+        target_arn: Option<&str>,
+    ) -> Result<ReplicationResyncStatus>;
 
     /// Get bucket CORS rules. Returns empty vec if no CORS config exists.
     async fn get_bucket_cors(&self, bucket: &str) -> Result<Vec<CorsRule>>;

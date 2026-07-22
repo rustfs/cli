@@ -4,6 +4,7 @@
 //! service accounts, and cluster operations through the RustFS Admin API.
 
 mod access_key;
+mod capabilities;
 mod decommission;
 mod expand;
 mod group;
@@ -27,6 +28,9 @@ use rc_s3::AdminClient;
 /// Admin subcommands for IAM and cluster management
 #[derive(Subcommand, Debug)]
 pub enum AdminCommands {
+    /// Discover effective RustFS runtime capabilities
+    Capabilities(capabilities::CapabilitiesArgs),
+
     /// Display cluster information (servers, disks, usage)
     #[command(subcommand)]
     Info(info::InfoCommands),
@@ -85,6 +89,7 @@ pub async fn execute(cmd: AdminCommands, output_config: OutputConfig) -> ExitCod
     let formatter = Formatter::new(output_config);
 
     match cmd {
+        AdminCommands::Capabilities(args) => capabilities::execute(args, &formatter).await,
         AdminCommands::Info(info_cmd) => info::execute(info_cmd, &formatter).await,
         AdminCommands::Heal(heal_cmd) => heal::execute(heal_cmd, &formatter).await,
         AdminCommands::Pool(pool_cmd) => pool::execute(pool_cmd, &formatter).await,
@@ -171,6 +176,19 @@ mod tests {
                 assert_eq!(args.alias, "local");
                 assert!(args.offline);
                 assert!(args.healing);
+            }
+            _ => panic!("Unexpected command parsing result"),
+        }
+    }
+
+    #[test]
+    fn test_parse_admin_capabilities_refresh() {
+        let cli = TestCli::parse_from(["rc", "capabilities", "local", "--refresh"]);
+
+        match cli.command {
+            AdminCommands::Capabilities(args) => {
+                assert_eq!(args.alias, "local");
+                assert!(args.refresh);
             }
             _ => panic!("Unexpected command parsing result"),
         }

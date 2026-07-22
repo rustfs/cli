@@ -1,0 +1,1 @@
+{"schema_version":3,"type":"versioned_objects","status":"error","error":{"type":"unsupported_feature","message":"Object version listing is unavailable","retryable":false,"capability":"list_object_versions","server":null,"suggestion":null}}

@@ -35,6 +35,8 @@ jiff.workspace = true
 url.workspace = true
 urlencoding.workspace = true
 humansize.workspace = true
+rustls-pki-types.workspace = true
+x509-parser.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -1,0 +1,1 @@
+{"schema_version":3,"type":"usage","status":"success","data":{"scope":"cluster","path":null,"total_bytes":4096,"object_count":4,"version_count":6,"delete_marker_count":1,"buckets":[{"name":"photos","total_bytes":4096,"object_count":4}]}}

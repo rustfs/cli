@@ -1,0 +1,1 @@
+{"schema_version":3,"type":"multipart_uploads","status":"error","error":{"type":"unsupported_feature","message":"Multipart upload listing is unavailable","retryable":false,"capability":"list_multipart_uploads","server":null,"suggestion":null}}

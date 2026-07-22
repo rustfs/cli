@@ -1,0 +1,1 @@
+{"schema_version":3,"type":"versioned_objects","status":"success","data":{"items":[{"bucket":"photos","key":"2026/image.jpg","version_id":"v1","is_latest":true,"delete_marker":false,"size_bytes":1024,"last_modified":"2026-07-21T04:00:00Z","etag":"abc123","storage_class":"STANDARD"}],"pagination":{"truncated":true,"continuation_token":"next-v1"}}}

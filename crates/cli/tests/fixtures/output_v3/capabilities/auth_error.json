@@ -1,0 +1,11 @@
+{
+  "schema_version": 3,
+  "type": "capabilities",
+  "status": "error",
+  "error": {
+    "type": "auth_error",
+    "message": "Failed to discover capabilities: Authentication failed: Access denied",
+    "retryable": false,
+    "suggestion": "Verify the alias credentials and ServerInfoAdminAction permission."
+  }
+}

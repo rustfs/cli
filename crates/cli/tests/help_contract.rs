@@ -240,7 +240,6 @@ fn top_level_command_help_contract() {
                 "--recursive",
                 "--force",
                 "--dry-run",
-                "--incomplete",
                 "--versions",
                 "--bypass",
                 "--purge",
@@ -268,7 +267,7 @@ fn top_level_command_help_contract() {
         HelpCase {
             args: &["rb"],
             usage: "Usage: rc rb [OPTIONS] <TARGET>",
-            expected_tokens: &["--force", "--dangerous"],
+            expected_tokens: &["--force"],
         },
         HelpCase {
             args: &["cat"],
@@ -321,7 +320,6 @@ fn top_level_command_help_contract() {
                 "--force",
                 "--purge",
                 "--dry-run",
-                "--incomplete",
                 "--versions",
                 "--bypass",
                 "Examples:",
@@ -474,6 +472,40 @@ fn nested_subcommand_help_contract() {
             expected_tokens: &["--offline", "--healing"],
         },
         HelpCase {
+            args: &["admin", "replicate", "edit"],
+            usage: "Usage: rc admin replicate edit [OPTIONS] --site <SITE> <ALIAS>",
+            expected_tokens: &[
+                "--site",
+                "--endpoint",
+                "--name",
+                "--skip-tls-verify",
+                "--verify-tls",
+                "--ca-cert",
+                "--clear-ca-cert",
+                "--yes",
+            ],
+        },
+        HelpCase {
+            args: &["admin", "replicate", "resync"],
+            usage: "Usage: rc admin replicate resync [OPTIONS] <COMMAND>",
+            expected_tokens: &["start", "status", "cancel"],
+        },
+        HelpCase {
+            args: &["admin", "replicate", "resync", "start"],
+            usage: "Usage: rc admin replicate resync start [OPTIONS] --site <SITE> <ALIAS>",
+            expected_tokens: &["--site", "--yes"],
+        },
+        HelpCase {
+            args: &["admin", "replicate", "resync", "status"],
+            usage: "Usage: rc admin replicate resync status [OPTIONS] --site <SITE> <ALIAS>",
+            expected_tokens: &["--site"],
+        },
+        HelpCase {
+            args: &["admin", "replicate", "resync", "cancel"],
+            usage: "Usage: rc admin replicate resync cancel [OPTIONS] --site <SITE> <ALIAS>",
+            expected_tokens: &["--site", "--yes"],
+        },
+        HelpCase {
             args: &["admin", "heal", "status"],
             usage: "Usage: rc admin heal status [OPTIONS] <ALIAS>",
             expected_tokens: &["--bucket", "--prefix", "--client-token"],
@@ -603,6 +635,40 @@ fn nested_subcommand_help_contract() {
                 "Examples:",
                 "rc bucket replication add local/my-bucket --remote-bucket backup/archive",
                 "The path is resolved on the CLI machine,",
+            ],
+        },
+        HelpCase {
+            args: &["bucket", "replication", "check"],
+            usage: "Usage: rc bucket replication check [OPTIONS] <PATH>",
+            expected_tokens: &[
+                "--yes",
+                "--force",
+                "active remote write/delete validation probe",
+            ],
+        },
+        HelpCase {
+            args: &["bucket", "replication", "resync"],
+            usage: "Usage: rc bucket replication resync [OPTIONS] <COMMAND>",
+            expected_tokens: &["start", "status"],
+        },
+        HelpCase {
+            args: &["bucket", "replication", "resync", "start"],
+            usage: "Usage: rc bucket replication resync start [OPTIONS] <PATH>",
+            expected_tokens: &[
+                "--target-arn",
+                "--older-than",
+                "--reset-id",
+                "--yes",
+                "--force",
+            ],
+        },
+        HelpCase {
+            args: &["bucket", "replication", "resync", "status"],
+            usage: "Usage: rc bucket replication resync status [OPTIONS] <PATH>",
+            expected_tokens: &[
+                "--target-arn",
+                "--force",
+                "persisted server-side resync status",
             ],
         },
         HelpCase {
