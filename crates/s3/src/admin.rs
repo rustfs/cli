@@ -9,15 +9,19 @@ use aws_sigv4::http_request::{
     SignableBody, SignableRequest, SignatureLocation, SigningSettings, sign,
 };
 use aws_sigv4::sign::v4;
+use futures::StreamExt;
 use rc_core::admin::{
     AccessKeyInfo, AdminApi, BucketQuota, CapabilityApi, CapabilityAvailability, CapabilityEntry,
     CapabilityReport, ClusterInfo, ClusterSnapshotMetadata, ClusterSnapshotSummary,
     CreateServiceAccountRequest, DecommissionPoolStatus, DecommissionStatus, ExtensionsCatalog,
     Group, GroupStatus, HealRuntimeState, HealScanMode, HealStartRequest, HealStatus,
-    HealTaskRequest, PeerSiteSpec, Policy, PolicyEntity, PolicyInfo, PoolStatus, PoolTarget,
-    RebalanceStartResult, RebalanceStatus, RuntimeCapabilitiesSnapshot, RuntimeCapabilityStatus,
-    ServiceAccount, ServiceAccountCreateResponse, ServiceActionResult, SiteRemoveSpec,
-    SiteStatusOptions, UpdateGroupMembersRequest, UpdateServiceAccountRequest, User, UserStatus,
+    HealTaskRequest, MAX_SITE_REPLICATION_ERROR_RESPONSE_BYTES, MAX_SITE_REPLICATION_REQUEST_BYTES,
+    MAX_SITE_REPLICATION_SUCCESS_RESPONSE_BYTES, PeerSiteSpec, Policy, PolicyEntity, PolicyInfo,
+    PoolStatus, PoolTarget, RebalanceStartResult, RebalanceStatus, ReplicateEditStatus,
+    RuntimeCapabilitiesSnapshot, RuntimeCapabilityStatus, ServiceAccount,
+    ServiceAccountCreateResponse, ServiceActionResult, SiteRemoveSpec, SiteReplicationInfo,
+    SiteReplicationPeer, SiteStatusOptions, UpdateGroupMembersRequest, UpdateServiceAccountRequest,
+    User, UserStatus,
 };
 use rc_core::{Alias, Error, Result};
 use reqwest::header::{CONTENT_TYPE, HOST, HeaderMap, HeaderName, HeaderValue};
@@ -358,6 +362,87 @@ impl AdminClient {
         }
     }
 
+    async fn request_site_replication<T: for<'de> Deserialize<'de>>(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&[u8]>,
+        operation_label: &'static str,
+    ) -> Result<T> {
+        let body_bytes = body.unwrap_or(&[]);
+        if body_bytes.len() > MAX_SITE_REPLICATION_REQUEST_BYTES {
+            return Err(Error::General(format!(
+                "Site replication request size {} exceeds the {} byte limit",
+                body_bytes.len(),
+                MAX_SITE_REPLICATION_REQUEST_BYTES
+            )));
+        }
+
+        let is_edit = method == Method::PUT;
+        let url = self.admin_url(path);
+        let headers = self.request_headers(body_bytes)?;
+        let signed_headers = self
+            .sign_request(&method, &url, &headers, body_bytes)
+            .await?;
+        let mut request_builder = self.http_client.request(method, &url);
+        for (name, value) in &signed_headers {
+            request_builder = request_builder.header(name, value);
+        }
+        if !body_bytes.is_empty() {
+            request_builder = request_builder.body(body_bytes.to_vec());
+        }
+
+        let response = request_builder.send().await.map_err(|error| {
+            if is_edit {
+                Error::Network(format!(
+                    "Site replication edit outcome is unknown; the request was not retried: {error}"
+                ))
+            } else {
+                Error::Network(format!("Request failed: {error}"))
+            }
+        })?;
+        let status = response.status();
+        let limit = if status.is_success() {
+            MAX_SITE_REPLICATION_SUCCESS_RESPONSE_BYTES
+        } else {
+            MAX_SITE_REPLICATION_ERROR_RESPONSE_BYTES
+        };
+        if response
+            .content_length()
+            .is_some_and(|content_length| content_length > limit as u64)
+        {
+            return Err(Error::General(format!(
+                "Site replication response exceeds the {limit} byte limit"
+            )));
+        }
+
+        let mut bytes = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| {
+                if is_edit {
+                    Error::Network(format!(
+                        "Site replication edit outcome is unknown; the response could not be read and the request was not retried: {error}"
+                    ))
+                } else {
+                    Error::Network(format!("Failed to read site replication response: {error}"))
+                }
+            })?;
+            if bytes.len().saturating_add(chunk.len()) > limit {
+                return Err(Error::General(format!(
+                    "Site replication response exceeds the {limit} byte limit"
+                )));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+
+        if !status.is_success() {
+            let error_body = String::from_utf8_lossy(&bytes);
+            return Err(self.map_site_replication_error(status, &error_body, operation_label));
+        }
+        serde_json::from_slice(&bytes).map_err(Error::Json)
+    }
+
     /// Make a signed request that returns no body
     async fn request_no_response(
         &self,
@@ -462,6 +547,47 @@ impl AdminClient {
             _ => Error::Network(format!("HTTP {}: {}", status.as_u16(), body)),
         }
     }
+
+    fn map_site_replication_error(
+        &self,
+        status: StatusCode,
+        body: &str,
+        operation_label: &str,
+    ) -> Error {
+        if matches!(
+            status,
+            StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_IMPLEMENTED
+        ) {
+            return Error::UnsupportedFeature(format!(
+                "{operation_label} is not supported by this server"
+            ));
+        }
+        if status == StatusCode::BAD_REQUEST && site_replication_operation_conflicts(body) {
+            return Error::Conflict("A site replication operation is already pending".to_string());
+        }
+        if matches!(status, StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED) {
+            return Error::Auth("Authentication failed for site replication request".to_string());
+        }
+        if status == StatusCode::CONFLICT {
+            return Error::Conflict("Site replication request conflicts with server state".into());
+        }
+        if status == StatusCode::BAD_REQUEST {
+            return Error::General("Site replication request was rejected by the server".into());
+        }
+        Error::Network(format!(
+            "Site replication request failed with HTTP {}",
+            status.as_u16()
+        ))
+    }
+
+    fn sanitize_site_replication_status(&self, status: &mut ReplicateEditStatus) {
+        for credential in [&self.access_key, &self.secret_key] {
+            if !credential.is_empty() {
+                status.status = status.status.replace(credential, "[REDACTED]");
+                status.error_detail = status.error_detail.replace(credential, "[REDACTED]");
+            }
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -480,6 +606,45 @@ impl AdminErrorResponse {
                 Some("get cred failed" | "authentication required" | "missing credentials")
             )
     }
+}
+
+fn site_replication_operation_conflicts(body: &str) -> bool {
+    let Some(error) = parse_admin_error(body) else {
+        return false;
+    };
+    site_replication_server_invalid_state(
+        error.code.as_deref(),
+        error.message.as_deref().unwrap_or_default(),
+    )
+}
+
+fn site_replication_server_invalid_state(code: Option<&str>, message: &str) -> bool {
+    if code.is_some_and(|code| {
+        matches!(
+            code,
+            "SiteReplicationIAMChangePending"
+                | "SiteReplicationOperationPending"
+                | "SiteReplicationPeerEditPending"
+        )
+    }) {
+        return true;
+    }
+
+    let message = message.trim().to_ascii_lowercase();
+    if matches!(
+        message.as_str(),
+        "site replication operation pending"
+            | "site replication peer edit pending"
+            | "site replication iam change pending"
+    ) {
+        return true;
+    }
+
+    let state_changed = matches!(
+        message.as_str(),
+        "site replication state changed" | "site replication refresh state changed"
+    );
+    state_changed && matches!(code, None | Some("InvalidRequest"))
 }
 
 fn parse_admin_error(body: &str) -> Option<AdminErrorResponse> {
@@ -1689,9 +1854,48 @@ impl AdminApi for AdminClient {
             .await
     }
 
-    async fn site_replication_info(&self) -> Result<serde_json::Value> {
-        self.request(Method::GET, "/site-replication/info", None, None)
-            .await
+    async fn site_replication_info(&self) -> Result<SiteReplicationInfo> {
+        self.request_site_replication(
+            Method::GET,
+            "/site-replication/info",
+            None,
+            "Site replication info",
+        )
+        .await
+    }
+
+    async fn site_replication_edit(
+        &self,
+        peer: &SiteReplicationPeer,
+    ) -> Result<ReplicateEditStatus> {
+        let body = serde_json::to_vec(peer).map_err(Error::Json)?;
+        let mut status: ReplicateEditStatus = self
+            .request_site_replication(
+                Method::PUT,
+                "/site-replication/edit",
+                Some(&body),
+                "Site replication edit",
+            )
+            .await?;
+        self.sanitize_site_replication_status(&mut status);
+        if status.success {
+            return Ok(status);
+        }
+
+        let detail = if status.error_detail.trim().is_empty() {
+            status.status.clone()
+        } else {
+            status.error_detail.clone()
+        };
+        if site_replication_server_invalid_state(None, &detail) {
+            Err(Error::Conflict(
+                "Site replication edit conflicts with current server state".to_string(),
+            ))
+        } else {
+            Err(Error::General(
+                "Site replication edit was rejected by the server".to_string(),
+            ))
+        }
     }
 
     async fn site_replication_add(&self, sites: &[PeerSiteSpec]) -> Result<serde_json::Value> {
@@ -1847,6 +2051,18 @@ mod tests {
         });
 
         (endpoint, receiver, handle)
+    }
+
+    fn start_admin_raw_response_server(response: Vec<u8>) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let _request = read_admin_request(&mut stream);
+            let _ = stream.write_all(&response);
+        });
+
+        (endpoint, handle)
     }
 
     fn admin_client_for_endpoint(endpoint: &str) -> AdminClient {
@@ -3315,6 +3531,454 @@ mod tests {
         assert_eq!(body[0].access_key, "site-a-access");
         assert_eq!(body[0].secret_key, "site-a-secret");
         assert!(body[0].skip_tls_verify);
+        handle.join().expect("server thread should finish");
+    }
+
+    const SITE_REPLICATION_INFO_RESPONSE: &str = r#"{
+        "enabled":true,
+        "name":"primary",
+        "sites":[{
+            "endpoint":"https://secondary.example.test",
+            "name":"secondary",
+            "deploymentID":"deployment-2",
+            "sync":"enable",
+            "defaultbandwidth":{"bandwidthLimitPerBucket":1024,"set":true},
+            "replicate-ilm-expiry":true,
+            "objectNamingMode":"path",
+            "skipTlsVerify":false,
+            "caCertPem":"ORIGINAL-CA",
+            "apiVersion":"v1",
+            "futurePeer":{"mode":"preserved","accessToken":"OPAQUE-TOKEN-MUST-NOT-PRINT"}
+        }],
+        "serviceAccountAccessKey":"DISCARDED",
+        "apiVersion":"v1"
+    }"#;
+
+    #[tokio::test]
+    async fn site_replication_info_returns_typed_opaque_snapshot() {
+        let (endpoint, receiver, handle) =
+            start_admin_test_server("200 OK", SITE_REPLICATION_INFO_RESPONSE);
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let info = client
+            .site_replication_info()
+            .await
+            .expect("site replication info request");
+
+        assert_eq!(info.sites[0].deployment_id(), Some("deployment-2"));
+        assert_eq!(info.sites[0].ca_cert_pem(), Some("ORIGINAL-CA"));
+        let wire = serde_json::to_value(&info.sites[0]).expect("peer is serializable");
+        assert_eq!(
+            wire["futurePeer"]["accessToken"],
+            "OPAQUE-TOKEN-MUST-NOT-PRINT"
+        );
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.target, "/rustfs/admin/v3/site-replication/info");
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn site_replication_edit_puts_lossless_peer_snapshot() {
+        let (endpoint, receiver, handle) = start_admin_test_server(
+            "200 OK",
+            r#"{"success":true,"status":"updated","errorDetail":"","apiVersion":"v1"}"#,
+        );
+        let client = admin_client_for_endpoint(&endpoint);
+        let info: rc_core::admin::SiteReplicationInfo =
+            serde_json::from_str(SITE_REPLICATION_INFO_RESPONSE).expect("valid info fixture");
+
+        let status = client
+            .site_replication_edit(&info.sites[0])
+            .await
+            .expect("site replication edit request");
+
+        assert!(status.success);
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(request.method, "PUT");
+        assert_eq!(request.target, "/rustfs/admin/v3/site-replication/edit");
+        let body: serde_json::Value =
+            serde_json::from_slice(&request.body).expect("edit body should be JSON");
+        assert_eq!(body["caCertPem"], "ORIGINAL-CA");
+        assert_eq!(body["futurePeer"]["mode"], "preserved");
+        assert_eq!(
+            body["futurePeer"]["accessToken"],
+            "OPAQUE-TOKEN-MUST-NOT-PRINT"
+        );
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn site_replication_info_rejects_declared_success_overflow() {
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n",
+            rc_core::admin::MAX_SITE_REPLICATION_SUCCESS_RESPONSE_BYTES + 1
+        )
+        .into_bytes();
+        let (endpoint, handle) = start_admin_raw_response_server(response);
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let error = client
+            .site_replication_info()
+            .await
+            .expect_err("oversized declared response must fail");
+
+        assert!(matches!(error, Error::General(_)));
+        assert!(error.to_string().contains("exceeds"));
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn site_replication_info_rejects_chunked_success_overflow() {
+        let mut response = b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n".to_vec();
+        let chunk = vec![b'x'; 64 * 1024];
+        for _ in 0..=rc_core::admin::MAX_SITE_REPLICATION_SUCCESS_RESPONSE_BYTES / chunk.len() {
+            response.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+            response.extend_from_slice(&chunk);
+            response.extend_from_slice(b"\r\n");
+        }
+        response.extend_from_slice(b"0\r\n\r\n");
+        let (endpoint, handle) = start_admin_raw_response_server(response);
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let error = client
+            .site_replication_info()
+            .await
+            .expect_err("oversized chunked response must fail");
+
+        assert!(matches!(error, Error::General(_)));
+        assert!(error.to_string().contains("exceeds"));
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn site_replication_edit_rejects_chunked_error_overflow() {
+        let mut response = b"HTTP/1.1 500 Internal Server Error\r\ntransfer-encoding: chunked\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n".to_vec();
+        let body = vec![b'x'; rc_core::admin::MAX_SITE_REPLICATION_ERROR_RESPONSE_BYTES + 1];
+        response.extend_from_slice(format!("{:x}\r\n", body.len()).as_bytes());
+        response.extend_from_slice(&body);
+        response.extend_from_slice(b"\r\n0\r\n\r\n");
+        let (endpoint, handle) = start_admin_raw_response_server(response);
+        let client = admin_client_for_endpoint(&endpoint);
+        let peer = rc_core::admin::SiteReplicationPeer::default();
+
+        let error = client
+            .site_replication_edit(&peer)
+            .await
+            .expect_err("oversized chunked error must fail");
+
+        assert!(matches!(error, Error::General(_)));
+        assert!(error.to_string().contains("exceeds"));
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn site_replication_info_rejects_malformed_json() {
+        let (endpoint, _receiver, handle) = start_admin_test_server("200 OK", "{");
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let error = client
+            .site_replication_info()
+            .await
+            .expect_err("malformed JSON must fail");
+
+        assert!(matches!(error, Error::Json(_)));
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn site_replication_edit_rejects_oversized_request_before_network() {
+        let client = admin_client_for_endpoint("http://127.0.0.1:1");
+        let mut peer = rc_core::admin::SiteReplicationPeer::default();
+        peer.set_ca_cert_pem("x".repeat(rc_core::admin::MAX_SITE_REPLICATION_REQUEST_BYTES + 1));
+
+        let error = client
+            .site_replication_edit(&peer)
+            .await
+            .expect_err("oversized request must fail before connecting");
+
+        assert!(matches!(error, Error::General(_)));
+        assert!(error.to_string().contains("exceeds"));
+    }
+
+    #[tokio::test]
+    async fn site_replication_edit_treats_success_false_as_failure() {
+        let (endpoint, _receiver, handle) = start_admin_test_server(
+            "200 OK",
+            r#"{"success":false,"status":"rejected","errorDetail":"peer is invalid","apiVersion":"v1"}"#,
+        );
+        let client = admin_client_for_endpoint(&endpoint);
+        let peer = rc_core::admin::SiteReplicationPeer::default();
+
+        let error = client
+            .site_replication_edit(&peer)
+            .await
+            .expect_err("success false must fail");
+
+        assert!(matches!(error, Error::General(_)));
+        assert!(!error.to_string().contains("peer is invalid"));
+        assert!(error.to_string().contains("rejected by the server"));
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn site_replication_edit_maps_typed_state_changes_to_conflict() {
+        for message in [
+            "site replication state changed",
+            "site replication refresh state changed",
+        ] {
+            let body = format!(
+                r#"{{"success":false,"status":"{message}","errorDetail":"","apiVersion":"v1"}}"#
+            );
+            let leaked: &'static str = Box::leak(body.into_boxed_str());
+            let (endpoint, _receiver, handle) = start_admin_test_server("200 OK", leaked);
+            let client = admin_client_for_endpoint(&endpoint);
+            let peer = rc_core::admin::SiteReplicationPeer::default();
+
+            let error = client
+                .site_replication_edit(&peer)
+                .await
+                .expect_err("typed state change must conflict");
+
+            assert!(matches!(error, Error::Conflict(_)));
+            assert_eq!(error.exit_code(), 6);
+            handle.join().expect("server thread should finish");
+        }
+    }
+
+    #[tokio::test]
+    async fn site_replication_edit_maps_typed_known_pending_phrases_to_conflict() {
+        for message in [
+            "site replication operation pending",
+            "site replication peer edit pending",
+            "site replication IAM change pending",
+        ] {
+            let body = format!(
+                r#"{{"success":false,"status":"{message}","errorDetail":"","apiVersion":"v1"}}"#
+            );
+            let leaked: &'static str = Box::leak(body.into_boxed_str());
+            let (endpoint, _receiver, handle) = start_admin_test_server("200 OK", leaked);
+            let client = admin_client_for_endpoint(&endpoint);
+            let peer = rc_core::admin::SiteReplicationPeer::default();
+
+            let error = client
+                .site_replication_edit(&peer)
+                .await
+                .expect_err("known typed pending state must conflict");
+
+            assert!(matches!(error, Error::Conflict(_)));
+            assert_eq!(error.exit_code(), 6);
+            handle.join().expect("server thread should finish");
+        }
+    }
+
+    #[tokio::test]
+    async fn site_replication_edit_does_not_overclassify_arbitrary_pending_text() {
+        let typed_body = r#"{"success":false,"status":"pending value is malformed","errorDetail":"","apiVersion":"v1"}"#;
+        let (endpoint, _receiver, handle) = start_admin_test_server("200 OK", typed_body);
+        let client = admin_client_for_endpoint(&endpoint);
+        let peer = rc_core::admin::SiteReplicationPeer::default();
+
+        let typed_error = client
+            .site_replication_edit(&peer)
+            .await
+            .expect_err("arbitrary typed pending text must fail");
+
+        assert!(matches!(typed_error, Error::General(_)));
+        assert_eq!(typed_error.exit_code(), 1);
+        handle.join().expect("server thread should finish");
+
+        let http_body = r#"{"code":"InvalidRequest","message":"pending value is malformed"}"#;
+        let (endpoint, _receiver, handle) = start_admin_test_server("400 Bad Request", http_body);
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let http_error = client
+            .site_replication_edit(&peer)
+            .await
+            .expect_err("arbitrary HTTP pending text must fail");
+
+        assert!(matches!(http_error, Error::General(_)));
+        assert_eq!(http_error.exit_code(), 1);
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn site_replication_edit_does_not_follow_temporary_redirect() {
+        let (endpoint, receiver, handle) = start_admin_test_server(
+            "307 Temporary Redirect",
+            r#"{"message":"do not redirect mutations"}"#,
+        );
+        let client = admin_client_for_endpoint(&endpoint);
+        let peer = rc_core::admin::SiteReplicationPeer::default();
+
+        let error = client
+            .site_replication_edit(&peer)
+            .await
+            .expect_err("redirect must not be followed");
+
+        assert!(matches!(error, Error::Network(_)));
+        let request = receiver.recv().expect("single captured request");
+        assert_eq!(request.method, "PUT");
+        assert_eq!(request.target, "/rustfs/admin/v3/site-replication/edit");
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn site_replication_edit_disconnect_reports_unknown_outcome_without_retry() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            sender
+                .send(read_admin_request(&mut stream))
+                .expect("send captured request");
+        });
+        let client = admin_client_for_endpoint(&endpoint);
+        let peer = rc_core::admin::SiteReplicationPeer::default();
+
+        let error = client
+            .site_replication_edit(&peer)
+            .await
+            .expect_err("disconnect after PUT must be an unknown outcome");
+
+        assert!(matches!(error, Error::Network(_)));
+        assert_eq!(error.exit_code(), 3);
+        assert!(error.to_string().contains("outcome is unknown"));
+        assert!(error.to_string().contains("not retried"));
+        let request = receiver.recv().expect("single captured request");
+        assert_eq!(request.method, "PUT");
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn site_replication_edit_maps_pending_bad_request_to_conflict() {
+        let (endpoint, _receiver, handle) = start_admin_test_server(
+            "400 Bad Request",
+            r#"{"code":"SiteReplicationOperationPending","message":"another site replication operation is pending"}"#,
+        );
+        let client = admin_client_for_endpoint(&endpoint);
+        let peer = rc_core::admin::SiteReplicationPeer::default();
+
+        let error = client
+            .site_replication_edit(&peer)
+            .await
+            .expect_err("pending operation must conflict");
+
+        assert!(matches!(error, Error::Conflict(_)));
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn site_replication_edit_maps_beta10_state_changes_to_conflict() {
+        for message in [
+            "site replication state changed",
+            "site replication refresh state changed",
+        ] {
+            let body = format!(r#"{{"code":"InvalidRequest","message":"{message}"}}"#);
+            let leaked: &'static str = Box::leak(body.into_boxed_str());
+            let (endpoint, _receiver, handle) = start_admin_test_server("400 Bad Request", leaked);
+            let client = admin_client_for_endpoint(&endpoint);
+            let peer = rc_core::admin::SiteReplicationPeer::default();
+
+            let error = client
+                .site_replication_edit(&peer)
+                .await
+                .expect_err("beta10 state change must conflict");
+
+            assert!(matches!(error, Error::Conflict(_)));
+            assert_eq!(error.exit_code(), 6);
+            handle.join().expect("server thread should finish");
+        }
+    }
+
+    #[tokio::test]
+    async fn site_replication_info_unsupported_message_names_info_operation() {
+        let (endpoint, _receiver, handle) = start_admin_test_server("404 Not Found", "");
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let error = client
+            .site_replication_info()
+            .await
+            .expect_err("missing info route must be unsupported");
+        let message = error.to_string();
+
+        assert!(matches!(error, Error::UnsupportedFeature(_)));
+        assert!(message.contains("Site replication info"));
+        assert!(!message.contains("edit"));
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn site_replication_edit_rejects_malformed_success_json() {
+        let (endpoint, _receiver, handle) = start_admin_test_server("200 OK", "{");
+        let client = admin_client_for_endpoint(&endpoint);
+        let peer = rc_core::admin::SiteReplicationPeer::default();
+
+        let error = client
+            .site_replication_edit(&peer)
+            .await
+            .expect_err("malformed JSON must fail");
+
+        assert!(matches!(error, Error::Json(_)));
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn site_replication_edit_maps_method_not_allowed_to_unsupported() {
+        let (endpoint, _receiver, handle) = start_admin_test_server("405 Method Not Allowed", "");
+        let client = admin_client_for_endpoint(&endpoint);
+        let peer = rc_core::admin::SiteReplicationPeer::default();
+
+        let error = client
+            .site_replication_edit(&peer)
+            .await
+            .expect_err("missing edit route must be unsupported");
+
+        assert!(matches!(error, Error::UnsupportedFeature(_)));
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn site_replication_error_does_not_echo_sensitive_server_body() {
+        let (endpoint, _receiver, handle) = start_admin_test_server(
+            "409 Conflict",
+            r#"{"code":"Conflict","message":"accessKey=DO-NOT-ECHO secret=DO-NOT-ECHO"}"#,
+        );
+        let client = admin_client_for_endpoint(&endpoint);
+        let peer = rc_core::admin::SiteReplicationPeer::default();
+
+        let error = client
+            .site_replication_edit(&peer)
+            .await
+            .expect_err("conflict must fail");
+        let message = error.to_string();
+
+        assert!(matches!(error, Error::Conflict(_)));
+        assert!(!message.contains("DO-NOT-ECHO"));
+        assert!(!message.contains("accessKey"));
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn site_replication_edit_redacts_alias_credentials_from_typed_status() {
+        let (endpoint, _receiver, handle) = start_admin_test_server(
+            "200 OK",
+            r#"{"success":true,"status":"updated by access using secret","errorDetail":"access secret","apiVersion":"v1"}"#,
+        );
+        let client = admin_client_for_endpoint(&endpoint);
+        let peer = rc_core::admin::SiteReplicationPeer::default();
+
+        let status = client
+            .site_replication_edit(&peer)
+            .await
+            .expect("edit status request");
+
+        assert!(!status.status.contains("access"));
+        assert!(!status.status.contains("secret"));
+        assert!(!status.error_detail.contains("access"));
+        assert!(!status.error_detail.contains("secret"));
+        assert!(status.status.contains("[REDACTED]"));
         handle.join().expect("server thread should finish");
     }
 

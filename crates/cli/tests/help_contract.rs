@@ -474,6 +474,20 @@ fn nested_subcommand_help_contract() {
             expected_tokens: &["--offline", "--healing"],
         },
         HelpCase {
+            args: &["admin", "replicate", "edit"],
+            usage: "Usage: rc admin replicate edit [OPTIONS] --site <SITE> <ALIAS>",
+            expected_tokens: &[
+                "--site",
+                "--endpoint",
+                "--name",
+                "--skip-tls-verify",
+                "--verify-tls",
+                "--ca-cert",
+                "--clear-ca-cert",
+                "--yes",
+            ],
+        },
+        HelpCase {
             args: &["admin", "heal", "status"],
             usage: "Usage: rc admin heal status [OPTIONS] <ALIAS>",
             expected_tokens: &["--bucket", "--prefix", "--client-token"],

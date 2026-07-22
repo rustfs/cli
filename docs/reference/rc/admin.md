@@ -24,6 +24,7 @@ rc admin service-account <ls|create|info|rm> ...
 rc admin service <restart|stop|freeze|unfreeze> <ALIAS>
 rc admin replicate add <ALIAS> <ALIAS> [<ALIAS>...]
 rc admin replicate <info|status> <ALIAS> [OPTIONS]
+rc admin replicate edit <ALIAS> --site <DEPLOYMENT_ID|NAME> [EDIT OPTIONS] --yes
 rc admin replicate remove <ALIAS> <--all|--site <NAME>>
 ```
 
@@ -130,6 +131,7 @@ Link two sites for site replication and check the result:
 ```bash
 rc admin replicate add site1 site2
 rc admin replicate info site1
+rc admin replicate edit site1 --site <DEPLOYMENT_ID> --name edge-eu --yes
 rc admin replicate status site1
 ```
 
@@ -219,6 +221,7 @@ The server response reports whether the action was `accepted` and whether it is 
 | --- | --- |
 | `rc admin replicate add <ALIAS> <ALIAS> [<ALIAS>...]` | Link two or more sites into a site replication cluster. The first alias receives the request. |
 | `rc admin replicate info <ALIAS>` | Show the current site replication configuration. |
+| `rc admin replicate edit <ALIAS> --site <DEPLOYMENT_ID\|NAME> [EDIT OPTIONS] --yes` | Read the complete peer document, select one exact peer, apply a bounded edit, and write the peer document back. |
 | `rc admin replicate status <ALIAS> [OPTIONS]` | Show replication status. Without flags the buckets, users, groups, and policies summaries are requested. |
 | `rc admin replicate remove <ALIAS> --all` | Dissolve the entire site replication cluster. |
 | `rc admin replicate remove <ALIAS> --site <NAME>` | Remove one or more named sites. Repeat `--site` per name. |
@@ -232,6 +235,27 @@ The server response reports whether the action was `accepted` and whether it is 
 | `--groups` | Include the IAM group replication summary. |
 | `--policies` | Include the IAM policy replication summary. |
 | `--metrics` | Include replication metrics. |
+
+`edit` accepts these options:
+
+| Option | Description |
+| --- | --- |
+| `--site <DEPLOYMENT_ID\|NAME>` | Select an exact deployment ID first, otherwise a unique exact site name. Partial matching is never used. |
+| `--endpoint <URL>` | Replace the peer endpoint. The value must be an HTTP or HTTPS origin without user information, path, query, or fragment. |
+| `--name <NAME>` | Rename the selected peer, including the local deployment when it is selected by deployment ID. |
+| `--skip-tls-verify` | Set `skipTlsVerify=true` and clear the custom CA. Conflicts with `--verify-tls` and `--ca-cert`. |
+| `--verify-tls` | Set `skipTlsVerify=false`. |
+| `--ca-cert <FILE>` | Set a certificate-only PEM CA bundle and enable TLS verification. The file is read with a 256 KiB bound. |
+| `--clear-ca-cert` | Set the custom CA to an empty value. Conflicts with `--ca-cert`. |
+| `--yes` | Confirm the mutating read-modify-write operation. This is required before alias lookup or network access. |
+
+At least one edit option must produce an effective semantic change. Endpoint origins are canonicalized for comparison, while an omitted `skipTlsVerify` is treated as `false` and an omitted `caCertPem` is treated as empty. The command rejects a final HTTP peer state when `skipTlsVerify=true` or a non-empty custom CA remains. This permits an atomic HTTPS-to-HTTP conversion only when the same command clears the active TLS values.
+
+The complete selected peer object is retained privately and sent back with opaque future fields unchanged during the read-modify-write operation, but those fields are never printed. `info` and `edit` output use explicit safe projections: service-account access keys, CA contents, opaque future fields, and arbitrary server status strings are never printed. Successful JSON output uses output schema v3 with the `admin_operations` family. Mutating network failures are reported as non-retryable in JSON because the server outcome may be unknown; inspect `info` before deciding whether to retry.
+
+### BREAKING output migration
+
+`rc admin replicate info --json` previously emitted the RustFS server response directly. It now emits an output-v3 `admin_operations` envelope with `changed=false`; the safe site configuration is under `data.operations[0].result`. Scripts must update field access accordingly. `serviceAccountAccessKey` and `caCertPem` are intentionally absent, with CA presence represented by `hasCustomCA`. This PR must be marked `BREAKING` because the protected CLI behavior contract changes.
 
 Site replication requires bucket versioning support on every site and replicates buckets, objects, IAM users, groups, policies, and service accounts across all linked sites. The server rejects loopback peer endpoints unless the deployment explicitly allows them (`RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET=true`), which is intended for local testing only.
 
