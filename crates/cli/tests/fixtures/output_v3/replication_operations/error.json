@@ -1,0 +1,1 @@
+{"schema_version":3,"type":"replication_operations","status":"error","error":{"type":"conflict","message":"Replication check failed: target versioning is disabled","retryable":false,"suggestion":"Review the replication target configuration and server error."}}

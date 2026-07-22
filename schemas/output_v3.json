@@ -32,7 +32,8 @@
         "usage",
         "metrics",
         "admin_operations",
-        "replication"
+        "replication",
+        "replication_operations"
       ]
     },
     "pagination": {
@@ -321,6 +322,80 @@
         "extensions": { "type": "object" }
       }
     },
+    "replicationTarget": {
+      "type": "object",
+      "required": [
+        "target_arn", "reset_id", "reset_before", "started_at",
+        "last_updated_at", "state", "server_state", "replicated_count",
+        "replicated_size", "failed_count", "failed_size", "current_bucket",
+        "current_object", "error"
+      ],
+      "properties": {
+        "target_arn": { "type": "string", "minLength": 1 },
+        "reset_id": { "type": "string" },
+        "reset_before": { "$ref": "#/definitions/nullableTimestamp" },
+        "started_at": { "$ref": "#/definitions/nullableTimestamp" },
+        "last_updated_at": { "$ref": "#/definitions/nullableTimestamp" },
+        "state": {
+          "type": ["string", "null"],
+          "enum": [
+            "not_started", "pending", "ongoing", "completed", "failed",
+            "canceled", "unknown", null
+          ]
+        },
+        "server_state": { "$ref": "#/definitions/nullableString" },
+        "replicated_count": { "type": ["integer", "null"], "minimum": 0 },
+        "replicated_size": { "$ref": "#/definitions/nullableBytes" },
+        "failed_count": { "type": ["integer", "null"], "minimum": 0 },
+        "failed_size": { "$ref": "#/definitions/nullableBytes" },
+        "current_bucket": { "$ref": "#/definitions/nullableString" },
+        "current_object": { "$ref": "#/definitions/nullableString" },
+        "error": { "$ref": "#/definitions/nullableString" }
+      }
+    },
+    "replicationStartTarget": {
+      "allOf": [
+        { "$ref": "#/definitions/replicationTarget" },
+        {
+          "properties": {
+            "reset_id": { "type": "string", "minLength": 1 }
+          }
+        }
+      ]
+    },
+    "replicationOperationsData": {
+      "type": "object",
+      "required": ["operation", "bucket", "valid", "targets"],
+      "properties": {
+        "operation": {
+          "type": "string",
+          "enum": ["check", "resync_start", "resync_status"]
+        },
+        "bucket": { "type": "string", "minLength": 1 },
+        "valid": { "type": ["boolean", "null"] },
+        "targets": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/replicationTarget" }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "operation": { "const": "resync_start" } }
+          },
+          "then": {
+            "properties": {
+              "targets": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 1,
+                "items": { "$ref": "#/definitions/replicationStartTarget" }
+              }
+            }
+          }
+        }
+      ]
+    },
     "unsupportedFeatureError": {
       "type": "object",
       "required": ["type", "message", "retryable", "capability", "server"],
@@ -462,6 +537,17 @@
           "properties": {
             "type": { "const": "replication" },
             "data": { "$ref": "#/definitions/replicationData" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/definitions/successEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "replication_operations" },
+            "data": { "$ref": "#/definitions/replicationOperationsData" }
           }
         }
       ]
