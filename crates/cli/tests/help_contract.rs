@@ -640,6 +640,40 @@ fn nested_subcommand_help_contract() {
             ],
         },
         HelpCase {
+            args: &["bucket", "replication", "check"],
+            usage: "Usage: rc bucket replication check [OPTIONS] <PATH>",
+            expected_tokens: &[
+                "--yes",
+                "--force",
+                "active remote write/delete validation probe",
+            ],
+        },
+        HelpCase {
+            args: &["bucket", "replication", "resync"],
+            usage: "Usage: rc bucket replication resync [OPTIONS] <COMMAND>",
+            expected_tokens: &["start", "status"],
+        },
+        HelpCase {
+            args: &["bucket", "replication", "resync", "start"],
+            usage: "Usage: rc bucket replication resync start [OPTIONS] <PATH>",
+            expected_tokens: &[
+                "--target-arn",
+                "--older-than",
+                "--reset-id",
+                "--yes",
+                "--force",
+            ],
+        },
+        HelpCase {
+            args: &["bucket", "replication", "resync", "status"],
+            usage: "Usage: rc bucket replication resync status [OPTIONS] <PATH>",
+            expected_tokens: &[
+                "--target-arn",
+                "--force",
+                "persisted server-side resync status",
+            ],
+        },
+        HelpCase {
             args: &["bucket", "event", "add"],
             usage: "Usage: rc bucket event add [OPTIONS] <PATH> <ARN>",
             expected_tokens: &[

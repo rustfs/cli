@@ -15,13 +15,15 @@ use rc_core::admin::{
     CapabilityReport, ClusterInfo, ClusterSnapshotMetadata, ClusterSnapshotSummary,
     CreateServiceAccountRequest, DecommissionPoolStatus, DecommissionStatus, ExtensionsCatalog,
     Group, GroupStatus, HealRuntimeState, HealScanMode, HealStartRequest, HealStatus,
-    HealTaskRequest, MAX_SITE_REPLICATION_ERROR_RESPONSE_BYTES, MAX_SITE_REPLICATION_REQUEST_BYTES,
+    HealTaskRequest, MAX_REPLICATION_DIFF_RESPONSE_BYTES,
+    MAX_SITE_REPLICATION_ERROR_RESPONSE_BYTES, MAX_SITE_REPLICATION_REQUEST_BYTES,
     MAX_SITE_REPLICATION_SUCCESS_RESPONSE_BYTES, PeerSiteSpec, Policy, PolicyEntity, PolicyInfo,
     PoolStatus, PoolTarget, RebalanceStartResult, RebalanceStatus, ReplicateEditStatus,
-    RuntimeCapabilitiesSnapshot, RuntimeCapabilityStatus, ServiceAccount,
-    ServiceAccountCreateResponse, ServiceActionResult, SiteRemoveSpec, SiteReplicationInfo,
-    SiteReplicationPeer, SiteReplicationResyncOperation, SiteReplicationResyncStatus,
-    SiteStatusOptions, UpdateGroupMembersRequest, UpdateServiceAccountRequest, User, UserStatus,
+    ReplicationDiff, ReplicationDiffApi, RuntimeCapabilitiesSnapshot, RuntimeCapabilityStatus,
+    ServiceAccount, ServiceAccountCreateResponse, ServiceActionResult, SiteRemoveSpec,
+    SiteReplicationInfo, SiteReplicationPeer, SiteReplicationResyncOperation,
+    SiteReplicationResyncStatus, SiteStatusOptions, UpdateGroupMembersRequest,
+    UpdateServiceAccountRequest, User, UserStatus,
 };
 use rc_core::{Alias, Error, Result};
 use reqwest::header::{CONTENT_TYPE, HOST, HeaderMap, HeaderName, HeaderValue};
@@ -465,6 +467,63 @@ impl AdminClient {
         })
     }
 
+    async fn request_bounded_json<T: for<'de> Deserialize<'de>>(
+        &self,
+        method: Method,
+        path: &str,
+        query: Option<&[(&str, &str)]>,
+        body: Option<&[u8]>,
+        max_response_bytes: usize,
+        response_name: &str,
+    ) -> Result<T> {
+        let mut url = self.admin_url(path);
+        if let Some(query) = query {
+            let query_string = query
+                .iter()
+                .map(|(key, value)| {
+                    format!(
+                        "{}={}",
+                        urlencoding::encode(key),
+                        urlencoding::encode(value)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("&");
+            if !query_string.is_empty() {
+                url.push('?');
+                url.push_str(&query_string);
+            }
+        }
+
+        let body_bytes = body.unwrap_or(&[]);
+        let headers = self.request_headers(body_bytes)?;
+        let signed_headers = self
+            .sign_request(&method, &url, &headers, body_bytes)
+            .await?;
+        let mut request_builder = self.http_client.request(method, &url);
+        for (name, value) in signed_headers.iter() {
+            request_builder = request_builder.header(name, value);
+        }
+        if !body_bytes.is_empty() {
+            request_builder = request_builder.body(body_bytes.to_vec());
+        }
+
+        let response = request_builder
+            .send()
+            .await
+            .map_err(|error| Error::Network(format!("Request failed: {error}")))?;
+        let status = response.status();
+        let response_body =
+            read_bounded_response_body(response, max_response_bytes, response_name).await?;
+        if !status.is_success() {
+            return Err(
+                self.map_replication_diff_error(status, &String::from_utf8_lossy(&response_body))
+            );
+        }
+
+        serde_json::from_slice(&response_body).map_err(Error::Json)
+    }
+
     /// Make a signed request that returns no body
     async fn request_no_response(
         &self,
@@ -658,6 +717,32 @@ impl AdminClient {
             }
         }
     }
+
+    fn map_replication_diff_error(&self, status: StatusCode, body: &str) -> Error {
+        if status != StatusCode::NOT_FOUND {
+            return self.map_error(status, body);
+        }
+
+        let structured_error = parse_admin_error(body);
+        if structured_error.as_ref().is_some_and(|error| {
+            matches!(
+                error.code.as_deref(),
+                Some(
+                    "NoSuchBucket"
+                        | "ReplicationConfigurationNotFoundError"
+                        | "ReplicationConfigurationNotFound"
+                )
+            )
+        }) {
+            return Error::NotFound(body.to_string());
+        }
+
+        let reason = structured_error
+            .and_then(|error| error.message)
+            .filter(|message| !message.trim().is_empty())
+            .unwrap_or_else(|| "the replication diff route was not found".to_string());
+        Error::UnsupportedFeature(reason)
+    }
 }
 
 fn site_replication_response_rejected(
@@ -814,6 +899,36 @@ fn parse_admin_error(body: &str) -> Option<AdminErrorResponse> {
     serde_json::from_str(body)
         .ok()
         .or_else(|| quick_xml::de::from_str(body).ok())
+}
+
+async fn read_bounded_response_body(
+    response: reqwest::Response,
+    max_response_bytes: usize,
+    response_name: &str,
+) -> Result<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_response_bytes as u64)
+    {
+        return Err(Error::General(format!(
+            "{response_name} exceeded the {max_response_bytes}-byte response limit"
+        )));
+    }
+
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.map_err(|error| Error::Network(format!("Failed to read response: {error}")))?;
+        if body.len().saturating_add(chunk.len()) > max_response_bytes {
+            return Err(Error::General(format!(
+                "{response_name} exceeded the {max_response_bytes}-byte response limit"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    Ok(body)
 }
 
 /// Response wrapper for user list
@@ -2145,6 +2260,30 @@ impl AdminApi for AdminClient {
     }
 }
 
+#[async_trait]
+impl ReplicationDiffApi for AdminClient {
+    async fn replication_diff(
+        &self,
+        bucket: &str,
+        prefix: Option<&str>,
+    ) -> Result<ReplicationDiff> {
+        let mut query = vec![("bucket", bucket)];
+        if let Some(prefix) = prefix {
+            query.push(("prefix", prefix));
+        }
+
+        self.request_bounded_json(
+            Method::POST,
+            "/replication/diff",
+            Some(&query),
+            None,
+            MAX_REPLICATION_DIFF_RESPONSE_BYTES,
+            "Replication diff response",
+        )
+        .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2293,6 +2432,75 @@ mod tests {
         });
 
         (endpoint, receiver, handle)
+    }
+
+    fn start_admin_declared_length_server(
+        response_status: &'static str,
+        content_length: usize,
+    ) -> (
+        String,
+        mpsc::Receiver<CapturedAdminRequest>,
+        thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            sender
+                .send(read_admin_request(&mut stream))
+                .expect("send captured request");
+            let response = format!(
+                "HTTP/1.1 {response_status}\r\ncontent-length: {content_length}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n"
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write HTTP headers");
+        });
+
+        (endpoint, receiver, handle)
+    }
+
+    fn start_admin_chunked_overflow_server() -> (
+        String,
+        mpsc::Receiver<CapturedAdminRequest>,
+        mpsc::Receiver<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        let (sender, receiver) = mpsc::channel();
+        let (completion_sender, completion_receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            sender
+                .send(read_admin_request(&mut stream))
+                .expect("send captured request");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .expect("set response write timeout");
+
+            let header = b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n";
+            let chunk = vec![b'x'; 64 * 1024];
+            let mut remaining = MAX_REPLICATION_DIFF_RESPONSE_BYTES;
+            let mut write_failed = stream.write_all(header).is_err();
+            while remaining > 0 && !write_failed {
+                let chunk_len = remaining.min(chunk.len());
+                let chunk_header = format!("{chunk_len:x}\r\n");
+                write_failed = stream.write_all(chunk_header.as_bytes()).is_err()
+                    || stream.write_all(&chunk[..chunk_len]).is_err()
+                    || stream.write_all(b"\r\n").is_err();
+                remaining -= chunk_len;
+            }
+            if !write_failed {
+                // One additional byte is sufficient to exercise the streaming limit. Sending
+                // megabytes beyond the limit can block when the client intentionally stops
+                // reading, especially with Windows socket buffering behavior.
+                let _ = stream.write_all(b"1\r\nx\r\n");
+            }
+            let _ = completion_sender.send(());
+        });
+
+        (endpoint, receiver, completion_receiver)
     }
 
     fn admin_client_for_endpoint(endpoint: &str) -> AdminClient {
@@ -4855,5 +5063,158 @@ mod tests {
             Ok(_) => panic!("Expected Error::Network for invalid PEM, got Ok(_)"),
             Err(e) => panic!("Expected Error::Network for invalid PEM, got Err({e})"),
         }
+    }
+
+    #[tokio::test]
+    async fn replication_diff_posts_empty_signed_body_and_preserves_extensions() {
+        let (endpoint, receiver, handle) = start_admin_test_server(
+            "200 OK",
+            r#"{
+                "Entries":[{
+                    "Object":"reports/a.json",
+                    "VersionID":"v1",
+                    "Size":42,
+                    "IsDeleteMarker":false,
+                    "ReplicationStatus":"FAILED",
+                    "LastModified":"2026-07-21T04:00:00Z",
+                    "TargetDetail":{"attempts":2}
+                }],
+                "IsTruncated":false,
+                "ScannedVersions":24,
+                "ServerRevision":7
+            }"#,
+        );
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let diff = client
+            .replication_diff("source bucket", Some("reports/2026 Q3/"))
+            .await
+            .expect("replication diff");
+
+        assert_eq!(diff.entries[0].object, "reports/a.json");
+        assert_eq!(diff.entries[0].extra["TargetDetail"]["attempts"], 2);
+        assert_eq!(diff.extra["ServerRevision"], 7);
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(request.method, "POST");
+        assert_eq!(
+            request.target,
+            "/rustfs/admin/v3/replication/diff?bucket=source%20bucket&prefix=reports%2F2026%20Q3%2F"
+        );
+        assert!(request.body.is_empty());
+        assert!(request.headers.to_ascii_lowercase().contains(
+            "x-amz-content-sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        ));
+        handle.join().expect("server thread");
+    }
+
+    #[tokio::test]
+    async fn replication_diff_omits_prefix_query_when_not_requested() {
+        let (endpoint, receiver, handle) = start_admin_test_server(
+            "200 OK",
+            r#"{"Entries":[],"IsTruncated":false,"ScannedVersions":0}"#,
+        );
+        let client = anonymous_admin_client_for_endpoint(&endpoint);
+
+        let diff = client
+            .replication_diff("source", None)
+            .await
+            .expect("empty replication diff");
+
+        assert!(diff.entries.is_empty());
+        assert_eq!(
+            receiver.recv().expect("captured request").target,
+            "/rustfs/admin/v3/replication/diff?bucket=source"
+        );
+        handle.join().expect("server thread");
+    }
+
+    #[tokio::test]
+    async fn replication_diff_maps_auth_missing_and_unsupported_responses() {
+        let cases = [
+            (
+                "403 Forbidden",
+                r#"{"Code":"AccessDenied","Message":"denied"}"#,
+                "auth",
+            ),
+            (
+                "404 Not Found",
+                r#"{"Code":"NoSuchBucket","Message":"missing bucket"}"#,
+                "not_found",
+            ),
+            (
+                "404 Not Found",
+                r#"{"Code":"ReplicationConfigurationNotFoundError","Message":"replication is not configured"}"#,
+                "not_found",
+            ),
+            (
+                "404 Not Found",
+                r#"{"message":"route missing"}"#,
+                "unsupported",
+            ),
+            (
+                "501 Not Implemented",
+                r#"{"Code":"NotImplemented","Message":"not implemented"}"#,
+                "unsupported",
+            ),
+        ];
+
+        for (status, body, expected) in cases {
+            let (endpoint, _receiver, handle) = start_admin_test_server(status, body);
+            let error = anonymous_admin_client_for_endpoint(&endpoint)
+                .replication_diff("source", None)
+                .await
+                .expect_err("HTTP error response");
+            match expected {
+                "auth" => assert!(matches!(error, Error::Auth(_))),
+                "not_found" => assert!(matches!(error, Error::NotFound(_))),
+                "unsupported" => assert!(matches!(error, Error::UnsupportedFeature(_))),
+                _ => panic!("unexpected test expectation"),
+            }
+            handle.join().expect("server thread");
+        }
+    }
+
+    #[tokio::test]
+    async fn replication_diff_rejects_malformed_json_and_network_failure() {
+        let (endpoint, _receiver, handle) = start_admin_test_server("200 OK", "not-json");
+        let malformed = anonymous_admin_client_for_endpoint(&endpoint)
+            .replication_diff("source", None)
+            .await
+            .expect_err("malformed JSON response");
+        assert!(matches!(malformed, Error::Json(_)));
+        handle.join().expect("server thread");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("reserve unused port");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        drop(listener);
+        let network = anonymous_admin_client_for_endpoint(&endpoint)
+            .replication_diff("source", None)
+            .await
+            .expect_err("connection failure");
+        assert!(matches!(network, Error::Network(_)));
+    }
+
+    #[tokio::test]
+    async fn replication_diff_rejects_declared_and_chunked_overflow() {
+        let (endpoint, _receiver, handle) = start_admin_declared_length_server(
+            "403 Forbidden",
+            MAX_REPLICATION_DIFF_RESPONSE_BYTES + 1,
+        );
+        let declared = anonymous_admin_client_for_endpoint(&endpoint)
+            .replication_diff("source", None)
+            .await
+            .expect_err("declared overflow");
+        assert!(matches!(declared, Error::General(message) if message.contains("response limit")));
+        handle.join().expect("server thread");
+
+        let (endpoint, _receiver, completion) = start_admin_chunked_overflow_server();
+        let chunked = anonymous_admin_client_for_endpoint(&endpoint)
+            .replication_diff("source", None)
+            .await
+            .expect_err("chunked overflow");
+        assert!(matches!(chunked, Error::General(message) if message.contains("response limit")));
+        completion
+            .recv_timeout(Duration::from_secs(5))
+            .expect("chunked overflow server should complete within its socket timeout");
     }
 }

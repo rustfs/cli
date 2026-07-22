@@ -5,6 +5,7 @@
 
 mod capabilities;
 mod cluster;
+mod replication;
 mod site;
 pub mod tier;
 mod types;
@@ -21,6 +22,9 @@ pub use cluster::{
     PoolDecommissionInfo, PoolErasureSetInfo, PoolStatus, PoolTarget, RebalanceCleanupWarnings,
     RebalancePoolProgress, RebalancePoolStatus, RebalanceStartResult, RebalanceStatus, ServerInfo,
     UsageInfo,
+};
+pub use replication::{
+    MAX_REPLICATION_DIFF_RESPONSE_BYTES, ReplicationDiff, ReplicationDiffApi, ReplicationDiffEntry,
 };
 pub use site::{
     MAX_SITE_REPLICATION_CA_CERT_BYTES, MAX_SITE_REPLICATION_ERROR_RESPONSE_BYTES,
