@@ -69,6 +69,10 @@ pub enum Error {
     /// General error
     #[error("{0}")]
     General(String),
+
+    /// Request rejected locally before any network operation was attempted
+    #[error("{0}")]
+    RequestRejected(String),
 }
 
 impl Error {
@@ -82,6 +86,7 @@ impl Error {
             Error::NotFound(_) | Error::AliasNotFound(_) => 5, // NotFound
             Error::Conflict(_) | Error::AliasExists(_) => 6,   // Conflict
             Error::UnsupportedFeature(_) => 7,                 // UnsupportedFeature
+            Error::RequestRejected(_) => 1,                    // GeneralError
             _ => 1,                                            // GeneralError
         }
     }
@@ -102,6 +107,7 @@ mod tests {
         assert_eq!(Error::Conflict("test".into()).exit_code(), 6);
         assert_eq!(Error::AliasExists("test".into()).exit_code(), 6);
         assert_eq!(Error::UnsupportedFeature("test".into()).exit_code(), 7);
+        assert_eq!(Error::RequestRejected("test".into()).exit_code(), 1);
         assert_eq!(Error::General("test".into()).exit_code(), 1);
     }
 
