@@ -1,0 +1,40 @@
+{
+  "schema_version": 3,
+  "type": "admin_operations",
+  "status": "success",
+  "data": {
+    "operations": [
+      {
+        "operation": "site_replication_resync_status",
+        "resource": "deployment-2",
+        "state": "unknown",
+        "operation_id": "resync-partial",
+        "changed": false,
+        "result": {
+          "snapshot_kind": "persisted_last_operation",
+          "lifecycle_state": "unknown",
+          "server_operation": "start",
+          "server_status": "success",
+          "error_detail": "partial failure in starting site resync",
+          "buckets": [
+            {
+              "bucket": "photos",
+              "status": "started",
+              "future": {
+                "updatedAt": "2026-07-22T00:00:00Z"
+              }
+            },
+            {
+              "bucket": "archive",
+              "status": "failed",
+              "error_detail": "target unavailable"
+            }
+          ],
+          "future": {
+            "updatedAt": "2026-07-22T00:00:01Z"
+          }
+        }
+      }
+    ]
+  }
+}
