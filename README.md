@@ -326,6 +326,23 @@ rc admin heal status local --json
 rc admin rebalance status local --json
 ```
 
+### Operational Health and Usage
+
+```bash
+# Public liveness and dependency-readiness probes
+rc ping local
+rc ready local --timeout 2
+
+# Prefer the RustFS background-scanner snapshot
+rc du local
+
+# Explicitly permit a portable paginated S3 fallback
+rc du local/photos/2026/ --fallback --versions
+rc du local/photos --fallback --incomplete
+```
+
+`rc du` never starts the potentially expensive client scan after an unsupported or unauthorized admin request unless `--fallback` is present. See the [operational utilities reference](docs/reference/rc/ops.md) for count, staleness, and partial-result semantics.
+
 ## Command Overview
 
 For full command documentation, see the [`rc` command reference](docs/reference/rc/README.md).
@@ -357,7 +374,11 @@ For full command documentation, see the [`rc` command reference](docs/reference/
 | `quota`       | Manage bucket quota                                                          |
 | `ilm`         | Manage lifecycle rules, storage tiers, and object restore                    |
 | `replicate`   | Manage bucket replication                                                    |
+| `watch`       | Stream live RustFS object notifications                                      |
 | `completions` | Generate shell completion scripts                                            |
+| `ping`        | Check service liveness and round-trip latency                                |
+| `ready`       | Check service dependency readiness                                           |
+| `du`          | Report server-snapshot or explicitly permitted client-scan usage             |
 
 ### Admin Subcommands
 
@@ -415,6 +436,8 @@ rc ls local/bucket
 ```
 
 ### JSON Format
+
+The versioned schemas and migration guidance are documented in the [JSON output contracts](docs/reference/rc/output.md). Existing command output remains on its documented v1 or v2 contract; new command families adopt v3 explicitly.
 
 ```bash
 rc ls local/bucket --json

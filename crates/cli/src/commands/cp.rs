@@ -12,7 +12,7 @@ use rc_core::{
 };
 use rc_s3::S3Client;
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -27,6 +27,11 @@ Examples:
 
 const REMOTE_PATH_SUGGESTION: &str =
     "Use a local filesystem path or a remote path in the form alias/bucket[/key].";
+const DEFAULT_TRANSFER_CONCURRENCY: usize = 4;
+const DEFAULT_RETRY_ATTEMPTS: u32 = 3;
+const DEFAULT_RETRY_INITIAL_BACKOFF_MS: u64 = 100;
+const DEFAULT_RETRY_MAX_BACKOFF_MS: u64 = 10_000;
+const MAX_SINGLE_COPY_SIZE: u64 = 5 * 1024 * 1024 * 1024;
 
 /// Copy objects
 #[derive(Args, Clone, Debug)]
@@ -96,24 +101,24 @@ pub struct CpArgs {
     pub rewind: Option<String>,
 
     /// Maximum number of transfers in flight across the command
-    #[arg(long, default_value_t = 4)]
-    pub concurrency: usize,
+    #[arg(long)]
+    pub concurrency: Option<usize>,
 
     /// Aggregate transfer start rate in bytes per second (for example 10MiB/s)
     #[arg(long)]
     pub rate_limit: Option<String>,
 
     /// Maximum attempts for transient transfer failures
-    #[arg(long, default_value_t = 3)]
-    pub retry_attempts: u32,
+    #[arg(long)]
+    pub retry_attempts: Option<u32>,
 
     /// Initial transient retry backoff in milliseconds
-    #[arg(long, default_value_t = 100)]
-    pub retry_initial_backoff_ms: u64,
+    #[arg(long)]
+    pub retry_initial_backoff_ms: Option<u64>,
 
     /// Maximum transient retry backoff in milliseconds
-    #[arg(long, default_value_t = 10_000)]
-    pub retry_max_backoff_ms: u64,
+    #[arg(long)]
+    pub retry_max_backoff_ms: Option<u64>,
 
     /// Return not-found when selection produces no transfer candidates
     #[arg(long)]
@@ -143,11 +148,11 @@ impl CpArgs {
             newer_than: None,
             older_than: None,
             rewind: None,
-            concurrency: 4,
+            concurrency: None,
             rate_limit: None,
-            retry_attempts: 3,
-            retry_initial_backoff_ms: 100,
-            retry_max_backoff_ms: 10_000,
+            retry_attempts: None,
+            retry_initial_backoff_ms: None,
+            retry_max_backoff_ms: None,
             fail_empty: false,
             summary: false,
         }
@@ -198,12 +203,12 @@ pub async fn execute(args: CpArgs, output_config: OutputConfig) -> ExitCode {
         Err(error) => return formatter.fail(ExitCode::UsageError, &error),
     };
 
-    let alias_manager = AliasManager::new().ok();
+    let alias_manager = AliasManager::new();
 
     // Parse every operand before starting any transfer.
     let mut sources = Vec::with_capacity(args.sources.len());
     for source in &args.sources {
-        match parse_cp_path(source, alias_manager.as_ref()) {
+        match parse_cp_path(source, alias_manager.as_ref().ok()) {
             Ok(path) => sources.push(path),
             Err(error) => {
                 return formatter.fail_with_suggestion(
@@ -215,7 +220,7 @@ pub async fn execute(args: CpArgs, output_config: OutputConfig) -> ExitCode {
         }
     }
 
-    let target = match parse_cp_path(&args.target, alias_manager.as_ref()) {
+    let target = match parse_cp_path(&args.target, alias_manager.as_ref().ok()) {
         Ok(p) => p,
         Err(e) => {
             return formatter.fail_with_suggestion(
@@ -245,6 +250,15 @@ pub async fn execute(args: CpArgs, output_config: OutputConfig) -> ExitCode {
         ([ParsedPath::Local(_)], ParsedPath::Local(_))
     );
     if uses_transfer_planner(&args) && !single_local_to_local {
+        let alias_manager = match alias_manager.as_ref() {
+            Ok(manager) => manager,
+            Err(error) => {
+                return formatter.fail(
+                    ExitCode::UsageError,
+                    &format!("Failed to load aliases: {error}"),
+                );
+            }
+        };
         return execute_transfer_plan(
             &args,
             sources,
@@ -254,6 +268,7 @@ pub async fn execute(args: CpArgs, output_config: OutputConfig) -> ExitCode {
             selection,
             controls,
             &formatter,
+            alias_manager,
         )
         .await;
     }
@@ -280,11 +295,11 @@ fn uses_transfer_planner(args: &CpArgs) -> bool {
         || args.newer_than.is_some()
         || args.older_than.is_some()
         || args.rewind.is_some()
-        || args.concurrency != 4
+        || args.concurrency.is_some()
         || args.rate_limit.is_some()
-        || args.retry_attempts != 3
-        || args.retry_initial_backoff_ms != 100
-        || args.retry_max_backoff_ms != 10_000
+        || args.retry_attempts.is_some()
+        || args.retry_initial_backoff_ms.is_some()
+        || args.retry_max_backoff_ms.is_some()
         || args.fail_empty
         || args.summary
 }
@@ -349,24 +364,15 @@ async fn execute_transfer_plan(
     selection: TransferSelection,
     controls: TransferControls,
     formatter: &Formatter,
+    alias_manager: &AliasManager,
 ) -> ExitCode {
-    let alias_manager = match AliasManager::new() {
-        Ok(manager) => manager,
-        Err(error) => {
-            return formatter.fail(
-                ExitCode::UsageError,
-                &format!("Failed to load aliases: {error}"),
-            );
-        }
-    };
-
     let candidates = match build_transfer_candidates(
         &sources,
         &target,
         target_is_container,
         args.recursive,
         encryption,
-        &alias_manager,
+        alias_manager,
     )
     .await
     {
@@ -410,6 +416,15 @@ async fn execute_transfer_plan(
         return ExitCode::Success;
     }
 
+    let clients = match create_planned_client_cache(&plan.items, alias_manager).await {
+        Ok(clients) => Arc::new(clients),
+        Err(error) => {
+            return formatter.fail(
+                exit_code_for_core_error(&error),
+                &format!("Failed to prepare copy clients: {error}"),
+            );
+        }
+    };
     let executor = match TransferExecutor::new(controls) {
         Ok(executor) => executor,
         Err(error) => {
@@ -420,9 +435,11 @@ async fn execute_transfer_plan(
     let report = executor
         .execute(plan, {
             let operation_args = Arc::clone(&operation_args);
+            let clients = Arc::clone(&clients);
             move |item| {
                 let operation_args = Arc::clone(&operation_args);
-                async move { execute_planned_operation(item, &operation_args).await }
+                let clients = Arc::clone(&clients);
+                async move { execute_planned_operation(item, &operation_args, &clients).await }
             }
         })
         .await;
@@ -454,31 +471,43 @@ async fn execute_transfer_plan(
 async fn execute_planned_operation(
     item: TransferCandidate<CpOperation>,
     args: &CpArgs,
+    clients: &HashMap<String, Arc<S3Client>>,
 ) -> rc_core::Result<u64> {
+    let client = planned_client(clients, operation_alias(&item.payload))?;
     match &item.payload {
         CpOperation::LocalToRemote {
             source,
             target,
             encryption,
-        } => perform_planned_upload(source, target, encryption.as_ref(), args).await,
+        } => perform_planned_upload(client, source, target, encryption.as_ref(), args).await,
         CpOperation::RemoteToLocal { source, target } => {
-            perform_planned_download(source, target, args).await
+            perform_planned_download(client, source, target, args).await
         }
         CpOperation::RemoteToRemote {
             source,
             target,
             encryption,
-        } => perform_planned_remote_copy(source, target, encryption.as_ref()).await,
+        } => {
+            perform_planned_remote_copy(
+                client,
+                source,
+                target,
+                encryption.as_ref(),
+                item.size_bytes,
+            )
+            .await
+        }
     }
 }
 
 async fn perform_planned_upload(
+    client: &S3Client,
     source: &Path,
     target: &RemotePath,
     encryption: Option<&ObjectEncryptionRequest>,
     args: &CpArgs,
 ) -> rc_core::Result<u64> {
-    let metadata = std::fs::metadata(source)?;
+    let metadata = tokio::fs::metadata(source).await?;
     let file_size = metadata.len();
     let guessed_type = mime_guess::from_path(source)
         .first()
@@ -488,7 +517,6 @@ async fn perform_planned_upload(
         guessed_type.as_deref(),
         file_size,
     );
-    let client = create_leaf_s3_client(&target.alias).await?;
     let info = client
         .put_object_from_path(target, source, content_type, encryption, |_| {})
         .await?;
@@ -499,6 +527,7 @@ async fn perform_planned_upload(
 }
 
 async fn perform_planned_download(
+    client: &S3Client,
     source: &RemotePath,
     target: &Path,
     args: &CpArgs,
@@ -512,28 +541,24 @@ async fn perform_planned_download(
     if let Some(parent) = target.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    let client = create_leaf_s3_client(&source.alias).await?;
     client
         .download_object_to_path(source, target, |_, _| {})
         .await
 }
 
 async fn perform_planned_remote_copy(
+    client: &S3Client,
     source: &RemotePath,
     target: &RemotePath,
     encryption: Option<&ObjectEncryptionRequest>,
+    planned_size: Option<u64>,
 ) -> rc_core::Result<u64> {
     if source.alias != target.alias {
         return Err(Error::UnsupportedFeature(
             "Cross-alias S3-to-S3 copy is not supported".to_string(),
         ));
     }
-    let client = create_leaf_s3_client(&source.alias).await?;
-    let source_info = client.head_object(source).await?;
-    if source_info
-        .size_bytes
-        .is_some_and(|size| size > 5 * 1024 * 1024 * 1024)
-    {
+    if requires_multipart_copy(planned_size) {
         return Err(Error::UnsupportedFeature(
             "Objects larger than 5 GiB require multipart copy, which is not implemented"
                 .to_string(),
@@ -542,13 +567,64 @@ async fn perform_planned_remote_copy(
     let copied = client.copy_object(source, target, encryption).await?;
     Ok(copied
         .size_bytes
-        .or(source_info.size_bytes)
         .and_then(|size| u64::try_from(size).ok())
+        .or(planned_size)
         .unwrap_or_default())
 }
 
-async fn create_leaf_s3_client(alias_name: &str) -> rc_core::Result<S3Client> {
-    let alias_manager = AliasManager::new()?;
+fn requires_multipart_copy(planned_size: Option<u64>) -> bool {
+    planned_size.is_some_and(|size| size > MAX_SINGLE_COPY_SIZE)
+}
+
+fn operation_alias(operation: &CpOperation) -> &str {
+    match operation {
+        CpOperation::LocalToRemote { target, .. } => &target.alias,
+        CpOperation::RemoteToLocal { source, .. } | CpOperation::RemoteToRemote { source, .. } => {
+            &source.alias
+        }
+    }
+}
+
+fn planned_client_aliases(items: &[TransferCandidate<CpOperation>]) -> BTreeSet<String> {
+    items
+        .iter()
+        .map(|item| operation_alias(&item.payload).to_string())
+        .collect()
+}
+
+async fn create_planned_client_cache(
+    items: &[TransferCandidate<CpOperation>],
+    alias_manager: &AliasManager,
+) -> rc_core::Result<HashMap<String, Arc<S3Client>>> {
+    let mut clients = HashMap::new();
+    for alias_name in planned_client_aliases(items) {
+        match create_leaf_s3_client(alias_manager, &alias_name).await {
+            Ok(client) => {
+                clients.insert(alias_name, Arc::new(client));
+            }
+            // Keep a missing alias as an item-level failure so continue-on-error and summaries
+            // retain their existing behavior without reloading configuration in each worker.
+            Err(Error::AliasNotFound(_)) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(clients)
+}
+
+fn planned_client<'a>(
+    clients: &'a HashMap<String, Arc<S3Client>>,
+    alias_name: &str,
+) -> rc_core::Result<&'a S3Client> {
+    clients
+        .get(alias_name)
+        .map(Arc::as_ref)
+        .ok_or_else(|| Error::AliasNotFound(alias_name.to_string()))
+}
+
+async fn create_leaf_s3_client(
+    alias_manager: &AliasManager,
+    alias_name: &str,
+) -> rc_core::Result<S3Client> {
     let mut alias = alias_manager
         .get(alias_name)
         .map_err(|_| Error::AliasNotFound(alias_name.to_string()))?;
@@ -631,12 +707,16 @@ fn build_transfer_controls(args: &CpArgs) -> Result<TransferControls, String> {
         .map(parse_byte_rate)
         .transpose()?;
     let controls = TransferControls {
-        concurrency: args.concurrency,
+        concurrency: args.concurrency.unwrap_or(DEFAULT_TRANSFER_CONCURRENCY),
         bytes_per_second,
         retry: RetryConfig {
-            max_attempts: args.retry_attempts,
-            initial_backoff_ms: args.retry_initial_backoff_ms,
-            max_backoff_ms: args.retry_max_backoff_ms,
+            max_attempts: args.retry_attempts.unwrap_or(DEFAULT_RETRY_ATTEMPTS),
+            initial_backoff_ms: args
+                .retry_initial_backoff_ms
+                .unwrap_or(DEFAULT_RETRY_INITIAL_BACKOFF_MS),
+            max_backoff_ms: args
+                .retry_max_backoff_ms
+                .unwrap_or(DEFAULT_RETRY_MAX_BACKOFF_MS),
         },
         continue_on_error: args.continue_on_error,
     };
@@ -731,6 +811,7 @@ async fn build_transfer_candidates(
     alias_manager: &AliasManager,
 ) -> rc_core::Result<Vec<TransferCandidate<CpOperation>>> {
     let mut candidates = Vec::new();
+    let mut planning_clients = HashMap::new();
     let multiple_sources = sources.len() > 1;
 
     for source in sources {
@@ -753,6 +834,7 @@ async fn build_transfer_candidates(
                     multiple_sources,
                     encryption.clone(),
                     alias_manager,
+                    &mut planning_clients,
                     &mut candidates,
                 )
                 .await?;
@@ -921,10 +1003,11 @@ async fn build_remote_candidates(
     multiple_sources: bool,
     encryption: Option<ObjectEncryptionRequest>,
     alias_manager: &AliasManager,
+    planning_clients: &mut HashMap<String, Arc<S3Client>>,
     candidates: &mut Vec<TransferCandidate<CpOperation>>,
 ) -> rc_core::Result<()> {
     let is_prefix = source.key.is_empty() || source.key.ends_with('/') || recursive;
-    let client = create_s3_client(alias_manager, &source.alias).await?;
+    let client = planning_client(planning_clients, alias_manager, &source.alias).await?;
 
     if is_prefix {
         if !recursive {
@@ -1060,14 +1143,20 @@ async fn build_remote_candidates(
     Ok(())
 }
 
-async fn create_s3_client(
+async fn planning_client(
+    clients: &mut HashMap<String, Arc<S3Client>>,
     alias_manager: &AliasManager,
     alias_name: &str,
-) -> rc_core::Result<S3Client> {
+) -> rc_core::Result<Arc<S3Client>> {
+    if let Some(client) = clients.get(alias_name) {
+        return Ok(Arc::clone(client));
+    }
     let alias = alias_manager
         .get(alias_name)
         .map_err(|_| Error::AliasNotFound(alias_name.to_string()))?;
-    S3Client::new(alias).await
+    let client = Arc::new(S3Client::new(alias).await?);
+    clients.insert(alias_name.to_string(), Arc::clone(&client));
+    Ok(client)
 }
 
 fn remote_child(parent: &RemotePath, relative: &str) -> RemotePath {
@@ -2177,8 +2266,116 @@ mod tests {
         assert!(args.overwrite);
         assert!(!args.recursive);
         assert!(!args.dry_run);
-        assert_eq!(args.concurrency, 4);
-        assert_eq!(args.retry_attempts, 3);
+        assert_eq!(args.concurrency, None);
+        assert_eq!(args.retry_attempts, None);
+        let controls = build_transfer_controls(&args).expect("default controls");
+        assert_eq!(controls.concurrency, DEFAULT_TRANSFER_CONCURRENCY);
+        assert_eq!(controls.retry.max_attempts, DEFAULT_RETRY_ATTEMPTS);
+        assert_eq!(
+            controls.retry.initial_backoff_ms,
+            DEFAULT_RETRY_INITIAL_BACKOFF_MS
+        );
+        assert_eq!(controls.retry.max_backoff_ms, DEFAULT_RETRY_MAX_BACKOFF_MS);
+    }
+
+    #[test]
+    fn explicit_default_transfer_controls_enable_planner_routing() {
+        let defaults = CpArgs::single("src", "dst");
+        assert!(!uses_transfer_planner(&defaults));
+
+        let mut explicit_concurrency = defaults.clone();
+        explicit_concurrency.concurrency = Some(DEFAULT_TRANSFER_CONCURRENCY);
+        let mut explicit_attempts = defaults.clone();
+        explicit_attempts.retry_attempts = Some(DEFAULT_RETRY_ATTEMPTS);
+        let mut explicit_initial_backoff = defaults.clone();
+        explicit_initial_backoff.retry_initial_backoff_ms = Some(DEFAULT_RETRY_INITIAL_BACKOFF_MS);
+        let mut explicit_max_backoff = defaults;
+        explicit_max_backoff.retry_max_backoff_ms = Some(DEFAULT_RETRY_MAX_BACKOFF_MS);
+
+        for args in [
+            explicit_concurrency,
+            explicit_attempts,
+            explicit_initial_backoff,
+            explicit_max_backoff,
+        ] {
+            assert!(uses_transfer_planner(&args));
+        }
+    }
+
+    #[test]
+    fn planned_client_aliases_are_deduplicated() {
+        let first = TransferCandidate {
+            payload: CpOperation::LocalToRemote {
+                source: PathBuf::from("first.txt"),
+                target: RemotePath::new("shared", "bucket", "first.txt"),
+                encryption: None,
+            },
+            source: "first.txt".to_string(),
+            target: "shared/bucket/first.txt".to_string(),
+            relative_path: "first.txt".to_string(),
+            modified: None,
+            size_bytes: Some(1),
+        };
+        let second = TransferCandidate {
+            payload: CpOperation::RemoteToLocal {
+                source: RemotePath::new("shared", "bucket", "second.txt"),
+                target: PathBuf::from("second.txt"),
+            },
+            source: "shared/bucket/second.txt".to_string(),
+            target: "second.txt".to_string(),
+            relative_path: "second.txt".to_string(),
+            modified: None,
+            size_bytes: Some(2),
+        };
+
+        assert_eq!(
+            planned_client_aliases(&[first, second])
+                .into_iter()
+                .collect::<Vec<_>>(),
+            ["shared"]
+        );
+    }
+
+    #[tokio::test]
+    async fn planning_client_reuses_one_connection_pool_per_alias() {
+        let (alias_manager, _temp_dir) = temp_alias_manager();
+        alias_manager
+            .set(Alias::new(
+                "shared",
+                "http://localhost:9000",
+                "access",
+                "secret",
+            ))
+            .expect("set alias");
+        let mut clients = HashMap::new();
+
+        let first = planning_client(&mut clients, &alias_manager, "shared")
+            .await
+            .expect("create first client");
+        let second = planning_client(&mut clients, &alias_manager, "shared")
+            .await
+            .expect("reuse first client");
+
+        assert_eq!(clients.len(), 1);
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn planned_remote_copy_uses_candidate_size_for_multipart_guard() {
+        let candidate = TransferCandidate {
+            payload: CpOperation::RemoteToRemote {
+                source: RemotePath::new("shared", "source", "large.bin"),
+                target: RemotePath::new("shared", "target", "large.bin"),
+                encryption: None,
+            },
+            source: "shared/source/large.bin".to_string(),
+            target: "shared/target/large.bin".to_string(),
+            relative_path: "large.bin".to_string(),
+            modified: None,
+            size_bytes: Some(MAX_SINGLE_COPY_SIZE + 1),
+        };
+
+        assert!(requires_multipart_copy(candidate.size_bytes));
     }
 
     #[test]

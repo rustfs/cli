@@ -1,0 +1,1 @@
+{"schema_version":3,"type":"locks","status":"error","error":{"type":"unsupported_feature","message":"Object locking is unavailable","retryable":false,"capability":"object_lock","server":"1.0.0-beta.10","suggestion":null}}

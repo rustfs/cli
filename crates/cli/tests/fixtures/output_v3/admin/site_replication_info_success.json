@@ -1,0 +1,37 @@
+{
+  "schema_version": 3,
+  "type": "admin_operations",
+  "status": "success",
+  "data": {
+    "operations": [
+      {
+        "operation": "site_replication_info",
+        "resource": "primary",
+        "state": "succeeded",
+        "operation_id": null,
+        "changed": false,
+        "result": {
+          "enabled": true,
+          "name": "primary",
+          "sites": [
+            {
+              "endpoint": "https://secondary.example.test",
+              "name": "secondary",
+              "deploymentID": "deployment-2",
+              "sync": "future-mode",
+              "defaultbandwidth": {
+                "bandwidthLimitPerBucket": 1024,
+                "set": true,
+                "updatedAt": "2026-07-22T00:00:00Z"
+              },
+              "skipTlsVerify": false,
+              "hasCustomCA": true,
+              "apiVersion": "v1"
+            }
+          ],
+          "apiVersion": "v1"
+        }
+      }
+    ]
+  }
+}

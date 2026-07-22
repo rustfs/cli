@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "supported_floor": "1.0.0-beta.9",
+  "target": "1.0.0-beta.10",
+  "servers": [
+    {
+      "version": "1.0.0-beta.9",
+      "image": "rustfs/rustfs:1.0.0-beta.9"
+    },
+    {
+      "version": "1.0.0-beta.10",
+      "image": "rustfs/rustfs:1.0.0-beta.10"
+    }
+  ],
+  "capabilities": [
+    {
+      "id": "s3-data-plane",
+      "surface": "s3",
+      "probe": "rc-integration",
+      "expectations": {
+        "1.0.0-beta.9": "supported",
+        "1.0.0-beta.10": "supported"
+      }
+    },
+    {
+      "id": "admin-v3",
+      "surface": "admin-v3",
+      "probe": "rc-integration",
+      "expectations": {
+        "1.0.0-beta.9": "supported",
+        "1.0.0-beta.10": "supported"
+      }
+    },
+    {
+      "id": "admin-v4-runtime-capabilities",
+      "surface": "admin-v4",
+      "probe": "signed-http",
+      "expectations": {
+        "1.0.0-beta.9": "version-dependent",
+        "1.0.0-beta.10": "supported"
+      }
+    },
+    {
+      "id": "listen-notification-stream",
+      "surface": "streaming",
+      "probe": "signed-http",
+      "expectations": {
+        "1.0.0-beta.9": "version-dependent",
+        "1.0.0-beta.10": "supported"
+      }
+    },
+    {
+      "id": "batch-jobs",
+      "surface": "admin-v3",
+      "probe": "signed-http",
+      "expectations": {
+        "1.0.0-beta.9": "version-dependent",
+        "1.0.0-beta.10": "not-implemented"
+      }
+    }
+  ]
+}

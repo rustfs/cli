@@ -12,12 +12,14 @@ For installation and quick-start usage, see the [project README](../../../README
 | Bucket workflows | [`rc bucket`](bucket.md) | `rc ls`, `rc mb`, `rc rb`, `rc event`, `rc cors`, `rc version`, `rc anonymous`, `rc quota`, `rc ilm`, `rc replicate` |
 | Object workflows | [`rc object`](object.md) | `rc ls`, `rc cp`, `rc mv`, `rc rm`, `rc cat`, `rc head`, `rc stat`, `rc find`, `rc tree`, `rc share` |
 | Administrative workflows | [`rc admin`](admin.md) | none |
+| Operational health and usage | [`rc ping`, `rc ready`, `rc du`](ops.md) | none |
 | Encryption guide | [`Encryption workflows`](encryption.md) | `rc bucket encryption`, `rc cp --enc-*`, `rc mv --enc-*`, `rc pipe --enc-*` |
 | Streaming upload | [`rc pipe`](pipe.md) | none |
 | Difference reports | [`rc diff`](diff.md) | none |
 | Mirroring | [`rc mirror`](mirror.md) | none |
 | S3 Select | [`rc sql`](sql.md) | none |
 | Tags | [`rc tag`](tag.md) | none |
+| Live object events | [`rc watch`](watch.md) | `mc watch`-compatible event shorthands |
 | Shell completions | [`rc completions`](completions.md) | none |
 
 Legacy command pages remain documented for users migrating from MinIO `mc`-style workflows:
@@ -47,6 +49,8 @@ Legacy command pages remain documented for users migrating from MinIO `mc`-style
 Remote paths use `ALIAS/BUCKET/KEY` form. An alias-only path such as `local/` refers to a configured S3-compatible service. A bucket path such as `local/photos` refers to a bucket. An object path such as `local/photos/2026/image.jpg` refers to a specific object key.
 
 ## Output Modes
+
+For the versioned machine-readable contracts and migration guidance, see [JSON output contracts](output.md).
 
 Global options shown in command syntax use the same meaning everywhere:
 
