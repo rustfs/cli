@@ -655,6 +655,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unavailable_snapshot_without_fallback_returns_unsupported_without_scanning() {
+        let command = args("local", false);
+        let target = parsed(&command);
+        let scan = MockScan {
+            calls: AtomicUsize::new(0),
+            report: UsageReport::empty(UsageSource::ClientScan, UsageScope::Cluster, None),
+        };
+        let code = execute_with_apis(
+            &command,
+            &target,
+            &MockCapabilities(Ok(capability_report(false))),
+            &MockSnapshot(Ok(snapshot(1_700_000_000))),
+            Some(&scan),
+            Timestamp::from_second(1_700_000_100).expect("timestamp"),
+            &Formatter::default(),
+        )
+        .await;
+
+        assert_eq!(code, ExitCode::UnsupportedFeature);
+        assert_eq!(scan.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn explicit_fallback_scans_when_capability_is_unavailable() {
         let command = args("local/photos", true);
         let target = parsed(&command);

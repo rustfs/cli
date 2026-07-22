@@ -289,8 +289,25 @@ async fn scan_current_objects(
         if !page.truncated {
             return Ok((bytes, objects));
         }
-        continuation_token = page.continuation_token;
+        continuation_token = Some(next_object_continuation_token(
+            continuation_token.as_deref(),
+            page.continuation_token,
+        )?);
     }
+}
+
+fn next_object_continuation_token(current: Option<&str>, next: Option<String>) -> Result<String> {
+    let next = next.filter(|token| !token.is_empty()).ok_or_else(|| {
+        Error::Network(
+            "S3 returned a truncated object listing without a continuation token".to_string(),
+        )
+    })?;
+    if current == Some(next.as_str()) {
+        return Err(Error::Network(
+            "S3 returned a truncated object listing without advancing its token".to_string(),
+        ));
+    }
+    Ok(next)
 }
 
 async fn scan_versions(
@@ -662,6 +679,31 @@ mod tests {
         assert!(first.contains("list-type=2"));
         assert!(second.contains("continuation-token=page-2"));
         handle.join().expect("object pagination server");
+    }
+
+    #[test]
+    fn truncated_object_listing_requires_a_non_empty_token() {
+        for next in [None, Some(String::new())] {
+            let error = next_object_continuation_token(None, next)
+                .expect_err("truncated listing without a usable token should fail");
+            assert!(matches!(
+                error,
+                Error::Network(message)
+                    if message.contains("truncated object listing without a continuation token")
+            ));
+        }
+    }
+
+    #[test]
+    fn truncated_object_listing_requires_an_advancing_token() {
+        let error = next_object_continuation_token(Some("page-2"), Some("page-2".to_string()))
+            .expect_err("truncated listing must advance its token");
+
+        assert!(matches!(
+            error,
+            Error::Network(message)
+                if message.contains("truncated object listing without advancing its token")
+        ));
     }
 
     #[tokio::test]
