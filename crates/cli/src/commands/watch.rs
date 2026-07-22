@@ -1,6 +1,7 @@
 //! Live RustFS object notification command.
 
 use std::future::Future;
+use std::io;
 use std::pin::Pin;
 use std::time::Duration;
 
@@ -64,6 +65,7 @@ pub struct WatchArgs {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WatchTermination {
     Cancelled,
+    OutputClosed,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -248,12 +250,13 @@ pub async fn execute(args: WatchArgs, output_config: OutputConfig) -> ExitCode {
     };
 
     let result = run_watch_loop(&client, &request, policy, cancellation, |event| {
-        emit_watch_event(&formatter, event);
+        emit_watch_event(&formatter, event).map(|_| ())
     })
     .await;
 
     match result {
         Ok(WatchTermination::Cancelled) => ExitCode::Interrupted,
+        Ok(WatchTermination::OutputClosed) => ExitCode::Success,
         Err(error) => fail_watch(
             &formatter,
             exit_code_for_error(&error),
@@ -271,7 +274,7 @@ async fn run_watch_loop<F>(
     mut on_event: F,
 ) -> Result<WatchTermination, Error>
 where
-    F: FnMut(&WatchEvent),
+    F: FnMut(&WatchEvent) -> io::Result<()>,
 {
     let mut reconnects = 0_u32;
 
@@ -304,8 +307,14 @@ where
             };
 
             match frame {
-                Some(Ok(WatchFrame::Event(event))) => on_event(&event),
-                Some(Ok(WatchFrame::KeepAlive)) => {}
+                Some(Ok(WatchFrame::Event(event))) => match on_event(&event) {
+                    Ok(()) => reconnects = 0,
+                    Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+                        return Ok(WatchTermination::OutputClosed);
+                    }
+                    Err(error) => return Err(Error::Io(error)),
+                },
+                Some(Ok(WatchFrame::KeepAlive)) => reconnects = 0,
                 Some(Err(error)) => break error,
                 None => {
                     break Error::Network("Watch stream disconnected".to_string());
@@ -455,13 +464,13 @@ fn validate_watch_capability(report: &CapabilityReport) -> Result<(), (ExitCode,
     }
 }
 
-fn emit_watch_event(formatter: &Formatter, event: &WatchEvent) -> bool {
+fn emit_watch_event(formatter: &Formatter, event: &WatchEvent) -> io::Result<bool> {
     if formatter.is_quiet() {
-        return false;
+        return Ok(false);
     }
 
     if formatter.is_json() {
-        formatter.json_line(&WatchSuccessOutput {
+        formatter.try_json_line(&WatchSuccessOutput {
             schema_version: 3,
             output_type: "watch_event",
             status: "success",
@@ -469,12 +478,12 @@ fn emit_watch_event(formatter: &Formatter, event: &WatchEvent) -> bool {
                 event,
                 keepalive: false,
             },
-        });
-        return true;
+        })?;
+        return Ok(true);
     }
 
-    formatter.println(&render_human_event(formatter, event));
-    true
+    formatter.try_println(&render_human_event(formatter, event))?;
+    Ok(true)
 }
 
 fn render_human_event(formatter: &Formatter, event: &WatchEvent) -> String {
@@ -804,6 +813,7 @@ mod tests {
             |event| {
                 keys.push(event.key.clone());
                 notify.notify_one();
+                Ok(())
             },
         )
         .await
@@ -812,6 +822,88 @@ mod tests {
         assert_eq!(result, WatchTermination::Cancelled);
         assert_eq!(keys, vec!["image.jpg"]);
         assert_eq!(api.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn healthy_frame_resets_the_consecutive_reconnect_budget() {
+        let api = SequenceWatchApi {
+            opens: Mutex::new(VecDeque::from([
+                OpenResult::Error(Error::Network("first failure".to_string())),
+                OpenResult::Frames(
+                    vec![Ok(WatchFrame::Event(Box::new(event("first.jpg"))))],
+                    false,
+                ),
+                OpenResult::Frames(
+                    vec![Ok(WatchFrame::Event(Box::new(event("second.jpg"))))],
+                    true,
+                ),
+            ])),
+            calls: AtomicUsize::new(0),
+        };
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let cancellation_notify = Arc::clone(&notify);
+        let mut keys = Vec::new();
+
+        let result = run_watch_loop(
+            &api,
+            &build_watch_request(&args("local/photos"))
+                .expect("request")
+                .1,
+            ReconnectPolicy {
+                max_reconnects: 1,
+                initial_delay: Duration::ZERO,
+                max_delay: Duration::ZERO,
+            },
+            Box::pin(async move { cancellation_notify.notified().await }),
+            |event| {
+                keys.push(event.key.clone());
+                if event.key == "second.jpg" {
+                    notify.notify_one();
+                }
+                Ok(())
+            },
+        )
+        .await
+        .expect("isolated failures should remain recoverable");
+
+        assert_eq!(result, WatchTermination::Cancelled);
+        assert_eq!(keys, vec!["first.jpg", "second.jpg"]);
+        assert_eq!(api.calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn broken_output_pipe_stops_watch_cleanly() {
+        let api = SequenceWatchApi {
+            opens: Mutex::new(VecDeque::from([OpenResult::Frames(
+                vec![Ok(WatchFrame::Event(Box::new(event("image.jpg"))))],
+                true,
+            )])),
+            calls: AtomicUsize::new(0),
+        };
+
+        let result = run_watch_loop(
+            &api,
+            &build_watch_request(&args("local/photos"))
+                .expect("request")
+                .1,
+            ReconnectPolicy {
+                max_reconnects: 1,
+                initial_delay: Duration::ZERO,
+                max_delay: Duration::ZERO,
+            },
+            Box::pin(std::future::pending()),
+            |_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "reader closed",
+                ))
+            },
+        )
+        .await
+        .expect("broken stdout should be a clean termination");
+
+        assert_eq!(result, WatchTermination::OutputClosed);
+        assert_eq!(api.calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -833,7 +925,7 @@ mod tests {
                 max_delay: Duration::ZERO,
             },
             Box::pin(std::future::pending()),
-            |_| {},
+            |_| Ok(()),
         )
         .await
         .expect_err("retry budget should be exhausted");
@@ -856,7 +948,7 @@ mod tests {
                     max_delay: Duration::ZERO,
                 },
                 Box::pin(std::future::ready(())),
-                |_| {},
+                |_| Ok(()),
             ),
         )
         .await
@@ -970,7 +1062,7 @@ mod tests {
             quiet: true,
         });
 
-        assert!(!emit_watch_event(&formatter, &event("image.jpg")));
+        assert!(!emit_watch_event(&formatter, &event("image.jpg")).expect("quiet output"));
     }
 
     #[test]
