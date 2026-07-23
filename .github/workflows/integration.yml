@@ -62,12 +62,29 @@ jobs:
           if [[ "${{ matrix.version }}" == "1.0.0-beta.10" ]]; then
             mkdir -p "$PWD/tls"
             openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+              -keyout "$PWD/tls/ca_key.pem" \
+              -out "$PWD/tls/ca_cert.pem" \
+              -subj "/CN=RustFS integration test CA" \
+              -addext "basicConstraints=critical,CA:TRUE" \
+              -addext "keyUsage=critical,keyCertSign,cRLSign"
+            openssl req -newkey rsa:2048 -nodes \
               -keyout "$PWD/tls/rustfs_key.pem" \
-              -out "$PWD/tls/rustfs_cert.pem" \
-              -subj "/CN=localhost" \
-              -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
-            chmod 0600 "$PWD/tls/rustfs_key.pem"
-            chmod 0644 "$PWD/tls/rustfs_cert.pem"
+              -out "$PWD/tls/rustfs.csr" \
+              -subj "/CN=localhost"
+            printf '%s\n' \
+              "subjectAltName=DNS:localhost,IP:127.0.0.1" \
+              "basicConstraints=critical,CA:FALSE" \
+              "keyUsage=critical,digitalSignature,keyEncipherment" \
+              "extendedKeyUsage=serverAuth" > "$PWD/tls/rustfs.ext"
+            openssl x509 -req -days 1 \
+              -in "$PWD/tls/rustfs.csr" \
+              -CA "$PWD/tls/ca_cert.pem" \
+              -CAkey "$PWD/tls/ca_key.pem" \
+              -CAcreateserial \
+              -extfile "$PWD/tls/rustfs.ext" \
+              -out "$PWD/tls/rustfs_cert.pem"
+            chmod 0600 "$PWD/tls/ca_key.pem" "$PWD/tls/rustfs_key.pem"
+            chmod 0644 "$PWD/tls/ca_cert.pem" "$PWD/tls/rustfs_cert.pem"
             sudo chown 10001:10001 "$PWD/tls/rustfs_key.pem"
             tls_args+=(
               -v "$PWD/tls:/opt/tls:ro"
@@ -75,7 +92,7 @@ jobs:
             )
             {
               echo "TEST_S3_ENDPOINT=https://localhost:9000"
-              echo "TEST_S3_CA_BUNDLE=$PWD/tls/rustfs_cert.pem"
+              echo "TEST_S3_CA_BUNDLE=$PWD/tls/ca_cert.pem"
             } >> "$GITHUB_ENV"
           fi
           docker run -d --name rustfs \
@@ -192,16 +209,33 @@ jobs:
           docker pull rustfs/rustfs:1.0.0-beta.10
           mkdir -p "$PWD/tls"
           openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+            -keyout "$PWD/tls/ca_key.pem" \
+            -out "$PWD/tls/ca_cert.pem" \
+            -subj "/CN=RustFS integration test CA" \
+            -addext "basicConstraints=critical,CA:TRUE" \
+            -addext "keyUsage=critical,keyCertSign,cRLSign"
+          openssl req -newkey rsa:2048 -nodes \
             -keyout "$PWD/tls/rustfs_key.pem" \
-            -out "$PWD/tls/rustfs_cert.pem" \
-            -subj "/CN=localhost" \
-            -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
-          chmod 0600 "$PWD/tls/rustfs_key.pem"
-          chmod 0644 "$PWD/tls/rustfs_cert.pem"
+            -out "$PWD/tls/rustfs.csr" \
+            -subj "/CN=localhost"
+          printf '%s\n' \
+            "subjectAltName=DNS:localhost,IP:127.0.0.1" \
+            "basicConstraints=critical,CA:FALSE" \
+            "keyUsage=critical,digitalSignature,keyEncipherment" \
+            "extendedKeyUsage=serverAuth" > "$PWD/tls/rustfs.ext"
+          openssl x509 -req -days 1 \
+            -in "$PWD/tls/rustfs.csr" \
+            -CA "$PWD/tls/ca_cert.pem" \
+            -CAkey "$PWD/tls/ca_key.pem" \
+            -CAcreateserial \
+            -extfile "$PWD/tls/rustfs.ext" \
+            -out "$PWD/tls/rustfs_cert.pem"
+          chmod 0600 "$PWD/tls/ca_key.pem" "$PWD/tls/rustfs_key.pem"
+          chmod 0644 "$PWD/tls/ca_cert.pem" "$PWD/tls/rustfs_cert.pem"
           sudo chown 10001:10001 "$PWD/tls/rustfs_key.pem"
           {
             echo "TEST_S3_ENDPOINT=https://localhost:9000"
-            echo "TEST_S3_CA_BUNDLE=$PWD/tls/rustfs_cert.pem"
+            echo "TEST_S3_CA_BUNDLE=$PWD/tls/ca_cert.pem"
           } >> "$GITHUB_ENV"
           docker run -d --name rustfs \
             -p 9000:9000 \
