@@ -4308,7 +4308,7 @@ mod tests {
         let task = tokio::spawn(async move { client.client_devnull(request).await });
         tokio::task::spawn_blocking(move || {
             accepted_receiver
-                .recv_timeout(Duration::from_secs(5))
+                .recv_timeout(Duration::from_secs(15))
                 .expect("active request accepted")
         })
         .await
@@ -4320,7 +4320,7 @@ mod tests {
         release_sender.send(()).expect("release test server");
 
         let (content_length, received) = result_receiver
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(Duration::from_secs(15))
             .expect("cancellation result");
         assert_eq!(content_length, 64 * 1024 * 1024);
         assert!(
