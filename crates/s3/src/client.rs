@@ -33,13 +33,14 @@ use rc_core::{
     Alias, BucketEncryption, BucketNotification, BucketObjectLockConfiguration, Capabilities,
     CopyObjectOptions, CorsRule, CreateBucketOptions, DefaultRetention, DeleteObjectFailure,
     DeleteObjectsResult, DeletedObject, Error, LegalHoldStatus, LifecycleRule,
-    ListObjectVersionsOptions, ListOptions, ListResult, NotificationTarget,
-    ObjectEncryptionRequest, ObjectInfo, ObjectLockOptions, ObjectReadOptions, ObjectRetention,
-    ObjectStore, ObjectVersion, ObjectVersionIdentifier, ObjectVersionListResult, RemotePath,
-    ReplicationConfiguration, ReplicationResyncStartOptions, ReplicationResyncStartResult,
-    ReplicationResyncState, ReplicationResyncStatus, ReplicationResyncTargetStatus, RequestHeader,
-    Result, RetentionDuration, RetentionDurationUnit, RetentionMode, SelectOptions,
-    global_request_headers,
+    ListObjectVersionsOptions, ListOptions, ListResult, MultipartAbortStatus,
+    MultipartCopyCancellation, MultipartCopyOptions, MultipartCopyProgress, MultipartCopyResult,
+    NotificationTarget, ObjectEncryptionRequest, ObjectInfo, ObjectLockOptions, ObjectReadOptions,
+    ObjectRetention, ObjectStore, ObjectVersion, ObjectVersionIdentifier, ObjectVersionListResult,
+    RemotePath, ReplicationConfiguration, ReplicationResyncStartOptions,
+    ReplicationResyncStartResult, ReplicationResyncState, ReplicationResyncStatus,
+    ReplicationResyncTargetStatus, RequestHeader, Result, RetentionDuration, RetentionDurationUnit,
+    RetentionMode, SelectOptions, global_request_headers,
 };
 use reqwest::Method;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
@@ -598,6 +599,21 @@ fn apply_object_encryption_to_copy_request(
     }
 }
 
+fn apply_object_encryption_to_multipart_create_request(
+    request: aws_sdk_s3::operation::create_multipart_upload::builders::CreateMultipartUploadFluentBuilder,
+    encryption: Option<&ObjectEncryptionRequest>,
+) -> aws_sdk_s3::operation::create_multipart_upload::builders::CreateMultipartUploadFluentBuilder {
+    match encryption {
+        Some(ObjectEncryptionRequest::SseS3) => {
+            request.server_side_encryption(aws_sdk_s3::types::ServerSideEncryption::Aes256)
+        }
+        Some(ObjectEncryptionRequest::SseKms { key_id }) => request
+            .server_side_encryption(aws_sdk_s3::types::ServerSideEncryption::AwsKms)
+            .ssekms_key_id(key_id),
+        None => request,
+    }
+}
+
 fn encoded_copy_source(src: &RemotePath, source_version_id: Option<&str>) -> String {
     let encoded_key = src
         .key
@@ -613,6 +629,10 @@ fn encoded_copy_source(src: &RemotePath, source_version_id: Option<&str>) -> Str
     }
 
     copy_source
+}
+
+fn quoted_etag(etag: &str) -> String {
+    format!("\"{}\"", etag.trim_matches('"'))
 }
 
 fn sdk_retention_mode(mode: RetentionMode) -> aws_sdk_s3::types::ObjectLockRetentionMode {
@@ -1851,6 +1871,14 @@ impl S3Client {
                     .and_then(|value| std::str::from_utf8(value.as_bytes()).ok())
             });
             let status = raw.status().as_u16();
+            if matches!(status, 409 | 412)
+                || matches!(
+                    code,
+                    Some("ConditionalRequestConflict") | Some("PreconditionFailed")
+                )
+            {
+                return Error::Conflict(formatted);
+            }
             if status == 401 || matches!(code, Some("Unauthorized")) {
                 return Error::Auth(formatted);
             }
@@ -2004,6 +2032,10 @@ impl S3Client {
             }
             Error::General(message) => Error::General(self.redact_sensitive_text(message)),
             Error::NotFound(message) => Error::NotFound(self.redact_sensitive_text(message)),
+            Error::RequestRejected(message) => {
+                Error::RequestRejected(self.redact_sensitive_text(message))
+            }
+            Error::Interrupted(message) => Error::Interrupted(self.redact_sensitive_text(message)),
             other => other,
         }
     }
@@ -2746,15 +2778,35 @@ impl S3Client {
         Ok(info)
     }
 
-    async fn abort_multipart_upload_best_effort(&self, path: &RemotePath, upload_id: &str) {
-        let _ = self
+    async fn abort_multipart_upload_best_effort(
+        &self,
+        path: &RemotePath,
+        upload_id: &str,
+    ) -> MultipartAbortStatus {
+        match self
             .inner
             .abort_multipart_upload()
             .bucket(&path.bucket)
             .key(&path.key)
             .upload_id(upload_id)
             .send()
+            .await
+        {
+            Ok(_) => MultipartAbortStatus::Succeeded,
+            Err(_) => MultipartAbortStatus::Failed,
+        }
+    }
+
+    async fn abort_multipart_copy_with_error(
+        &self,
+        path: &RemotePath,
+        upload_id: &str,
+        error: Error,
+    ) -> Error {
+        let abort_status = self
+            .abort_multipart_upload_best_effort(path, upload_id)
             .await;
+        self.redact_sensitive_error(error.with_multipart_copy_context(upload_id, abort_status))
     }
 
     async fn put_object_multipart_from_path(
@@ -3636,6 +3688,181 @@ impl ObjectStore for S3Client {
         }
 
         Ok(result)
+    }
+
+    async fn multipart_copy(
+        &self,
+        src: &RemotePath,
+        dst: &RemotePath,
+        options: &MultipartCopyOptions,
+        cancellation: &MultipartCopyCancellation,
+        encryption: Option<&ObjectEncryptionRequest>,
+        on_progress: &MultipartCopyProgress<'_>,
+    ) -> Result<MultipartCopyResult> {
+        use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+
+        let plan = options
+            .plan()
+            .map_err(|error| self.redact_sensitive_error(error))?;
+        let copy_source = encoded_copy_source(src, options.source_version_id.as_deref());
+        let source_etag = quoted_etag(&options.source_etag);
+        let metadata = (!options.metadata.is_empty()).then(|| options.metadata.clone());
+
+        let mut create_request = apply_object_encryption_to_multipart_create_request(
+            self.inner
+                .create_multipart_upload()
+                .bucket(&dst.bucket)
+                .key(&dst.key)
+                .set_metadata(metadata),
+            encryption,
+        );
+        if let Some(content_type) = &options.content_type {
+            create_request = create_request.content_type(content_type);
+        }
+        let create_response = create_request.send().await.map_err(|error| {
+            self.redact_sensitive_error(Self::map_object_request_error(&error, dst, None))
+        })?;
+        let upload_id = create_response
+            .upload_id()
+            .ok_or_else(|| {
+                self.redact_sensitive_error(Error::General(
+                    "Multipart copy create response did not include an upload ID".to_string(),
+                ))
+            })?
+            .to_string();
+
+        let mut completed_parts = Vec::with_capacity(plan.parts.len());
+        let mut bytes_copied = 0_u64;
+        let mut service_source_version = None;
+
+        for part in &plan.parts {
+            let copy_request = self
+                .inner
+                .upload_part_copy()
+                .bucket(&dst.bucket)
+                .key(&dst.key)
+                .upload_id(&upload_id)
+                .part_number(part.part_number)
+                .copy_source(&copy_source)
+                .copy_source_range(format!("bytes={}-{}", part.start, part.end_inclusive))
+                .copy_source_if_match(&source_etag)
+                .send();
+            let copy_response = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {
+                    return Err(self
+                        .abort_multipart_copy_with_error(
+                            dst,
+                            &upload_id,
+                            Error::Interrupted("Multipart copy was cancelled".to_string()),
+                        )
+                        .await);
+                }
+                response = copy_request => response,
+            };
+
+            let copy_response = match copy_response {
+                Ok(response) => response,
+                Err(error) => {
+                    let primary = Self::map_object_request_error(
+                        &error,
+                        src,
+                        options.source_version_id.as_deref(),
+                    );
+                    return Err(self
+                        .abort_multipart_copy_with_error(dst, &upload_id, primary)
+                        .await);
+                }
+            };
+
+            if service_source_version.is_none() {
+                service_source_version = copy_response
+                    .copy_source_version_id()
+                    .map(ToString::to_string);
+            }
+            let etag = match copy_response
+                .copy_part_result()
+                .and_then(|result| result.e_tag())
+            {
+                Some(etag) => etag.trim_matches('"').to_string(),
+                None => {
+                    return Err(self
+                        .abort_multipart_copy_with_error(
+                            dst,
+                            &upload_id,
+                            Error::General(format!(
+                                "UploadPartCopy response for part {} did not include an ETag",
+                                part.part_number
+                            )),
+                        )
+                        .await);
+                }
+            };
+            completed_parts.push(
+                CompletedPart::builder()
+                    .part_number(part.part_number)
+                    .e_tag(etag)
+                    .build(),
+            );
+
+            bytes_copied += part.size;
+            on_progress(bytes_copied);
+        }
+
+        let completed_upload = CompletedMultipartUpload::builder()
+            .set_parts(Some(completed_parts))
+            .build();
+        let complete_request = self
+            .inner
+            .complete_multipart_upload()
+            .bucket(&dst.bucket)
+            .key(&dst.key)
+            .upload_id(&upload_id)
+            .multipart_upload(completed_upload)
+            .send();
+        let complete_response = tokio::select! {
+            biased;
+            // A successful completion is irreversible. Prefer an already-ready
+            // service response over a simultaneous cancellation signal so the
+            // caller is not told that a completed destination was interrupted.
+            response = complete_request => response,
+            _ = cancellation.cancelled() => {
+                return Err(self
+                    .abort_multipart_copy_with_error(
+                        dst,
+                        &upload_id,
+                        Error::Interrupted("Multipart copy was cancelled".to_string()),
+                    )
+                    .await);
+            }
+        };
+        let complete_response = match complete_response {
+            Ok(response) => response,
+            Err(error) => {
+                let primary = Self::map_object_request_error(&error, dst, None);
+                return Err(self
+                    .abort_multipart_copy_with_error(dst, &upload_id, primary)
+                    .await);
+            }
+        };
+
+        let mut object = ObjectInfo::file(&dst.key, plan.object_size as i64);
+        object.etag = complete_response
+            .e_tag()
+            .map(|etag| etag.trim_matches('"').to_string());
+        object.version_id = complete_response.version_id().map(ToString::to_string);
+        object.source_version_id =
+            service_source_version.or_else(|| options.source_version_id.clone());
+        object.content_type = options.content_type.clone();
+        object.metadata = (!options.metadata.is_empty()).then(|| options.metadata.clone());
+        object.last_modified = Some(jiff::Timestamp::now());
+
+        Ok(MultipartCopyResult {
+            object,
+            upload_id,
+            part_count: plan.parts.len(),
+            bytes_copied,
+        })
     }
 
     async fn presign_get(&self, path: &RemotePath, expires_secs: u64) -> Result<String> {
@@ -4876,12 +5103,17 @@ mod tests {
     use aws_smithy_http_client::test_util::{
         CaptureRequestReceiver, ReplayEvent, StaticReplayClient, capture_request,
     };
+    use rc_core::S3_MULTIPART_COPY_MIN_PART_SIZE;
     use std::collections::HashMap;
+    use std::collections::VecDeque;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
+    use tokio::sync::Notify;
 
     #[derive(Debug)]
     struct CapturedXmlRequest {
@@ -4954,6 +5186,13 @@ mod tests {
     fn test_s3_client_with_response_sequence(
         responses: Vec<http::Response<SdkBody>>,
     ) -> (S3Client, StaticReplayClient) {
+        test_s3_client_with_response_sequence_and_headers(responses, Vec::new())
+    }
+
+    fn test_s3_client_with_response_sequence_and_headers(
+        responses: Vec<http::Response<SdkBody>>,
+        request_headers: Vec<RequestHeader>,
+    ) -> (S3Client, StaticReplayClient) {
         let events = responses
             .into_iter()
             .enumerate()
@@ -4966,6 +5205,141 @@ mod tests {
             })
             .collect();
         let replay = StaticReplayClient::new(events);
+        let credentials = Credentials::new(
+            "access-key",
+            "secret-key",
+            None,
+            None,
+            "rc-test-credentials",
+        );
+        let mut config_builder = aws_sdk_s3::config::Builder::new()
+            .credentials_provider(credentials)
+            .endpoint_url("https://example.com")
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .force_path_style(true)
+            .retry_config(aws_smithy_types::retry::RetryConfig::disabled())
+            .behavior_version_latest()
+            .http_client(replay.clone());
+        let presign_config = config_builder.clone().build();
+        if !request_headers.is_empty() {
+            config_builder = config_builder.interceptor(CustomHeaderInterceptor {
+                headers: request_headers.clone(),
+            });
+        }
+        let config = config_builder.build();
+        let alias = Alias::new("test", "https://example.com", "access-key", "secret-key");
+        let client = S3Client {
+            inner: aws_sdk_s3::Client::from_conf(config),
+            presign_inner: aws_sdk_s3::Client::from_conf(presign_config),
+            xml_http_client: reqwest::Client::new(),
+            alias,
+            request_headers,
+        };
+        (client, replay)
+    }
+
+    #[derive(Debug)]
+    enum BlockingReplayEvent {
+        Response(Box<aws_smithy_runtime_api::client::orchestrator::HttpResponse>),
+        Pending,
+    }
+
+    #[derive(Debug, Clone)]
+    struct BlockingReplayClient {
+        events: Arc<Mutex<VecDeque<BlockingReplayEvent>>>,
+        requests: Arc<Mutex<Vec<(String, String)>>>,
+        pending_started: Arc<AtomicBool>,
+        pending_notify: Arc<Notify>,
+    }
+
+    impl BlockingReplayClient {
+        fn new(
+            create_response: http::Response<SdkBody>,
+            abort_response: http::Response<SdkBody>,
+        ) -> Self {
+            let events = VecDeque::from([
+                BlockingReplayEvent::Response(Box::new(
+                    create_response.try_into().expect("valid create response"),
+                )),
+                BlockingReplayEvent::Pending,
+                BlockingReplayEvent::Response(Box::new(
+                    abort_response.try_into().expect("valid abort response"),
+                )),
+            ]);
+            Self {
+                events: Arc::new(Mutex::new(events)),
+                requests: Arc::new(Mutex::new(Vec::new())),
+                pending_started: Arc::new(AtomicBool::new(false)),
+                pending_notify: Arc::new(Notify::new()),
+            }
+        }
+
+        async fn wait_for_pending_request(&self) {
+            let notified = self.pending_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.pending_started.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+
+        fn requests(&self) -> Vec<(String, String)> {
+            self.requests.lock().expect("request lock").clone()
+        }
+    }
+
+    impl HttpConnector for BlockingReplayClient {
+        fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+            self.requests
+                .lock()
+                .expect("request lock")
+                .push((request.method().to_string(), request.uri().to_string()));
+            let event = self.events.lock().expect("event lock").pop_front();
+            match event {
+                Some(BlockingReplayEvent::Response(response)) => {
+                    HttpConnectorFuture::ready(Ok(*response))
+                }
+                Some(BlockingReplayEvent::Pending) => {
+                    self.pending_started.store(true, Ordering::Release);
+                    self.pending_notify.notify_waiters();
+                    HttpConnectorFuture::new(async {
+                        futures::future::pending::<
+                            std::result::Result<
+                                aws_smithy_runtime_api::client::orchestrator::HttpResponse,
+                                ConnectorError,
+                            >,
+                        >()
+                        .await
+                    })
+                }
+                None => HttpConnectorFuture::ready(Err(ConnectorError::other(
+                    "BlockingReplayClient has no remaining response".into(),
+                    None,
+                ))),
+            }
+        }
+    }
+
+    impl HttpClient for BlockingReplayClient {
+        fn http_connector(
+            &self,
+            _settings: &HttpConnectorSettings,
+            _runtime_components: &RuntimeComponents,
+        ) -> SharedHttpConnector {
+            SharedHttpConnector::new(self.clone())
+        }
+    }
+
+    fn test_s3_client_with_pending_part() -> (S3Client, BlockingReplayClient) {
+        let abort_response = http::Response::builder()
+            .status(204)
+            .body(SdkBody::empty())
+            .expect("build abort response");
+        let replay = BlockingReplayClient::new(
+            multipart_copy_create_response("cancel-upload-id"),
+            abort_response,
+        );
         let credentials = Credentials::new(
             "access-key",
             "secret-key",
@@ -7452,6 +7826,566 @@ mod tests {
                 ..
             }) if version_id == "missing-v1"
         ));
+    }
+
+    fn multipart_copy_create_response(upload_id: &str) -> http::Response<SdkBody> {
+        http::Response::builder()
+            .status(200)
+            .header("content-type", "application/xml")
+            .body(SdkBody::from(format!(
+                r#"<InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>destination-bucket</Bucket><Key>dst.txt</Key><UploadId>{upload_id}</UploadId></InitiateMultipartUploadResult>"#
+            )))
+            .expect("build multipart copy create response")
+    }
+
+    fn multipart_copy_part_response(
+        etag: &str,
+        source_version_id: Option<&str>,
+    ) -> http::Response<SdkBody> {
+        let mut builder = http::Response::builder()
+            .status(200)
+            .header("content-type", "application/xml");
+        if let Some(source_version_id) = source_version_id {
+            builder = builder.header("x-amz-copy-source-version-id", source_version_id);
+        }
+        builder
+            .body(SdkBody::from(format!(
+                r#"<CopyPartResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><LastModified>2026-07-23T00:00:00Z</LastModified><ETag>"{etag}"</ETag></CopyPartResult>"#
+            )))
+            .expect("build multipart copy part response")
+    }
+
+    fn multipart_copy_complete_response() -> http::Response<SdkBody> {
+        http::Response::builder()
+            .status(200)
+            .header("content-type", "application/xml")
+            .header("x-amz-version-id", "destination-v2")
+            .body(SdkBody::from(
+                r#"<CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>destination-bucket</Bucket><Key>dst.txt</Key><ETag>"complete-etag"</ETag></CompleteMultipartUploadResult>"#,
+            ))
+            .expect("build multipart copy complete response")
+    }
+
+    fn multipart_copy_options(source_size: u64) -> MultipartCopyOptions {
+        let mut options = MultipartCopyOptions::new(source_size, "source-etag")
+            .expect("valid multipart copy options");
+        options.source_version_id = Some("source v1+/?".to_string());
+        options.preferred_part_size = Some(S3_MULTIPART_COPY_MIN_PART_SIZE);
+        options.content_type = Some("application/octet-stream".to_string());
+        options
+            .metadata
+            .insert("owner".to_string(), "copy-test".to_string());
+        options
+    }
+
+    #[tokio::test]
+    async fn multipart_copy_sends_encoded_versioned_ranges_and_reports_progress() {
+        let source_size = S3_MULTIPART_COPY_MIN_PART_SIZE + 1;
+        let (client, replay) = test_s3_client_with_response_sequence(vec![
+            multipart_copy_create_response("copy-upload-id"),
+            multipart_copy_part_response("part-1", Some("source v1+/?")),
+            multipart_copy_part_response("part-2", Some("source v1+/?")),
+            multipart_copy_complete_response(),
+        ]);
+        let src = RemotePath::new("test", "source-bucket", "dir one/a+b?#.bin");
+        let dst = RemotePath::new("test", "destination-bucket", "dst.txt");
+        let options = multipart_copy_options(source_size);
+        let progress = std::sync::Mutex::new(Vec::new());
+
+        let result = client
+            .multipart_copy(
+                &src,
+                &dst,
+                &options,
+                &MultipartCopyCancellation::new(),
+                Some(&ObjectEncryptionRequest::SseKms {
+                    key_id: "kms-key".to_string(),
+                }),
+                &|bytes| progress.lock().expect("progress lock").push(bytes),
+            )
+            .await
+            .expect("multipart server-side copy");
+
+        assert_eq!(result.upload_id, "copy-upload-id");
+        assert_eq!(result.part_count, 2);
+        assert_eq!(result.bytes_copied, source_size);
+        assert_eq!(result.object.size_bytes, Some(source_size as i64));
+        assert_eq!(result.object.version_id.as_deref(), Some("destination-v2"));
+        assert_eq!(
+            result.object.source_version_id.as_deref(),
+            Some("source v1+/?")
+        );
+        assert_eq!(
+            *progress.lock().expect("progress lock"),
+            vec![S3_MULTIPART_COPY_MIN_PART_SIZE, source_size]
+        );
+
+        let requests = replay.actual_requests().collect::<Vec<_>>();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[0].method(), "POST");
+        assert!(requests[0].uri().ends_with("?uploads"));
+        assert_eq!(
+            requests[0].headers().get("content-type"),
+            Some("application/octet-stream")
+        );
+        assert_eq!(
+            requests[0].headers().get("x-amz-meta-owner"),
+            Some("copy-test")
+        );
+        assert_eq!(
+            requests[0].headers().get("x-amz-server-side-encryption"),
+            Some("aws:kms")
+        );
+        assert_eq!(
+            requests[0]
+                .headers()
+                .get("x-amz-server-side-encryption-aws-kms-key-id"),
+            Some("kms-key")
+        );
+
+        for request in &requests[1..=2] {
+            assert_eq!(request.method(), "PUT");
+            assert_eq!(
+                request.headers().get("x-amz-copy-source"),
+                Some("source-bucket/dir%20one/a%2Bb%3F%23.bin?versionId=source%20v1%2B%2F%3F")
+            );
+            assert_eq!(
+                request.headers().get("x-amz-copy-source-if-match"),
+                Some("\"source-etag\"")
+            );
+        }
+        assert_eq!(
+            requests[1].headers().get("x-amz-copy-source-range"),
+            Some("bytes=0-5242879")
+        );
+        assert_eq!(
+            requests[2].headers().get("x-amz-copy-source-range"),
+            Some("bytes=5242880-5242880")
+        );
+        assert_eq!(requests[3].method(), "POST");
+        assert!(requests[3].uri().contains("uploadId=copy-upload-id"));
+        let completion_body = requests[3].body().bytes().expect("completion request body");
+        let completion_body = std::str::from_utf8(completion_body).expect("completion body is XML");
+        assert!(completion_body.contains("part-1"));
+        assert!(completion_body.contains("part-2"));
+    }
+
+    #[tokio::test]
+    async fn multipart_copy_part_failure_aborts_once_and_preserves_missing_version() {
+        let missing_version_response = http::Response::builder()
+            .status(404)
+            .header("content-type", "application/xml")
+            .header("x-amz-error-code", "NoSuchVersion")
+            .body(SdkBody::from(
+                "<Error><Code>NoSuchVersion</Code><Message>missing</Message></Error>",
+            ))
+            .expect("build missing version response");
+        let abort_response = http::Response::builder()
+            .status(204)
+            .body(SdkBody::empty())
+            .expect("build abort response");
+        let (client, replay) = test_s3_client_with_response_sequence(vec![
+            multipart_copy_create_response("failed-upload-id"),
+            missing_version_response,
+            abort_response,
+        ]);
+        let src = RemotePath::new("test", "source-bucket", "src.bin");
+        let dst = RemotePath::new("test", "destination-bucket", "dst.bin");
+        let options = multipart_copy_options(S3_MULTIPART_COPY_MIN_PART_SIZE);
+
+        let error = client
+            .multipart_copy(
+                &src,
+                &dst,
+                &options,
+                &MultipartCopyCancellation::new(),
+                None,
+                &|_| {},
+            )
+            .await
+            .expect_err("missing source version should fail");
+
+        assert!(matches!(
+            error,
+            Error::VersionNotFound {
+                path,
+                version_id,
+            } if version_id == "source v1+/?"
+                && path.contains("failed-upload-id")
+                && path.contains("abort: succeeded")
+        ));
+        let requests = replay.actual_requests().collect::<Vec<_>>();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.method() == "DELETE")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn multipart_copy_access_denial_stays_typed_after_abort() {
+        let denied_response = http::Response::builder()
+            .status(403)
+            .header("content-type", "application/xml")
+            .header("x-amz-error-code", "AccessDenied")
+            .body(SdkBody::from("<Error><Code>AccessDenied</Code><Message>access-key secret-key custom-header-secret</Message></Error>"))
+            .expect("build access denied response");
+        let abort_response = http::Response::builder()
+            .status(204)
+            .body(SdkBody::empty())
+            .expect("build abort response");
+        let (client, _) = test_s3_client_with_response_sequence_and_headers(
+            vec![
+                multipart_copy_create_response("denied-upload-id"),
+                denied_response,
+                abort_response,
+            ],
+            vec![RequestHeader {
+                name: "x-test-secret".to_string(),
+                value: "custom-header-secret".to_string(),
+            }],
+        );
+        let src = RemotePath::new("test", "source-bucket", "src.bin");
+        let dst = RemotePath::new("test", "destination-bucket", "dst.bin");
+        let options = multipart_copy_options(S3_MULTIPART_COPY_MIN_PART_SIZE);
+
+        let error = client
+            .multipart_copy(
+                &src,
+                &dst,
+                &options,
+                &MultipartCopyCancellation::new(),
+                None,
+                &|_| {},
+            )
+            .await
+            .expect_err("access denial should fail");
+
+        assert_eq!(error.exit_code(), 4);
+        let display = error.to_string();
+        assert!(matches!(error, Error::Auth(_)));
+        assert!(display.contains("denied-upload-id"));
+        for secret in ["access-key", "secret-key", "custom-header-secret"] {
+            assert!(!display.contains(secret), "{display}");
+        }
+    }
+
+    #[tokio::test]
+    async fn multipart_copy_create_failure_redacts_all_configured_secrets() {
+        let missing_bucket_response = http::Response::builder()
+            .status(404)
+            .header("content-type", "application/xml")
+            .header("x-amz-error-code", "NoSuchBucket")
+            .body(SdkBody::from(
+                "<Error><Code>NoSuchBucket</Code><Message>missing</Message></Error>",
+            ))
+            .expect("build missing bucket response");
+        let (client, replay) = test_s3_client_with_response_sequence_and_headers(
+            vec![missing_bucket_response],
+            vec![RequestHeader {
+                name: "x-test-secret".to_string(),
+                value: "custom-header-secret".to_string(),
+            }],
+        );
+        let src = RemotePath::new("test", "source-bucket", "src.bin");
+        let dst = RemotePath::new(
+            "test",
+            "access-key-secret-key-custom-header-secret",
+            "dst.bin",
+        );
+        let options = multipart_copy_options(S3_MULTIPART_COPY_MIN_PART_SIZE);
+
+        let error = client
+            .multipart_copy(
+                &src,
+                &dst,
+                &options,
+                &MultipartCopyCancellation::new(),
+                None,
+                &|_| {},
+            )
+            .await
+            .expect_err("missing destination bucket should fail");
+        let display = error.to_string();
+
+        assert!(matches!(error, Error::NotFound(_)));
+        assert!(display.contains("[REDACTED]"), "{display}");
+        for secret in ["access-key", "secret-key", "custom-header-secret"] {
+            assert!(!display.contains(secret), "{display}");
+        }
+        let requests = replay.actual_requests().collect::<Vec<_>>();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method(), "POST");
+    }
+
+    #[tokio::test]
+    async fn multipart_copy_part_precondition_failure_aborts_once_as_conflict() {
+        let conflict_response = http::Response::builder()
+            .status(412)
+            .header("content-type", "application/xml")
+            .header("x-amz-error-code", "PreconditionFailed")
+            .body(SdkBody::from(
+                "<Error><Code>PreconditionFailed</Code><Message>source changed</Message></Error>",
+            ))
+            .expect("build precondition response");
+        let abort_response = http::Response::builder()
+            .status(204)
+            .body(SdkBody::empty())
+            .expect("build abort response");
+        let (client, replay) = test_s3_client_with_response_sequence(vec![
+            multipart_copy_create_response("conflict-upload-id"),
+            conflict_response,
+            abort_response,
+        ]);
+        let src = RemotePath::new("test", "source-bucket", "src.bin");
+        let dst = RemotePath::new("test", "destination-bucket", "dst.bin");
+        let options = multipart_copy_options(S3_MULTIPART_COPY_MIN_PART_SIZE);
+
+        let error = client
+            .multipart_copy(
+                &src,
+                &dst,
+                &options,
+                &MultipartCopyCancellation::new(),
+                None,
+                &|_| {},
+            )
+            .await
+            .expect_err("source precondition should fail");
+
+        assert_eq!(error.exit_code(), 6);
+        assert!(matches!(error, Error::Conflict(_)));
+        let requests = replay.actual_requests().collect::<Vec<_>>();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.method() == "DELETE")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn multipart_copy_missing_part_etag_aborts_once() {
+        let missing_etag_response = http::Response::builder()
+            .status(200)
+            .header("content-type", "application/xml")
+            .body(SdkBody::from(
+                r#"<CopyPartResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><LastModified>2026-07-23T00:00:00Z</LastModified></CopyPartResult>"#,
+            ))
+            .expect("build missing ETag response");
+        let abort_response = http::Response::builder()
+            .status(204)
+            .body(SdkBody::empty())
+            .expect("build abort response");
+        let (client, replay) = test_s3_client_with_response_sequence(vec![
+            multipart_copy_create_response("missing-etag-upload-id"),
+            missing_etag_response,
+            abort_response,
+        ]);
+        let src = RemotePath::new("test", "source-bucket", "src.bin");
+        let dst = RemotePath::new("test", "destination-bucket", "dst.bin");
+        let options = multipart_copy_options(S3_MULTIPART_COPY_MIN_PART_SIZE);
+
+        let error = client
+            .multipart_copy(
+                &src,
+                &dst,
+                &options,
+                &MultipartCopyCancellation::new(),
+                None,
+                &|_| {},
+            )
+            .await
+            .expect_err("missing ETag should fail");
+
+        assert!(matches!(error, Error::General(_)));
+        assert!(error.to_string().contains("missing-etag-upload-id"));
+        let requests = replay.actual_requests().collect::<Vec<_>>();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.method() == "DELETE")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn multipart_copy_cooperative_cancellation_aborts_pending_part_once() {
+        let (client, replay) = test_s3_client_with_pending_part();
+        let replay_for_wait = replay.clone();
+        let cancellation = MultipartCopyCancellation::new();
+        let cancellation_for_copy = cancellation.clone();
+        let copy = tokio::spawn(async move {
+            let src = RemotePath::new("test", "source-bucket", "src.bin");
+            let dst = RemotePath::new("test", "destination-bucket", "dst.bin");
+            let options = multipart_copy_options(S3_MULTIPART_COPY_MIN_PART_SIZE);
+            client
+                .multipart_copy(&src, &dst, &options, &cancellation_for_copy, None, &|_| {})
+                .await
+        });
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            replay_for_wait.wait_for_pending_request(),
+        )
+        .await
+        .expect("part request should become pending");
+        cancellation.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(2), copy)
+            .await
+            .expect("cooperative cancellation must await abort")
+            .expect("copy task")
+            .expect_err("copy should be interrupted");
+
+        assert_eq!(error.exit_code(), 130);
+        assert!(matches!(error, Error::Interrupted(_)));
+        assert!(error.to_string().contains("cancel-upload-id"));
+        assert!(error.to_string().contains("abort: succeeded"));
+        let requests = replay.requests();
+        assert_eq!(requests.len(), 3, "{requests:?}");
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|(method, _)| method == "DELETE")
+                .count(),
+            1
+        );
+        assert!(requests[1].1.contains("partNumber=1"));
+        assert!(requests[2].1.contains("uploadId=cancel-upload-id"));
+    }
+
+    #[tokio::test]
+    async fn multipart_copy_ready_completion_wins_simultaneous_cancellation() {
+        let source_size = S3_MULTIPART_COPY_MIN_PART_SIZE;
+        let (client, replay) = test_s3_client_with_response_sequence(vec![
+            multipart_copy_create_response("complete-race-id"),
+            multipart_copy_part_response("part-1", None),
+            multipart_copy_complete_response(),
+        ]);
+        let src = RemotePath::new("test", "source-bucket", "src.bin");
+        let dst = RemotePath::new("test", "destination-bucket", "dst.bin");
+        let options = multipart_copy_options(source_size);
+        let cancellation = MultipartCopyCancellation::new();
+
+        let result = client
+            .multipart_copy(&src, &dst, &options, &cancellation, None, &|bytes| {
+                assert_eq!(bytes, source_size);
+                cancellation.cancel();
+            })
+            .await
+            .expect("ready completion should win cancellation");
+
+        assert_eq!(result.bytes_copied, source_size);
+        let requests = replay.actual_requests().collect::<Vec<_>>();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.method() == "DELETE")
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn multipart_copy_complete_failure_aborts_exactly_once() {
+        let complete_failure = http::Response::builder()
+            .status(500)
+            .header("content-type", "application/xml")
+            .header("x-amz-error-code", "InternalError")
+            .body(SdkBody::from(
+                "<Error><Code>InternalError</Code><Message>complete failed</Message></Error>",
+            ))
+            .expect("build complete failure response");
+        let abort_response = http::Response::builder()
+            .status(204)
+            .body(SdkBody::empty())
+            .expect("build abort response");
+        let (client, replay) = test_s3_client_with_response_sequence(vec![
+            multipart_copy_create_response("complete-failure-id"),
+            multipart_copy_part_response("part-1", None),
+            complete_failure,
+            abort_response,
+        ]);
+        let src = RemotePath::new("test", "source-bucket", "src.bin");
+        let dst = RemotePath::new("test", "destination-bucket", "dst.bin");
+        let options = multipart_copy_options(S3_MULTIPART_COPY_MIN_PART_SIZE);
+
+        let error = client
+            .multipart_copy(
+                &src,
+                &dst,
+                &options,
+                &MultipartCopyCancellation::new(),
+                None,
+                &|_| {},
+            )
+            .await
+            .expect_err("completion failure should abort");
+
+        assert!(error.to_string().contains("complete-failure-id"));
+        assert!(error.to_string().contains("abort: succeeded"));
+        let requests = replay.actual_requests().collect::<Vec<_>>();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.method() == "DELETE")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn multipart_copy_abort_failure_is_reported_without_service_details() {
+        let part_failure = http::Response::builder()
+            .status(500)
+            .header("content-type", "application/xml")
+            .header("x-amz-error-code", "InternalError")
+            .body(SdkBody::from(
+                "<Error><Code>InternalError</Code><Message>part failed</Message></Error>",
+            ))
+            .expect("build part failure response");
+        let abort_failure = http::Response::builder()
+            .status(500)
+            .header("content-type", "application/xml")
+            .body(SdkBody::from(
+                "<Error><Code>InternalError</Code><Message>SECRET_ABORT_DETAIL</Message></Error>",
+            ))
+            .expect("build abort failure response");
+        let (client, _) = test_s3_client_with_response_sequence(vec![
+            multipart_copy_create_response("abort-failure-id"),
+            part_failure,
+            abort_failure,
+        ]);
+        let src = RemotePath::new("test", "source-bucket", "src.bin");
+        let dst = RemotePath::new("test", "destination-bucket", "dst.bin");
+        let options = multipart_copy_options(S3_MULTIPART_COPY_MIN_PART_SIZE);
+
+        let error = client
+            .multipart_copy(
+                &src,
+                &dst,
+                &options,
+                &MultipartCopyCancellation::new(),
+                None,
+                &|_| {},
+            )
+            .await
+            .expect_err("part and abort failures should be reported");
+        let display = error.to_string();
+
+        assert!(matches!(error, Error::Network(_)));
+        assert!(display.contains("abort-failure-id"));
+        assert!(display.contains("abort: failed"));
+        assert!(!display.contains("SECRET_ABORT_DETAIL"));
     }
 
     #[tokio::test]

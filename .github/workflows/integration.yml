@@ -109,6 +109,12 @@ jobs:
             "option_behavior_operations::test_mirror_parallel_zero_returns_usage_error"
           )
 
+          if [[ "${{ matrix.version }}" == "1.0.0-beta.10" ]]; then
+            TESTS+=(
+              "multipart_operations::test_multipart_server_side_copy_direct_primitive"
+            )
+          fi
+
           for test_name in "${TESTS[@]}"; do
             echo "==> Running $test_name"
             cargo test \

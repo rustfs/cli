@@ -16,6 +16,7 @@ pub mod cors;
 pub mod encryption;
 pub mod error;
 pub mod lifecycle;
+pub mod multipart_copy;
 pub mod object_lock;
 pub mod ops;
 pub mod path;
@@ -34,10 +35,16 @@ pub use alias::{
 pub use config::{Config, ConfigManager};
 pub use cors::{CorsConfiguration, CorsRule};
 pub use encryption::{BucketEncryption, ObjectEncryptionRequest};
-pub use error::{Error, Result};
+pub use error::{Error, MultipartAbortStatus, Result};
 pub use lifecycle::{
     LifecycleConfiguration, LifecycleExpiration, LifecycleRule, LifecycleRuleStatus,
     LifecycleTransition, NoncurrentVersionExpiration, NoncurrentVersionTransition,
+};
+pub use multipart_copy::{
+    DEFAULT_MULTIPART_COPY_PART_SIZE, MultipartCopyCancellation, MultipartCopyOptions,
+    MultipartCopyPart, MultipartCopyPlan, MultipartCopyProgress, MultipartCopyResult,
+    S3_MAX_OBJECT_SIZE, S3_MULTIPART_COPY_MAX_PART_SIZE, S3_MULTIPART_COPY_MAX_PARTS,
+    S3_MULTIPART_COPY_MIN_PART_SIZE, S3_SINGLE_COPY_MAX_SIZE, requires_multipart_copy,
 };
 pub use object_lock::{
     BucketObjectLockConfiguration, DefaultRetention, LegalHoldStatus, ObjectLockOptions,

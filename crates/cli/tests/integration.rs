@@ -1216,6 +1216,11 @@ mod presigned_urls {
 
 mod multipart_operations {
     use super::*;
+    use rc_core::{
+        Alias, MultipartCopyCancellation, MultipartCopyOptions, ObjectStore, RemotePath,
+        S3_MULTIPART_COPY_MIN_PART_SIZE,
+    };
+    use rc_s3::S3Client;
     use std::io::Write;
 
     #[test]
@@ -1336,6 +1341,92 @@ mod multipart_operations {
 
         // Cleanup
         cleanup_bucket(config_dir.path(), &bucket_name);
+    }
+
+    #[test]
+    fn test_multipart_server_side_copy_direct_primitive() {
+        let (endpoint, access_key, secret_key) = match get_test_config() {
+            Some(config) => config,
+            None => panic!("S3 integration test setup failed"),
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build multipart copy test runtime");
+
+        runtime.block_on(async {
+            let bucket = format!("test-multipart-copy-{}", uuid_suffix());
+            let source = RemotePath::new("test", &bucket, "source.bin");
+            let destination = RemotePath::new("test", &bucket, "destination.bin");
+            let mut alias = Alias::new("test", endpoint, access_key, secret_key);
+            alias.bucket_lookup = "path".to_string();
+            let client = S3Client::new(alias).await.expect("create direct S3 client");
+            client
+                .create_bucket(&bucket)
+                .await
+                .expect("create multipart copy bucket");
+
+            let source_size = S3_MULTIPART_COPY_MIN_PART_SIZE + 1;
+            let source_data = (0..source_size)
+                .map(|index| (index % 251) as u8)
+                .collect::<Vec<_>>();
+            client
+                .put_object(
+                    &source,
+                    source_data.clone(),
+                    Some("application/octet-stream"),
+                    None,
+                )
+                .await
+                .expect("upload multipart copy source");
+            let source_info = client
+                .head_object(&source)
+                .await
+                .expect("head multipart copy source");
+            let source_etag = source_info
+                .etag
+                .as_deref()
+                .expect("source ETag")
+                .to_string();
+            let mut options = MultipartCopyOptions::new(source_size, source_etag)
+                .expect("multipart copy options");
+            options.preferred_part_size = Some(S3_MULTIPART_COPY_MIN_PART_SIZE);
+            options.content_type = source_info.content_type.clone();
+            options.metadata = source_info.metadata.unwrap_or_default();
+
+            let copy = client
+                .multipart_copy(
+                    &source,
+                    &destination,
+                    &options,
+                    &MultipartCopyCancellation::new(),
+                    None,
+                    &|_| {},
+                )
+                .await
+                .expect("multipart server-side copy");
+            let destination_info = client
+                .head_object(&destination)
+                .await
+                .expect("head multipart copy destination");
+            let destination_data = client
+                .get_object(&destination)
+                .await
+                .expect("download multipart copy destination");
+
+            let _ = client.delete_object(&destination).await;
+            let _ = client.delete_object(&source).await;
+            let _ = client.delete_bucket(&bucket).await;
+
+            assert!(copy.part_count > 1);
+            assert_eq!(copy.bytes_copied, source_size);
+            assert_eq!(destination_info.size_bytes, Some(source_size as i64));
+            assert_eq!(
+                destination_info.content_type.as_deref(),
+                Some("application/octet-stream")
+            );
+            assert_eq!(destination_data, source_data);
+        });
     }
 }
 

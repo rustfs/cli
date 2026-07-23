@@ -14,6 +14,9 @@ use crate::cors::CorsRule;
 use crate::encryption::{BucketEncryption, ObjectEncryptionRequest};
 use crate::error::{Error, Result};
 use crate::lifecycle::LifecycleRule;
+use crate::multipart_copy::{
+    MultipartCopyCancellation, MultipartCopyOptions, MultipartCopyProgress, MultipartCopyResult,
+};
 use crate::object_lock::{
     BucketObjectLockConfiguration, LegalHoldStatus, ObjectLockOptions, ObjectRetention,
 };
@@ -601,6 +604,24 @@ pub trait ObjectStore: Send + Sync {
             ));
         }
         self.copy_object(src, dst, encryption).await
+    }
+
+    /// Copy an object with S3's multipart server-side copy lifecycle.
+    ///
+    /// Backends that do not implement multipart copy fail explicitly. The
+    /// callback receives cumulative logical bytes after each successful part.
+    async fn multipart_copy(
+        &self,
+        _src: &RemotePath,
+        _dst: &RemotePath,
+        _options: &MultipartCopyOptions,
+        _cancellation: &MultipartCopyCancellation,
+        _encryption: Option<&ObjectEncryptionRequest>,
+        _on_progress: &MultipartCopyProgress<'_>,
+    ) -> Result<MultipartCopyResult> {
+        Err(Error::UnsupportedFeature(
+            "Multipart server-side copy is not implemented by this object store".to_string(),
+        ))
     }
 
     /// Generate a presigned URL for an object

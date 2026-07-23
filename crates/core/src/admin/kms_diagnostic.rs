@@ -241,7 +241,8 @@ fn classify_and_discard_error(mut error: Error) -> KmsRoundTripErrorClass {
         | Error::InvalidPath(message)
         | Error::UnsupportedFeature(message)
         | Error::General(message)
-        | Error::RequestRejected(message) => {
+        | Error::RequestRejected(message)
+        | Error::Interrupted(message) => {
             message.zeroize();
             KmsRoundTripErrorClass::General
         }
