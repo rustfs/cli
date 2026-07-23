@@ -5,12 +5,14 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-#[derive(Debug)]
 #[allow(dead_code)]
+#[derive(Debug)]
 pub struct CapturedAdminRequest {
     #[allow(dead_code)]
     pub method: String,
     pub target: String,
+    #[allow(dead_code)]
+    pub headers: String,
     #[allow(dead_code)]
     pub body: Vec<u8>,
 }
@@ -77,12 +79,12 @@ fn read_admin_request(stream: &mut TcpStream) -> CapturedAdminRequest {
     let mut parts = request_line.split_whitespace();
     let method = parts.next().expect("request method").to_string();
     let target = parts.next().expect("request target").to_string();
-
     let body = request[header_end..header_end + content_length].to_vec();
 
     CapturedAdminRequest {
         method,
         target,
+        headers,
         body,
     }
 }

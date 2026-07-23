@@ -38,6 +38,7 @@ rc admin policy <ls|create|info|rm|attach> ...
 rc admin group <ls|add|info|rm|enable|disable|add-members|rm-members> ...
 rc admin service-account <ls|create|info|rm> ...
 rc admin service <restart|stop|freeze|unfreeze> <ALIAS>
+rc admin diagnostics client-devnull <ALIAS> [--size <SIZE>] [--timeout <DURATION>] [--concurrency <N>] --yes
 rc admin replicate add <ALIAS> <ALIAS> [<ALIAS>...]
 rc admin replicate <info|status> <ALIAS> [OPTIONS]
 rc admin replicate edit <ALIAS> --site <DEPLOYMENT_ID|NAME> [EDIT OPTIONS] --yes
@@ -50,7 +51,7 @@ rc admin replicate remove <ALIAS> <--all|--site <NAME>>
 
 | Command | Description |
 | --- | --- |
-| `diagnostics` | Read bounded authenticated health, cluster, and extension snapshots. |
+| `diagnostics` | Read bounded authenticated snapshots or run explicitly confirmed bounded probes. |
 | `info` | Display cluster, server, or disk information. |
 | `scanner` | Inspect scanner health, freshness, and cycle state. |
 | `metrics` | Query bounded realtime metrics as normalized JSON Lines or raw server records. |
@@ -205,11 +206,17 @@ rc admin service stop local
 rc admin service restart local
 ```
 
+Measure bounded client-to-server upload throughput without storing an object:
+
+```bash
+rc admin diagnostics client-devnull local --size 8MiB --timeout 30s --concurrency 1 --yes
+```
+
 ## Behavior
 
 Admin operations use the configured alias to create a RustFS admin client. The credentials behind the alias must have permissions for the requested administrative API. The command accepts aliases with or without a trailing slash.
 
-`rc admin diagnostics` performs bounded read-only requests. Each JSON response is limited to 8 MiB. The health command reads the authenticated RustFS health snapshot and is separate from public liveness or readiness probes. Its drive throughput and latency fields are live observations, not active benchmarks, and the command preserves the server's `unsupported_probes` list instead of claiming `mc support diag` parity. Cluster output represents `snapshot: null` as `initializing_or_unavailable`. Extension diagnostics read schemas and runtime capability summaries only; they never request extension instance configuration.
+`rc admin diagnostics health`, `rc admin diagnostics cluster`, and `rc admin diagnostics extensions` perform bounded read-only requests. Each JSON response for these three snapshot commands is limited to 8 MiB. The health command reads the authenticated RustFS health snapshot and is separate from public liveness or readiness probes. Its drive throughput and latency fields are live observations, not active benchmarks, and the command preserves the server's `unsupported_probes` list instead of claiming `mc support diag` parity. Cluster output represents `snapshot: null` as `initializing_or_unavailable`. Extension diagnostics read schemas and runtime capability summaries only; they never request extension instance configuration.
 
 The diagnostic commands require capability discovery to classify the corresponding route as available. Authentication failures, unsupported routes, malformed JSON, and transport failures retain distinct exit codes.
 
@@ -276,6 +283,33 @@ The v3 lifecycle success operations are `configure`, `reconfigure`, `start`, `re
 `kms key status` describes native RustFS key lifecycle metadata. It does not claim compatibility with the `mc admin kms key status` encryption/decryption probe. The round-trip diagnostic uses only the S3 object API and does not call an Admin API key-generation route. RustFS beta.10 has no direct decrypt-test Admin API or KMS-specific metrics route/selector contract, so `rc` does not offer KMS-specific metrics and intentionally does not expose the legacy `generate-data-key` response because that response contains plaintext data-key material.
 
 `rc admin heal status <ALIAS>` reports aggregate background heal status. Manual heals started with `rc admin heal start` are token-scoped tasks; the start output includes a client token. Root recursive tasks are inspected or stopped with `--client-token`, while bucket or prefix tasks additionally pass `--bucket` and optional `--prefix`.
+
+## Diagnostics Workflow
+
+`rc admin diagnostics client-devnull` measures bounded client-to-server ingress throughput by sending zero-filled request bodies to the RustFS devnull endpoint. The server consumes the bytes without creating an object. The command requires credentials with `HealthInfoAdminAction` permission.
+
+```bash
+rc admin diagnostics client-devnull <ALIAS> \
+  [--size <SIZE>] \
+  [--timeout <DURATION>] \
+  [--concurrency <N>] \
+  --yes
+```
+
+| Option | Default | Limits and behavior |
+| --- | --- | --- |
+| `--size <SIZE>` | `8MiB` | Bytes sent by each request. The value must be greater than zero; binary byte units such as `MiB` are accepted. `size × concurrency` must not exceed `64MiB`. |
+| `--timeout <DURATION>` | `30s` | Overall active-probe timeout. Use whole seconds from `1s` through `60s`. |
+| `--concurrency <N>` | `1` | Number of simultaneous requests, from `1` through `4`. |
+| `--yes` | none | Required confirmation because the command deliberately generates network load. |
+
+The client checks RustFS diagnostic capabilities before starting the upload and fails closed unless discovery explicitly reports the non-stub `admin.diagnostics.client-devnull` capability. Unknown server versions, missing capability data, and advertised placeholder implementations are rejected without sending an active probe.
+
+Every successful request must return a measured response with the exact kind `client-devnull`, `measured: true`, an `rx_bytes` value equal to the bytes sent by that request, and present, finite, positive duration and aggregate-write-throughput measurements. Each active-probe response body is limited to 64 KiB. Placeholder responses, oversized or incomplete measurements, non-finite or non-positive measurements, and byte-count mismatches are reported as unsupported rather than as successful results.
+
+A successful result reports `requested_bytes`, `received_bytes`, `concurrency`, `elapsed_seconds`, and `aggregate_throughput_bytes_per_second`; human output presents the same values with readable units. Requested and received byte counts are aggregate values across all concurrent requests, and aggregate throughput is calculated from received bytes over client-observed elapsed time.
+
+The active upload is attempted once per concurrent lane and is never retried. Reaching the timeout or pressing Ctrl-C cancels the in-flight requests and stops further body generation; Ctrl-C returns the interrupted exit status. The command does not run object read/write, server-to-client, network mesh, site, drive, or netperf probes, and it does not persist diagnostic payloads.
 
 ## Heal Workflow
 

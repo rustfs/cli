@@ -29,10 +29,13 @@ pub use cluster::{
     UsageInfo,
 };
 pub use diagnostics::{
-    ClusterComponentSnapshot, ClusterComponentSnapshots, ClusterListingSnapshot,
-    ClusterSnapshotDocument, ClusterUsageSnapshot, DetailedHealthSnapshot,
-    DiagnosticClusterSnapshot, DiagnosticClusterSummary, DiagnosticReadApi, HealthCpuSnapshot,
-    HealthDriveSnapshot, HealthMemorySnapshot, HealthOsSnapshot, HealthProcessSnapshot,
+    ClientDevnullRequest, ClientDevnullResult, ClusterComponentSnapshot, ClusterComponentSnapshots,
+    ClusterListingSnapshot, ClusterSnapshotDocument, ClusterUsageSnapshot,
+    DEFAULT_CLIENT_DEVNULL_BYTES, DEFAULT_CLIENT_DEVNULL_CONCURRENCY,
+    DEFAULT_CLIENT_DEVNULL_TIMEOUT, DetailedHealthSnapshot, DiagnosticClusterSnapshot,
+    DiagnosticClusterSummary, DiagnosticReadApi, HealthCpuSnapshot, HealthDriveSnapshot,
+    HealthMemorySnapshot, HealthOsSnapshot, HealthProcessSnapshot,
+    MAX_CLIENT_DEVNULL_AGGREGATE_BYTES, MAX_CLIENT_DEVNULL_CONCURRENCY, MAX_CLIENT_DEVNULL_TIMEOUT,
     MAX_DIAGNOSTIC_RESPONSE_BYTES,
 };
 pub use kms::{
@@ -320,6 +323,13 @@ pub trait AdminApi: Send + Sync {
 pub trait CapabilityApi: Send + Sync {
     /// Discover capabilities, bypassing the process cache when `refresh` is true.
     async fn discover_capabilities(&self, refresh: bool) -> Result<CapabilityReport>;
+}
+
+/// Bounded active RustFS diagnostic probes.
+#[async_trait]
+pub trait DiagnosticApi: CapabilityApi {
+    /// Measure client-to-server upload throughput without persisting an object.
+    async fn client_devnull(&self, request: ClientDevnullRequest) -> Result<ClientDevnullResult>;
 }
 
 #[cfg(test)]

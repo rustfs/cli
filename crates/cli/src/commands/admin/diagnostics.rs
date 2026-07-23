@@ -1,4 +1,6 @@
-//! Read-only RustFS diagnostic snapshots.
+//! RustFS read-only snapshots and explicitly confirmed bounded active diagnostics.
+
+mod client_devnull;
 
 use std::collections::BTreeMap;
 
@@ -15,6 +17,8 @@ use super::get_admin_client;
 use crate::exit_code::ExitCode;
 use crate::output::Formatter;
 
+pub use client_devnull::ClientDevnullArgs;
+
 #[derive(Subcommand, Debug, Clone)]
 pub enum DiagnosticsCommands {
     /// Display authenticated host, process, and drive health observations
@@ -23,6 +27,9 @@ pub enum DiagnosticsCommands {
     Cluster(DiagnosticsArgs),
     /// Display extension schemas and runtime capability summaries
     Extensions(DiagnosticsArgs),
+    /// Measure bounded client-to-server upload throughput without storing data
+    #[command(name = "client-devnull")]
+    ClientDevnull(ClientDevnullArgs),
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -38,12 +45,14 @@ impl DiagnosticsCommands {
             Self::Health(_) => "health",
             Self::Cluster(_) => "cluster",
             Self::Extensions(_) => "extensions",
+            Self::ClientDevnull(_) => "client-devnull",
         }
     }
 
     pub fn alias(&self) -> &str {
         match self {
             Self::Health(args) | Self::Cluster(args) | Self::Extensions(args) => &args.alias,
+            Self::ClientDevnull(args) => &args.alias,
         }
     }
 
@@ -52,6 +61,7 @@ impl DiagnosticsCommands {
             Self::Health(_) => DiagnosticCapability::HealthSnapshot,
             Self::Cluster(_) => DiagnosticCapability::ClusterSnapshot,
             Self::Extensions(_) => DiagnosticCapability::ExtensionsCatalog,
+            Self::ClientDevnull(_) => DiagnosticCapability::ClientDevnull,
         }
     }
 
@@ -60,6 +70,7 @@ impl DiagnosticsCommands {
             Self::Health(_) => "health_snapshot",
             Self::Cluster(_) => "cluster_snapshot",
             Self::Extensions(_) => "extension_catalog",
+            Self::ClientDevnull(_) => "admin_operations",
         }
     }
 }
@@ -105,11 +116,18 @@ struct ErrorBody<'a> {
 }
 
 pub async fn execute(command: DiagnosticsCommands, formatter: &Formatter) -> ExitCode {
-    let client = match get_admin_client(command.alias(), formatter) {
-        Ok(client) => client,
-        Err(code) => return code,
-    };
-    execute_with_api(command, &client, &client, formatter).await
+    match command {
+        DiagnosticsCommands::ClientDevnull(args) => {
+            client_devnull::execute_client_devnull(args, formatter).await
+        }
+        read_command => {
+            let client = match get_admin_client(read_command.alias(), formatter) {
+                Ok(client) => client,
+                Err(code) => return code,
+            };
+            execute_with_api(read_command, &client, &client, formatter).await
+        }
+    }
 }
 
 async fn execute_with_api(
@@ -170,6 +188,14 @@ async fn execute_with_api(
                 formatter,
             ),
         },
+        DiagnosticsCommands::ClientDevnull(_) => emit_diagnostic_error(
+            &command,
+            "Failed to route active diagnostic",
+            &Error::General(
+                "Client devnull must use the bounded active diagnostic executor".to_string(),
+            ),
+            formatter,
+        ),
     }
 }
 

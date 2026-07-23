@@ -37,7 +37,7 @@ pub enum AdminCommands {
     /// Discover effective RustFS runtime capabilities
     Capabilities(capabilities::CapabilitiesArgs),
 
-    /// Read bounded RustFS diagnostic snapshots
+    /// Read bounded snapshots or run explicitly confirmed RustFS diagnostic probes
     #[command(subcommand)]
     Diagnostics(diagnostics::DiagnosticsCommands),
 
@@ -264,7 +264,7 @@ mod tests {
     use super::*;
     use clap::Parser;
 
-    #[derive(Parser)]
+    #[derive(Debug, Parser)]
     struct TestCli {
         #[command(subcommand)]
         command: AdminCommands,
@@ -460,6 +460,42 @@ mod tests {
                 _ => panic!("Unexpected command parsing result"),
             }
         }
+    }
+
+    #[test]
+    fn test_parse_admin_diagnostics_client_devnull_options() {
+        let cli = TestCli::parse_from([
+            "rc",
+            "diagnostics",
+            "client-devnull",
+            "local",
+            "--size",
+            "16MiB",
+            "--timeout",
+            "45s",
+            "--concurrency",
+            "2",
+            "--yes",
+        ]);
+
+        match cli.command {
+            AdminCommands::Diagnostics(diagnostics::DiagnosticsCommands::ClientDevnull(args)) => {
+                assert_eq!(args.alias, "local");
+                assert_eq!(args.size, "16MiB");
+                assert_eq!(args.timeout, "45s");
+                assert_eq!(args.concurrency, 2);
+                assert!(args.yes);
+            }
+            _ => panic!("Unexpected command parsing result"),
+        }
+    }
+
+    #[test]
+    fn test_parse_admin_diagnostics_client_devnull_requires_confirmation() {
+        let error = TestCli::try_parse_from(["rc", "diagnostics", "client-devnull", "local"])
+            .expect_err("client devnull must require --yes");
+
+        assert!(error.to_string().contains("--yes"));
     }
 
     #[test]

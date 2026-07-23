@@ -3,6 +3,8 @@
 //! This module provides the AdminClient that implements the AdminApi trait
 //! using HTTP requests with AWS SigV4 signing.
 
+mod diagnostics;
+
 use async_trait::async_trait;
 use aws_credential_types::Credentials;
 use aws_sigv4::http_request::{
@@ -49,6 +51,11 @@ impl AsRef<[u8]> for SensitiveRequestBody {
         self.0.as_slice()
     }
 }
+
+#[cfg(test)]
+use diagnostics::{
+    CLIENT_DEVNULL_CHUNK_BYTES, client_devnull_payload_hash, next_client_devnull_chunk,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CapabilityCacheKey {
@@ -245,6 +252,17 @@ impl AdminClient {
         headers: &HeaderMap,
         body: &[u8],
     ) -> Result<HeaderMap> {
+        self.sign_request_with_body(method, url, headers, SignableBody::Bytes(body))
+            .await
+    }
+
+    async fn sign_request_with_body(
+        &self,
+        method: &Method,
+        url: &str,
+        headers: &HeaderMap,
+        signable_body: SignableBody<'_>,
+    ) -> Result<HeaderMap> {
         if self.anonymous {
             return Ok(headers.clone());
         }
@@ -275,8 +293,6 @@ impl AdminClient {
             .iter()
             .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.as_str(), v)))
             .collect();
-
-        let signable_body = SignableBody::Bytes(body);
 
         let signable_request = SignableRequest::new(
             method.as_str(),
@@ -3398,6 +3414,7 @@ impl ReplicationDiffApi for AdminClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rc_core::admin::{ClientDevnullRequest, DiagnosticApi};
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::mpsc;
@@ -3454,6 +3471,29 @@ mod tests {
             headers,
             body,
         }
+    }
+
+    fn read_admin_request_head(stream: &mut TcpStream) -> (String, usize, usize) {
+        let mut buffer = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        let header_end = loop {
+            let read = stream.read(&mut chunk).expect("read HTTP request headers");
+            assert!(read > 0, "client closed connection before headers");
+            buffer.extend_from_slice(&chunk[..read]);
+            if let Some(position) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                break position + 4;
+            }
+        };
+        let headers = String::from_utf8_lossy(&buffer[..header_end]).into_owned();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().expect("valid content length"))
+            })
+            .unwrap_or(0);
+        (headers, content_length, buffer.len() - header_end)
     }
 
     fn start_admin_test_server(
@@ -3674,6 +3714,36 @@ mod tests {
         (endpoint, receiver, handle)
     }
 
+    fn start_client_devnull_raw_response_server(
+        raw_response: Vec<u8>,
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        let handle = thread::spawn(move || {
+            for response_body in [
+                CAPABILITY_INFO_RESPONSE,
+                RUNTIME_CAPABILITIES_RESPONSE,
+                EXTENSIONS_RESPONSE,
+                CLUSTER_SNAPSHOT_RESPONSE,
+            ] {
+                let (mut stream, _) = listener.accept().expect("accept discovery request");
+                let _request = read_admin_request(&mut stream);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{response_body}",
+                    response_body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write discovery response");
+            }
+
+            let (mut stream, _) = listener.accept().expect("accept active request");
+            let _request = read_admin_request(&mut stream);
+            let _write_result = stream.write_all(&raw_response);
+        });
+        (endpoint, handle)
+    }
+
     fn admin_client_for_endpoint(endpoint: &str) -> AdminClient {
         let alias = Alias::new("test", endpoint, "access", "secret");
         AdminClient::new(&alias).expect("admin client should build")
@@ -3723,6 +3793,7 @@ mod tests {
     const RUNTIME_CAPABILITIES_RESPONSE: &str = r#"{"summary":{"observability":{"state":"supported"},"userspace_profiling":{"state":"disabled","reason":"disabled by configuration"},"memory_sampling":{"state":"unsupported","reason":"not available on this platform"},"platform":{"state":"supported"},"topology":{"state":"unknown","reason":"storage is initializing"},"cluster_snapshot":{"state":"supported"}},"cluster_snapshot_path":"/rustfs/admin/v4/cluster/snapshot","cluster_snapshot_summary":{"state":"supported"},"observability":{},"workload_admission":{},"topology":null,"topology_status":{"state":"unknown"}}"#;
     const EXTENSIONS_RESPONSE: &str = r#"{"extensions":[{"schema_version":"rustfs.extension-schema.v1","extension_id":"ops.diagnostics","display_name":"Operations Diagnostics","provider":"rustfs","version":"1","kind":"ops_diagnostics","runtime":{"api_version":"v1","boundary":"builtin"},"capabilities":[],"disabled_by_default":false}],"runtime_capabilities":{},"cluster_snapshot":{},"external_plugin_flow":{}}"#;
     const CLUSTER_SNAPSHOT_RESPONSE: &str = r#"{"snapshot":{"summary":{"runtime":{"state":"supported"},"topology":{"state":"supported"},"membership":{"state":"supported"},"peer_health":{"state":"supported"},"rpc_boundary":{"state":"supported"},"observability":{"state":"supported"},"workload_admission":{"state":"supported"},"actionable_pressure":{"state":"disabled"}},"runtime_capabilities_path":"/rustfs/admin/v4/runtime/capabilities","extensions_catalog_path":"/rustfs/admin/v4/extensions/catalog"}}"#;
+    const CLIENT_DEVNULL_RESPONSE: &str = r#"{"kind":"client-devnull","measured":true,"aggregate_write_throughput_bytes_per_sec":2048.0,"rx_bytes":65536,"duration_secs":0.5}"#;
 
     #[tokio::test]
     async fn capability_discovery_uses_v4_routes_and_classifies_beta10_stubs() {
@@ -3882,6 +3953,399 @@ mod tests {
         assert!(is_rustfs_beta_10("rustfs/v1.0.0-beta.10+build.7"));
         assert!(!is_rustfs_beta_10("1.0.0-beta.100"));
         assert!(!is_rustfs_beta_10("1.0.0-beta.9"));
+    }
+
+    #[tokio::test]
+    async fn client_devnull_streams_exact_signed_payloads_and_aggregates_measurements() {
+        let (endpoint, receiver, handle) = start_admin_sequence_server(vec![
+            ("200 OK", CAPABILITY_INFO_RESPONSE),
+            ("200 OK", RUNTIME_CAPABILITIES_RESPONSE),
+            ("200 OK", EXTENSIONS_RESPONSE),
+            ("200 OK", CLUSTER_SNAPSHOT_RESPONSE),
+            ("200 OK", CLIENT_DEVNULL_RESPONSE),
+            ("200 OK", CLIENT_DEVNULL_RESPONSE),
+        ]);
+        let client = admin_client_for_endpoint(&endpoint);
+        let request = ClientDevnullRequest::new(65_536, 2, Duration::from_secs(5))
+            .expect("probe request should be valid");
+
+        let result = client
+            .client_devnull(request)
+            .await
+            .expect("client devnull should succeed");
+
+        assert_eq!(result.requested_bytes, 131_072);
+        assert_eq!(result.received_bytes, 131_072);
+        assert_eq!(result.concurrency, 2);
+        assert!(result.elapsed_seconds > 0.0);
+        assert!(result.elapsed_seconds < 5.0);
+        assert_eq!(
+            result.aggregate_throughput_bytes_per_second,
+            result.received_bytes as f64 / result.elapsed_seconds
+        );
+
+        let captured = (0..6)
+            .map(|_| receiver.recv().expect("captured request"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            captured
+                .iter()
+                .map(|request| request.target.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "/rustfs/admin/v3/info",
+                "/rustfs/admin/v4/runtime/capabilities",
+                "/rustfs/admin/v4/extensions/catalog",
+                "/rustfs/admin/v4/cluster/snapshot",
+                "/rustfs/admin/v3/speedtest/client/devnull",
+                "/rustfs/admin/v3/speedtest/client/devnull",
+            ]
+        );
+        for request in &captured[4..] {
+            assert_eq!(request.method, "POST");
+            assert_eq!(request.body.len(), 65_536);
+            assert!(request.body.iter().all(|byte| *byte == 0));
+            assert!(request.headers.contains("content-length: 65536"));
+            assert!(request.headers.contains(&format!(
+                "x-amz-content-sha256: {}",
+                AdminClient::sha256_hash(&request.body)
+            )));
+        }
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn client_devnull_rejects_placeholder_and_mismatched_responses() {
+        for response in [
+            r#"{"kind":"client-devnull","measured":false,"aggregate_write_throughput_bytes_per_sec":2048.0,"rx_bytes":65536,"duration_secs":0.5}"#,
+            r#"{"kind":"client-devnull","measured":true,"aggregate_write_throughput_bytes_per_sec":2048.0,"rx_bytes":1,"duration_secs":0.5}"#,
+            r#"{"kind":"object","measured":true,"aggregate_write_throughput_bytes_per_sec":2048.0,"rx_bytes":65536,"duration_secs":0.5}"#,
+            r#"{"kind":"client-devnull","measured":true,"aggregate_write_throughput_bytes_per_sec":0.0,"rx_bytes":65536,"duration_secs":0.5}"#,
+            r#"{"kind":"client-devnull","measured":true,"aggregate_write_throughput_bytes_per_sec":2048.0,"rx_bytes":65536,"duration_secs":0.0}"#,
+            r#"{"kind":"client-devnull","measured":true,"aggregate_write_throughput_bytes_per_sec":2048.0,"rx_bytes":65536}"#,
+            r#"{"kind":"client-devnull","measured":true,"rx_bytes":65536,"duration_secs":0.5}"#,
+        ] {
+            let (endpoint, _receiver, handle) = start_admin_sequence_server(vec![
+                ("200 OK", CAPABILITY_INFO_RESPONSE),
+                ("200 OK", RUNTIME_CAPABILITIES_RESPONSE),
+                ("200 OK", EXTENSIONS_RESPONSE),
+                ("200 OK", CLUSTER_SNAPSHOT_RESPONSE),
+                ("200 OK", response),
+            ]);
+            let client = admin_client_for_endpoint(&endpoint);
+            let request = ClientDevnullRequest::new(65_536, 1, Duration::from_secs(5))
+                .expect("probe request should be valid");
+
+            let error = client
+                .client_devnull(request)
+                .await
+                .expect_err("placeholder responses must not succeed");
+
+            assert!(matches!(error, Error::UnsupportedFeature(_)));
+            handle.join().expect("server thread should finish");
+        }
+    }
+
+    #[tokio::test]
+    async fn client_devnull_fails_closed_before_active_request_on_unknown_version() {
+        let (endpoint, receiver, handle) = start_admin_sequence_server(vec![
+            ("200 OK", UNKNOWN_CAPABILITY_INFO_RESPONSE),
+            ("200 OK", RUNTIME_CAPABILITIES_RESPONSE),
+            ("200 OK", EXTENSIONS_RESPONSE),
+            ("200 OK", CLUSTER_SNAPSHOT_RESPONSE),
+        ]);
+        let client = admin_client_for_endpoint(&endpoint);
+        let request = ClientDevnullRequest::new(65_536, 1, Duration::from_secs(5))
+            .expect("probe request should be valid");
+
+        let error = client
+            .client_devnull(request)
+            .await
+            .expect_err("unknown capability must fail closed");
+
+        assert!(matches!(error, Error::UnsupportedFeature(_)));
+        let targets = (0..4)
+            .map(|_| receiver.recv().expect("captured request").target)
+            .collect::<Vec<_>>();
+        assert!(!targets.iter().any(|target| target.contains("devnull")));
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn client_devnull_preserves_permission_denial() {
+        let (endpoint, _receiver, handle) = start_admin_sequence_server(vec![
+            ("200 OK", CAPABILITY_INFO_RESPONSE),
+            ("200 OK", RUNTIME_CAPABILITIES_RESPONSE),
+            ("200 OK", EXTENSIONS_RESPONSE),
+            ("200 OK", CLUSTER_SNAPSHOT_RESPONSE),
+            ("403 Forbidden", r#"{"code":"AccessDenied"}"#),
+        ]);
+        let client = admin_client_for_endpoint(&endpoint);
+        let request = ClientDevnullRequest::new(65_536, 1, Duration::from_secs(5))
+            .expect("probe request should be valid");
+
+        let error = client
+            .client_devnull(request)
+            .await
+            .expect_err("permission denial must not be reclassified");
+
+        assert!(matches!(error, Error::Auth(_)));
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn client_devnull_timeout_stops_incremental_body_generation() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            for response_body in [
+                CAPABILITY_INFO_RESPONSE,
+                RUNTIME_CAPABILITIES_RESPONSE,
+                EXTENSIONS_RESPONSE,
+                CLUSTER_SNAPSHOT_RESPONSE,
+            ] {
+                let (mut stream, _) = listener.accept().expect("accept discovery request");
+                let _request = read_admin_request(&mut stream);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{response_body}",
+                    response_body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write discovery response");
+            }
+
+            let (mut stream, _) = listener.accept().expect("accept active request");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set read timeout");
+            let (_headers, content_length, mut received) = read_admin_request_head(&mut stream);
+            thread::sleep(Duration::from_millis(1_200));
+            let mut chunk = [0_u8; 8192];
+            loop {
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => received += read,
+                }
+            }
+            sender
+                .send((content_length, received))
+                .expect("send upload byte counts");
+        });
+        let client = admin_client_for_endpoint(&endpoint);
+        let request = ClientDevnullRequest::new(64 * 1024 * 1024, 1, Duration::from_secs(1))
+            .expect("probe request should be valid");
+
+        let error = client
+            .client_devnull(request)
+            .await
+            .expect_err("stalled upload must time out");
+
+        assert!(matches!(error, Error::Network(message) if message.contains("timed out")));
+        let (content_length, received) = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("upload byte counts");
+        assert_eq!(content_length, 64 * 1024 * 1024);
+        assert!(
+            received < content_length,
+            "received {received} of {content_length}"
+        );
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn client_devnull_does_not_retry_server_failures() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            for response_body in [
+                CAPABILITY_INFO_RESPONSE,
+                RUNTIME_CAPABILITIES_RESPONSE,
+                EXTENSIONS_RESPONSE,
+                CLUSTER_SNAPSHOT_RESPONSE,
+            ] {
+                let (mut stream, _) = listener.accept().expect("accept discovery request");
+                let _request = read_admin_request(&mut stream);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{response_body}",
+                    response_body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write discovery response");
+            }
+
+            let (mut stream, _) = listener.accept().expect("accept active request");
+            let request = read_admin_request(&mut stream);
+            assert_eq!(request.target, "/rustfs/admin/v3/speedtest/client/devnull");
+            stream
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 4\r\nconnection: close\r\n\r\nbusy",
+                )
+                .expect("write active response");
+
+            listener
+                .set_nonblocking(true)
+                .expect("set listener nonblocking");
+            let deadline = std::time::Instant::now() + Duration::from_millis(300);
+            let mut active_requests = 1;
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((_stream, _)) => active_requests += 1,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept retry request: {error}"),
+                }
+            }
+            sender
+                .send(active_requests)
+                .expect("send active request count");
+        });
+        let client = admin_client_for_endpoint(&endpoint);
+        let request = ClientDevnullRequest::new(65_536, 1, Duration::from_secs(5))
+            .expect("probe request should be valid");
+
+        let error = client
+            .client_devnull(request)
+            .await
+            .expect_err("server failure must be returned");
+
+        assert!(matches!(error, Error::Network(_)));
+        assert_eq!(
+            receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("active request count"),
+            1
+        );
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn client_devnull_rejects_declared_and_chunked_response_overflow() {
+        let declared = format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            64 * 1024 + 1
+        )
+        .into_bytes();
+        let first_chunk = vec![b'a'; 32 * 1024];
+        let second_chunk = vec![b'b'; 32 * 1024 + 1];
+        let mut chunked =
+            b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n".to_vec();
+        chunked.extend_from_slice(format!("{:x}\r\n", first_chunk.len()).as_bytes());
+        chunked.extend_from_slice(&first_chunk);
+        chunked.extend_from_slice(b"\r\n");
+        chunked.extend_from_slice(format!("{:x}\r\n", second_chunk.len()).as_bytes());
+        chunked.extend_from_slice(&second_chunk);
+        chunked.extend_from_slice(b"\r\n0\r\n\r\n");
+
+        for raw_response in [declared, chunked] {
+            let (endpoint, handle) = start_client_devnull_raw_response_server(raw_response);
+            let client = admin_client_for_endpoint(&endpoint);
+            let request = ClientDevnullRequest::new(65_536, 1, Duration::from_secs(5))
+                .expect("probe request should be valid");
+
+            let error = client
+                .client_devnull(request)
+                .await
+                .expect_err("oversized responses must be rejected");
+
+            assert!(
+                matches!(error, Error::UnsupportedFeature(message) if message.contains("exceeded"))
+            );
+            handle.join().expect("server thread should finish");
+        }
+    }
+
+    #[tokio::test]
+    async fn aborting_client_devnull_closes_an_incomplete_upload() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        let (accepted_sender, accepted_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let (result_sender, result_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            for response_body in [
+                CAPABILITY_INFO_RESPONSE,
+                RUNTIME_CAPABILITIES_RESPONSE,
+                EXTENSIONS_RESPONSE,
+                CLUSTER_SNAPSHOT_RESPONSE,
+            ] {
+                let (mut stream, _) = listener.accept().expect("accept discovery request");
+                let _request = read_admin_request(&mut stream);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{response_body}",
+                    response_body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write discovery response");
+            }
+
+            let (mut stream, _) = listener.accept().expect("accept active request");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set read timeout");
+            let (_headers, content_length, mut received) = read_admin_request_head(&mut stream);
+            accepted_sender.send(()).expect("signal active request");
+            release_receiver.recv().expect("wait for cancellation");
+            let mut chunk = [0_u8; 8192];
+            loop {
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => received += read,
+                }
+            }
+            result_sender
+                .send((content_length, received))
+                .expect("send cancellation result");
+        });
+        let client = admin_client_for_endpoint(&endpoint);
+        let request = ClientDevnullRequest::new(64 * 1024 * 1024, 1, Duration::from_secs(60))
+            .expect("probe request should be valid");
+        let task = tokio::spawn(async move { client.client_devnull(request).await });
+        tokio::task::spawn_blocking(move || {
+            accepted_receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("active request accepted")
+        })
+        .await
+        .expect("accept wait task");
+
+        task.abort();
+        let join_error = task.await.expect_err("aborted task must not complete");
+        assert!(join_error.is_cancelled());
+        release_sender.send(()).expect("release test server");
+
+        let (content_length, received) = result_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("cancellation result");
+        assert_eq!(content_length, 64 * 1024 * 1024);
+        assert!(
+            received < content_length,
+            "received {received} of {content_length}"
+        );
+        handle.join().expect("server thread should finish");
+    }
+
+    #[test]
+    fn client_devnull_chunks_and_hash_are_bounded_and_exact() {
+        let mut remaining = 2 * CLIENT_DEVNULL_CHUNK_BYTES as u64 + 17;
+        let mut generated = 0_u64;
+        while let Some((chunk, next_remaining)) = next_client_devnull_chunk(remaining) {
+            assert!(chunk.len() <= CLIENT_DEVNULL_CHUNK_BYTES);
+            assert!(chunk.iter().all(|byte| *byte == 0));
+            generated += chunk.len() as u64;
+            remaining = next_remaining;
+        }
+
+        assert_eq!(generated, 2 * CLIENT_DEVNULL_CHUNK_BYTES as u64 + 17);
+        assert_eq!(
+            client_devnull_payload_hash(3),
+            AdminClient::sha256_hash(&[0, 0, 0])
+        );
     }
 
     #[tokio::test]
