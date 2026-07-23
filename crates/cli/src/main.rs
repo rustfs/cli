@@ -49,8 +49,6 @@ fn main() {
         .with(env_filter)
         .init();
 
-    install_command_panic_hook();
-
     let exit_code = match run_command(cli) {
         Ok(exit_code) => exit_code,
         Err(error) => {
@@ -62,25 +60,15 @@ fn main() {
     std::process::exit(exit_code.as_i32());
 }
 
-fn install_command_panic_hook() {
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |panic_info| {
-        let current_thread = std::thread::current();
-        if current_thread.name() != Some(COMMAND_THREAD_NAME) {
-            default_hook(panic_info);
-        }
-    }));
+fn run_command(cli: Cli) -> Result<ExitCode, LauncherError> {
+    run_async_command(move || commands::execute(cli), command_runtime)
 }
 
-fn run_command(cli: Cli) -> Result<ExitCode, LauncherError> {
-    run_async_command(
-        move || commands::execute(cli),
-        || {
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-        },
-    )
+fn command_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .thread_stack_size(COMMAND_THREAD_STACK_SIZE)
+        .enable_all()
+        .build()
 }
 
 fn run_async_command<T, F, Fut, R>(
@@ -95,7 +83,11 @@ where
 {
     run_on_command_thread(move || {
         let runtime = runtime_factory().map_err(LauncherError::Runtime)?;
-        Ok(runtime.block_on(future_factory()))
+        let output = runtime.block_on(future_factory());
+        // The former async main exited the process without waiting for runtime workers.
+        // Preserve that bounded shutdown behavior if a background task is wedged.
+        runtime.shutdown_background();
+        Ok(output)
     })
 }
 
@@ -122,6 +114,8 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::sync_channel;
+    use std::time::Duration;
 
     fn test_runtime() -> std::io::Result<tokio::runtime::Runtime> {
         tokio::runtime::Builder::new_current_thread()
@@ -174,6 +168,71 @@ mod tests {
     }
 
     #[test]
+    fn command_runtime_polls_spawned_large_future_on_sized_worker() {
+        const LARGE_FUTURE_SIZE: usize = 1024 * 1024;
+
+        async fn large_future() -> usize {
+            let marker = std::hint::black_box(11_u8);
+            let payload = [marker; LARGE_FUTURE_SIZE];
+            tokio::task::yield_now().await;
+            let payload = std::hint::black_box(&payload);
+            usize::from(payload[0]) + usize::from(payload[LARGE_FUTURE_SIZE - 1])
+        }
+
+        let result = run_async_command(
+            || async {
+                tokio::spawn(large_future())
+                    .await
+                    .expect("spawned large future should complete")
+            },
+            command_runtime,
+        )
+        .expect("command launcher should use the production runtime");
+
+        assert_eq!(result, 22);
+    }
+
+    #[test]
+    fn command_launcher_does_not_wait_for_blocking_tasks_on_shutdown() {
+        let (started_tx, started_rx) = sync_channel(0);
+        let (release_tx, release_rx) = sync_channel(0);
+        let (result_tx, result_rx) = sync_channel(1);
+        let launcher = std::thread::spawn(move || {
+            let result = run_async_command(
+                move || async move {
+                    let _task = tokio::task::spawn_blocking(move || {
+                        started_tx
+                            .send(())
+                            .expect("test should observe the blocking task start");
+                        release_rx
+                            .recv()
+                            .expect("test should release the blocking task");
+                    });
+                    started_rx
+                        .recv()
+                        .expect("blocking task should report that it started");
+                    ExitCode::Success
+                },
+                command_runtime,
+            );
+            result_tx
+                .send(result)
+                .expect("test should receive the launcher result");
+        });
+
+        let result = result_rx.recv_timeout(Duration::from_secs(2));
+        release_tx
+            .send(())
+            .expect("blocking task should remain available for cleanup");
+        launcher.join().expect("launcher test thread should finish");
+
+        let exit_code = result
+            .expect("command launcher should not join blocking runtime tasks")
+            .expect("command launcher should return a successful result");
+        assert_eq!(exit_code, ExitCode::Success);
+    }
+
+    #[test]
     fn command_launcher_maps_runtime_creation_failure() {
         let future_created = Arc::new(AtomicBool::new(false));
         let future_created_by_worker = Arc::clone(&future_created);
@@ -206,17 +265,15 @@ mod tests {
     }
 
     #[test]
-    fn command_launcher_maps_worker_panic_without_exposing_payload() {
-        let error = run_on_command_thread::<(), _>(|| {
-            panic!("sensitive panic payload must not be propagated")
-        })
-        .expect_err("worker panic should be returned by the launcher");
+    fn command_launcher_maps_worker_panic_to_stable_error() {
+        let error = run_on_command_thread::<(), _>(|| panic!("expected worker panic"))
+            .expect_err("worker panic should be returned by the launcher");
 
         assert!(matches!(error, LauncherError::ThreadPanicked));
         assert_eq!(
             error.to_string(),
             "Command execution thread terminated unexpectedly"
         );
-        assert!(!error.to_string().contains("sensitive panic payload"));
+        assert!(!error.to_string().contains("expected worker panic"));
     }
 }

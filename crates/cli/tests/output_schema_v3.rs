@@ -12,11 +12,15 @@ const V3_FAMILIES: &[&str] = &[
     "locks",
     "multipart_uploads",
     "watch_event",
+    "health",
     "usage",
     "metrics",
     "scanner_status",
     "storage_info",
     "admin_operations",
+    "replication",
+    "replication_operations",
+    "bucket_operations",
 ];
 
 fn repository_root() -> PathBuf {
@@ -65,6 +69,12 @@ fn fixture_path(family: &str, case: &str) -> PathBuf {
         .join("tests/fixtures/output_v3")
         .join(family)
         .join(format!("{case}.{extension}"))
+}
+
+fn version_operation_fixture_path(case: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/output_v3/version_operations")
+        .join(format!("{case}.json"))
 }
 
 fn snapshot_payload(contents: &str) -> Option<&str> {
@@ -127,6 +137,106 @@ fn every_v3_family_has_valid_success_empty_and_error_fixtures() {
 }
 
 #[test]
+fn version_operation_success_empty_error_and_dry_run_fixtures_are_valid() {
+    let validator = load_validator(3);
+
+    for case in ["success", "empty", "error", "dry_run", "stat"] {
+        let path = version_operation_fixture_path(case);
+        let value = load_json(&path);
+        assert_valid(&validator, &value, &path.display().to_string());
+    }
+}
+
+#[test]
+fn version_remove_contract_requires_version_aware_partial_results() {
+    let validator = load_validator(3);
+    let fixture = load_json(&version_operation_fixture_path("error"));
+
+    assert_eq!(fixture["status"], "error");
+    assert_eq!(fixture["data"]["outcome"], "partial");
+    assert_eq!(fixture["data"]["removed"][0]["version_id"], "v1");
+    assert_eq!(fixture["data"]["failed"][0]["version_id"], "v2");
+
+    let mut missing_version = fixture;
+    missing_version["data"]["failed"][0]
+        .as_object_mut()
+        .expect("failure must be an object")
+        .remove("version_id");
+    assert!(
+        !validator.is_valid(&missing_version),
+        "version removal failures must preserve the selected version ID field"
+    );
+}
+
+#[test]
+fn version_dry_run_contract_distinguishes_planned_from_removed_items() {
+    let validator = load_validator(3);
+    let fixture = load_json(&version_operation_fixture_path("dry_run"));
+
+    assert_eq!(fixture["data"]["dry_run"], true);
+    assert_eq!(fixture["data"]["outcome"], "planned");
+    assert_eq!(fixture["data"]["planned"].as_array().map(Vec::len), Some(1));
+    assert_eq!(fixture["data"]["removed"].as_array().map(Vec::len), Some(0));
+    assert_valid(&validator, &fixture, "version removal dry-run fixture");
+
+    let mut contradictory = fixture;
+    contradictory["data"]["removed"] = serde_json::json!([{
+        "path": "local/photos/image.jpg",
+        "version_id": "v1",
+        "delete_marker": false
+    }]);
+    assert!(
+        !validator.is_valid(&contradictory),
+        "dry-run records must never claim that an object version was removed"
+    );
+}
+
+#[test]
+fn locks_contract_types_bucket_defaults_and_mutation_metadata() {
+    let validator = load_validator(3);
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/output_v3/locks/bucket.json");
+    let fixture = load_json(&path);
+
+    assert_valid(&validator, &fixture, "bucket Object Lock fixture");
+    assert_eq!(fixture["data"]["operation"], "bucket_lock_info");
+    assert_eq!(fixture["data"]["changed"], false);
+    assert_eq!(
+        fixture["data"]["items"][0]["default_retention"]["duration"]["unit"],
+        "days"
+    );
+
+    let mut invalid = fixture.clone();
+    invalid["data"]["items"][0]["default_retention"]["duration"]["unit"] =
+        Value::String("months".to_string());
+    assert!(
+        !validator.is_valid(&invalid),
+        "bucket default retention must use an unambiguous day or year unit"
+    );
+
+    let mut overflowing = fixture;
+    overflowing["data"]["items"][0]["default_retention"]["duration"]["value"] =
+        serde_json::json!(2_147_483_648_i64);
+    assert!(
+        !validator.is_valid(&overflowing),
+        "bucket default retention must fit the S3 signed 32-bit field"
+    );
+}
+
+#[test]
+fn bucket_creation_partial_contract_preserves_effective_state_and_failed_stage() {
+    let validator = load_validator(3);
+    let fixture = load_json(&fixture_path("bucket_operations", "error"));
+
+    assert_valid(&validator, &fixture, "partial bucket creation fixture");
+    assert_eq!(fixture["status"], "error");
+    assert_eq!(fixture["data"]["outcome"], "partial");
+    assert_eq!(fixture["data"]["created"], true);
+    assert_eq!(fixture["data"]["effective_versioning"], true);
+    assert_eq!(fixture["data"]["failed_stage"], "verify_object_lock");
+}
+
+#[test]
 fn legacy_schemas_compile_and_existing_v1_golden_snapshots_remain_valid() {
     let v1_validator = load_validator(1);
     // Compiling v2 guards its existing references even though this repository does not yet
@@ -163,6 +273,48 @@ fn v3_allows_unknown_server_fields() {
         serde_json::json!({ "route": "/minio/admin/v4/runtime/capabilities" });
 
     assert_valid(&validator, &value, "extended capabilities output");
+}
+
+#[test]
+fn replication_truncated_fixture_is_explicitly_non_resumable() {
+    let validator = load_validator(3);
+    let value = load_json(&fixture_path("replication", "truncated"));
+
+    assert_eq!(value["data"]["scan"]["truncated"], true);
+    assert_eq!(value["data"]["scan"]["resumable"], false);
+    assert_valid(&validator, &value, "truncated replication diff");
+}
+
+#[test]
+fn replication_status_allows_empty_reset_id_but_start_requires_exactly_one_target() {
+    let validator = load_validator(3);
+    let status = load_json(&fixture_path("replication_operations", "success"));
+    assert_eq!(status["data"]["targets"][0]["reset_id"], "");
+    assert_valid(&validator, &status, "status with persisted empty reset ID");
+
+    let mut start = status;
+    start["data"]["operation"] = Value::String("resync_start".to_string());
+    assert!(
+        !validator.is_valid(&start),
+        "start output must retain a nonempty server reset ID"
+    );
+    start["data"]["targets"][0]["reset_id"] = Value::String("server-id".to_string());
+    assert_valid(&validator, &start, "start with nonempty server reset ID");
+
+    let mut empty_targets = start.clone();
+    empty_targets["data"]["targets"] = serde_json::json!([]);
+    assert!(
+        !validator.is_valid(&empty_targets),
+        "start output must contain exactly one target"
+    );
+
+    let mut multiple_targets = start;
+    let target = multiple_targets["data"]["targets"][0].clone();
+    multiple_targets["data"]["targets"] = serde_json::json!([target.clone(), target]);
+    assert!(
+        !validator.is_valid(&multiple_targets),
+        "start output must not contain multiple targets"
+    );
 }
 
 #[test]

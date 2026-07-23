@@ -1,0 +1,16 @@
+{
+  "schema_version": 3,
+  "type": "bucket_operations",
+  "status": "success",
+  "data": {
+    "operation": "create",
+    "bucket": "existing-bucket",
+    "outcome": "existing",
+    "created": false,
+    "requested": {
+      "versioning_enabled": false,
+      "object_lock_enabled": false
+    },
+    "completed_stages": ["existing_bucket_detected"]
+  }
+}
