@@ -3701,6 +3701,12 @@ impl ObjectStore for S3Client {
     ) -> Result<MultipartCopyResult> {
         use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 
+        if cancellation.is_cancelled() {
+            return Err(self.redact_sensitive_error(Error::Interrupted(
+                "Multipart copy cancelled before upload creation".to_string(),
+            )));
+        }
+
         let plan = options
             .plan()
             .map_err(|error| self.redact_sensitive_error(error))?;
@@ -7876,6 +7882,24 @@ mod tests {
             .metadata
             .insert("owner".to_string(), "copy-test".to_string());
         options
+    }
+
+    #[tokio::test]
+    async fn multipart_copy_cancelled_before_start_sends_no_requests() {
+        let (client, replay) = test_s3_client_with_response_sequence(vec![]);
+        let src = RemotePath::new("test", "source-bucket", "src.bin");
+        let dst = RemotePath::new("test", "destination-bucket", "dst.bin");
+        let options = multipart_copy_options(S3_MULTIPART_COPY_MIN_PART_SIZE);
+        let cancellation = MultipartCopyCancellation::new();
+        cancellation.cancel();
+
+        let error = client
+            .multipart_copy(&src, &dst, &options, &cancellation, None, &|_| {})
+            .await
+            .expect_err("pre-cancelled copy should be interrupted");
+
+        assert!(matches!(error, Error::Interrupted(_)));
+        assert!(replay.actual_requests().next().is_none());
     }
 
     #[tokio::test]

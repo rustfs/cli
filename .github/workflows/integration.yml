@@ -112,6 +112,7 @@ jobs:
           if [[ "${{ matrix.version }}" == "1.0.0-beta.10" ]]; then
             TESTS+=(
               "multipart_operations::test_multipart_server_side_copy_direct_primitive"
+              "recursive_operations::test_recursive_copy"
             )
           fi
 

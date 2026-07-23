@@ -7,18 +7,19 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures::stream::{FuturesUnordered, StreamExt as _};
 use glob::Pattern;
 use jiff::Timestamp;
 use serde::Serialize;
-use tokio::sync::Mutex;
-use tokio::time::{Instant, sleep_until};
+use tokio::sync::{Mutex, Notify};
+use tokio::time::{Instant, sleep, sleep_until};
 
 use crate::alias::RetryConfig;
 use crate::error::{Error, Result};
-use crate::retry::{is_retryable_error, retry_with_backoff};
+use crate::retry::{calculate_backoff, is_retryable_error};
 
 /// A storage-independent item that can be selected and executed as part of a transfer.
 #[derive(Debug, Clone)]
@@ -202,12 +203,50 @@ impl Default for TransferControls {
     }
 }
 
+/// Cooperative cancellation shared by a transfer command and its executor.
+#[derive(Debug, Clone, Default)]
+pub struct TransferCancellation {
+    inner: Arc<TransferCancellationInner>,
+}
+
+#[derive(Debug, Default)]
+struct TransferCancellationInner {
+    cancelled: AtomicBool,
+    notify: Notify,
+}
+
+impl TransferCancellation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        if !self.inner.cancelled.swap(true, Ordering::AcqRel) {
+            self.inner.notify.notify_waiters();
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.inner.cancelled.load(Ordering::Acquire)
+    }
+
+    pub async fn cancelled(&self) {
+        let notified = self.inner.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if self.is_cancelled() {
+            return;
+        }
+        notified.await;
+    }
+}
+
 /// Result state for one candidate.
 #[derive(Debug)]
 pub enum TransferOutcomeState {
     Success { bytes_transferred: u64 },
     Failed { error: Error },
-    Cancelled,
+    Cancelled { error: Option<Error> },
 }
 
 /// Deterministically ordered result for one candidate.
@@ -222,6 +261,7 @@ pub struct TransferOutcome<T> {
 pub struct TransferReport<T> {
     pub summary: TransferSummary,
     pub outcomes: Vec<TransferOutcome<T>>,
+    pub was_cancelled: bool,
 }
 
 impl<T> TransferReport<T> {
@@ -231,7 +271,8 @@ impl<T> TransferReport<T> {
             .iter()
             .find_map(|outcome| match &outcome.state {
                 TransferOutcomeState::Failed { error } => Some(error),
-                TransferOutcomeState::Success { .. } | TransferOutcomeState::Cancelled => None,
+                TransferOutcomeState::Success { .. }
+                | TransferOutcomeState::Cancelled { error: _ } => None,
             })
     }
 }
@@ -255,6 +296,24 @@ impl TransferExecutor {
         F: Fn(TransferCandidate<T>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<u64>> + Send + 'static,
     {
+        self.execute_with_cancellation(plan, TransferCancellation::new(), operation)
+            .await
+    }
+
+    /// Execute candidates until completion, failure policy, or cooperative cancellation.
+    ///
+    /// Work already in flight is allowed to settle so callers can await backend cleanup.
+    pub async fn execute_with_cancellation<T, F, Fut>(
+        &self,
+        plan: TransferPlan<T>,
+        cancellation: TransferCancellation,
+        operation: F,
+    ) -> TransferReport<T>
+    where
+        T: Clone + Send + Sync + 'static,
+        F: Fn(TransferCandidate<T>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<u64>> + Send + 'static,
+    {
         let mut summary = plan.summary;
         let items = plan.items;
         let operation = Arc::new(operation);
@@ -262,26 +321,52 @@ impl TransferExecutor {
         let mut in_flight = FuturesUnordered::new();
         let mut completed = BTreeMap::new();
         let mut next_index = 0usize;
-        let mut stop_scheduling = false;
+        let mut was_cancelled = cancellation.is_cancelled();
+        let mut stop_scheduling = was_cancelled;
 
-        while next_index < items.len() && in_flight.len() < self.controls.concurrency {
+        while !stop_scheduling
+            && next_index < items.len()
+            && in_flight.len() < self.controls.concurrency
+        {
             in_flight.push(execute_candidate(
                 next_index,
                 items[next_index].clone(),
                 Arc::clone(&operation),
                 Arc::clone(&rate_gate),
                 self.controls.retry.clone(),
+                cancellation.clone(),
             ));
             next_index += 1;
         }
 
-        while let Some((index, result)) = in_flight.next().await {
+        while !in_flight.is_empty() {
+            let next = if stop_scheduling {
+                in_flight.next().await
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => {
+                        was_cancelled = true;
+                        stop_scheduling = true;
+                        continue;
+                    }
+                    next = in_flight.next() => next,
+                }
+            };
+            let Some((index, result)) = next else {
+                break;
+            };
             let failed = result.is_err();
             completed.insert(index, result);
 
             if failed && !self.controls.continue_on_error {
                 // Work that has already started is allowed to settle so the report never marks a
                 // completed side effect as cancelled. No additional candidates are scheduled.
+                stop_scheduling = true;
+            }
+
+            if cancellation.is_cancelled() {
+                was_cancelled = true;
                 stop_scheduling = true;
             }
 
@@ -292,11 +377,15 @@ impl TransferExecutor {
                     Arc::clone(&operation),
                     Arc::clone(&rate_gate),
                     self.controls.retry.clone(),
+                    cancellation.clone(),
                 ));
                 next_index += 1;
             }
         }
         drop(in_flight);
+        if cancellation.is_cancelled() {
+            was_cancelled = true;
+        }
 
         let mut outcomes = Vec::with_capacity(items.len());
         for (index, item) in items.into_iter().enumerate() {
@@ -307,19 +396,27 @@ impl TransferExecutor {
                         summary.transferred_bytes.saturating_add(bytes_transferred);
                     TransferOutcomeState::Success { bytes_transferred }
                 }
+                Some(Err(error @ Error::Interrupted(_))) => {
+                    summary.cancelled += 1;
+                    TransferOutcomeState::Cancelled { error: Some(error) }
+                }
                 Some(Err(error)) => {
                     summary.failed += 1;
                     TransferOutcomeState::Failed { error }
                 }
                 None => {
                     summary.cancelled += 1;
-                    TransferOutcomeState::Cancelled
+                    TransferOutcomeState::Cancelled { error: None }
                 }
             };
             outcomes.push(TransferOutcome { item, state });
         }
 
-        TransferReport { summary, outcomes }
+        TransferReport {
+            summary,
+            outcomes,
+            was_cancelled,
+        }
     }
 }
 
@@ -329,26 +426,56 @@ async fn execute_candidate<T, F, Fut>(
     operation: Arc<F>,
     rate_gate: Arc<RateGate>,
     retry: RetryConfig,
+    cancellation: TransferCancellation,
 ) -> (usize, Result<u64>)
 where
     T: Clone + Send + Sync + 'static,
     F: Fn(TransferCandidate<T>) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<u64>> + Send + 'static,
 {
-    let result = retry_with_backoff(
-        &retry,
-        || {
-            let item = item.clone();
-            let operation = Arc::clone(&operation);
-            let rate_gate = Arc::clone(&rate_gate);
-            async move {
-                rate_gate.wait(item.size_bytes.unwrap_or_default()).await;
-                operation(item).await
+    let mut attempt = 0;
+    let result = loop {
+        if cancellation.is_cancelled() {
+            break Err(Error::Interrupted("Transfer cancelled".to_string()));
+        }
+
+        attempt += 1;
+        let rate_wait = rate_gate.wait(item.size_bytes.unwrap_or_default());
+        tokio::pin!(rate_wait);
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                break Err(Error::Interrupted("Transfer cancelled".to_string()));
             }
-        },
-        is_retryable_error,
-    )
-    .await;
+            _ = &mut rate_wait => {}
+        }
+
+        // Once an operation starts it is allowed to settle so callers can complete backend
+        // cleanup. Cancellation is checked again before any retry is attempted.
+        match operation(item.clone()).await {
+            Ok(bytes) => break Ok(bytes),
+            Err(error) => {
+                if attempt >= retry.max_attempts || !is_retryable_error(&error) {
+                    break Err(error);
+                }
+
+                let backoff = calculate_backoff(&retry, attempt);
+                tracing::debug!(
+                    attempt,
+                    backoff_ms = backoff.as_millis(),
+                    error = %error,
+                    "Retrying transfer after transient error"
+                );
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => {
+                        break Err(Error::Interrupted("Transfer cancelled".to_string()));
+                    }
+                    _ = sleep(backoff) => {}
+                }
+            }
+        }
+    };
     (index, result)
 }
 
@@ -680,5 +807,170 @@ mod tests {
         assert_eq!(report.summary.successful, 1);
         assert_eq!(report.summary.failed, 1);
         assert_eq!(report.summary.cancelled, 1);
+    }
+
+    #[tokio::test]
+    async fn cooperative_cancellation_stops_scheduling_and_drains_started_work() {
+        let controls = TransferControls {
+            concurrency: 2,
+            retry: RetryConfig {
+                max_attempts: 1,
+                ..RetryConfig::default()
+            },
+            continue_on_error: true,
+            ..TransferControls::default()
+        };
+        let executor = TransferExecutor::new(controls).expect("valid controls");
+        let cancellation = TransferCancellation::new();
+        let plan = TransferPlan::build(
+            vec![
+                candidate("a", None, 1),
+                candidate("b", None, 1),
+                candidate("c", None, 1),
+            ],
+            &TransferSelection::default(),
+        );
+        let started = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+
+        let task = tokio::spawn({
+            let cancellation = cancellation.clone();
+            let started = Arc::clone(&started);
+            let release = Arc::clone(&release);
+            async move {
+                executor
+                    .execute_with_cancellation(plan, cancellation, move |_| {
+                        let started = Arc::clone(&started);
+                        let release = Arc::clone(&release);
+                        async move {
+                            started.fetch_add(1, Ordering::SeqCst);
+                            release.acquire().await.expect("release semaphore").forget();
+                            Ok(1)
+                        }
+                    })
+                    .await
+            }
+        });
+
+        while started.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+        cancellation.cancel();
+        release.add_permits(2);
+        let report = task.await.expect("executor task");
+
+        assert!(report.was_cancelled);
+        assert_eq!(started.load(Ordering::SeqCst), 2);
+        assert_eq!(report.summary.successful, 2);
+        assert_eq!(report.summary.cancelled, 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_retry_backoff_does_not_start_another_attempt() {
+        let controls = TransferControls {
+            concurrency: 1,
+            retry: RetryConfig {
+                max_attempts: 3,
+                initial_backoff_ms: 10_000,
+                max_backoff_ms: 10_000,
+            },
+            continue_on_error: true,
+            ..TransferControls::default()
+        };
+        let executor = TransferExecutor::new(controls).expect("valid controls");
+        let cancellation = TransferCancellation::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let first_attempt = Arc::new(tokio::sync::Semaphore::new(0));
+        let plan = TransferPlan::build(
+            vec![candidate("retry", None, 1)],
+            &TransferSelection::default(),
+        );
+
+        let task = tokio::spawn({
+            let cancellation = cancellation.clone();
+            let calls = Arc::clone(&calls);
+            let first_attempt = Arc::clone(&first_attempt);
+            async move {
+                executor
+                    .execute_with_cancellation(plan, cancellation, move |_| {
+                        let calls = Arc::clone(&calls);
+                        let first_attempt = Arc::clone(&first_attempt);
+                        async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            first_attempt.add_permits(1);
+                            Err(Error::Network("503 Service Unavailable".to_string()))
+                        }
+                    })
+                    .await
+            }
+        });
+
+        first_attempt
+            .acquire()
+            .await
+            .expect("first attempt semaphore")
+            .forget();
+        cancellation.cancel();
+        let report = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("cancellation should interrupt retry backoff")
+            .expect("executor task");
+
+        assert!(report.was_cancelled);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(report.summary.failed, 0);
+        assert_eq!(report.summary.cancelled, 1);
+    }
+
+    #[tokio::test]
+    async fn simultaneous_completion_and_cancellation_never_schedules_more_work() {
+        for _ in 0..100 {
+            let controls = TransferControls {
+                concurrency: 1,
+                retry: RetryConfig {
+                    max_attempts: 1,
+                    ..RetryConfig::default()
+                },
+                continue_on_error: true,
+                ..TransferControls::default()
+            };
+            let executor = TransferExecutor::new(controls).expect("valid controls");
+            let cancellation = TransferCancellation::new();
+            let started = Arc::new(AtomicUsize::new(0));
+            let release = Arc::new(tokio::sync::Semaphore::new(0));
+            let plan = TransferPlan::build(
+                vec![candidate("a", None, 1), candidate("b", None, 1)],
+                &TransferSelection::default(),
+            );
+
+            let task = tokio::spawn({
+                let cancellation = cancellation.clone();
+                let started = Arc::clone(&started);
+                let release = Arc::clone(&release);
+                async move {
+                    executor
+                        .execute_with_cancellation(plan, cancellation, move |_| {
+                            let started = Arc::clone(&started);
+                            let release = Arc::clone(&release);
+                            async move {
+                                started.fetch_add(1, Ordering::SeqCst);
+                                release.acquire().await.expect("release semaphore").forget();
+                                Ok(1)
+                            }
+                        })
+                        .await
+                }
+            });
+
+            while started.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+            cancellation.cancel();
+            release.add_permits(1);
+            let report = task.await.expect("executor task");
+
+            assert!(report.was_cancelled);
+            assert_eq!(started.load(Ordering::SeqCst), 1);
+        }
     }
 }

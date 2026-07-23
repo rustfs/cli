@@ -59,7 +59,7 @@ where
 }
 
 /// Calculate backoff duration with jitter
-fn calculate_backoff(config: &RetryConfig, attempt: u32) -> Duration {
+pub(crate) fn calculate_backoff(config: &RetryConfig, attempt: u32) -> Duration {
     // Exponential backoff: initial * 2^(attempt-1)
     let base_ms = config.initial_backoff_ms * (1u64 << (attempt - 1).min(10));
     let capped_ms = base_ms.min(config.max_backoff_ms);

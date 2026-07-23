@@ -74,8 +74,8 @@ pub use traits::{
     ObjectVersion, ObjectVersionIdentifier, ObjectVersionListResult,
 };
 pub use transfer::{
-    TransferCandidate, TransferControls, TransferExecutor, TransferOutcome, TransferOutcomeState,
-    TransferPlan, TransferReport, TransferSelection, TransferSummary,
+    TransferCancellation, TransferCandidate, TransferControls, TransferExecutor, TransferOutcome,
+    TransferOutcomeState, TransferPlan, TransferReport, TransferSelection, TransferSummary,
 };
 pub use undo::{
     UndoAction, UndoObjectResult, UndoOutcome, UndoPlan, UndoPlanItem, plan_object_undo,

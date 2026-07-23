@@ -1527,27 +1527,21 @@ mod recursive_operations {
             assert!(output.status.success(), "Failed to upload {}", file);
         }
 
-        // Copy src/ to dst/ - Note: recursive S3-to-S3 copy may not be fully implemented
+        // Copy src/ to dst/ through the recursive same-endpoint planner.
         let output = run_rc(
             &[
                 "cp",
                 "--recursive",
                 &format!("test/{}/src/", bucket_name),
                 &format!("test/{}/dst/", bucket_name),
-                "--json",
             ],
             config_dir.path(),
         );
-
-        // If recursive copy is not supported, skip the rest of the test
-        if !output.status.success() {
-            eprintln!(
-                "Recursive S3-to-S3 copy not fully implemented, skipping: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            cleanup_bucket(config_dir.path(), &bucket_name);
-            return;
-        }
+        assert!(
+            output.status.success(),
+            "Failed to recursively copy remote prefix: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
 
         // Verify both src and dst exist
         let output = run_rc(

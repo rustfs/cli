@@ -6,15 +6,17 @@ use clap::Args;
 use jiff::Timestamp;
 use rc_core::alias::RetryConfig;
 use rc_core::{
-    AliasManager, Error, ObjectEncryptionRequest, ObjectStore as _, ParsedPath, RemotePath,
-    TransferCandidate, TransferControls, TransferExecutor, TransferOutcomeState, TransferPlan,
-    TransferSelection, parse_path,
+    AliasManager, CopyObjectOptions, Error, MultipartCopyCancellation, MultipartCopyOptions,
+    ObjectEncryptionRequest, ObjectInfo, ObjectStore as _, ParsedPath, RemotePath,
+    TransferCancellation, TransferCandidate, TransferControls, TransferExecutor,
+    TransferOutcomeState, TransferPlan, TransferSelection, parse_path,
 };
 use rc_s3::S3Client;
 use serde::Serialize;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::exit_code::ExitCode;
 use crate::output::{Formatter, OutputConfig, ProgressBar, V3SuccessEnvelope};
@@ -31,7 +33,8 @@ const DEFAULT_TRANSFER_CONCURRENCY: usize = 4;
 const DEFAULT_RETRY_ATTEMPTS: u32 = 3;
 const DEFAULT_RETRY_INITIAL_BACKOFF_MS: u64 = 100;
 const DEFAULT_RETRY_MAX_BACKOFF_MS: u64 = 10_000;
-const MAX_SINGLE_COPY_SIZE: u64 = 5 * 1024 * 1024 * 1024;
+#[cfg(test)]
+const MAX_SINGLE_COPY_SIZE: u64 = rc_core::S3_SINGLE_COPY_MAX_SIZE;
 
 /// Copy objects
 #[derive(Args, Clone, Debug)]
@@ -57,8 +60,18 @@ pub struct CpArgs {
     pub continue_on_error: bool,
 
     /// Overwrite destination if it exists
-    #[arg(long, default_value = "true")]
+    #[arg(
+        long,
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
     pub overwrite: bool,
+
+    /// Skip remote destinations that already exist
+    #[arg(long)]
+    pub skip_existing: bool,
 
     /// Only show what would be copied (dry run)
     #[arg(long)]
@@ -138,6 +151,7 @@ impl CpArgs {
             preserve: false,
             continue_on_error: false,
             overwrite: true,
+            skip_existing: false,
             dry_run: false,
             storage_class: None,
             content_type: None,
@@ -305,6 +319,8 @@ pub async fn execute(args: CpArgs, output_config: OutputConfig) -> ExitCode {
 fn uses_transfer_planner(args: &CpArgs) -> bool {
     args.sources.len() > 1
         || args.recursive
+        || args.skip_existing
+        || !args.overwrite
         || !args.include.is_empty()
         || !args.exclude.is_empty()
         || args.newer_than.is_some()
@@ -365,9 +381,58 @@ enum CpOperation {
     RemoteToRemote {
         source: RemotePath,
         target: RemotePath,
+        source_info: Box<ObjectInfo>,
         encryption: Option<ObjectEncryptionRequest>,
     },
 }
+
+#[derive(Debug, Clone)]
+struct PlannedCopyDetail {
+    source_version_id: Option<String>,
+    destination_version_id: Option<String>,
+    upload_id: Option<String>,
+}
+
+type PlannedCopyDetails = Arc<AsyncMutex<HashMap<(String, String), PlannedCopyDetail>>>;
+
+#[derive(Debug)]
+struct PlannedCopyProgress {
+    positions: StdMutex<HashMap<(String, String), u64>>,
+    bar: Option<ProgressBar>,
+}
+
+impl PlannedCopyProgress {
+    fn new(output_config: OutputConfig, total: u64) -> Self {
+        Self {
+            positions: StdMutex::new(HashMap::new()),
+            bar: (total > 0).then(|| ProgressBar::new(output_config, total)),
+        }
+    }
+
+    fn reset(&self, key: &(String, String)) {
+        self.set(key, 0);
+    }
+
+    fn set(&self, key: &(String, String), bytes: u64) {
+        let mut positions = self
+            .positions
+            .lock()
+            .expect("planned copy progress lock should not be poisoned");
+        positions.insert(key.clone(), bytes);
+        let aggregate = positions.values().copied().fold(0_u64, u64::saturating_add);
+        if let Some(bar) = &self.bar {
+            bar.set_position(aggregate);
+        }
+    }
+
+    fn finish(&self) {
+        if let Some(bar) = &self.bar {
+            bar.finish_and_clear();
+        }
+    }
+}
+
+type SharedPlannedCopyProgress = Arc<PlannedCopyProgress>;
 
 #[allow(clippy::too_many_arguments)]
 async fn execute_transfer_plan(
@@ -400,7 +465,7 @@ async fn execute_transfer_plan(
         }
     };
 
-    let plan = TransferPlan::build(candidates, &selection);
+    let mut plan = TransferPlan::build(candidates, &selection);
     if let Err(error) = validate_plan_targets(&plan) {
         return formatter.fail(ExitCode::UsageError, &error.to_string());
     }
@@ -417,20 +482,6 @@ async fn execute_transfer_plan(
         return ExitCode::Success;
     }
 
-    if args.dry_run {
-        for item in &plan.items {
-            formatter.println(&format!(
-                "Would copy: {} -> {}",
-                formatter.style_file(&item.source),
-                formatter.style_file(&item.target)
-            ));
-        }
-        if args.summary || args.recursive || args.sources.len() > 1 {
-            print_transfer_summary(formatter, &plan.summary);
-        }
-        return ExitCode::Success;
-    }
-
     let clients = match create_planned_client_cache(&plan.items, alias_manager).await {
         Ok(clients) => Arc::new(clients),
         Err(error) => {
@@ -440,6 +491,58 @@ async fn execute_transfer_plan(
             );
         }
     };
+    let skipped_existing = if args.skip_existing || !args.overwrite {
+        match skip_existing_remote_targets(&mut plan, &clients).await {
+            Ok(skipped) => skipped,
+            Err(error) => {
+                return formatter.fail(
+                    exit_code_for_core_error(&error),
+                    &format!("Failed to inspect copy destinations: {error}"),
+                );
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
+    if args.dry_run {
+        for item in &plan.items {
+            formatter.println(&format!(
+                "Would copy: {} -> {}",
+                formatter.style_file(&item.source),
+                formatter.style_file(&item.target)
+            ));
+        }
+        for item in &skipped_existing {
+            print_skipped_existing(formatter, item, true);
+        }
+        if args.summary || args.recursive || args.sources.len() > 1 {
+            print_transfer_summary(formatter, &plan.summary);
+        }
+        return ExitCode::Success;
+    }
+
+    for item in &skipped_existing {
+        print_skipped_existing(formatter, item, false);
+    }
+    if plan.items.is_empty() {
+        if args.summary || args.recursive || args.sources.len() > 1 {
+            print_transfer_summary(formatter, &plan.summary);
+        }
+        return ExitCode::Success;
+    }
+
+    let total_bytes = plan
+        .items
+        .iter()
+        .filter_map(|item| {
+            if matches!(item.payload, CpOperation::RemoteToRemote { .. }) {
+                item.size_bytes
+            } else {
+                None
+            }
+        })
+        .sum::<u64>();
     let executor = match TransferExecutor::new(controls) {
         Ok(executor) => executor,
         Err(error) => {
@@ -447,30 +550,82 @@ async fn execute_transfer_plan(
         }
     };
     let operation_args = Arc::new(args.clone());
+    let transfer_cancellation = TransferCancellation::new();
+    let multipart_cancellation = MultipartCopyCancellation::new();
+    let signal_task = tokio::spawn({
+        let transfer_cancellation = transfer_cancellation.clone();
+        let multipart_cancellation = multipart_cancellation.clone();
+        async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                multipart_cancellation.cancel();
+                transfer_cancellation.cancel();
+            }
+        }
+    });
+    let copy_details = PlannedCopyDetails::default();
+    let copy_progress = Arc::new(PlannedCopyProgress::new(
+        formatter.output_config(),
+        total_bytes,
+    ));
     let report = executor
-        .execute(plan, {
+        .execute_with_cancellation(plan, transfer_cancellation, {
             let operation_args = Arc::clone(&operation_args);
             let clients = Arc::clone(&clients);
+            let multipart_cancellation = multipart_cancellation.clone();
+            let copy_details = Arc::clone(&copy_details);
+            let copy_progress = Arc::clone(&copy_progress);
             move |item| {
                 let operation_args = Arc::clone(&operation_args);
                 let clients = Arc::clone(&clients);
-                async move { execute_planned_operation(item, &operation_args, &clients).await }
+                let multipart_cancellation = multipart_cancellation.clone();
+                let copy_details = Arc::clone(&copy_details);
+                let copy_progress = Arc::clone(&copy_progress);
+                async move {
+                    execute_planned_operation(
+                        item,
+                        &operation_args,
+                        &clients,
+                        &multipart_cancellation,
+                        &copy_details,
+                        &copy_progress,
+                    )
+                    .await
+                }
             }
         })
         .await;
+    signal_task.abort();
+    let _ = signal_task.await;
+    copy_progress.finish();
 
+    let copy_details = copy_details.lock().await;
     for outcome in &report.outcomes {
         match &outcome.state {
             TransferOutcomeState::Success { bytes_transferred } => {
-                print_planned_success(formatter, &outcome.item, *bytes_transferred);
+                let key = (outcome.item.source.clone(), outcome.item.target.clone());
+                print_planned_success(
+                    formatter,
+                    &outcome.item,
+                    *bytes_transferred,
+                    copy_details.get(&key),
+                );
             }
             TransferOutcomeState::Failed { error } => {
                 formatter.error_with_code(exit_code_for_core_error(error), &error.to_string());
             }
-            TransferOutcomeState::Cancelled => formatter.warning(&format!(
-                "Cancelled before transfer: {}",
-                outcome.item.source
-            )),
+            TransferOutcomeState::Cancelled { error } => {
+                if let Some(error) = error {
+                    formatter.warning(&format!(
+                        "Cancelled transfer: {} ({error})",
+                        outcome.item.source
+                    ));
+                } else {
+                    formatter.warning(&format!(
+                        "Cancelled before transfer: {}",
+                        outcome.item.source
+                    ));
+                }
+            }
         }
     }
 
@@ -478,15 +633,22 @@ async fn execute_transfer_plan(
         print_transfer_summary(formatter, &report.summary);
     }
 
-    report
-        .first_failure()
-        .map_or(ExitCode::Success, exit_code_for_core_error)
+    if report.was_cancelled {
+        ExitCode::Interrupted
+    } else {
+        report
+            .first_failure()
+            .map_or(ExitCode::Success, exit_code_for_core_error)
+    }
 }
 
 async fn execute_planned_operation(
     item: TransferCandidate<CpOperation>,
     args: &CpArgs,
     clients: &HashMap<String, Arc<S3Client>>,
+    multipart_cancellation: &MultipartCopyCancellation,
+    copy_details: &PlannedCopyDetails,
+    copy_progress: &SharedPlannedCopyProgress,
 ) -> rc_core::Result<u64> {
     let client = planned_client(clients, operation_alias(&item.payload))?;
     match &item.payload {
@@ -501,16 +663,31 @@ async fn execute_planned_operation(
         CpOperation::RemoteToRemote {
             source,
             target,
+            source_info,
             encryption,
         } => {
-            perform_planned_remote_copy(
+            let progress_key = (item.source.clone(), item.target.clone());
+            copy_progress.reset(&progress_key);
+            let result = perform_planned_remote_copy(
                 client,
                 source,
                 target,
+                source_info,
                 encryption.as_ref(),
-                item.size_bytes,
+                multipart_cancellation,
+                &|bytes| copy_progress.set(&progress_key, bytes),
             )
-            .await
+            .await?;
+            copy_progress.set(&progress_key, result.bytes_copied);
+            copy_details.lock().await.insert(
+                (item.source, item.target),
+                PlannedCopyDetail {
+                    source_version_id: result.source_version_id,
+                    destination_version_id: result.destination_version_id,
+                    upload_id: result.upload_id,
+                },
+            );
+            Ok(result.bytes_copied)
         }
     }
 }
@@ -561,34 +738,105 @@ async fn perform_planned_download(
         .await
 }
 
+struct PlannedRemoteCopyResult {
+    bytes_copied: u64,
+    source_version_id: Option<String>,
+    destination_version_id: Option<String>,
+    upload_id: Option<String>,
+    object: ObjectInfo,
+}
+
 async fn perform_planned_remote_copy(
     client: &S3Client,
     source: &RemotePath,
     target: &RemotePath,
+    source_info: &ObjectInfo,
     encryption: Option<&ObjectEncryptionRequest>,
-    planned_size: Option<u64>,
-) -> rc_core::Result<u64> {
+    cancellation: &MultipartCopyCancellation,
+    on_progress: &(dyn Fn(u64) + Send + Sync),
+) -> rc_core::Result<PlannedRemoteCopyResult> {
     if source.alias != target.alias {
         return Err(Error::UnsupportedFeature(
             "Cross-alias S3-to-S3 copy is not supported".to_string(),
         ));
     }
-    if requires_multipart_copy(planned_size) {
-        return Err(Error::UnsupportedFeature(
-            "Objects larger than 5 GiB require multipart copy, which is not implemented"
-                .to_string(),
-        ));
-    }
-    let copied = client.copy_object(source, target, encryption).await?;
-    Ok(copied
+    let planned_size = source_info
         .size_bytes
         .and_then(|size| u64::try_from(size).ok())
-        .or(planned_size)
-        .unwrap_or_default())
+        .ok_or_else(|| Error::InvalidPath(format!("Source size is unavailable: {source}")))?;
+    if rc_core::requires_multipart_copy(planned_size) {
+        let current = client.head_object(source).await?;
+        if current.size_bytes != source_info.size_bytes
+            || source_info
+                .etag
+                .as_ref()
+                .zip(current.etag.as_ref())
+                .is_some_and(|(planned, current)| planned != current)
+        {
+            return Err(Error::Conflict(format!(
+                "Source changed after copy planning: {source}"
+            )));
+        }
+        let options = multipart_options_from_source(&current)?;
+        let copied = client
+            .multipart_copy(
+                source,
+                target,
+                &options,
+                cancellation,
+                encryption,
+                on_progress,
+            )
+            .await?;
+        return Ok(PlannedRemoteCopyResult {
+            bytes_copied: copied.bytes_copied,
+            source_version_id: options.source_version_id,
+            destination_version_id: copied.object.version_id.clone(),
+            upload_id: Some(copied.upload_id),
+            object: copied.object,
+        });
+    }
+    let options = CopyObjectOptions::for_source_version(source_info.version_id.clone())?;
+    let copied = client
+        .copy_object_with_options(source, target, &options, encryption)
+        .await?;
+    let bytes_copied = copied
+        .size_bytes
+        .and_then(|size| u64::try_from(size).ok())
+        .unwrap_or(planned_size);
+    on_progress(bytes_copied);
+    Ok(PlannedRemoteCopyResult {
+        bytes_copied,
+        source_version_id: copied
+            .source_version_id
+            .clone()
+            .or_else(|| source_info.version_id.clone()),
+        destination_version_id: copied.version_id.clone(),
+        upload_id: None,
+        object: copied,
+    })
 }
 
+#[cfg(test)]
 fn requires_multipart_copy(planned_size: Option<u64>) -> bool {
-    planned_size.is_some_and(|size| size > MAX_SINGLE_COPY_SIZE)
+    planned_size.is_some_and(rc_core::requires_multipart_copy)
+}
+
+fn multipart_options_from_source(source: &ObjectInfo) -> rc_core::Result<MultipartCopyOptions> {
+    let source_size = source
+        .size_bytes
+        .and_then(|size| u64::try_from(size).ok())
+        .ok_or_else(|| {
+            Error::InvalidPath("Multipart copy source size is unavailable".to_string())
+        })?;
+    let source_etag = source.etag.clone().ok_or_else(|| {
+        Error::InvalidPath("Multipart copy source ETag is unavailable".to_string())
+    })?;
+    let mut options = MultipartCopyOptions::new(source_size, source_etag)?;
+    options.source_version_id = source.version_id.clone();
+    options.content_type = source.content_type.clone();
+    options.metadata = source.metadata.clone().unwrap_or_default();
+    Ok(options)
 }
 
 fn operation_alias(operation: &CpOperation) -> &str {
@@ -657,6 +905,7 @@ fn print_planned_success(
     formatter: &Formatter,
     item: &TransferCandidate<CpOperation>,
     bytes_transferred: u64,
+    detail: Option<&PlannedCopyDetail>,
 ) {
     let size_bytes = i64::try_from(bytes_transferred).ok();
     let size_human = size_bytes.map(|size| humansize::format_size(size as u64, humansize::BINARY));
@@ -671,13 +920,42 @@ fn print_planned_success(
             source_version_id: None,
         });
     } else {
-        formatter.println(&format!(
+        let mut line = format!(
             "{} -> {} ({})",
             formatter.style_file(&item.source),
             formatter.style_file(&item.target),
             formatter.style_size(size_human.as_deref().unwrap_or_default())
-        ));
+        );
+        if let Some(detail) = detail {
+            if let Some(version_id) = &detail.source_version_id {
+                line.push_str(&format!(" source-version={version_id}"));
+            }
+            if let Some(version_id) = &detail.destination_version_id {
+                line.push_str(&format!(" destination-version={version_id}"));
+            }
+            if let Some(upload_id) = &detail.upload_id {
+                line.push_str(&format!(" upload-id={upload_id}"));
+            }
+        }
+        formatter.println(&line);
     }
+}
+
+fn print_skipped_existing(
+    formatter: &Formatter,
+    item: &TransferCandidate<CpOperation>,
+    dry_run: bool,
+) {
+    let action = if dry_run {
+        "Would skip existing"
+    } else {
+        "Skipped existing"
+    };
+    formatter.println(&format!(
+        "{action}: {} -> {}",
+        formatter.style_file(&item.source),
+        formatter.style_file(&item.target)
+    ));
 }
 
 fn print_transfer_summary(formatter: &Formatter, summary: &rc_core::TransferSummary) {
@@ -865,6 +1143,14 @@ async fn build_transfer_candidates(
 fn validate_plan_targets(plan: &TransferPlan<CpOperation>) -> rc_core::Result<()> {
     let mut targets = HashSet::with_capacity(plan.items.len());
     for candidate in &plan.items {
+        if let CpOperation::RemoteToRemote { source, target, .. } = &candidate.payload
+            && source == target
+        {
+            return Err(Error::InvalidPath(format!(
+                "Source and destination resolve to the same object '{}'",
+                candidate.source
+            )));
+        }
         if !targets.insert(candidate.target.clone()) {
             return Err(Error::InvalidPath(format!(
                 "Multiple sources resolve to the same destination '{}'",
@@ -873,6 +1159,37 @@ fn validate_plan_targets(plan: &TransferPlan<CpOperation>) -> rc_core::Result<()
         }
     }
     Ok(())
+}
+
+async fn skip_existing_remote_targets(
+    plan: &mut TransferPlan<CpOperation>,
+    clients: &HashMap<String, Arc<S3Client>>,
+) -> rc_core::Result<Vec<TransferCandidate<CpOperation>>> {
+    let mut retained = Vec::with_capacity(plan.items.len());
+    let mut skipped = Vec::new();
+    for candidate in plan.items.drain(..) {
+        let destination = match &candidate.payload {
+            CpOperation::LocalToRemote { target, .. }
+            | CpOperation::RemoteToRemote { target, .. } => Some(target),
+            CpOperation::RemoteToLocal { .. } => None,
+        };
+        let Some(destination) = destination else {
+            retained.push(candidate);
+            continue;
+        };
+        let client = planned_client(clients, &destination.alias)?;
+        match client.head_object(destination).await {
+            Ok(_) => skipped.push(candidate),
+            Err(Error::NotFound(_)) | Err(Error::VersionNotFound { .. }) => {
+                retained.push(candidate);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    plan.items = retained;
+    plan.summary.planned = plan.items.len();
+    plan.summary.skipped = plan.summary.skipped.saturating_add(skipped.len());
+    Ok(skipped)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1032,33 +1349,35 @@ async fn build_remote_candidates(
                 "Remote prefix copy requires -r/--recursive".to_string(),
             ));
         }
-        let ParsedPath::Local(target_root) = target else {
-            return Err(Error::UnsupportedFeature(
-                "Recursive S3-to-S3 copy is not implemented".to_string(),
-            ));
-        };
         if !target_is_container {
             return Err(Error::InvalidPath(
-                "Recursive copy requires a directory destination ending in '/'".to_string(),
+                "Recursive copy requires a directory or remote prefix destination ending in '/'"
+                    .to_string(),
             ));
         }
 
-        let source_root = if multiple_sources {
-            source
-                .key
-                .trim_end_matches('/')
-                .rsplit('/')
-                .next()
-                .filter(|value| !value.is_empty())
-                .unwrap_or(&source.bucket)
-        } else {
-            ""
-        };
+        let listing_source = recursive_listing_source(source);
+        if let ParsedPath::Remote(target) = target {
+            if source.alias != target.alias {
+                return Err(Error::UnsupportedFeature(
+                    "Cross-alias S3-to-S3 copy is not supported".to_string(),
+                ));
+            }
+            if remote_copy_scopes_overlap(&listing_source, target) {
+                return Err(Error::Conflict(format!(
+                    "Recursive source '{}' overlaps destination '{}'",
+                    listing_source, target
+                )));
+            }
+        }
+
+        let source_root = recursive_source_root(&listing_source, multiple_sources);
         let mut continuation_token = None;
+        let mut seen_tokens = HashSet::new();
         loop {
             let result = client
                 .list_objects(
-                    source,
+                    &listing_source,
                     rc_core::ListOptions {
                         recursive: true,
                         max_keys: Some(1_000),
@@ -1068,34 +1387,73 @@ async fn build_remote_candidates(
                 )
                 .await?;
             for object in result.items.into_iter().filter(|object| !object.is_dir) {
-                let relative = safe_download_relative_path(&object.key, &source.key)
-                    .map_err(Error::InvalidPath)?;
-                let relative_string = relative.to_string_lossy().replace('\\', "/");
-                let target_relative = if source_root.is_empty() {
-                    relative.clone()
-                } else {
-                    PathBuf::from(source_root).join(&relative)
-                };
-                let destination = safe_download_destination(target_root, &target_relative)
-                    .await
-                    .map_err(Error::InvalidPath)?;
-                let object_source = RemotePath::new(&source.alias, &source.bucket, &object.key);
-                candidates.push(TransferCandidate {
-                    payload: CpOperation::RemoteToLocal {
-                        source: object_source.clone(),
-                        target: destination.clone(),
-                    },
-                    source: object_source.to_string(),
-                    target: destination.display().to_string(),
-                    relative_path: relative_string,
-                    modified: object.last_modified,
-                    size_bytes: object.size_bytes.and_then(|size| u64::try_from(size).ok()),
-                });
+                let object_source =
+                    RemotePath::new(&listing_source.alias, &listing_source.bucket, &object.key);
+                match target {
+                    ParsedPath::Local(target_root) => {
+                        let relative =
+                            safe_download_relative_path(&object.key, &listing_source.key)
+                                .map_err(Error::InvalidPath)?;
+                        let relative_string = relative.to_string_lossy().replace('\\', "/");
+                        let target_relative = if source_root.is_empty() {
+                            relative.clone()
+                        } else {
+                            PathBuf::from(&source_root).join(&relative)
+                        };
+                        let destination = safe_download_destination(target_root, &target_relative)
+                            .await
+                            .map_err(Error::InvalidPath)?;
+                        candidates.push(TransferCandidate {
+                            payload: CpOperation::RemoteToLocal {
+                                source: object_source.clone(),
+                                target: destination.clone(),
+                            },
+                            source: object_source.to_string(),
+                            target: destination.display().to_string(),
+                            relative_path: relative_string,
+                            modified: object.last_modified,
+                            size_bytes: object.size_bytes.and_then(|size| u64::try_from(size).ok()),
+                        });
+                    }
+                    ParsedPath::Remote(target) => {
+                        let (destination, relative) = recursive_remote_target(
+                            &listing_source,
+                            target,
+                            &object.key,
+                            multiple_sources,
+                        )?;
+                        let size_bytes =
+                            object.size_bytes.and_then(|size| u64::try_from(size).ok());
+                        candidates.push(TransferCandidate {
+                            payload: CpOperation::RemoteToRemote {
+                                source: object_source.clone(),
+                                target: destination.clone(),
+                                source_info: Box::new(object.clone()),
+                                encryption: encryption.clone(),
+                            },
+                            source: object_source.to_string(),
+                            target: destination.to_string(),
+                            relative_path: relative,
+                            modified: object.last_modified,
+                            size_bytes,
+                        });
+                    }
+                }
             }
             if !result.truncated {
                 break;
             }
-            continuation_token = result.continuation_token;
+            let next_token = result.continuation_token.ok_or_else(|| {
+                Error::InvalidPath(
+                    "Truncated object listing did not include a continuation token".to_string(),
+                )
+            })?;
+            if !seen_tokens.insert(next_token.clone()) {
+                return Err(Error::Conflict(
+                    "Object listing repeated a continuation token".to_string(),
+                ));
+            }
+            continuation_token = Some(next_token);
         }
         return Ok(());
     }
@@ -1147,6 +1505,7 @@ async fn build_remote_candidates(
                 payload: CpOperation::RemoteToRemote {
                     source: source.clone(),
                     target: destination.clone(),
+                    source_info: Box::new(object),
                     encryption,
                 },
                 source: source.to_string(),
@@ -1185,6 +1544,69 @@ fn remote_child(parent: &RemotePath, relative: &str) -> RemotePath {
         format!("{}/{}", parent.key, relative)
     };
     RemotePath::new(&parent.alias, &parent.bucket, key)
+}
+
+fn recursive_listing_source(source: &RemotePath) -> RemotePath {
+    let key = if source.key.is_empty() || source.key.ends_with('/') {
+        source.key.clone()
+    } else {
+        format!("{}/", source.key)
+    };
+    RemotePath::new(&source.alias, &source.bucket, key)
+}
+
+fn recursive_source_root(source: &RemotePath, multiple_sources: bool) -> String {
+    if !multiple_sources {
+        return String::new();
+    }
+    source
+        .key
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&source.bucket)
+        .to_string()
+}
+
+fn recursive_remote_target(
+    source: &RemotePath,
+    target: &RemotePath,
+    object_key: &str,
+    multiple_sources: bool,
+) -> rc_core::Result<(RemotePath, String)> {
+    let relative = object_key.strip_prefix(&source.key).ok_or_else(|| {
+        Error::InvalidPath(format!(
+            "Listed object key '{object_key}' is outside source prefix '{}'",
+            source.key
+        ))
+    })?;
+    if relative.is_empty() {
+        return Err(Error::InvalidPath(format!(
+            "Listed object key '{object_key}' does not identify a child of source prefix '{}'",
+            source.key
+        )));
+    }
+    let destination_relative = match recursive_source_root(source, multiple_sources) {
+        root if root.is_empty() => relative.to_string(),
+        root => format!("{root}/{relative}"),
+    };
+    Ok((
+        remote_child(target, &destination_relative),
+        relative.to_string(),
+    ))
+}
+
+fn remote_copy_scopes_overlap(source: &RemotePath, target: &RemotePath) -> bool {
+    if source.alias != target.alias || source.bucket != target.bucket {
+        return false;
+    }
+    let source_prefix = recursive_listing_source(source).key;
+    let target_prefix = recursive_listing_source(target).key;
+    source_prefix.is_empty()
+        || target_prefix.is_empty()
+        || source_prefix.starts_with(&target_prefix)
+        || target_prefix.starts_with(&source_prefix)
 }
 
 fn parse_cp_path(path: &str, alias_manager: Option<&AliasManager>) -> rc_core::Result<ParsedPath> {
@@ -1874,19 +2296,9 @@ async fn copy_s3_to_s3_prepared(
         return ExitCode::Success;
     }
 
-    match client.head_object(src).await {
-        Ok(info)
-            if info
-                .size_bytes
-                .is_some_and(|size| size > 5 * 1024 * 1024 * 1024) =>
-        {
-            return formatter.fail(
-                ExitCode::UnsupportedFeature,
-                "Objects larger than 5 GiB require multipart copy, which is not implemented",
-            );
-        }
-        Ok(_) => {}
-        Err(rc_core::Error::NotFound(_)) => {
+    let source_info = match client.head_object(src).await {
+        Ok(info) => info,
+        Err(Error::NotFound(_)) => {
             return formatter.fail_with_suggestion(
                 ExitCode::NotFound,
                 &format!("Source not found: {src_display}"),
@@ -1895,34 +2307,87 @@ async fn copy_s3_to_s3_prepared(
         }
         Err(error) => {
             return formatter.fail(
-                ExitCode::NetworkError,
+                exit_code_for_core_error(&error),
                 &format!("Failed to inspect source object: {error}"),
             );
         }
-    }
+    };
 
-    match client.copy_object(src, dst, encryption).await {
-        Ok(info) => {
+    let cancellation = MultipartCopyCancellation::new();
+    let transfer_cancellation = TransferCancellation::new();
+    let signal_task = tokio::spawn({
+        let cancellation = cancellation.clone();
+        let transfer_cancellation = transfer_cancellation.clone();
+        async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                cancellation.cancel();
+                transfer_cancellation.cancel();
+            }
+        }
+    });
+    let ignore_progress = |_: u64| {};
+    let copy = perform_planned_remote_copy(
+        &client,
+        src,
+        dst,
+        &source_info,
+        encryption,
+        &cancellation,
+        &ignore_progress,
+    );
+    tokio::pin!(copy);
+    let result = tokio::select! {
+        biased;
+        _ = transfer_cancellation.cancelled() => {
+            // Do not drop an in-flight request. Multipart copy observes its own token and performs
+            // cleanup; CopyObject is allowed to settle before the command reports interruption.
+            let _ = copy.await;
+            Err(Error::Interrupted("Copy interrupted".to_string()))
+        }
+        result = &mut copy => {
+            if transfer_cancellation.is_cancelled() {
+                Err(Error::Interrupted("Copy interrupted".to_string()))
+            } else {
+                result
+            }
+        }
+    };
+    signal_task.abort();
+    let _ = signal_task.await;
+
+    match result {
+        Ok(result) => {
             if formatter.is_json() {
-                print_copy_json(formatter, &info, &src_display, &dst_display);
+                print_copy_json(formatter, &result.object, &src_display, &dst_display);
             } else {
                 let styled_src = formatter.style_file(&src_display);
                 let styled_dst = formatter.style_file(&dst_display);
-                let styled_size = formatter.style_size(&info.size_human.unwrap_or_default());
-                formatter.println(&format!("{styled_src} -> {styled_dst} ({styled_size})"));
+                let styled_size =
+                    formatter.style_size(&result.object.size_human.unwrap_or_else(|| {
+                        humansize::format_size(result.bytes_copied, humansize::BINARY)
+                    }));
+                let upload = result
+                    .upload_id
+                    .map(|upload_id| format!(" upload-id={upload_id}"))
+                    .unwrap_or_default();
+                formatter.println(&format!(
+                    "{styled_src} -> {styled_dst} ({styled_size}){upload}"
+                ));
             }
             ExitCode::Success
         }
-        Err(e) => {
-            let err_str = e.to_string();
-            if err_str.contains("NotFound") || err_str.contains("NoSuchKey") {
+        Err(error) => {
+            if matches!(error, Error::NotFound(_) | Error::VersionNotFound { .. }) {
                 formatter.fail_with_suggestion(
                     ExitCode::NotFound,
                     &format!("Source not found: {src_display}"),
                     "Check the source bucket and object key, then retry the copy command.",
                 )
             } else {
-                formatter.fail(ExitCode::NetworkError, &format!("Failed to copy: {e}"))
+                formatter.fail(
+                    exit_code_for_core_error(&error),
+                    &format!("Failed to copy: {error}"),
+                )
             }
         }
     }
@@ -2395,6 +2860,10 @@ mod tests {
             payload: CpOperation::RemoteToRemote {
                 source: RemotePath::new("shared", "source", "large.bin"),
                 target: RemotePath::new("shared", "target", "large.bin"),
+                source_info: Box::new(ObjectInfo::file(
+                    "large.bin",
+                    (MAX_SINGLE_COPY_SIZE + 1) as i64,
+                )),
                 encryption: None,
             },
             source: "shared/source/large.bin".to_string(),
@@ -2405,6 +2874,106 @@ mod tests {
         };
 
         assert!(requires_multipart_copy(candidate.size_bytes));
+    }
+
+    #[test]
+    fn planned_remote_copy_uses_exact_five_gib_boundary() {
+        assert!(!requires_multipart_copy(Some(MAX_SINGLE_COPY_SIZE)));
+        assert!(requires_multipart_copy(Some(MAX_SINGLE_COPY_SIZE + 1)));
+    }
+
+    #[test]
+    fn planned_progress_replaces_attempt_bytes_instead_of_double_counting() {
+        let progress = PlannedCopyProgress::new(
+            OutputConfig {
+                no_progress: true,
+                ..OutputConfig::default()
+            },
+            20,
+        );
+        let first = ("source/a".to_string(), "target/a".to_string());
+        let second = ("source/b".to_string(), "target/b".to_string());
+
+        progress.set(&first, 7);
+        progress.set(&second, 5);
+        progress.reset(&first);
+        progress.set(&first, 15);
+
+        let positions = progress
+            .positions
+            .lock()
+            .expect("planned copy progress lock");
+        assert_eq!(positions.get(&first), Some(&15));
+        assert_eq!(positions.get(&second), Some(&5));
+        assert_eq!(
+            positions.values().copied().fold(0_u64, u64::saturating_add),
+            20
+        );
+    }
+
+    #[test]
+    fn recursive_remote_mapping_preserves_source_relative_keys() {
+        let source = RemotePath::new("shared", "source", "src/");
+        let target = RemotePath::new("shared", "destination", "archive/");
+
+        let (destination, relative) =
+            recursive_remote_target(&source, &target, "src/nested/report.csv", false)
+                .expect("map recursive object");
+
+        assert_eq!(relative, "nested/report.csv");
+        assert_eq!(destination.key, "archive/nested/report.csv");
+    }
+
+    #[test]
+    fn recursive_bucket_root_mapping_keeps_the_full_object_key() {
+        let source = RemotePath::new("shared", "source", "");
+        let target = RemotePath::new("shared", "destination", "archive/");
+
+        let (destination, relative) =
+            recursive_remote_target(&source, &target, "nested/report.csv", false)
+                .expect("map bucket object");
+
+        assert_eq!(relative, "nested/report.csv");
+        assert_eq!(destination.key, "archive/nested/report.csv");
+    }
+
+    #[test]
+    fn recursive_remote_overlap_is_boundary_aware_and_symmetric() {
+        let source = RemotePath::new("shared", "bucket", "src/");
+        let child = RemotePath::new("shared", "bucket", "src/archive/");
+        let sibling = RemotePath::new("shared", "bucket", "src-old/");
+        let other_bucket = RemotePath::new("shared", "other", "src/archive/");
+
+        assert!(remote_copy_scopes_overlap(&source, &child));
+        assert!(remote_copy_scopes_overlap(&child, &source));
+        assert!(!remote_copy_scopes_overlap(&source, &sibling));
+        assert!(!remote_copy_scopes_overlap(&source, &other_bucket));
+    }
+
+    #[test]
+    fn multipart_options_require_and_preserve_planned_source_identity() {
+        let mut source = rc_core::ObjectInfo::file("large.bin", (MAX_SINGLE_COPY_SIZE + 1) as i64);
+        source.etag = Some("planned-etag".to_string());
+        source.version_id = Some("source-version".to_string());
+        source.content_type = Some("application/octet-stream".to_string());
+        source.metadata = Some(HashMap::from([(
+            "project".to_string(),
+            "archive".to_string(),
+        )]));
+
+        let options = multipart_options_from_source(&source).expect("multipart options");
+
+        assert_eq!(options.source_size, MAX_SINGLE_COPY_SIZE + 1);
+        assert_eq!(options.source_etag, "planned-etag");
+        assert_eq!(options.source_version_id.as_deref(), Some("source-version"));
+        assert_eq!(
+            options.content_type.as_deref(),
+            Some("application/octet-stream")
+        );
+        assert_eq!(
+            options.metadata.get("project").map(String::as_str),
+            Some("archive")
+        );
     }
 
     #[test]

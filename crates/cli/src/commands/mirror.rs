@@ -1169,6 +1169,7 @@ fn report_without_execution<T>(plan: TransferPlan<T>) -> TransferReport<T> {
     TransferReport {
         summary: plan.summary,
         outcomes: Vec::new(),
+        was_cancelled: false,
     }
 }
 
@@ -1302,10 +1303,19 @@ fn output_outcomes<T>(formatter: &Formatter, marker: &str, report: &TransferRepo
                     formatter.sanitize_text(&outcome.item.relative_path)
                 ),
             ),
-            TransferOutcomeState::Cancelled => formatter.warning(&format!(
-                "Cancelled before mirror operation: {}",
-                formatter.sanitize_text(&outcome.item.relative_path)
-            )),
+            TransferOutcomeState::Cancelled { error } => {
+                if let Some(error) = error {
+                    formatter.warning(&format!(
+                        "Cancelled mirror operation: {} ({error})",
+                        formatter.sanitize_text(&outcome.item.relative_path)
+                    ));
+                } else {
+                    formatter.warning(&format!(
+                        "Cancelled before mirror operation: {}",
+                        formatter.sanitize_text(&outcome.item.relative_path)
+                    ));
+                }
+            }
         }
     }
 }
