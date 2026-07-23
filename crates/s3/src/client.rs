@@ -33,14 +33,15 @@ use rc_core::{
     Alias, BucketEncryption, BucketNotification, BucketObjectLockConfiguration, Capabilities,
     CopyObjectOptions, CorsRule, CreateBucketOptions, DefaultRetention, DeleteObjectFailure,
     DeleteObjectsResult, DeletedObject, Error, LegalHoldStatus, LifecycleRule,
-    ListObjectVersionsOptions, ListOptions, ListResult, MultipartAbortStatus,
-    MultipartCopyCancellation, MultipartCopyOptions, MultipartCopyProgress, MultipartCopyResult,
-    NotificationTarget, ObjectEncryptionRequest, ObjectInfo, ObjectLockOptions, ObjectReadOptions,
-    ObjectRetention, ObjectStore, ObjectVersion, ObjectVersionIdentifier, ObjectVersionListResult,
-    RemotePath, ReplicationConfiguration, ReplicationResyncStartOptions,
+    ListObjectVersionsOptions, ListOptions, ListResult, MetadataDirective, MultipartAbortStatus,
+    MultipartCopyCancellation, MultipartCopyOptions, MultipartCopyPlan, MultipartCopyProgress,
+    MultipartCopyResult, NotificationTarget, ObjectAttributes, ObjectEncryptionRequest, ObjectInfo,
+    ObjectLockOptions, ObjectReadOptions, ObjectRetention, ObjectStore, ObjectTransferMetadata,
+    ObjectVersion, ObjectVersionIdentifier, ObjectVersionListResult, ObjectWriteEncryption,
+    ObjectWriteOptions, RemotePath, ReplicationConfiguration, ReplicationResyncStartOptions,
     ReplicationResyncStartResult, ReplicationResyncState, ReplicationResyncStatus,
     ReplicationResyncTargetStatus, RequestHeader, Result, RetentionDuration, RetentionDurationUnit,
-    RetentionMode, SelectOptions, global_request_headers,
+    RetentionMode, SelectOptions, TransferCopyOptions, TransferReadOptions, global_request_headers,
 };
 use reqwest::Method;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
@@ -418,6 +419,14 @@ fn sorted_tags(tags: &HashMap<String, String>) -> Vec<(&str, &str)> {
     pairs
 }
 
+fn encode_object_tags(tags: &HashMap<String, String>) -> String {
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    for (key, value) in sorted_tags(tags) {
+        serializer.append_pair(key, value);
+    }
+    serializer.finish()
+}
+
 fn append_tag_xml(xml: &mut String, key: &str, value: &str) {
     xml.push_str("<Tag><Key>");
     xml.push_str(&xml_escape(key));
@@ -614,6 +623,104 @@ fn apply_object_encryption_to_multipart_create_request(
     }
 }
 
+fn apply_object_attributes_to_put_request(
+    request: aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder,
+    attributes: Option<&ObjectAttributes>,
+) -> Result<aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder> {
+    let Some(attributes) = attributes else {
+        return Ok(request);
+    };
+    Ok(request
+        .set_content_type(attributes.content_type.clone())
+        .set_cache_control(attributes.cache_control.clone())
+        .set_content_disposition(attributes.content_disposition.clone())
+        .set_content_encoding(attributes.content_encoding.clone())
+        .set_content_language(attributes.content_language.clone())
+        .set_expires(attributes.expires.map(sdk_timestamp).transpose()?)
+        .set_metadata(
+            (!attributes.user_metadata.is_empty()).then(|| attributes.user_metadata.clone()),
+        ))
+}
+
+fn apply_object_attributes_to_multipart_create_request(
+    request: aws_sdk_s3::operation::create_multipart_upload::builders::CreateMultipartUploadFluentBuilder,
+    attributes: &ObjectAttributes,
+) -> Result<
+    aws_sdk_s3::operation::create_multipart_upload::builders::CreateMultipartUploadFluentBuilder,
+> {
+    Ok(request
+        .set_content_type(attributes.content_type.clone())
+        .set_cache_control(attributes.cache_control.clone())
+        .set_content_disposition(attributes.content_disposition.clone())
+        .set_content_encoding(attributes.content_encoding.clone())
+        .set_content_language(attributes.content_language.clone())
+        .set_expires(attributes.expires.map(sdk_timestamp).transpose()?)
+        .set_metadata(
+            (!attributes.user_metadata.is_empty()).then(|| attributes.user_metadata.clone()),
+        ))
+}
+
+fn managed_object_encryption(
+    options: &ObjectWriteOptions,
+) -> Result<Option<&ObjectEncryptionRequest>> {
+    match options.encryption.as_ref() {
+        Some(ObjectWriteEncryption::Managed(encryption)) => Ok(Some(encryption)),
+        Some(ObjectWriteEncryption::SseCustomer { .. }) => Err(Error::UnsupportedFeature(
+            "SSE-C writes are tracked by rustfs/backlog#1459".to_string(),
+        )),
+        None => Ok(None),
+    }
+}
+
+fn validate_attribute_tag_write_options(options: &ObjectWriteOptions) -> Result<()> {
+    options.validate()?;
+    if options.storage_class.is_some() {
+        return Err(Error::UnsupportedFeature(
+            "Storage-class writes are tracked by rustfs/backlog#1457".to_string(),
+        ));
+    }
+    if options.checksum.is_some() {
+        return Err(Error::UnsupportedFeature(
+            "Checksum writes are tracked by rustfs/backlog#1458".to_string(),
+        ));
+    }
+    if options.retention.is_some() || options.legal_hold.is_some() {
+        return Err(Error::UnsupportedFeature(
+            "Object-lock writes are tracked by rustfs/backlog#1460".to_string(),
+        ));
+    }
+    managed_object_encryption(options)?;
+    Ok(())
+}
+
+fn validate_beta10_copy_options(options: &TransferCopyOptions) -> Result<()> {
+    options.validate()?;
+    if options.source.checksum_mode {
+        return Err(Error::UnsupportedFeature(
+            "Checksum-mode copies are tracked by rustfs/backlog#1458".to_string(),
+        ));
+    }
+    if options.source.customer_key.is_some() {
+        return Err(Error::UnsupportedFeature(
+            "SSE-C copies are tracked by rustfs/backlog#1459".to_string(),
+        ));
+    }
+    validate_attribute_tag_write_options(&options.destination)?;
+    if matches!(options.metadata_directive, Some(MetadataDirective::Replace)) {
+        return Err(Error::UnsupportedFeature(
+            "RustFS beta.10 does not preserve complete metadata REPLACE semantics; tracked by rustfs/backlog#1463"
+                .to_string(),
+        ));
+    }
+    if options.tagging_directive.is_some() || options.destination.tags.is_some() {
+        return Err(Error::UnsupportedFeature(
+            "RustFS beta.10 does not preserve CopyObject tagging directives; tracked by rustfs/backlog#1462"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn encoded_copy_source(src: &RemotePath, source_version_id: Option<&str>) -> String {
     let encoded_key = src
         .key
@@ -712,6 +819,15 @@ fn core_timestamp(timestamp: &aws_smithy_types::DateTime) -> Result<Timestamp> {
             "Object retention timestamp is outside the supported range: {error}"
         ))
     })
+}
+
+fn core_http_date(value: &str) -> Result<Timestamp> {
+    let timestamp =
+        aws_smithy_types::DateTime::from_str(value, aws_smithy_types::date_time::Format::HttpDate)
+            .map_err(|error| {
+                Error::General(format!("Object expiry is not a valid HTTP date: {error}"))
+            })?;
+    core_timestamp(&timestamp)
 }
 
 fn sdk_bucket_lock_configuration(
@@ -3093,6 +3209,157 @@ impl S3Client {
                 .await
         }
     }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_multipart_copy(
+        &self,
+        src: &RemotePath,
+        dst: &RemotePath,
+        options: &MultipartCopyOptions,
+        plan: &MultipartCopyPlan,
+        copy_source: &str,
+        source_etag: &str,
+        upload_id: String,
+        cancellation: &MultipartCopyCancellation,
+        on_progress: &MultipartCopyProgress<'_>,
+        attributes: &ObjectAttributes,
+    ) -> Result<MultipartCopyResult> {
+        use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+
+        let mut completed_parts = Vec::with_capacity(plan.parts.len());
+        let mut bytes_copied = 0_u64;
+        let mut service_source_version = None;
+
+        for part in &plan.parts {
+            let copy_request = self
+                .inner
+                .upload_part_copy()
+                .bucket(&dst.bucket)
+                .key(&dst.key)
+                .upload_id(&upload_id)
+                .part_number(part.part_number)
+                .copy_source(copy_source)
+                .copy_source_range(format!("bytes={}-{}", part.start, part.end_inclusive))
+                .copy_source_if_match(source_etag)
+                .send();
+            let copy_response = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {
+                    return Err(self
+                        .abort_multipart_copy_with_error(
+                            dst,
+                            &upload_id,
+                            Error::Interrupted("Multipart copy was cancelled".to_string()),
+                        )
+                        .await);
+                }
+                response = copy_request => response,
+            };
+
+            let copy_response = match copy_response {
+                Ok(response) => response,
+                Err(error) => {
+                    let primary = Self::map_object_request_error(
+                        &error,
+                        src,
+                        options.source_version_id.as_deref(),
+                    );
+                    return Err(self
+                        .abort_multipart_copy_with_error(dst, &upload_id, primary)
+                        .await);
+                }
+            };
+
+            if service_source_version.is_none() {
+                service_source_version = copy_response
+                    .copy_source_version_id()
+                    .map(ToString::to_string);
+            }
+            let etag = match copy_response
+                .copy_part_result()
+                .and_then(|result| result.e_tag())
+            {
+                Some(etag) => etag.trim_matches('"').to_string(),
+                None => {
+                    return Err(self
+                        .abort_multipart_copy_with_error(
+                            dst,
+                            &upload_id,
+                            Error::General(format!(
+                                "UploadPartCopy response for part {} did not include an ETag",
+                                part.part_number
+                            )),
+                        )
+                        .await);
+                }
+            };
+            completed_parts.push(
+                CompletedPart::builder()
+                    .part_number(part.part_number)
+                    .e_tag(etag)
+                    .build(),
+            );
+
+            bytes_copied += part.size;
+            on_progress(bytes_copied);
+        }
+
+        let completed_upload = CompletedMultipartUpload::builder()
+            .set_parts(Some(completed_parts))
+            .build();
+        let complete_request = self
+            .inner
+            .complete_multipart_upload()
+            .bucket(&dst.bucket)
+            .key(&dst.key)
+            .upload_id(&upload_id)
+            .multipart_upload(completed_upload)
+            .send();
+        let complete_response = tokio::select! {
+            biased;
+            // A successful completion is irreversible. Prefer an already-ready
+            // service response over a simultaneous cancellation signal so the
+            // caller is not told that a completed destination was interrupted.
+            response = complete_request => response,
+            _ = cancellation.cancelled() => {
+                return Err(self
+                    .abort_multipart_copy_with_error(
+                        dst,
+                        &upload_id,
+                        Error::Interrupted("Multipart copy was cancelled".to_string()),
+                    )
+                    .await);
+            }
+        };
+        let complete_response = match complete_response {
+            Ok(response) => response,
+            Err(error) => {
+                let primary = Self::map_object_request_error(&error, dst, None);
+                return Err(self
+                    .abort_multipart_copy_with_error(dst, &upload_id, primary)
+                    .await);
+            }
+        };
+
+        let mut object = ObjectInfo::file(&dst.key, plan.object_size as i64);
+        object.etag = complete_response
+            .e_tag()
+            .map(|etag| etag.trim_matches('"').to_string());
+        object.version_id = complete_response.version_id().map(ToString::to_string);
+        object.source_version_id =
+            service_source_version.or_else(|| options.source_version_id.clone());
+        object.content_type = attributes.content_type.clone();
+        object.metadata =
+            (!attributes.user_metadata.is_empty()).then(|| attributes.user_metadata.clone());
+        object.last_modified = Some(jiff::Timestamp::now());
+
+        Ok(MultipartCopyResult {
+            object,
+            upload_id,
+            part_count: plan.parts.len(),
+            bytes_copied,
+        })
+    }
 }
 
 fn build_tagging(
@@ -3409,6 +3676,59 @@ impl ObjectStore for S3Client {
         Ok(info)
     }
 
+    async fn head_object_transfer_metadata(
+        &self,
+        path: &RemotePath,
+        options: &TransferReadOptions,
+    ) -> Result<ObjectTransferMetadata> {
+        options.validate()?;
+        if options.checksum_mode {
+            return Err(Error::UnsupportedFeature(
+                "Checksum-mode metadata reads are tracked by rustfs/backlog#1458".to_string(),
+            ));
+        }
+        if options.customer_key.is_some() {
+            return Err(Error::UnsupportedFeature(
+                "SSE-C metadata reads are tracked by rustfs/backlog#1459".to_string(),
+            ));
+        }
+
+        let mut request = self.inner.head_object().bucket(&path.bucket).key(&path.key);
+        if let Some(version_id) = &options.version_id {
+            request = request.version_id(version_id);
+        }
+        let response = request.send().await.map_err(|error| {
+            Self::map_object_request_error(&error, path, options.version_id.as_deref())
+        })?;
+        if response.delete_marker().unwrap_or(false) {
+            return Err(Error::DeleteMarker {
+                path: path.to_string(),
+                version_id: response
+                    .version_id()
+                    .or(options.version_id.as_deref())
+                    .unwrap_or("unknown")
+                    .to_string(),
+            });
+        }
+
+        let expires = response.expires_string().map(core_http_date).transpose()?;
+        Ok(ObjectTransferMetadata {
+            attributes: ObjectAttributes {
+                content_type: response.content_type().map(ToString::to_string),
+                cache_control: response.cache_control().map(ToString::to_string),
+                content_disposition: response.content_disposition().map(ToString::to_string),
+                content_encoding: response.content_encoding().map(ToString::to_string),
+                content_language: response.content_language().map(ToString::to_string),
+                expires,
+                user_metadata: response.metadata().cloned().unwrap_or_default(),
+            },
+            storage_class: response
+                .storage_class()
+                .map(|storage_class| storage_class.as_str().to_string()),
+            checksums: Vec::new(),
+        })
+    }
+
     async fn bucket_exists(&self, bucket: &str) -> Result<bool> {
         match self.inner.head_bucket().bucket(bucket).send().await {
             Ok(_) => Ok(true),
@@ -3613,6 +3933,47 @@ impl ObjectStore for S3Client {
         Ok(info)
     }
 
+    async fn put_object_with_options(
+        &self,
+        path: &RemotePath,
+        data: Vec<u8>,
+        options: &ObjectWriteOptions,
+    ) -> Result<ObjectInfo> {
+        validate_attribute_tag_write_options(options)?;
+        let size = data.len() as i64;
+        let body = aws_sdk_s3::primitives::ByteStream::from(data);
+        let encryption = managed_object_encryption(options)?;
+        let request = apply_object_encryption_to_put_request(
+            self.inner
+                .put_object()
+                .bucket(&path.bucket)
+                .key(&path.key)
+                .body(body),
+            encryption,
+        );
+        let mut request =
+            apply_object_attributes_to_put_request(request, options.attributes.as_ref())?;
+        if let Some(tags) = &options.tags {
+            request = request.tagging(encode_object_tags(tags));
+        }
+        let response = request.send().await.map_err(|error| {
+            self.redact_sensitive_error(Self::map_object_request_error(&error, path, None))
+        })?;
+
+        let mut info = ObjectInfo::file(&path.key, size);
+        if let Some(attributes) = &options.attributes {
+            info.content_type = attributes.content_type.clone();
+            info.metadata =
+                (!attributes.user_metadata.is_empty()).then(|| attributes.user_metadata.clone());
+        }
+        info.etag = response
+            .e_tag()
+            .map(|etag| etag.trim_matches('"').to_string());
+        info.version_id = response.version_id().map(ToString::to_string);
+        info.last_modified = Some(jiff::Timestamp::now());
+        Ok(info)
+    }
+
     async fn delete_object(&self, path: &RemotePath) -> Result<()> {
         S3Client::delete_object_with_options(self, path, DeleteRequestOptions::default()).await
     }
@@ -3690,6 +4051,45 @@ impl ObjectStore for S3Client {
         Ok(result)
     }
 
+    async fn copy_object_with_transfer_options(
+        &self,
+        src: &RemotePath,
+        dst: &RemotePath,
+        options: &TransferCopyOptions,
+    ) -> Result<ObjectInfo> {
+        validate_beta10_copy_options(options)?;
+        let copy_source = encoded_copy_source(src, options.source.version_id.as_deref());
+        let encryption = managed_object_encryption(&options.destination)?;
+        let mut request = apply_object_encryption_to_copy_request(
+            self.inner
+                .copy_object()
+                .copy_source(&copy_source)
+                .bucket(&dst.bucket)
+                .key(&dst.key),
+            encryption,
+        );
+        if matches!(options.metadata_directive, Some(MetadataDirective::Copy)) {
+            request = request.metadata_directive(aws_sdk_s3::types::MetadataDirective::Copy);
+        }
+        let response = request.send().await.map_err(|error| {
+            Self::map_object_request_error(&error, src, options.source.version_id.as_deref())
+        })?;
+
+        let mut result = self.head_object(dst).await?;
+        result.version_id = response
+            .version_id()
+            .map(ToString::to_string)
+            .or(result.version_id);
+        result.source_version_id = response.copy_source_version_id().map(ToString::to_string);
+        if let Some(etag) = response
+            .copy_object_result()
+            .and_then(|copy_result| copy_result.e_tag())
+        {
+            result.etag = Some(etag.trim_matches('"').to_string());
+        }
+        Ok(result)
+    }
+
     async fn multipart_copy(
         &self,
         src: &RemotePath,
@@ -3699,8 +4099,6 @@ impl ObjectStore for S3Client {
         encryption: Option<&ObjectEncryptionRequest>,
         on_progress: &MultipartCopyProgress<'_>,
     ) -> Result<MultipartCopyResult> {
-        use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
-
         if cancellation.is_cancelled() {
             return Err(self.redact_sensitive_error(Error::Interrupted(
                 "Multipart copy cancelled before upload creation".to_string(),
@@ -3712,19 +4110,21 @@ impl ObjectStore for S3Client {
             .map_err(|error| self.redact_sensitive_error(error))?;
         let copy_source = encoded_copy_source(src, options.source_version_id.as_deref());
         let source_etag = quoted_etag(&options.source_etag);
-        let metadata = (!options.metadata.is_empty()).then(|| options.metadata.clone());
+        let attributes = ObjectAttributes {
+            content_type: options.content_type.clone(),
+            user_metadata: options.metadata.clone(),
+            ..ObjectAttributes::default()
+        };
 
-        let mut create_request = apply_object_encryption_to_multipart_create_request(
+        let create_request = apply_object_encryption_to_multipart_create_request(
             self.inner
                 .create_multipart_upload()
                 .bucket(&dst.bucket)
-                .key(&dst.key)
-                .set_metadata(metadata),
+                .key(&dst.key),
             encryption,
         );
-        if let Some(content_type) = &options.content_type {
-            create_request = create_request.content_type(content_type);
-        }
+        let create_request =
+            apply_object_attributes_to_multipart_create_request(create_request, &attributes)?;
         let create_response = create_request.send().await.map_err(|error| {
             self.redact_sensitive_error(Self::map_object_request_error(&error, dst, None))
         })?;
@@ -3737,138 +4137,102 @@ impl ObjectStore for S3Client {
             })?
             .to_string();
 
-        let mut completed_parts = Vec::with_capacity(plan.parts.len());
-        let mut bytes_copied = 0_u64;
-        let mut service_source_version = None;
-
-        for part in &plan.parts {
-            let copy_request = self
-                .inner
-                .upload_part_copy()
-                .bucket(&dst.bucket)
-                .key(&dst.key)
-                .upload_id(&upload_id)
-                .part_number(part.part_number)
-                .copy_source(&copy_source)
-                .copy_source_range(format!("bytes={}-{}", part.start, part.end_inclusive))
-                .copy_source_if_match(&source_etag)
-                .send();
-            let copy_response = tokio::select! {
-                biased;
-                _ = cancellation.cancelled() => {
-                    return Err(self
-                        .abort_multipart_copy_with_error(
-                            dst,
-                            &upload_id,
-                            Error::Interrupted("Multipart copy was cancelled".to_string()),
-                        )
-                        .await);
-                }
-                response = copy_request => response,
-            };
-
-            let copy_response = match copy_response {
-                Ok(response) => response,
-                Err(error) => {
-                    let primary = Self::map_object_request_error(
-                        &error,
-                        src,
-                        options.source_version_id.as_deref(),
-                    );
-                    return Err(self
-                        .abort_multipart_copy_with_error(dst, &upload_id, primary)
-                        .await);
-                }
-            };
-
-            if service_source_version.is_none() {
-                service_source_version = copy_response
-                    .copy_source_version_id()
-                    .map(ToString::to_string);
-            }
-            let etag = match copy_response
-                .copy_part_result()
-                .and_then(|result| result.e_tag())
-            {
-                Some(etag) => etag.trim_matches('"').to_string(),
-                None => {
-                    return Err(self
-                        .abort_multipart_copy_with_error(
-                            dst,
-                            &upload_id,
-                            Error::General(format!(
-                                "UploadPartCopy response for part {} did not include an ETag",
-                                part.part_number
-                            )),
-                        )
-                        .await);
-                }
-            };
-            completed_parts.push(
-                CompletedPart::builder()
-                    .part_number(part.part_number)
-                    .e_tag(etag)
-                    .build(),
-            );
-
-            bytes_copied += part.size;
-            on_progress(bytes_copied);
-        }
-
-        let completed_upload = CompletedMultipartUpload::builder()
-            .set_parts(Some(completed_parts))
-            .build();
-        let complete_request = self
-            .inner
-            .complete_multipart_upload()
-            .bucket(&dst.bucket)
-            .key(&dst.key)
-            .upload_id(&upload_id)
-            .multipart_upload(completed_upload)
-            .send();
-        let complete_response = tokio::select! {
-            biased;
-            // A successful completion is irreversible. Prefer an already-ready
-            // service response over a simultaneous cancellation signal so the
-            // caller is not told that a completed destination was interrupted.
-            response = complete_request => response,
-            _ = cancellation.cancelled() => {
-                return Err(self
-                    .abort_multipart_copy_with_error(
-                        dst,
-                        &upload_id,
-                        Error::Interrupted("Multipart copy was cancelled".to_string()),
-                    )
-                    .await);
-            }
-        };
-        let complete_response = match complete_response {
-            Ok(response) => response,
-            Err(error) => {
-                let primary = Self::map_object_request_error(&error, dst, None);
-                return Err(self
-                    .abort_multipart_copy_with_error(dst, &upload_id, primary)
-                    .await);
-            }
-        };
-
-        let mut object = ObjectInfo::file(&dst.key, plan.object_size as i64);
-        object.etag = complete_response
-            .e_tag()
-            .map(|etag| etag.trim_matches('"').to_string());
-        object.version_id = complete_response.version_id().map(ToString::to_string);
-        object.source_version_id =
-            service_source_version.or_else(|| options.source_version_id.clone());
-        object.content_type = options.content_type.clone();
-        object.metadata = (!options.metadata.is_empty()).then(|| options.metadata.clone());
-        object.last_modified = Some(jiff::Timestamp::now());
-
-        Ok(MultipartCopyResult {
-            object,
+        self.finish_multipart_copy(
+            src,
+            dst,
+            options,
+            &plan,
+            &copy_source,
+            &source_etag,
             upload_id,
-            part_count: plan.parts.len(),
-            bytes_copied,
-        })
+            cancellation,
+            on_progress,
+            &attributes,
+        )
+        .await
+    }
+
+    async fn multipart_copy_with_transfer_options(
+        &self,
+        src: &RemotePath,
+        dst: &RemotePath,
+        multipart: &MultipartCopyOptions,
+        transfer: &TransferCopyOptions,
+        cancellation: &MultipartCopyCancellation,
+        on_progress: &MultipartCopyProgress<'_>,
+    ) -> Result<MultipartCopyResult> {
+        if cancellation.is_cancelled() {
+            return Err(self.redact_sensitive_error(Error::Interrupted(
+                "Multipart copy cancelled before metadata preflight".to_string(),
+            )));
+        }
+        validate_beta10_copy_options(transfer)?;
+        if transfer.source.version_id.is_some()
+            && transfer.source.version_id.as_deref() != multipart.source_version_id.as_deref()
+        {
+            return Err(Error::InvalidPath(
+                "Transfer and multipart source version IDs must match".to_string(),
+            ));
+        }
+        let plan = multipart
+            .plan()
+            .map_err(|error| self.redact_sensitive_error(error))?;
+        let attributes = if matches!(transfer.metadata_directive, Some(MetadataDirective::Copy)) {
+            let mut source_options = transfer.source.clone();
+            if source_options.version_id.is_none() {
+                source_options.version_id = multipart.source_version_id.clone();
+            }
+            self.head_object_transfer_metadata(src, &source_options)
+                .await?
+                .attributes
+        } else {
+            ObjectAttributes {
+                content_type: multipart.content_type.clone(),
+                user_metadata: multipart.metadata.clone(),
+                ..ObjectAttributes::default()
+            }
+        };
+        if cancellation.is_cancelled() {
+            return Err(self.redact_sensitive_error(Error::Interrupted(
+                "Multipart copy cancelled after metadata preflight".to_string(),
+            )));
+        }
+        let encryption = managed_object_encryption(&transfer.destination)?;
+        let create_request = apply_object_encryption_to_multipart_create_request(
+            self.inner
+                .create_multipart_upload()
+                .bucket(&dst.bucket)
+                .key(&dst.key),
+            encryption,
+        );
+        let create_request =
+            apply_object_attributes_to_multipart_create_request(create_request, &attributes)?;
+        let create_response = create_request.send().await.map_err(|error| {
+            self.redact_sensitive_error(Self::map_object_request_error(&error, dst, None))
+        })?;
+        let upload_id = create_response
+            .upload_id()
+            .ok_or_else(|| {
+                self.redact_sensitive_error(Error::General(
+                    "Multipart copy create response did not include an upload ID".to_string(),
+                ))
+            })?
+            .to_string();
+        let copy_source = encoded_copy_source(src, multipart.source_version_id.as_deref());
+        let source_etag = quoted_etag(&multipart.source_etag);
+        self.finish_multipart_copy(
+            src,
+            dst,
+            multipart,
+            &plan,
+            &copy_source,
+            &source_etag,
+            upload_id,
+            cancellation,
+            on_progress,
+            &attributes,
+        )
+        .await
     }
 
     async fn presign_get(&self, path: &RemotePath, expires_secs: u64) -> Result<String> {
@@ -6963,6 +7327,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transfer_metadata_reads_all_attributes() {
+        let response = http::Response::builder()
+            .status(200)
+            .header("content-length", "3")
+            .header("content-type", "text/plain")
+            .header("cache-control", "max-age=60")
+            .header("content-disposition", "attachment")
+            .header("content-encoding", "gzip")
+            .header("content-language", "en")
+            .header("expires", "Thu, 23 Jul 2026 08:00:00 GMT")
+            .header("x-amz-meta-owner", "storage")
+            .header("x-amz-storage-class", "STANDARD")
+            .body(SdkBody::from(""))
+            .expect("build transfer metadata response");
+        let (client, request_receiver) = test_s3_client(Some(response));
+        let path = RemotePath::new("test", "bucket", "key.txt");
+        let options = TransferReadOptions {
+            version_id: Some("source-v1".to_string()),
+            ..TransferReadOptions::default()
+        };
+
+        let metadata = client
+            .head_object_transfer_metadata(&path, &options)
+            .await
+            .expect("read complete transfer metadata");
+
+        assert_eq!(
+            metadata.attributes.content_type.as_deref(),
+            Some("text/plain")
+        );
+        assert_eq!(
+            metadata.attributes.cache_control.as_deref(),
+            Some("max-age=60")
+        );
+        assert_eq!(
+            metadata.attributes.content_disposition.as_deref(),
+            Some("attachment")
+        );
+        assert_eq!(
+            metadata.attributes.content_encoding.as_deref(),
+            Some("gzip")
+        );
+        assert_eq!(metadata.attributes.content_language.as_deref(), Some("en"));
+        assert!(metadata.attributes.expires.is_some());
+        assert_eq!(
+            metadata.attributes.user_metadata.get("owner"),
+            Some(&"storage".to_string())
+        );
+        assert_eq!(metadata.storage_class.as_deref(), Some("STANDARD"));
+        assert!(metadata.checksums.is_empty());
+        let request = request_receiver.expect_request();
+        assert!(request.uri().to_string().contains("versionId=source-v1"));
+    }
+
+    #[tokio::test]
     async fn exact_version_errors_distinguish_missing_versions_and_delete_markers() {
         let missing_response = http::Response::builder()
             .status(404)
@@ -7634,6 +8053,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transfer_put_applies_attributes_metadata_and_tags_atomically() {
+        let response = http::Response::builder()
+            .status(200)
+            .body(SdkBody::from(""))
+            .expect("build put response");
+        let (client, request_receiver) = test_s3_client(Some(response));
+        let path = RemotePath::new("test", "bucket", "file.txt");
+        let options = ObjectWriteOptions {
+            attributes: Some(ObjectAttributes {
+                content_type: Some("text/plain".to_string()),
+                cache_control: Some("max-age=60".to_string()),
+                content_disposition: Some("attachment".to_string()),
+                content_encoding: Some("gzip".to_string()),
+                content_language: Some("en".to_string()),
+                expires: Some(
+                    jiff::Timestamp::from_second(1_774_515_600).expect("valid expiry timestamp"),
+                ),
+                user_metadata: HashMap::from([("owner".to_string(), "storage".to_string())]),
+            }),
+            tags: Some(HashMap::from([
+                ("team name".to_string(), "storage/core".to_string()),
+                ("owner".to_string(), "alice smith".to_string()),
+            ])),
+            ..ObjectWriteOptions::default()
+        };
+
+        client
+            .put_object_with_options(&path, b"payload".to_vec(), &options)
+            .await
+            .expect("put object with attributes and tags");
+
+        let request = request_receiver.expect_request();
+        assert_eq!(request.headers().get("content-type"), Some("text/plain"));
+        assert_eq!(request.headers().get("cache-control"), Some("max-age=60"));
+        assert_eq!(
+            request.headers().get("content-disposition"),
+            Some("attachment")
+        );
+        assert_eq!(request.headers().get("content-encoding"), Some("gzip"));
+        assert_eq!(request.headers().get("content-language"), Some("en"));
+        assert!(request.headers().get("expires").is_some());
+        assert_eq!(request.headers().get("x-amz-meta-owner"), Some("storage"));
+        assert_eq!(
+            request.headers().get("x-amz-tagging"),
+            Some("owner=alice+smith&team+name=storage%2Fcore")
+        );
+    }
+
+    #[tokio::test]
+    async fn transfer_put_preserves_explicit_empty_tags_and_maps_access_denied() {
+        let empty_response = http::Response::builder()
+            .status(200)
+            .body(SdkBody::from(""))
+            .expect("build empty-tag put response");
+        let (empty_client, empty_requests) = test_s3_client(Some(empty_response));
+        let path = RemotePath::new("test", "bucket", "file.txt");
+        empty_client
+            .put_object_with_options(
+                &path,
+                b"payload".to_vec(),
+                &ObjectWriteOptions {
+                    tags: Some(HashMap::new()),
+                    ..ObjectWriteOptions::default()
+                },
+            )
+            .await
+            .expect("put object with explicit empty tags");
+        let request = empty_requests.expect_request();
+        assert_eq!(request.headers().get("x-amz-tagging"), Some(""));
+
+        let denied_response = http::Response::builder()
+            .status(403)
+            .header("x-amz-error-code", "AccessDenied")
+            .body(SdkBody::from(
+                "<Error><Code>AccessDenied</Code><Message>denied</Message></Error>",
+            ))
+            .expect("build access denied response");
+        let (denied_client, denied_requests) = test_s3_client(Some(denied_response));
+        let error = denied_client
+            .put_object_with_options(
+                &path,
+                b"payload".to_vec(),
+                &ObjectWriteOptions {
+                    tags: Some(HashMap::from([(
+                        "owner".to_string(),
+                        "storage".to_string(),
+                    )])),
+                    ..ObjectWriteOptions::default()
+                },
+            )
+            .await
+            .expect_err("access denied must remain typed");
+        assert!(matches!(error, Error::Auth(_)));
+        denied_requests.expect_request();
+    }
+
+    #[tokio::test]
     async fn advanced_transfer_defaults_reject_before_backend_requests() {
         let path = RemotePath::new("test", "bucket", "file.txt");
 
@@ -7670,11 +8186,6 @@ mod tests {
             .await
             .expect_err("advanced streaming read must not silently degrade");
         assert!(matches!(stream_error, Error::UnsupportedFeature(_)));
-        let metadata_error = read_store
-            .head_object_transfer_metadata(&path, &TransferReadOptions::default())
-            .await
-            .expect_err("complete transfer metadata needs an explicit backend implementation");
-        assert!(matches!(metadata_error, Error::UnsupportedFeature(_)));
         read_requests.expect_no_request();
 
         let (copy_client, copy_requests) = test_s3_client(None);
@@ -7684,12 +8195,16 @@ mod tests {
                 &path,
                 &RemotePath::new("test", "bucket", "copy.txt"),
                 &TransferCopyOptions {
-                    metadata_directive: Some(MetadataDirective::Copy),
+                    tagging_directive: Some(rc_core::TaggingDirective::Replace),
+                    destination: ObjectWriteOptions {
+                        tags: Some(HashMap::new()),
+                        ..ObjectWriteOptions::default()
+                    },
                     ..TransferCopyOptions::default()
                 },
             )
             .await
-            .expect_err("explicit copy directive must not silently degrade");
+            .expect_err("unsupported tag replacement must not silently degrade");
         assert!(matches!(copy_error, Error::UnsupportedFeature(_)));
         copy_requests.expect_no_request();
     }
@@ -7880,6 +8395,88 @@ mod tests {
             request.headers().get("x-amz-copy-source"),
             Some("source-bucket/dir%20one/a%2Bb%3F%23.txt?versionId=v%201%2B%2F%3D%3F%23%25")
         );
+    }
+
+    #[tokio::test]
+    async fn transfer_copy_sends_explicit_metadata_copy_directive() {
+        let response = http::Response::builder()
+            .status(500)
+            .header("x-amz-error-code", "InternalError")
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?><Error><Code>InternalError</Code></Error>"#,
+            ))
+            .expect("build copy object response");
+        let (client, request_receiver) = test_s3_client(Some(response));
+        let src = RemotePath::new("test", "source-bucket", "src.txt");
+        let dst = RemotePath::new("test", "destination-bucket", "dst.txt");
+
+        let _ = client
+            .copy_object_with_transfer_options(
+                &src,
+                &dst,
+                &TransferCopyOptions {
+                    metadata_directive: Some(MetadataDirective::Copy),
+                    ..TransferCopyOptions::default()
+                },
+            )
+            .await;
+
+        let request = request_receiver.expect_request();
+        assert_eq!(
+            request.headers().get("x-amz-metadata-directive"),
+            Some("COPY")
+        );
+    }
+
+    #[tokio::test]
+    async fn transfer_copy_rejects_metadata_replace_before_request() {
+        let (client, request_receiver) = test_s3_client(None);
+        let src = RemotePath::new("test", "source-bucket", "src.txt");
+        let dst = RemotePath::new("test", "destination-bucket", "dst.txt");
+
+        let error = client
+            .copy_object_with_transfer_options(
+                &src,
+                &dst,
+                &TransferCopyOptions {
+                    metadata_directive: Some(MetadataDirective::Replace),
+                    destination: ObjectWriteOptions {
+                        attributes: Some(ObjectAttributes {
+                            content_type: Some("text/plain".to_string()),
+                            user_metadata: HashMap::from([(
+                                "owner".to_string(),
+                                "storage".to_string(),
+                            )]),
+                            ..ObjectAttributes::default()
+                        }),
+                        ..ObjectWriteOptions::default()
+                    },
+                    ..TransferCopyOptions::default()
+                },
+            )
+            .await
+            .expect_err("beta.10 cannot safely replace complete metadata");
+        assert!(matches!(error, Error::UnsupportedFeature(_)));
+        request_receiver.expect_no_request();
+
+        let (empty_client, empty_requests) = test_s3_client(None);
+        let empty_error = empty_client
+            .copy_object_with_transfer_options(
+                &src,
+                &dst,
+                &TransferCopyOptions {
+                    metadata_directive: Some(MetadataDirective::Replace),
+                    destination: ObjectWriteOptions {
+                        attributes: Some(ObjectAttributes::default()),
+                        ..ObjectWriteOptions::default()
+                    },
+                    ..TransferCopyOptions::default()
+                },
+            )
+            .await
+            .expect_err("empty metadata replacement must not use partial server semantics");
+        assert!(matches!(empty_error, Error::UnsupportedFeature(_)));
+        empty_requests.expect_no_request();
     }
 
     #[tokio::test]
@@ -8087,6 +8684,101 @@ mod tests {
             requests[0].headers().get("x-amz-server-side-encryption"),
             Some("AES256")
         );
+    }
+
+    #[tokio::test]
+    async fn multipart_transfer_copy_preflights_and_applies_all_source_attributes() {
+        let head_response = http::Response::builder()
+            .status(200)
+            .header("content-length", S3_MULTIPART_COPY_MIN_PART_SIZE)
+            .header("content-type", "text/plain")
+            .header("cache-control", "max-age=60")
+            .header("content-disposition", "attachment")
+            .header("content-encoding", "gzip")
+            .header("content-language", "en")
+            .header("expires", "Thu, 23 Jul 2026 08:00:00 GMT")
+            .header("x-amz-meta-owner", "source")
+            .body(SdkBody::empty())
+            .expect("build source metadata response");
+        let (client, replay) = test_s3_client_with_response_sequence(vec![
+            head_response,
+            multipart_copy_create_response("attribute-upload-id"),
+            multipart_copy_part_response("part-1", Some("source v1+/?")),
+            multipart_copy_complete_response(),
+        ]);
+        let src = RemotePath::new("test", "source-bucket", "src.bin");
+        let dst = RemotePath::new("test", "destination-bucket", "dst.bin");
+        let multipart = multipart_copy_options(S3_MULTIPART_COPY_MIN_PART_SIZE);
+        let transfer = TransferCopyOptions {
+            metadata_directive: Some(MetadataDirective::Copy),
+            ..TransferCopyOptions::default()
+        };
+
+        client
+            .multipart_copy_with_transfer_options(
+                &src,
+                &dst,
+                &multipart,
+                &transfer,
+                &MultipartCopyCancellation::new(),
+                &|_| {},
+            )
+            .await
+            .expect("multipart copy with source metadata");
+
+        let requests = replay.actual_requests().collect::<Vec<_>>();
+        assert_eq!(requests.len(), 4);
+        assert!(
+            requests[0]
+                .uri()
+                .to_string()
+                .contains("versionId=source%20v1%2B%2F%3F")
+        );
+        let create = &requests[1];
+        assert_eq!(create.headers().get("content-type"), Some("text/plain"));
+        assert_eq!(create.headers().get("cache-control"), Some("max-age=60"));
+        assert_eq!(
+            create.headers().get("content-disposition"),
+            Some("attachment")
+        );
+        assert_eq!(create.headers().get("content-encoding"), Some("gzip"));
+        assert_eq!(create.headers().get("content-language"), Some("en"));
+        assert!(create.headers().get("expires").is_some());
+        assert_eq!(create.headers().get("x-amz-meta-owner"), Some("source"));
+    }
+
+    #[tokio::test]
+    async fn multipart_transfer_rejects_server_gaps_before_preflight() {
+        let (client, replay) = test_s3_client_with_response_sequence(vec![]);
+        let src = RemotePath::new("test", "source-bucket", "src.bin");
+        let dst = RemotePath::new("test", "destination-bucket", "dst.bin");
+        let multipart = multipart_copy_options(S3_MULTIPART_COPY_MIN_PART_SIZE);
+        let transfer = TransferCopyOptions {
+            source: TransferReadOptions {
+                version_id: multipart.source_version_id.clone(),
+                ..TransferReadOptions::default()
+            },
+            tagging_directive: Some(rc_core::TaggingDirective::Replace),
+            destination: ObjectWriteOptions {
+                tags: Some(HashMap::new()),
+                ..ObjectWriteOptions::default()
+            },
+            ..TransferCopyOptions::default()
+        };
+
+        let error = client
+            .multipart_copy_with_transfer_options(
+                &src,
+                &dst,
+                &multipart,
+                &transfer,
+                &MultipartCopyCancellation::new(),
+                &|_| {},
+            )
+            .await
+            .expect_err("unsupported multipart tags must fail before preflight");
+        assert!(matches!(error, Error::UnsupportedFeature(_)));
+        assert!(replay.actual_requests().next().is_none());
     }
 
     #[tokio::test]
