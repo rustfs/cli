@@ -1,0 +1,11 @@
+{
+  "schema_version": 3,
+  "type": "admin_operations",
+  "status": "error",
+  "error": {
+    "type": "usage_error",
+    "message": "bad edit",
+    "retryable": false,
+    "suggestion": "Run the command with --help and verify its edit options."
+  }
+}

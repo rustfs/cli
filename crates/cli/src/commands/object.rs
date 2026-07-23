@@ -8,7 +8,7 @@ use clap::{Args, Subcommand};
 use crate::exit_code::ExitCode;
 use crate::output::OutputConfig;
 
-use super::{cat, cp, find, head, ls, mv, rm, share, stat, tree};
+use super::{cat, cp, find, head, legalhold, ls, mv, retention, rm, share, stat, tree};
 
 const OBJECT_AFTER_HELP: &str = "\
 Examples:
@@ -16,6 +16,8 @@ Examples:
   rc object copy ./report.json local/my-bucket/reports/
   rc object show local/my-bucket/report.json
   rc object remove local/my-bucket/report.json --dry-run
+  rc object retention info local/my-bucket/report.json
+  rc object legalhold set local/my-bucket/report.json
   rc object share local/my-bucket/report.json --expire 1d";
 
 /// Manage object-oriented workflows
@@ -58,6 +60,13 @@ pub enum ObjectCommands {
 
     /// Generate a presigned object URL
     Share(share::ShareArgs),
+
+    /// Manage object retention
+    Retention(retention::RetentionArgs),
+
+    /// Manage object legal hold
+    #[command(name = "legalhold", alias = "legal-hold")]
+    LegalHold(legalhold::LegalHoldArgs),
 }
 
 /// Execute the object command group
@@ -73,5 +82,7 @@ pub async fn execute(args: ObjectArgs, output_config: OutputConfig) -> ExitCode 
         ObjectCommands::Find(args) => find::execute(args, output_config).await,
         ObjectCommands::Tree(args) => tree::execute(args, output_config).await,
         ObjectCommands::Share(args) => share::execute(args, output_config).await,
+        ObjectCommands::Retention(args) => retention::execute(args, output_config).await,
+        ObjectCommands::LegalHold(args) => legalhold::execute(args, output_config).await,
     }
 }

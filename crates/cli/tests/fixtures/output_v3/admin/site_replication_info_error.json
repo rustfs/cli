@@ -1,0 +1,13 @@
+{
+  "schema_version": 3,
+  "type": "admin_operations",
+  "status": "error",
+  "error": {
+    "type": "unsupported_feature",
+    "message": "unsupported",
+    "retryable": false,
+    "capability": "site_replication_info",
+    "server": null,
+    "suggestion": "Upgrade RustFS or verify server support for this operation."
+  }
+}
