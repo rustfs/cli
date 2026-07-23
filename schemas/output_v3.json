@@ -1,0 +1,1292 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/rustfs/cli/schemas/output_v3.json",
+  "title": "rc CLI Output Schema v3",
+  "description": "Forward-compatible JSON and JSON Lines record contract for rc command families introduced after output v2.",
+  "definitions": {
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "nullableTimestamp": {
+      "oneOf": [
+        { "$ref": "#/definitions/timestamp" },
+        { "type": "null" }
+      ]
+    },
+    "nullableString": {
+      "type": ["string", "null"]
+    },
+    "nullableBytes": {
+      "type": ["integer", "null"],
+      "minimum": 0
+    },
+    "family": {
+      "type": "string",
+      "enum": [
+        "capabilities",
+        "versioned_objects",
+        "locks",
+        "multipart_uploads",
+        "watch_event",
+        "health",
+        "usage",
+        "metrics",
+        "admin_operations",
+        "replication",
+        "replication_operations",
+        "bucket_operations",
+        "scanner_status",
+        "storage_info",
+        "kms",
+        "health_snapshot",
+        "cluster_snapshot",
+        "extension_catalog"
+      ]
+    },
+    "pagination": {
+      "type": "object",
+      "required": ["truncated", "continuation_token"],
+      "properties": {
+        "truncated": { "type": "boolean" },
+        "continuation_token": { "$ref": "#/definitions/nullableString" }
+      }
+    },
+    "meta": {
+      "type": "object",
+      "properties": {
+        "request_id": { "$ref": "#/definitions/nullableString" },
+        "server_version": { "$ref": "#/definitions/nullableString" },
+        "generated_at": { "$ref": "#/definitions/nullableTimestamp" }
+      }
+    },
+    "successEnvelope": {
+      "type": "object",
+      "required": ["schema_version", "type", "status", "data"],
+      "properties": {
+        "schema_version": { "const": 3 },
+        "type": { "$ref": "#/definitions/family" },
+        "status": { "const": "success" },
+        "data": { "type": "object" },
+        "meta": { "$ref": "#/definitions/meta" }
+      }
+    },
+    "capability": {
+      "type": "object",
+      "required": ["name", "scope", "support"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "scope": { "type": "string", "minLength": 1 },
+        "support": {
+          "type": "string",
+          "description": "Effective support: unsupported is a server-declared runtime state or version gate, while stub is reserved for registered but unimplemented routes.",
+          "enum": ["supported", "unsupported", "stub", "disabled", "unknown"]
+        },
+        "reason": { "$ref": "#/definitions/nullableString" }
+      }
+    },
+    "capabilitiesData": {
+      "type": "object",
+      "required": ["server", "api_version", "capabilities"],
+      "properties": {
+        "server": { "type": "string", "minLength": 1 },
+        "api_version": { "$ref": "#/definitions/nullableString" },
+        "capabilities": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/capability" }
+        }
+      }
+    },
+    "healthSnapshotData": {
+      "type": "object",
+      "required": ["version", "cpu", "memory", "os", "process", "drives", "unsupported_probes"],
+      "properties": {
+        "version": { "type": "string" },
+        "deployment_id": { "$ref": "#/definitions/nullableString" },
+        "region": { "$ref": "#/definitions/nullableString" },
+        "timestamp": { "$ref": "#/definitions/nullableTimestamp" },
+        "cpu": { "type": "object" },
+        "memory": { "type": "object" },
+        "os": { "type": "object" },
+        "process": { "type": "object" },
+        "drives": { "type": "array", "items": { "type": "object" } },
+        "unsupported_probes": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "clusterSnapshotData": {
+      "type": "object",
+      "required": ["available", "state", "snapshot"],
+      "properties": {
+        "available": { "type": "boolean" },
+        "state": {
+          "type": "string",
+          "enum": ["available", "initializing_or_unavailable"]
+        },
+        "snapshot": { "type": ["object", "null"] }
+      }
+    },
+    "extensionCatalogData": {
+      "type": "object",
+      "required": ["extensions", "runtime_capabilities", "cluster_snapshot", "external_plugin_flow"],
+      "properties": {
+        "extensions": { "type": "array", "items": { "type": "object" } },
+        "runtime_capabilities": { "type": "object" },
+        "cluster_snapshot": { "type": "object" },
+        "external_plugin_flow": { "type": "object" }
+      }
+    },
+    "objectVersion": {
+      "type": "object",
+      "required": [
+        "bucket", "key", "version_id", "is_latest", "delete_marker",
+        "size_bytes", "last_modified", "etag", "storage_class"
+      ],
+      "properties": {
+        "bucket": { "type": "string", "minLength": 1 },
+        "key": { "type": "string" },
+        "version_id": { "$ref": "#/definitions/nullableString" },
+        "is_latest": { "type": "boolean" },
+        "delete_marker": { "type": "boolean" },
+        "size_bytes": { "$ref": "#/definitions/nullableBytes" },
+        "last_modified": { "$ref": "#/definitions/nullableTimestamp" },
+        "etag": { "$ref": "#/definitions/nullableString" },
+        "storage_class": { "$ref": "#/definitions/nullableString" }
+      }
+    },
+    "versionedObjectsListData": {
+      "type": "object",
+      "required": ["items", "pagination"],
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/objectVersion" }
+        },
+        "pagination": { "$ref": "#/definitions/pagination" }
+      }
+    },
+    "versionOperationItem": {
+      "type": "object",
+      "required": ["path", "version_id", "delete_marker"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "version_id": { "$ref": "#/definitions/nullableString" },
+        "delete_marker": { "type": "boolean" }
+      }
+    },
+    "versionOperationFailure": {
+      "type": "object",
+      "required": ["path", "version_id", "error_type", "message"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "version_id": { "$ref": "#/definitions/nullableString" },
+        "error_type": {
+          "type": "string",
+          "enum": [
+            "general_error", "usage_error", "network_error", "auth_error",
+            "not_found", "conflict", "unsupported_feature", "interrupted"
+          ]
+        },
+        "message": { "type": "string", "minLength": 1 }
+      }
+    },
+    "versionRemoveSummary": {
+      "type": "object",
+      "required": ["planned", "removed", "failed"],
+      "properties": {
+        "planned": { "type": "integer", "minimum": 0 },
+        "removed": { "type": "integer", "minimum": 0 },
+        "failed": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "versionRemoveData": {
+      "type": "object",
+      "required": [
+        "operation", "outcome", "dry_run", "planned", "removed", "failed", "summary"
+      ],
+      "properties": {
+        "operation": { "const": "remove" },
+        "outcome": {
+          "type": "string",
+          "enum": ["success", "empty", "planned", "partial", "failed"]
+        },
+        "dry_run": { "type": "boolean" },
+        "planned": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/versionOperationItem" }
+        },
+        "removed": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/versionOperationItem" }
+        },
+        "failed": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/versionOperationFailure" }
+        },
+        "summary": { "$ref": "#/definitions/versionRemoveSummary" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "outcome": { "const": "planned" } },
+            "required": ["outcome"]
+          },
+          "then": {
+            "properties": {
+              "dry_run": { "const": true },
+              "planned": { "minItems": 1 },
+              "removed": { "maxItems": 0 },
+              "failed": { "maxItems": 0 }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "outcome": { "const": "partial" } },
+            "required": ["outcome"]
+          },
+          "then": {
+            "properties": {
+              "dry_run": { "const": false },
+              "planned": { "maxItems": 0 },
+              "removed": { "minItems": 1 },
+              "failed": { "minItems": 1 }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "outcome": { "const": "failed" } },
+            "required": ["outcome"]
+          },
+          "then": {
+            "properties": {
+              "removed": { "maxItems": 0 },
+              "failed": { "minItems": 1 }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "outcome": { "const": "success" } },
+            "required": ["outcome"]
+          },
+          "then": {
+            "properties": {
+              "dry_run": { "const": false },
+              "planned": { "maxItems": 0 },
+              "removed": { "minItems": 1 },
+              "failed": { "maxItems": 0 }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "outcome": { "const": "empty" } },
+            "required": ["outcome"]
+          },
+          "then": {
+            "properties": {
+              "planned": { "maxItems": 0 },
+              "removed": { "maxItems": 0 },
+              "failed": { "maxItems": 0 }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "dry_run": { "const": true } },
+            "required": ["dry_run"]
+          },
+          "then": {
+            "properties": { "removed": { "maxItems": 0 } }
+          }
+        }
+      ]
+    },
+    "versionCopyData": {
+      "type": "object",
+      "required": [
+        "operation", "source", "target", "source_version_id", "version_id",
+        "size_bytes", "size_human"
+      ],
+      "properties": {
+        "operation": { "const": "copy" },
+        "source": { "type": "string", "minLength": 1 },
+        "target": { "type": "string", "minLength": 1 },
+        "source_version_id": { "$ref": "#/definitions/nullableString" },
+        "version_id": { "$ref": "#/definitions/nullableString" },
+        "size_bytes": { "$ref": "#/definitions/nullableBytes" },
+        "size_human": { "$ref": "#/definitions/nullableString" }
+      }
+    },
+    "versionStatObject": {
+      "type": "object",
+      "required": [
+        "path", "bucket", "key", "version_id", "delete_marker", "last_modified",
+        "size_bytes", "size_human", "etag", "content_type", "storage_class", "metadata"
+      ],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "bucket": { "type": "string", "minLength": 1 },
+        "key": { "type": "string" },
+        "version_id": { "$ref": "#/definitions/nullableString" },
+        "delete_marker": { "type": "boolean" },
+        "last_modified": { "$ref": "#/definitions/nullableTimestamp" },
+        "size_bytes": { "$ref": "#/definitions/nullableBytes" },
+        "size_human": { "$ref": "#/definitions/nullableString" },
+        "etag": { "$ref": "#/definitions/nullableString" },
+        "content_type": { "$ref": "#/definitions/nullableString" },
+        "storage_class": { "$ref": "#/definitions/nullableString" },
+        "metadata": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": { "type": "string" }
+            },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "versionStatData": {
+      "type": "object",
+      "required": ["operation", "object"],
+      "properties": {
+        "operation": { "const": "stat" },
+        "object": { "$ref": "#/definitions/versionStatObject" }
+      }
+    },
+    "versionOperationData": {
+      "oneOf": [
+        { "$ref": "#/definitions/versionStatData" },
+        { "$ref": "#/definitions/versionCopyData" },
+        { "$ref": "#/definitions/versionRemoveData" }
+      ]
+    },
+    "versionedObjectsData": {
+      "oneOf": [
+        { "$ref": "#/definitions/versionedObjectsListData" },
+        { "$ref": "#/definitions/versionOperationData" }
+      ]
+    },
+    "retention": {
+      "type": ["object", "null"],
+      "required": ["mode", "retain_until"],
+      "properties": {
+        "mode": { "type": "string", "enum": ["governance", "compliance"] },
+        "retain_until": { "$ref": "#/definitions/timestamp" }
+      }
+    },
+    "retentionDuration": {
+      "type": "object",
+      "required": ["unit", "value"],
+      "properties": {
+        "unit": { "type": "string", "enum": ["days", "years"] },
+        "value": { "type": "integer", "minimum": 1, "maximum": 2147483647 }
+      }
+    },
+    "defaultRetention": {
+      "type": "object",
+      "required": ["mode", "duration"],
+      "properties": {
+        "mode": { "type": "string", "enum": ["governance", "compliance"] },
+        "duration": { "$ref": "#/definitions/retentionDuration" }
+      }
+    },
+    "lockState": {
+      "type": "object",
+      "required": [
+        "bucket", "key", "version_id", "object_lock_enabled", "retention",
+        "legal_hold"
+      ],
+      "properties": {
+        "bucket": { "type": "string", "minLength": 1 },
+        "key": { "type": "string" },
+        "version_id": { "$ref": "#/definitions/nullableString" },
+        "object_lock_enabled": { "type": "boolean" },
+        "retention": { "$ref": "#/definitions/retention" },
+        "legal_hold": { "type": ["boolean", "null"] },
+        "default_retention": {
+          "oneOf": [
+            { "$ref": "#/definitions/defaultRetention" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "locksData": {
+      "type": "object",
+      "required": ["items"],
+      "properties": {
+        "operation": {
+          "type": "string",
+          "enum": [
+            "bucket_lock_info", "bucket_lock_set", "bucket_lock_clear",
+            "retention_info", "retention_set", "retention_clear",
+            "legal_hold_info", "legal_hold_set", "legal_hold_clear"
+          ]
+        },
+        "changed": { "type": "boolean" },
+        "items": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/lockState" }
+        }
+      }
+    },
+    "multipartUpload": {
+      "type": "object",
+      "required": [
+        "bucket", "key", "upload_id", "initiated", "size_bytes", "storage_class"
+      ],
+      "properties": {
+        "bucket": { "type": "string", "minLength": 1 },
+        "key": { "type": "string" },
+        "upload_id": { "type": "string", "minLength": 1 },
+        "initiated": { "$ref": "#/definitions/nullableTimestamp" },
+        "size_bytes": { "$ref": "#/definitions/nullableBytes" },
+        "storage_class": { "$ref": "#/definitions/nullableString" }
+      }
+    },
+    "multipartUploadsData": {
+      "type": "object",
+      "required": ["items", "pagination"],
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/multipartUpload" }
+        },
+        "pagination": { "$ref": "#/definitions/pagination" }
+      }
+    },
+    "watchSource": {
+      "type": "object",
+      "properties": {
+        "event_source": { "$ref": "#/definitions/nullableString" },
+        "region": { "$ref": "#/definitions/nullableString" },
+        "principal_id": { "$ref": "#/definitions/nullableString" },
+        "host": { "$ref": "#/definitions/nullableString" },
+        "port": { "$ref": "#/definitions/nullableString" },
+        "user_agent": { "$ref": "#/definitions/nullableString" }
+      }
+    },
+    "watchEvent": {
+      "type": ["object", "null"],
+      "required": [
+        "event_id", "event_name", "bucket", "key", "version_id",
+        "size_bytes", "etag", "event_time"
+      ],
+      "properties": {
+        "event_id": { "$ref": "#/definitions/nullableString" },
+        "event_name": { "type": "string", "minLength": 1 },
+        "bucket": { "type": "string", "minLength": 1 },
+        "key": { "type": "string" },
+        "version_id": { "$ref": "#/definitions/nullableString" },
+        "delete_marker": { "type": "boolean" },
+        "size_bytes": { "$ref": "#/definitions/nullableBytes" },
+        "etag": { "$ref": "#/definitions/nullableString" },
+        "event_time": { "$ref": "#/definitions/timestamp" },
+        "source": {
+          "oneOf": [
+            { "$ref": "#/definitions/watchSource" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "watchData": {
+      "type": "object",
+      "required": ["event", "keepalive"],
+      "properties": {
+        "event": { "$ref": "#/definitions/watchEvent" },
+        "keepalive": { "type": "boolean" }
+      }
+    },
+    "healthData": {
+      "type": "object",
+      "required": [
+        "check", "alias", "endpoint", "path", "healthy", "status_code",
+        "latency_ms", "status", "service"
+      ],
+      "properties": {
+        "check": { "type": "string", "enum": ["liveness", "readiness"] },
+        "alias": { "type": "string", "minLength": 1 },
+        "endpoint": { "type": "string", "minLength": 1 },
+        "path": { "type": "string", "enum": ["/health", "/health/ready"] },
+        "healthy": { "type": "boolean" },
+        "status_code": { "type": "integer", "minimum": 100, "maximum": 599 },
+        "latency_ms": { "type": "integer", "minimum": 0 },
+        "status": { "$ref": "#/definitions/nullableString" },
+        "service": { "$ref": "#/definitions/nullableString" }
+      }
+    },
+    "usageData": {
+      "type": "object",
+      "required": [
+        "scope", "path", "total_bytes", "object_count", "version_count",
+        "delete_marker_count", "buckets"
+      ],
+      "properties": {
+        "scope": { "type": "string", "enum": ["cluster", "bucket", "prefix"] },
+        "path": { "$ref": "#/definitions/nullableString" },
+        "total_bytes": { "$ref": "#/definitions/nullableBytes" },
+        "object_count": { "type": ["integer", "null"], "minimum": 0 },
+        "version_count": { "type": ["integer", "null"], "minimum": 0 },
+        "delete_marker_count": { "type": ["integer", "null"], "minimum": 0 },
+        "source": {
+          "type": "string",
+          "enum": ["server_snapshot", "client_scan"]
+        },
+        "snapshot_at": { "$ref": "#/definitions/nullableTimestamp" },
+        "snapshot_age_seconds": { "type": ["integer", "null"], "minimum": 0 },
+        "stale": { "type": "boolean" },
+        "incomplete_upload_count": { "type": ["integer", "null"], "minimum": 0 },
+        "incomplete_upload_bytes": { "$ref": "#/definitions/nullableBytes" },
+        "partial": { "type": "boolean" },
+        "failures": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["bucket", "message"],
+            "properties": {
+              "bucket": { "type": "string", "minLength": 1 },
+              "message": { "type": "string", "minLength": 1 }
+            }
+          }
+        },
+        "buckets": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "total_bytes", "object_count"],
+            "properties": {
+              "name": { "type": "string", "minLength": 1 },
+              "total_bytes": { "$ref": "#/definitions/nullableBytes" },
+              "object_count": { "type": ["integer", "null"], "minimum": 0 },
+              "version_count": { "type": ["integer", "null"], "minimum": 0 },
+              "delete_marker_count": { "type": ["integer", "null"], "minimum": 0 },
+              "incomplete_upload_count": { "type": ["integer", "null"], "minimum": 0 },
+              "incomplete_upload_bytes": { "$ref": "#/definitions/nullableBytes" }
+            }
+          }
+        }
+      }
+    },
+    "metricSample": {
+      "type": "object",
+      "required": ["name", "value", "unit", "labels", "collected_at"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "value": { "type": "number" },
+        "unit": { "$ref": "#/definitions/nullableString" },
+        "labels": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "collected_at": { "$ref": "#/definitions/timestamp" }
+      }
+    },
+    "metricsData": {
+      "type": "object",
+      "required": ["scope", "collected_at", "samples", "errors", "partial", "final", "raw"],
+      "properties": {
+        "scope": { "type": "string", "minLength": 1 },
+        "collected_at": { "$ref": "#/definitions/timestamp" },
+        "samples": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/metricSample" }
+        },
+        "errors": { "type": "array", "items": { "type": "string" } },
+        "partial": { "type": "boolean" },
+        "final": { "type": "boolean" },
+        "raw": { "type": "object" }
+      }
+    },
+    "scannerStatusData": {
+      "type": "object",
+      "required": ["health", "enabled", "disabled_reason", "freshness", "metrics", "cycle_schedule", "runtime_config"],
+      "properties": {
+        "health": { "type": "string", "enum": ["healthy", "stale", "empty", "partial", "disabled"] },
+        "enabled": { "type": "boolean" },
+        "disabled_reason": { "$ref": "#/definitions/nullableString" },
+        "freshness": { "type": "object" },
+        "metrics": { "type": "object" },
+        "cycle_schedule": { "type": "object" },
+        "runtime_config": { "type": "object" }
+      }
+    },
+    "storageSummary": {
+      "type": "object",
+      "required": ["backend", "total_disks", "online_disks", "offline_disks", "total_capacity_bytes", "used_capacity_bytes", "available_capacity_bytes"],
+      "properties": {
+        "backend": { "type": "string" },
+        "total_disks": { "type": "integer", "minimum": 0 },
+        "online_disks": { "type": "integer", "minimum": 0 },
+        "offline_disks": { "type": "integer", "minimum": 0 },
+        "total_capacity_bytes": { "type": "integer", "minimum": 0 },
+        "used_capacity_bytes": { "type": "integer", "minimum": 0 },
+        "available_capacity_bytes": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "storageInfoData": {
+      "type": "object",
+      "required": ["summary", "backend", "disks"],
+      "properties": {
+        "summary": { "$ref": "#/definitions/storageSummary" },
+        "backend": { "type": "object" },
+        "disks": { "type": "array", "items": { "type": "object" } }
+      }
+    },
+    "kmsCacheSummary": {
+      "type": "object",
+      "required": ["enabled", "max_keys", "ttl_seconds", "metrics_enabled"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "max_keys": { "type": ["integer", "null"], "minimum": 0 },
+        "ttl_seconds": { "type": ["integer", "null"], "minimum": 0 },
+        "metrics_enabled": { "type": ["boolean", "null"] }
+      }
+    },
+    "kmsConfigSummary": {
+      "type": ["object", "null"],
+      "required": ["backend", "default_key_id", "timeout_seconds", "retry_attempts", "cache", "endpoint", "auth_method", "credentials_configured", "tls_verification_disabled"],
+      "properties": {
+        "backend": { "type": "string", "enum": ["local", "vault-kv2", "vault-transit", "unknown"] },
+        "default_key_id": { "$ref": "#/definitions/nullableString" },
+        "timeout_seconds": { "type": ["integer", "null"], "minimum": 0 },
+        "retry_attempts": { "type": ["integer", "null"], "minimum": 0 },
+        "cache": { "$ref": "#/definitions/kmsCacheSummary" },
+        "endpoint": { "$ref": "#/definitions/nullableString" },
+        "auth_method": { "$ref": "#/definitions/nullableString" },
+        "credentials_configured": { "type": ["boolean", "null"] },
+        "tls_verification_disabled": { "type": ["boolean", "null"] }
+      }
+    },
+    "kmsServiceStatusData": {
+      "type": "object",
+      "required": ["operation", "state", "backend", "healthy", "error_message", "config"],
+      "properties": {
+        "operation": { "const": "status" },
+        "state": { "type": "string", "enum": ["not-configured", "configured", "running", "error", "unknown"] },
+        "backend": { "type": ["string", "null"], "enum": ["local", "vault-kv2", "vault-transit", "unknown", null] },
+        "healthy": { "type": ["boolean", "null"] },
+        "error_message": { "$ref": "#/definitions/nullableString" },
+        "config": { "$ref": "#/definitions/kmsConfigSummary" }
+      }
+    },
+    "kmsKey": {
+      "type": "object",
+      "required": ["key_id", "state", "usage", "description", "algorithm", "version", "created_at", "deletion_date", "rotated_at", "origin", "manager", "tags"],
+      "properties": {
+        "key_id": { "type": "string", "minLength": 1 },
+        "state": { "type": "string", "enum": ["enabled", "active", "disabled", "pending-deletion", "pending-import", "unavailable", "deleted", "unknown"] },
+        "usage": { "type": "string", "enum": ["encrypt-decrypt", "sign-verify", "unknown"] },
+        "description": { "$ref": "#/definitions/nullableString" },
+        "algorithm": { "$ref": "#/definitions/nullableString" },
+        "version": { "type": ["integer", "null"], "minimum": 0 },
+        "created_at": { "$ref": "#/definitions/nullableString" },
+        "deletion_date": { "$ref": "#/definitions/nullableString" },
+        "rotated_at": { "$ref": "#/definitions/nullableString" },
+        "origin": { "$ref": "#/definitions/nullableString" },
+        "manager": { "$ref": "#/definitions/nullableString" },
+        "tags": { "type": "object", "additionalProperties": { "type": "string" } }
+      }
+    },
+    "kmsKeyListData": {
+      "type": "object",
+      "required": ["operation", "keys", "pagination"],
+      "properties": {
+        "operation": { "const": "key_list" },
+        "keys": { "type": "array", "items": { "$ref": "#/definitions/kmsKey" } },
+        "pagination": { "$ref": "#/definitions/pagination" }
+      }
+    },
+    "kmsKeyStatusData": {
+      "type": "object",
+      "required": ["operation", "key"],
+      "properties": {
+        "operation": { "const": "key_status" },
+        "key": { "$ref": "#/definitions/kmsKey" }
+      }
+    },
+    "kmsKeyCreateData": {
+      "type": "object",
+      "required": ["operation", "key_id", "key"],
+      "properties": {
+        "operation": { "const": "key_create" },
+        "key_id": { "type": "string", "minLength": 1 },
+        "key": {
+          "oneOf": [
+            { "$ref": "#/definitions/kmsKey" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "kmsKeyDeleteData": {
+      "type": "object",
+      "required": ["operation", "key_id", "deletion_date", "immediate"],
+      "properties": {
+        "operation": { "const": "key_delete" },
+        "key_id": { "type": "string", "minLength": 1 },
+        "deletion_date": { "$ref": "#/definitions/nullableString" },
+        "immediate": { "type": "boolean" }
+      }
+    },
+    "kmsKeyCancelDeletionData": {
+      "type": "object",
+      "required": ["operation", "key_id", "key"],
+      "properties": {
+        "operation": { "const": "key_cancel_deletion" },
+        "key_id": { "type": "string", "minLength": 1 },
+        "key": {
+          "oneOf": [
+            { "$ref": "#/definitions/kmsKey" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "kmsLifecycleData": {
+      "type": "object",
+      "required": ["operation", "state"],
+      "properties": {
+        "operation": {
+          "type": "string",
+          "enum": ["configure", "reconfigure", "start", "restart", "stop"]
+        },
+        "state": {
+          "type": "string",
+          "enum": ["not-configured", "configured", "running", "error", "unknown"]
+        }
+      }
+    },
+    "kmsRoundTripTimings": {
+      "type": "object",
+      "required": ["write_ms", "read_ms", "cleanup_ms", "total_ms"],
+      "properties": {
+        "write_ms": { "type": "integer", "minimum": 0 },
+        "read_ms": { "type": "integer", "minimum": 0 },
+        "cleanup_ms": { "type": "integer", "minimum": 0 },
+        "total_ms": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "kmsRoundTripData": {
+      "type": "object",
+      "required": ["operation", "bucket", "key_id", "passed", "cleanup_passed", "timings"],
+      "properties": {
+        "operation": { "const": "roundtrip" },
+        "bucket": { "type": "string", "minLength": 1 },
+        "key_id": { "type": "string", "minLength": 1 },
+        "passed": { "const": true },
+        "cleanup_passed": { "const": true },
+        "timings": { "$ref": "#/definitions/kmsRoundTripTimings" }
+      }
+    },
+    "kmsData": {
+      "oneOf": [
+        { "$ref": "#/definitions/kmsServiceStatusData" },
+        { "$ref": "#/definitions/kmsKeyListData" },
+        { "$ref": "#/definitions/kmsKeyStatusData" },
+        { "$ref": "#/definitions/kmsKeyCreateData" },
+        { "$ref": "#/definitions/kmsKeyDeleteData" },
+        { "$ref": "#/definitions/kmsKeyCancelDeletionData" },
+        { "$ref": "#/definitions/kmsLifecycleData" },
+        { "$ref": "#/definitions/kmsRoundTripData" }
+      ]
+    },
+    "adminOperation": {
+      "type": "object",
+      "required": [
+        "operation", "resource", "state", "operation_id", "changed", "result"
+      ],
+      "properties": {
+        "operation": { "type": "string", "minLength": 1 },
+        "resource": { "type": "string", "minLength": 1 },
+        "state": {
+          "type": "string",
+          "enum": ["pending", "running", "succeeded", "failed", "cancelled", "unknown"]
+        },
+        "operation_id": { "$ref": "#/definitions/nullableString" },
+        "changed": { "type": "boolean" },
+        "result": { "type": ["object", "null"] }
+      }
+    },
+    "adminOperationsData": {
+      "type": "object",
+      "required": ["operations"],
+      "properties": {
+        "operations": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/adminOperation" }
+        }
+      }
+    },
+    "replicationDiffEntry": {
+      "type": "object",
+      "required": [
+        "object", "version_id", "delete_marker", "size_bytes",
+        "replication_status", "last_modified", "extensions"
+      ],
+      "properties": {
+        "object": { "type": "string" },
+        "version_id": { "$ref": "#/definitions/nullableString" },
+        "delete_marker": { "type": "boolean" },
+        "size_bytes": { "type": "integer", "minimum": 0 },
+        "replication_status": { "type": "string", "minLength": 1 },
+        "last_modified": { "$ref": "#/definitions/nullableTimestamp" },
+        "extensions": { "type": "object" }
+      }
+    },
+    "replicationDiffScan": {
+      "type": "object",
+      "required": ["scanned_versions", "truncated", "resumable"],
+      "properties": {
+        "scanned_versions": { "type": "integer", "minimum": 0 },
+        "truncated": { "type": "boolean" },
+        "resumable": { "const": false }
+      }
+    },
+    "replicationData": {
+      "type": "object",
+      "required": [
+        "operation", "bucket", "prefix", "entries", "scan", "extensions"
+      ],
+      "properties": {
+        "operation": { "const": "diff" },
+        "bucket": { "type": "string", "minLength": 1 },
+        "prefix": { "$ref": "#/definitions/nullableString" },
+        "entries": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/replicationDiffEntry" }
+        },
+        "scan": { "$ref": "#/definitions/replicationDiffScan" },
+        "extensions": { "type": "object" }
+      }
+    },
+    "replicationTarget": {
+      "type": "object",
+      "required": [
+        "target_arn", "reset_id", "reset_before", "started_at",
+        "last_updated_at", "state", "server_state", "replicated_count",
+        "replicated_size", "failed_count", "failed_size", "current_bucket",
+        "current_object", "error"
+      ],
+      "properties": {
+        "target_arn": { "type": "string", "minLength": 1 },
+        "reset_id": { "type": "string" },
+        "reset_before": { "$ref": "#/definitions/nullableTimestamp" },
+        "started_at": { "$ref": "#/definitions/nullableTimestamp" },
+        "last_updated_at": { "$ref": "#/definitions/nullableTimestamp" },
+        "state": {
+          "type": ["string", "null"],
+          "enum": [
+            "not_started", "pending", "ongoing", "completed", "failed",
+            "canceled", "unknown", null
+          ]
+        },
+        "server_state": { "$ref": "#/definitions/nullableString" },
+        "replicated_count": { "type": ["integer", "null"], "minimum": 0 },
+        "replicated_size": { "$ref": "#/definitions/nullableBytes" },
+        "failed_count": { "type": ["integer", "null"], "minimum": 0 },
+        "failed_size": { "$ref": "#/definitions/nullableBytes" },
+        "current_bucket": { "$ref": "#/definitions/nullableString" },
+        "current_object": { "$ref": "#/definitions/nullableString" },
+        "error": { "$ref": "#/definitions/nullableString" }
+      }
+    },
+    "replicationStartTarget": {
+      "allOf": [
+        { "$ref": "#/definitions/replicationTarget" },
+        {
+          "properties": {
+            "reset_id": { "type": "string", "minLength": 1 }
+          }
+        }
+      ]
+    },
+    "replicationOperationsData": {
+      "type": "object",
+      "required": ["operation", "bucket", "valid", "targets"],
+      "properties": {
+        "operation": {
+          "type": "string",
+          "enum": ["check", "resync_start", "resync_status"]
+        },
+        "bucket": { "type": "string", "minLength": 1 },
+        "valid": { "type": ["boolean", "null"] },
+        "targets": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/replicationTarget" }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "operation": { "const": "resync_start" } }
+          },
+          "then": {
+            "properties": {
+              "targets": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 1,
+                "items": { "$ref": "#/definitions/replicationStartTarget" }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "bucketCreateRequest": {
+      "type": "object",
+      "required": ["versioning_enabled", "object_lock_enabled"],
+      "properties": {
+        "region": { "$ref": "#/definitions/nullableString" },
+        "versioning_enabled": { "type": "boolean" },
+        "object_lock_enabled": { "type": "boolean" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "object_lock_enabled": { "const": true } },
+            "required": ["object_lock_enabled"]
+          },
+          "then": {
+            "properties": { "versioning_enabled": { "const": true } }
+          }
+        }
+      ]
+    },
+    "bucketOperationsData": {
+      "type": "object",
+      "required": [
+        "operation", "bucket", "outcome", "created", "requested",
+        "completed_stages"
+      ],
+      "properties": {
+        "operation": { "const": "create" },
+        "bucket": { "type": "string", "minLength": 1 },
+        "outcome": {
+          "type": "string",
+          "enum": ["created", "existing", "partial", "failed"]
+        },
+        "created": { "type": "boolean" },
+        "requested": { "$ref": "#/definitions/bucketCreateRequest" },
+        "effective_region": { "$ref": "#/definitions/nullableString" },
+        "region_semantics": { "const": "service_reported" },
+        "effective_versioning": { "type": "boolean" },
+        "effective_object_lock": { "type": "boolean" },
+        "completed_stages": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "existing_bucket_detected", "bucket_created", "region_verified",
+              "versioning_enabled", "versioning_verified", "object_lock_verified"
+            ]
+          }
+        },
+        "failed_stage": {
+          "type": "string",
+          "enum": [
+            "validate_options", "check_bucket_exists", "create_bucket",
+            "verify_region", "enable_versioning", "verify_versioning",
+            "verify_object_lock"
+          ]
+        }
+      }
+    },
+    "bucketOperationsSuccessData": {
+      "allOf": [
+        { "$ref": "#/definitions/bucketOperationsData" },
+        {
+          "properties": {
+            "outcome": { "enum": ["created", "existing"] }
+          },
+          "not": { "required": ["failed_stage"] }
+        }
+      ]
+    },
+    "bucketOperationsErrorData": {
+      "allOf": [
+        { "$ref": "#/definitions/bucketOperationsData" },
+        {
+          "required": ["failed_stage"],
+          "properties": {
+            "outcome": { "enum": ["partial", "failed"] }
+          }
+        }
+      ]
+    },
+    "unsupportedFeatureError": {
+      "type": "object",
+      "required": ["type", "message", "retryable", "capability", "server"],
+      "properties": {
+        "type": { "const": "unsupported_feature" },
+        "message": { "type": "string", "minLength": 1 },
+        "retryable": { "const": false },
+        "capability": { "type": "string", "minLength": 1 },
+        "server": { "$ref": "#/definitions/nullableString" },
+        "suggestion": { "$ref": "#/definitions/nullableString" }
+      }
+    },
+    "standardError": {
+      "type": "object",
+      "required": ["type", "message", "retryable"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "general_error", "usage_error", "network_error", "auth_error",
+            "not_found", "conflict", "interrupted"
+          ]
+        },
+        "message": { "type": "string", "minLength": 1 },
+        "retryable": { "type": "boolean" },
+        "suggestion": { "$ref": "#/definitions/nullableString" }
+      }
+    },
+    "errorOutput": {
+      "type": "object",
+      "required": ["schema_version", "type", "status", "error"],
+      "properties": {
+        "schema_version": { "const": 3 },
+        "type": { "$ref": "#/definitions/family" },
+        "status": { "const": "error" },
+        "error": {
+          "oneOf": [
+            { "$ref": "#/definitions/unsupportedFeatureError" },
+            { "$ref": "#/definitions/standardError" }
+          ]
+        },
+        "data": { "type": "object" },
+        "meta": { "$ref": "#/definitions/meta" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "type": { "const": "versioned_objects" } },
+            "required": ["type", "data"]
+          },
+          "then": {
+            "properties": {
+              "data": { "$ref": "#/definitions/versionOperationData" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "type": { "const": "bucket_operations" } },
+            "required": ["type", "data"]
+          },
+          "then": {
+            "properties": {
+              "data": { "$ref": "#/definitions/bucketOperationsErrorData" }
+            }
+          }
+        }
+      ]
+    }
+  },
+  "oneOf": [
+    {
+      "allOf": [
+        { "$ref": "#/definitions/successEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "capabilities" },
+            "data": { "$ref": "#/definitions/capabilitiesData" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/definitions/successEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "health_snapshot" },
+            "data": { "$ref": "#/definitions/healthSnapshotData" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/definitions/successEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "cluster_snapshot" },
+            "data": { "$ref": "#/definitions/clusterSnapshotData" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/definitions/successEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "extension_catalog" },
+            "data": { "$ref": "#/definitions/extensionCatalogData" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/definitions/successEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "scanner_status" },
+            "data": { "$ref": "#/definitions/scannerStatusData" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/definitions/successEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "storage_info" },
+            "data": { "$ref": "#/definitions/storageInfoData" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/definitions/successEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "versioned_objects" },
+            "data": { "$ref": "#/definitions/versionedObjectsData" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/definitions/successEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "locks" },
+            "data": { "$ref": "#/definitions/locksData" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/definitions/successEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "multipart_uploads" },
+            "data": { "$ref": "#/definitions/multipartUploadsData" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/definitions/successEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "watch_event" },
+            "data": { "$ref": "#/definitions/watchData" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/definitions/successEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "health" },
+            "data": { "$ref": "#/definitions/healthData" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/definitions/successEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "usage" },
+            "data": { "$ref": "#/definitions/usageData" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/definitions/successEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "metrics" },
+            "data": { "$ref": "#/definitions/metricsData" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/definitions/successEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "kms" },
+            "data": { "$ref": "#/definitions/kmsData" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/definitions/successEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "admin_operations" },
+            "data": { "$ref": "#/definitions/adminOperationsData" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/definitions/successEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "replication" },
+            "data": { "$ref": "#/definitions/replicationData" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/definitions/successEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "replication_operations" },
+            "data": { "$ref": "#/definitions/replicationOperationsData" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/definitions/successEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "bucket_operations" },
+            "data": { "$ref": "#/definitions/bucketOperationsSuccessData" }
+          }
+        }
+      ]
+    },
+    { "$ref": "#/definitions/errorOutput" }
+  ]
+}

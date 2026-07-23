@@ -1,0 +1,1 @@
+{"schema_version":3,"type":"extension_catalog","status":"error","error":{"type":"unsupported_feature","message":"Extension catalog is unavailable","retryable":false,"capability":"admin.diagnostics.extensions-catalog","server":"rustfs","suggestion":"Verify the server diagnostic capability and version."}}

@@ -1,0 +1,20 @@
+{
+  "schema_version": 3,
+  "type": "capabilities",
+  "status": "success",
+  "data": {
+    "server": "rustfs",
+    "api_version": "v4",
+    "capabilities": [
+      {
+        "name": "runtime.observability",
+        "scope": "runtime",
+        "support": "supported",
+        "reason": null
+      }
+    ]
+  },
+  "meta": {
+    "server_version": "1.0.0-beta.10"
+  }
+}

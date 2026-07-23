@@ -16,11 +16,18 @@ pub mod cors;
 pub mod encryption;
 pub mod error;
 pub mod lifecycle;
+pub mod multipart_copy;
+pub mod object_lock;
+pub mod ops;
 pub mod path;
 pub mod replication;
 pub mod retry;
 pub mod select;
 pub mod traits;
+pub mod transfer;
+pub mod transfer_options;
+pub mod undo;
+pub mod watch;
 
 pub use alias::{
     Alias, AliasManager, RequestHeader, global_request_headers, set_global_request_headers,
@@ -29,15 +36,30 @@ pub use alias::{
 pub use config::{Config, ConfigManager};
 pub use cors::{CorsConfiguration, CorsRule};
 pub use encryption::{BucketEncryption, ObjectEncryptionRequest};
-pub use error::{Error, Result};
+pub use error::{Error, MultipartAbortStatus, Result};
 pub use lifecycle::{
     LifecycleConfiguration, LifecycleExpiration, LifecycleRule, LifecycleRuleStatus,
     LifecycleTransition, NoncurrentVersionExpiration, NoncurrentVersionTransition,
 };
+pub use multipart_copy::{
+    DEFAULT_MULTIPART_COPY_PART_SIZE, MultipartCopyCancellation, MultipartCopyOptions,
+    MultipartCopyPart, MultipartCopyPlan, MultipartCopyProgress, MultipartCopyResult,
+    S3_MAX_OBJECT_SIZE, S3_MULTIPART_COPY_MAX_PART_SIZE, S3_MULTIPART_COPY_MAX_PARTS,
+    S3_MULTIPART_COPY_MIN_PART_SIZE, S3_SINGLE_COPY_MAX_SIZE, requires_multipart_copy,
+};
+pub use object_lock::{
+    BucketObjectLockConfiguration, DefaultRetention, LegalHoldStatus, ObjectLockOptions,
+    ObjectRetention, RetentionDuration, RetentionDurationUnit, RetentionMode,
+};
+pub use ops::{
+    HealthApi, HealthProbe, HealthReport, UsageBucket, UsageFailure, UsageReport, UsageScanApi,
+    UsageScanRequest, UsageScope, UsageSnapshotApi, UsageSource,
+};
 pub use path::{ParsedPath, RemotePath, parse_object_path, parse_path};
 pub use replication::{
     BucketTarget, BucketTargetCredentials, ReplicationConfiguration, ReplicationDestination,
-    ReplicationRule, ReplicationRuleStatus,
+    ReplicationResyncStartOptions, ReplicationResyncStartResult, ReplicationResyncState,
+    ReplicationResyncStatus, ReplicationResyncTargetStatus, ReplicationRule, ReplicationRuleStatus,
 };
 pub use retry::{RetryBuilder, is_retryable_error, retry_with_backoff};
 pub use select::{
@@ -47,6 +69,21 @@ pub use select::{
     SelectSseCustomerOptions,
 };
 pub use traits::{
-    BucketNotification, Capabilities, ListOptions, ListResult, NotificationTarget, ObjectInfo,
-    ObjectStore, ObjectVersion, ObjectVersionListResult,
+    BucketNotification, Capabilities, CopyObjectOptions, CreateBucketOptions, DeleteObjectFailure,
+    DeleteObjectsResult, DeleteRequestOptions, DeletedObject, ListObjectVersionsOptions,
+    ListOptions, ListResult, NotificationTarget, ObjectInfo, ObjectReadOptions, ObjectStore,
+    ObjectVersion, ObjectVersionIdentifier, ObjectVersionListResult,
 };
+pub use transfer::{
+    TransferCancellation, TransferCandidate, TransferControls, TransferExecutor, TransferOutcome,
+    TransferOutcomeState, TransferPlan, TransferReport, TransferSelection, TransferSummary,
+};
+pub use transfer_options::{
+    ChecksumAlgorithm, ChecksumRequest, MetadataDirective, ObjectAttributes, ObjectChecksum,
+    ObjectTransferMetadata, ObjectWriteEncryption, ObjectWriteOptions, SseCustomerKey,
+    TaggingDirective, TransferCopyOptions, TransferReadOptions,
+};
+pub use undo::{
+    UndoAction, UndoObjectResult, UndoOutcome, UndoPlan, UndoPlanItem, plan_object_undo,
+};
+pub use watch::{WatchApi, WatchEvent, WatchFrame, WatchRequest, WatchSource, WatchStream};

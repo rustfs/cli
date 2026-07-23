@@ -1,0 +1,1 @@
+{"schema_version":3,"type":"storage_info","status":"error","error":{"type":"auth_error","message":"StorageInfoAdminAction permission is required","retryable":false,"suggestion":"Grant StorageInfoAdminAction and retry."}}

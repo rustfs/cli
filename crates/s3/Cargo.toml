@@ -36,8 +36,11 @@ tracing.workspace = true
 
 # Utilities
 jiff.workspace = true
+humantime.workspace = true
 bytes.workspace = true
+base64.workspace = true
 url.workspace = true
+zeroize.workspace = true
 
 # HTTP client for Admin API
 reqwest.workspace = true
@@ -46,8 +49,10 @@ http.workspace = true
 http-body.workspace = true
 http-body-util.workspace = true
 sha2.workspace = true
+md-5.workspace = true
 hex.workspace = true
 urlencoding.workspace = true
+tempfile.workspace = true
 
 # Serialization
 serde.workspace = true
@@ -56,5 +61,4 @@ quick-xml.workspace = true
 
 [dev-dependencies]
 aws-smithy-http-client = { version = "1.1.5", features = ["test-util"] }
-tempfile.workspace = true
 mockall.workspace = true

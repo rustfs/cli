@@ -1,0 +1,1 @@
+{"schema_version":3,"type":"cluster_snapshot","status":"success","data":{"available":true,"state":"available","snapshot":{"summary":{},"components":{"storage":{"condition":"healthy"}},"actionable_pressure":false}}}

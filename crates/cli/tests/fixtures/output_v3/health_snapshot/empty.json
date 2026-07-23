@@ -1,0 +1,1 @@
+{"schema_version":3,"type":"health_snapshot","status":"success","data":{"version":"","deployment_id":null,"region":null,"timestamp":null,"cpu":{},"memory":{},"os":{},"process":{},"drives":[],"unsupported_probes":[]}}

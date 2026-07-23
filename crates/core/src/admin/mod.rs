@@ -3,11 +3,24 @@
 //! This module provides the AdminApi trait and types for managing
 //! IAM users, policies, groups, service accounts, and cluster operations.
 
+mod capabilities;
 mod cluster;
+mod configuration;
+mod diagnostics;
+mod kms;
+mod kms_diagnostic;
+mod observability;
+mod replication;
 mod site;
 pub mod tier;
 mod types;
 
+pub use capabilities::{
+    CapabilityAvailability, CapabilityEntry, CapabilityReport, ClusterSnapshotMetadata,
+    ClusterSnapshotSummary, DiagnosticCapability, DiagnosticCapabilityGuardError,
+    ExtensionMetadata, ExtensionsCatalog, RuntimeCapabilitiesSnapshot, RuntimeCapabilitiesSummary,
+    RuntimeCapabilityState, RuntimeCapabilityStatus,
+};
 pub use cluster::{
     BackendInfo, BackendType, BucketsInfo, ClusterInfo, DecommissionPoolStatus, DecommissionStatus,
     DiskInfo, HealDriveInfo, HealDriveInfos, HealResultItem, HealRuntimeState, HealScanMode,
@@ -16,7 +29,50 @@ pub use cluster::{
     RebalancePoolProgress, RebalancePoolStatus, RebalanceStartResult, RebalanceStatus, ServerInfo,
     UsageInfo,
 };
-pub use site::{PeerSiteSpec, ServiceActionResult, SiteRemoveSpec, SiteStatusOptions};
+pub use configuration::{
+    ConfigApi, ConfigChange, ConfigDiff, ConfigDocument, ConfigHelp, ConfigHelpEntry,
+    ConfigHistoryEntry, ConfigMutationResult, ModuleSwitches, config_document_fields,
+    config_import_diff, config_mutation_diff, redact_config_document, validate_config_directive,
+    validate_config_import,
+};
+pub use diagnostics::{
+    ClientDevnullRequest, ClientDevnullResult, ClusterComponentSnapshot, ClusterComponentSnapshots,
+    ClusterListingSnapshot, ClusterSnapshotDocument, ClusterUsageSnapshot,
+    DEFAULT_CLIENT_DEVNULL_BYTES, DEFAULT_CLIENT_DEVNULL_CONCURRENCY,
+    DEFAULT_CLIENT_DEVNULL_TIMEOUT, DetailedHealthSnapshot, DiagnosticClusterSnapshot,
+    DiagnosticClusterSummary, DiagnosticReadApi, HealthCpuSnapshot, HealthDriveSnapshot,
+    HealthMemorySnapshot, HealthOsSnapshot, HealthProcessSnapshot,
+    MAX_CLIENT_DEVNULL_AGGREGATE_BYTES, MAX_CLIENT_DEVNULL_CONCURRENCY, MAX_CLIENT_DEVNULL_TIMEOUT,
+    MAX_DIAGNOSTIC_RESPONSE_BYTES,
+};
+pub use kms::{
+    KmsApi, KmsBackendKind, KmsCacheSummary, KmsCancelKeyDeletionResult, KmsConfigSummary,
+    KmsConfigureRequest, KmsCreateKeyRequest, KmsCreateKeyResult, KmsDeleteKeyRequest,
+    KmsDeleteKeyResult, KmsKey, KmsKeyPage, KmsKeyState, KmsKeyUsage, KmsLocalConfigureRequest,
+    KmsServiceState, KmsStatus, KmsVaultAuthMethod, KmsVaultKv2ConfigureRequest,
+    KmsVaultTransitConfigureRequest,
+};
+pub use kms_diagnostic::{
+    KMS_DIAGNOSTIC_CONTENT_BYTES, KmsDiagnosticStore, KmsRoundTripError, KmsRoundTripErrorClass,
+    KmsRoundTripPhase, KmsRoundTripReport, KmsRoundTripTimings, run_kms_round_trip,
+};
+pub use observability::{
+    MAX_METRICS_LINE_BYTES, MAX_METRICS_RESPONSE_BYTES, MAX_METRICS_SAMPLES, MetricGroup,
+    MetricGroups, MetricsBatch, MetricsQuery, MetricsScope, ObservabilityApi, RealtimeMetrics,
+    ScannerCycleSchedule, ScannerFreshness, ScannerHealth, ScannerMetrics, ScannerRuntimeConfig,
+    ScannerRuntimeConfigValue, ScannerStatus, StorageBackend, StorageBackendKind, StorageDisk,
+    StorageDiskMetrics, StorageInfo,
+};
+pub use replication::{
+    MAX_REPLICATION_DIFF_RESPONSE_BYTES, ReplicationDiff, ReplicationDiffApi, ReplicationDiffEntry,
+};
+pub use site::{
+    MAX_SITE_REPLICATION_CA_CERT_BYTES, MAX_SITE_REPLICATION_ERROR_RESPONSE_BYTES,
+    MAX_SITE_REPLICATION_REQUEST_BYTES, MAX_SITE_REPLICATION_SUCCESS_RESPONSE_BYTES, PeerSiteSpec,
+    ReplicateEditStatus, ServiceActionResult, SiteRemoveSpec, SiteReplicationInfo,
+    SiteReplicationPeer, SiteReplicationResyncBucketStatus, SiteReplicationResyncOperation,
+    SiteReplicationResyncStatus, SiteStatusOptions, validate_site_replication_ca_bundle,
+};
 pub use tier::{
     TierAliyun, TierAzure, TierConfig, TierCreds, TierGCS, TierHuaweicloud, TierMinIO, TierR2,
     TierRustFS, TierS3, TierTencent, TierType,
@@ -241,7 +297,20 @@ pub trait AdminApi: Send + Sync {
     // ==================== Site Replication Operations ====================
 
     /// Get current site replication configuration
-    async fn site_replication_info(&self) -> Result<serde_json::Value>;
+    async fn site_replication_info(&self) -> Result<SiteReplicationInfo>;
+
+    /// Edit a peer using a complete read-modify-write snapshot
+    async fn site_replication_edit(
+        &self,
+        peer: &SiteReplicationPeer,
+    ) -> Result<ReplicateEditStatus>;
+
+    /// Start, inspect, or cancel a resync toward one complete peer snapshot
+    async fn site_replication_resync(
+        &self,
+        operation: SiteReplicationResyncOperation,
+        peer: &SiteReplicationPeer,
+    ) -> Result<SiteReplicationResyncStatus>;
 
     /// Add peer sites to the site replication cluster
     async fn site_replication_add(&self, sites: &[PeerSiteSpec]) -> Result<serde_json::Value>;
@@ -254,6 +323,20 @@ pub trait AdminApi: Send + Sync {
 
     /// Remove sites from the site replication cluster
     async fn site_replication_remove(&self, spec: &SiteRemoveSpec) -> Result<serde_json::Value>;
+}
+
+/// Read-only RustFS runtime capability discovery.
+#[async_trait]
+pub trait CapabilityApi: Send + Sync {
+    /// Discover capabilities, bypassing the process cache when `refresh` is true.
+    async fn discover_capabilities(&self, refresh: bool) -> Result<CapabilityReport>;
+}
+
+/// Bounded active RustFS diagnostic probes.
+#[async_trait]
+pub trait DiagnosticApi: CapabilityApi {
+    /// Measure client-to-server upload throughput without persisting an object.
+    async fn client_devnull(&self, request: ClientDevnullRequest) -> Result<ClientDevnullResult>;
 }
 
 #[cfg(test)]

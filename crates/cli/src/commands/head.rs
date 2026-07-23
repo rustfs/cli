@@ -3,10 +3,11 @@
 //! Outputs the first N lines (or bytes) of an object to stdout.
 
 use clap::Args;
-use rc_core::{AliasManager, ObjectStore as _, RemotePath};
+use rc_core::{AliasManager, ObjectReadOptions, ObjectStore, RemotePath};
 use rc_s3::S3Client;
 use std::io::{self, Write};
 
+use crate::commands::{exit_code_for_core_error, validate_version_selector};
 use crate::exit_code::ExitCode;
 use crate::output::{Formatter, OutputConfig};
 
@@ -33,12 +34,13 @@ pub struct HeadArgs {
 pub async fn execute(args: HeadArgs, output_config: OutputConfig) -> ExitCode {
     let formatter = Formatter::new(output_config);
 
-    if args.version_id.is_some() {
-        return formatter.fail(
-            ExitCode::UnsupportedFeature,
-            "--version-id is not implemented for head",
-        );
+    if let Err(error) = validate_version_selector(args.version_id.as_deref(), None) {
+        return formatter.fail(ExitCode::UsageError, &error);
     }
+    let read_options = match ObjectReadOptions::for_version(args.version_id.clone()) {
+        Ok(options) => options,
+        Err(error) => return formatter.fail(ExitCode::UsageError, &error.to_string()),
+    };
 
     // Parse the path
     let (alias_name, bucket, key) = match parse_head_path(&args.path) {
@@ -79,9 +81,14 @@ pub async fn execute(args: HeadArgs, output_config: OutputConfig) -> ExitCode {
 
     if let Some(num_bytes) = args.bytes {
         let mut stdout = tokio::io::stdout();
-        return match client
-            .write_object_to(&path, &mut stdout, Some(num_bytes as u64))
-            .await
+        return match ObjectStore::write_object_to_with_options(
+            &client,
+            &path,
+            &read_options,
+            &mut stdout,
+            Some(num_bytes as u64),
+        )
+        .await
         {
             Ok(_) => ExitCode::Success,
             Err(e) => output_get_error(&formatter, &args.path, e),
@@ -89,7 +96,7 @@ pub async fn execute(args: HeadArgs, output_config: OutputConfig) -> ExitCode {
     }
 
     // Get object content
-    match client.get_object(&path).await {
+    match ObjectStore::get_object_with_options(&client, &path, &read_options).await {
         Ok(data) => {
             let content = String::from_utf8_lossy(&data);
             let lines: Vec<&str> = content.lines().take(args.lines).collect();
@@ -105,17 +112,9 @@ pub async fn execute(args: HeadArgs, output_config: OutputConfig) -> ExitCode {
 }
 
 fn output_get_error(formatter: &Formatter, path: &str, error: rc_core::Error) -> ExitCode {
-    let message = error.to_string();
-    if message.contains("NotFound") || message.contains("NoSuchKey") {
-        formatter.error(&format!("Object not found: {path}"));
-        ExitCode::NotFound
-    } else if message.contains("AccessDenied") {
-        formatter.error(&format!("Access denied: {path}"));
-        ExitCode::AuthError
-    } else {
-        formatter.error(&format!("Failed to get object: {error}"));
-        ExitCode::NetworkError
-    }
+    let exit_code = exit_code_for_core_error(&error);
+    formatter.error_with_code(exit_code, &format!("Failed to read {path}: {error}"));
+    exit_code
 }
 
 /// Parse head path into (alias, bucket, key)

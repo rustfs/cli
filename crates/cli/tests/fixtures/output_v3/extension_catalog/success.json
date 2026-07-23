@@ -1,0 +1,1 @@
+{"schema_version":3,"type":"extension_catalog","status":"success","data":{"extensions":[{"extension_id":"builtin:ops-diagnostics"}],"runtime_capabilities":{"ops_diagnostics":{"runtime_capability_summary":{"state":"supported"}}},"cluster_snapshot":{"path":"/rustfs/admin/v4/cluster/snapshot"},"external_plugin_flow":{"enabled":false}}}

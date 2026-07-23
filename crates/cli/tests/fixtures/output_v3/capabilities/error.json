@@ -1,0 +1,1 @@
+{"schema_version":3,"type":"capabilities","status":"error","error":{"type":"unsupported_feature","message":"Runtime capability discovery is unavailable","retryable":false,"capability":"runtime_capabilities","server":"1.0.0-beta.9","suggestion":"Upgrade the server or use --force."}}

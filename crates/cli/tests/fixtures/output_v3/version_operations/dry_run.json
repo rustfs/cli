@@ -1,0 +1,1 @@
+{"schema_version":3,"type":"versioned_objects","status":"success","data":{"operation":"remove","outcome":"planned","dry_run":true,"planned":[{"path":"local/photos/image.jpg","version_id":"v1","delete_marker":false}],"removed":[],"failed":[],"summary":{"planned":1,"removed":0,"failed":0}}}

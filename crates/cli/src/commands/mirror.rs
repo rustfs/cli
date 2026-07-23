@@ -1,46 +1,98 @@
-//! mirror command - Synchronize objects between two locations
-//!
-//! Mirrors objects from source to destination, optionally removing extra files.
+//! mirror command - Synchronize trees between local filesystems and S3-compatible storage.
+
+use std::collections::BTreeMap;
+use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use clap::Args;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use rc_core::{AliasManager, ListOptions, ObjectStore as _, ParsedPath, RemotePath, parse_path};
+use jiff::Timestamp;
+use rc_core::alias::RetryConfig;
+use rc_core::{
+    AliasManager, Error, ListOptions, ObjectInfo, ObjectStore as _, ParsedPath, RemotePath,
+    TransferCandidate, TransferControls, TransferExecutor, TransferOutcomeState, TransferPlan,
+    TransferReport, TransferSelection, TransferSummary, parse_path,
+};
 use rc_s3::S3Client;
 use serde::Serialize;
-use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::task::{JoinError, JoinSet};
+use tokio::io::AsyncWriteExt as _;
 
-use crate::commands::diff::{DiffEntry, DiffStatus};
+use super::cp::{parse_age_cutoff, parse_byte_rate};
 use crate::exit_code::ExitCode;
 use crate::output::{Formatter, OutputConfig};
 
-/// Synchronize objects between two locations
-#[derive(Args, Debug)]
+const MIRROR_AFTER_HELP: &str = "\
+Examples:
+  rc mirror ./site/ local/web/site/ --overwrite
+  rc mirror local/archive/ ./restore/ --remove --dry-run
+  rc mirror stage/data/ prod/data/ --include '**/*.json' --summary";
+
+/// Synchronize objects between two directory-like roots.
+#[derive(Args, Clone, Debug)]
+#[command(after_help = MIRROR_AFTER_HELP)]
 pub struct MirrorArgs {
-    /// Source path (alias/bucket/prefix)
+    /// Source directory or remote bucket/prefix
     pub source: String,
 
-    /// Destination path (alias/bucket/prefix)
+    /// Destination directory or remote bucket/prefix
     pub target: String,
 
-    /// Remove extra objects at destination
+    /// Remove destination files that are absent from the selected source tree
     #[arg(long)]
     pub remove: bool,
 
-    /// Overwrite existing objects
+    /// Overwrite changed destination files
     #[arg(long)]
     pub overwrite: bool,
 
-    /// Dry run (show what would be done without doing it)
+    /// Include source-relative paths matching this glob (repeatable)
+    #[arg(long)]
+    pub include: Vec<String>,
+
+    /// Exclude source-relative paths matching this glob; exclusions always win (repeatable)
+    #[arg(long)]
+    pub exclude: Vec<String>,
+
+    /// Select files modified more recently than this age (for example 1h or 7d)
+    #[arg(long)]
+    pub newer_than: Option<String>,
+
+    /// Select files modified less recently than this age (for example 1h or 7d)
+    #[arg(long)]
+    pub older_than: Option<String>,
+
+    /// Continue after per-file failures
+    #[arg(long, visible_alias = "skip-errors")]
+    pub continue_on_error: bool,
+
+    /// Only show the deterministic plan without writing or deleting
     #[arg(short = 'n', long)]
     pub dry_run: bool,
 
-    /// Number of parallel operations
-    #[arg(short = 'P', long, default_value = "4")]
-    pub parallel: usize,
+    /// Maximum number of operations in flight across the command
+    #[arg(short = 'P', long, visible_alias = "parallel", default_value_t = 4)]
+    pub concurrency: usize,
 
-    /// Disable progress bar
+    /// Aggregate transfer start rate in bytes per second (for example 10MiB/s)
+    #[arg(long)]
+    pub rate_limit: Option<String>,
+
+    /// Maximum attempts for transient transfer failures
+    #[arg(long, default_value_t = 3)]
+    pub retry_attempts: u32,
+
+    /// Initial transient retry backoff in milliseconds
+    #[arg(long, default_value_t = 100)]
+    pub retry_initial_backoff_ms: u64,
+
+    /// Maximum transient retry backoff in milliseconds
+    #[arg(long, default_value_t = 10_000)]
+    pub retry_max_backoff_ms: u64,
+
+    /// Print deterministic aggregate transfer counters
+    #[arg(long)]
+    pub summary: bool,
+
+    /// Suppress non-error mirror output (legacy command-local alias)
     #[arg(long)]
     pub quiet: bool,
 }
@@ -56,607 +108,1646 @@ struct MirrorOutput {
     dry_run: bool,
 }
 
-#[derive(Debug, Clone)]
-struct FileInfo {
-    size: Option<i64>,
-    modified: Option<String>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MirrorSnapshot {
+    size_bytes: Option<u64>,
+    modified: Option<Timestamp>,
     etag: Option<String>,
 }
 
-struct MirrorTaskContext<'a> {
-    success_marker: &'a str,
-    operation: &'a str,
-    quiet: bool,
-    formatter: &'a Formatter,
-    progress: Option<&'a ProgressBar>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MirrorLocation {
+    Local(PathBuf),
+    Remote(RemotePath),
 }
 
-trait MirrorCopySource {
-    async fn head_object_for_mirror(
-        &self,
-        path: &RemotePath,
-    ) -> rc_core::Result<rc_core::ObjectInfo>;
-
-    async fn get_object_for_mirror(&self, path: &RemotePath) -> rc_core::Result<Vec<u8>>;
+impl std::fmt::Display for MirrorLocation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Local(path) => write!(formatter, "{}", path.display()),
+            Self::Remote(path) => write!(formatter, "{path}"),
+        }
+    }
 }
 
-trait MirrorCopyTarget {
-    async fn put_object_for_mirror(
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MirrorEntry {
+    relative_path: String,
+    location: MirrorLocation,
+    snapshot: MirrorSnapshot,
+}
+
+#[derive(Debug, Default)]
+struct MirrorManifest {
+    entries: BTreeMap<String, MirrorEntry>,
+    // A skipped source symlink protects the same destination path (and descendants) from removal.
+    protected_paths: Vec<String>,
+    ignored: usize,
+}
+
+#[derive(Debug, Clone)]
+enum MirrorEndpointSpec {
+    Local(PathBuf),
+    Remote(RemotePath),
+}
+
+impl MirrorEndpointSpec {
+    fn location_for(&self, relative_path: &str) -> rc_core::Result<MirrorLocation> {
+        let relative_path = normalize_relative_path(relative_path)?;
+        match self {
+            Self::Local(root) => {
+                let mut target = root.clone();
+                for component in relative_path.split('/') {
+                    target.push(component);
+                }
+                Ok(MirrorLocation::Local(target))
+            }
+            Self::Remote(root) => {
+                let prefix = normalized_remote_root_prefix(&root.key)?;
+                Ok(MirrorLocation::Remote(RemotePath::new(
+                    &root.alias,
+                    &root.bucket,
+                    format!("{prefix}{relative_path}"),
+                )))
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MirrorCopyOperation {
+    relative_path: String,
+    source: MirrorEntry,
+    target: MirrorLocation,
+    target_before: Option<MirrorEntry>,
+}
+
+#[derive(Debug, Clone)]
+struct MirrorRemoveOperation {
+    relative_path: String,
+    target: MirrorEntry,
+}
+
+#[async_trait::async_trait]
+trait MirrorIo: Send + Sync + 'static {
+    async fn copy(&self, operation: MirrorCopyOperation) -> rc_core::Result<u64>;
+    async fn remove(&self, operation: MirrorRemoveOperation) -> rc_core::Result<u64>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RemoteWriteCondition {
+    IfAbsent,
+    IfMatch(String),
+}
+
+#[async_trait::async_trait]
+trait MirrorRemoteTransfer: Send + Sync {
+    async fn mirror_head(&self, path: &RemotePath) -> rc_core::Result<ObjectInfo>;
+    async fn mirror_download(&self, path: &RemotePath, destination: &Path) -> rc_core::Result<u64>;
+    async fn mirror_upload(
         &self,
         path: &RemotePath,
-        data: Vec<u8>,
+        source: &Path,
         content_type: Option<&str>,
-        if_absent: bool,
-    ) -> rc_core::Result<rc_core::ObjectInfo>;
+        condition: RemoteWriteCondition,
+    ) -> rc_core::Result<ObjectInfo>;
 }
 
-impl MirrorCopySource for S3Client {
-    async fn head_object_for_mirror(
-        &self,
-        path: &RemotePath,
-    ) -> rc_core::Result<rc_core::ObjectInfo> {
+#[async_trait::async_trait]
+impl MirrorRemoteTransfer for S3Client {
+    async fn mirror_head(&self, path: &RemotePath) -> rc_core::Result<ObjectInfo> {
         rc_core::ObjectStore::head_object(self, path).await
     }
 
-    async fn get_object_for_mirror(&self, path: &RemotePath) -> rc_core::Result<Vec<u8>> {
-        rc_core::ObjectStore::get_object(self, path).await
+    async fn mirror_download(&self, path: &RemotePath, destination: &Path) -> rc_core::Result<u64> {
+        self.download_object_to_path(path, destination, |_, _| {})
+            .await
     }
-}
 
-impl MirrorCopyTarget for S3Client {
-    async fn put_object_for_mirror(
+    async fn mirror_upload(
         &self,
         path: &RemotePath,
-        data: Vec<u8>,
+        source: &Path,
         content_type: Option<&str>,
-        if_absent: bool,
-    ) -> rc_core::Result<rc_core::ObjectInfo> {
-        if if_absent {
-            self.put_object_if_absent(path, data, content_type).await
-        } else {
-            rc_core::ObjectStore::put_object(self, path, data, content_type, None).await
+        condition: RemoteWriteCondition,
+    ) -> rc_core::Result<ObjectInfo> {
+        match condition {
+            RemoteWriteCondition::IfAbsent => {
+                self.put_object_from_path_if_absent(path, source, content_type, None, |_| {})
+                    .await
+            }
+            RemoteWriteCondition::IfMatch(etag) => {
+                self.put_object_from_path_if_match(path, source, content_type, None, &etag, |_| {})
+                    .await
+            }
         }
     }
 }
 
-/// Execute the mirror command
-pub async fn execute(args: MirrorArgs, output_config: OutputConfig) -> ExitCode {
-    let formatter = Formatter::new(output_config);
+struct MirrorOperationReports {
+    copy: TransferReport<MirrorCopyOperation>,
+    remove: Option<TransferReport<MirrorRemoveOperation>>,
+    blocked_removals: usize,
+}
 
-    if !(1..=256).contains(&args.parallel) {
-        formatter.error("--parallel must be between 1 and 256");
-        return ExitCode::UsageError;
-    }
+#[derive(Clone)]
+enum RuntimeEndpoint {
+    Local {
+        root: PathBuf,
+    },
+    Remote {
+        root: RemotePath,
+        client: Arc<S3Client>,
+    },
+}
 
-    // Parse both paths
-    let source_parsed = parse_path(&args.source);
-    let target_parsed = parse_path(&args.target);
-
-    // Both must be remote for now
-    let (source_path, target_path) = match (&source_parsed, &target_parsed) {
-        (Ok(ParsedPath::Remote(s)), Ok(ParsedPath::Remote(t))) => (s.clone(), t.clone()),
-        (Ok(ParsedPath::Local(_)), _) | (_, Ok(ParsedPath::Local(_))) => {
-            formatter.error("Local paths are not yet supported in mirror command");
-            return ExitCode::UsageError;
-        }
-        (Err(e), _) => {
-            formatter.error(&format!("Invalid source path: {e}"));
-            return ExitCode::UsageError;
-        }
-        (_, Err(e)) => {
-            formatter.error(&format!("Invalid target path: {e}"));
-            return ExitCode::UsageError;
-        }
-    };
-
-    // Load aliases
-    let alias_manager = match AliasManager::new() {
-        Ok(am) => am,
-        Err(e) => {
-            formatter.error(&format!("Failed to load aliases: {e}"));
-            return ExitCode::GeneralError;
-        }
-    };
-
-    // Create clients
-    let source_alias = match alias_manager.get(&source_path.alias) {
-        Ok(a) => a,
-        Err(_) => {
-            formatter.error(&format!("Alias '{}' not found", source_path.alias));
-            return ExitCode::NotFound;
-        }
-    };
-
-    let target_alias = match alias_manager.get(&target_path.alias) {
-        Ok(a) => a,
-        Err(_) => {
-            formatter.error(&format!("Alias '{}' not found", target_path.alias));
-            return ExitCode::NotFound;
-        }
-    };
-
-    if mirror_locations_overlap(
-        &source_path,
-        &target_path,
-        &source_alias.endpoint,
-        &target_alias.endpoint,
-    ) {
-        formatter.error("Mirror source and destination prefixes must not overlap");
-        return ExitCode::UsageError;
-    }
-
-    let source_client = Arc::new(match S3Client::new(source_alias).await {
-        Ok(c) => c,
-        Err(e) => {
-            formatter.error(&format!("Failed to create source client: {e}"));
-            return ExitCode::NetworkError;
-        }
-    });
-
-    let target_client = Arc::new(match S3Client::new(target_alias).await {
-        Ok(c) => c,
-        Err(e) => {
-            formatter.error(&format!("Failed to create target client: {e}"));
-            return ExitCode::NetworkError;
-        }
-    });
-
-    // List objects from both paths
-    let source_objects = match list_objects_map(&source_client, &source_path).await {
-        Ok(o) => o,
-        Err(e) => {
-            formatter.error(&format!("Failed to list source: {e}"));
-            return ExitCode::NetworkError;
-        }
-    };
-
-    let target_objects = match list_objects_map(&target_client, &target_path).await {
-        Ok(o) => o,
-        Err(e) => {
-            formatter.error(&format!("Failed to list target: {e}"));
-            return ExitCode::NetworkError;
-        }
-    };
-
-    // Compare and determine operations
-    let diff_entries = compare_objects_internal(&source_objects, &target_objects);
-
-    let mut to_copy: Vec<(&str, &FileInfo, bool)> = Vec::new();
-    let mut to_remove: Vec<(&str, &FileInfo)> = Vec::new();
-    let mut skipped = 0;
-
-    for entry in &diff_entries {
-        match entry.status {
-            DiffStatus::OnlyFirst => {
-                // New object, copy it
-                if let Some(info) = source_objects.get(&entry.key) {
-                    to_copy.push((&entry.key, info, true));
-                }
-            }
-            DiffStatus::Different => {
-                if args.overwrite {
-                    // Different and overwrite enabled, copy it
-                    if let Some(info) = source_objects.get(&entry.key) {
-                        to_copy.push((&entry.key, info, false));
-                    }
-                } else {
-                    skipped += 1;
-                }
-            }
-            DiffStatus::OnlySecond => {
-                if args.remove {
-                    // Extra object at destination, remove it
-                    if let Some(info) = target_objects.get(&entry.key) {
-                        to_remove.push((&entry.key, info));
-                    }
-                }
-            }
-            DiffStatus::Same => {
-                skipped += 1;
-            }
+impl RuntimeEndpoint {
+    fn spec(&self) -> MirrorEndpointSpec {
+        match self {
+            Self::Local { root } => MirrorEndpointSpec::Local(root.clone()),
+            Self::Remote { root, .. } => MirrorEndpointSpec::Remote(root.clone()),
         }
     }
 
-    // Dry run output
-    if args.dry_run {
-        if !formatter.is_json() {
-            formatter.println("Dry run mode - no changes will be made:");
-            formatter.println("");
-
-            if !to_copy.is_empty() {
-                formatter.println(&format!("Would copy {} object(s):", to_copy.len()));
-                for (key, info, _) in &to_copy {
-                    let size = info
-                        .size
-                        .map(|s| humansize::format_size(s as u64, humansize::BINARY))
-                        .unwrap_or_default();
-                    formatter.println(&format!("  + {} ({size})", formatter.sanitize_text(key)));
-                }
-                formatter.println("");
+    async fn current_entry(&self, relative_path: &str) -> rc_core::Result<Option<MirrorEntry>> {
+        let location = self.spec().location_for(relative_path)?;
+        match (&location, self) {
+            (MirrorLocation::Local(path), Self::Local { root }) => {
+                inspect_local_entry(root, relative_path, path).await
             }
-
-            if !to_remove.is_empty() {
-                formatter.println(&format!("Would remove {} object(s):", to_remove.len()));
-                for (key, _) in &to_remove {
-                    formatter.println(&format!("  - {}", formatter.sanitize_text(key)));
+            (MirrorLocation::Remote(path), Self::Remote { client, .. }) => {
+                match client.head_object(path).await {
+                    Ok(info) => Ok(Some(MirrorEntry {
+                        relative_path: relative_path.to_string(),
+                        location,
+                        snapshot: snapshot_from_object(&info)?,
+                    })),
+                    Err(Error::NotFound(_)) => Ok(None),
+                    Err(error) => Err(error),
                 }
-                formatter.println("");
             }
-
-            formatter.println(&format!(
-                "Summary: {} to copy, {} to remove, {} skipped",
-                to_copy.len(),
-                to_remove.len(),
-                skipped
-            ));
-        } else {
-            let output = MirrorOutput {
-                source: args.source.clone(),
-                target: args.target.clone(),
-                copied: to_copy.len(),
-                removed: to_remove.len(),
-                skipped,
-                errors: 0,
-                dry_run: true,
-            };
-            formatter.json(&output);
+            _ => Err(Error::General(
+                "Mirror runtime endpoint does not match its planned location".to_string(),
+            )),
         }
-        return ExitCode::Success;
+    }
+}
+
+#[derive(Clone)]
+struct LiveMirrorIo {
+    source: RuntimeEndpoint,
+    target: RuntimeEndpoint,
+}
+
+#[async_trait::async_trait]
+impl MirrorIo for LiveMirrorIo {
+    async fn copy(&self, operation: MirrorCopyOperation) -> rc_core::Result<u64> {
+        match (&operation.source.location, &operation.target) {
+            (MirrorLocation::Local(source), MirrorLocation::Remote(target)) => {
+                self.copy_local_to_remote(source, target, &operation).await
+            }
+            (MirrorLocation::Remote(source), MirrorLocation::Local(target)) => {
+                self.copy_remote_to_local(source, target, &operation).await
+            }
+            (MirrorLocation::Remote(source), MirrorLocation::Remote(target)) => {
+                self.copy_remote_to_remote(source, target, &operation).await
+            }
+            (MirrorLocation::Local(_), MirrorLocation::Local(_)) => Err(Error::UnsupportedFeature(
+                "Local-to-local mirror is out of scope; use a filesystem synchronization tool"
+                    .to_string(),
+            )),
+        }
     }
 
-    // Progress bar setup
-    let multi_progress = if !args.quiet && !formatter.is_json() {
-        Some(MultiProgress::new())
-    } else {
-        None
-    };
-
-    let overall_pb = multi_progress.as_ref().map(|mp| {
-        let pb = mp.add(ProgressBar::new((to_copy.len() + to_remove.len()) as u64));
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} {msg}")
-                .expect("Valid template")
-                .progress_chars("#>-"),
-        );
-        pb.set_message("Syncing...");
-        pb
-    });
-
-    // Perform copy operations
-    let mut copied = 0;
-    let mut errors = 0;
-
-    let parallel_limit = args.parallel.max(1);
-    let mut copy_tasks: JoinSet<(String, Result<(), String>)> = JoinSet::new();
-    let copy_context = MirrorTaskContext {
-        success_marker: "+",
-        operation: "copy",
-        quiet: args.quiet,
-        formatter: &formatter,
-        progress: overall_pb.as_ref(),
-    };
-
-    for (key, _, if_absent) in to_copy {
-        let source_sep = if source_path.key.is_empty() || source_path.key.ends_with('/') {
-            ""
-        } else {
-            "/"
+    async fn remove(&self, operation: MirrorRemoveOperation) -> rc_core::Result<u64> {
+        let Some(current) = self.target.current_entry(&operation.relative_path).await? else {
+            // A previous attempt may have removed the entry before its response was lost.
+            return Ok(0);
         };
-        let source_full = RemotePath::new(
-            &source_path.alias,
-            &source_path.bucket,
-            format!("{}{source_sep}{key}", source_path.key),
-        );
+        if current.snapshot != operation.target.snapshot {
+            return Err(Error::Conflict(format!(
+                "Destination changed before removal: {}",
+                operation.relative_path
+            )));
+        }
 
-        let target_sep = if target_path.key.is_empty() || target_path.key.ends_with('/') {
-            ""
-        } else {
-            "/"
-        };
-        let target_full = RemotePath::new(
-            &target_path.alias,
-            &target_path.bucket,
-            format!("{}{target_sep}{key}", target_path.key),
-        );
-
-        let key = key.to_string();
-        let source_client = Arc::clone(&source_client);
-        let target_client = Arc::clone(&target_client);
-        copy_tasks.spawn(async move {
-            let result = copy_object_with_metadata(
-                source_client.as_ref(),
-                target_client.as_ref(),
-                &source_full,
-                &target_full,
-                if_absent,
-            )
-            .await
-            .map_err(|e| format!("Failed to copy {key}: {e}"));
-            (key, result)
-        });
-
-        if copy_tasks.len() >= parallel_limit
-            && let Some(task_result) = copy_tasks.join_next().await
-        {
-            record_mirror_task(task_result, &copy_context, &mut copied, &mut errors);
+        match (&current.location, &self.target) {
+            (MirrorLocation::Local(path), RuntimeEndpoint::Local { root }) => {
+                let safe_path = secure_local_path(root, &operation.relative_path, false).await?;
+                if &safe_path != path {
+                    return Err(Error::InvalidPath(format!(
+                        "Removal target escaped mirror root: {}",
+                        path.display()
+                    )));
+                }
+                tokio::fs::remove_file(path).await?;
+                Ok(0)
+            }
+            (MirrorLocation::Remote(path), RuntimeEndpoint::Remote { client, .. }) => {
+                let etag = current.snapshot.etag.as_deref().ok_or_else(|| {
+                    Error::Conflict(format!(
+                        "Refusing to remove {} because its ETag is unavailable",
+                        operation.relative_path
+                    ))
+                })?;
+                client.delete_object_if_match(path, etag).await?;
+                Ok(0)
+            }
+            _ => Err(Error::General(
+                "Mirror removal target does not match the runtime endpoint".to_string(),
+            )),
         }
     }
+}
 
-    while let Some(task_result) = copy_tasks.join_next().await {
-        record_mirror_task(task_result, &copy_context, &mut copied, &mut errors);
-    }
-
-    // Perform remove operations
-    let mut removed = 0;
-
-    if args.remove && errors == 0 {
-        let mut remove_tasks: JoinSet<(String, Result<(), String>)> = JoinSet::new();
-        let remove_context = MirrorTaskContext {
-            success_marker: "-",
-            operation: "remove",
-            quiet: args.quiet,
-            formatter: &formatter,
-            progress: overall_pb.as_ref(),
-        };
-
-        for (key, info) in to_remove {
-            let sep = if target_path.key.is_empty() || target_path.key.ends_with('/') {
-                ""
-            } else {
-                "/"
-            };
-            let target_full = RemotePath::new(
-                &target_path.alias,
-                &target_path.bucket,
-                format!("{}{sep}{key}", target_path.key),
-            );
-
-            let key = key.to_string();
-            let etag = info.etag.clone();
-            let target_client = Arc::clone(&target_client);
-            remove_tasks.spawn(async move {
-                let result = match etag {
-                    Some(etag) => {
-                        target_client
-                            .delete_object_if_match(&target_full, &etag)
-                            .await
-                    }
-                    None => Err(rc_core::Error::Conflict(format!(
-                        "Refusing to remove {key} because its ETag is unavailable"
-                    ))),
-                }
-                .map_err(|e| format!("Failed to remove {key}: {e}"));
-                (key, result)
-            });
-
-            if remove_tasks.len() >= parallel_limit
-                && let Some(task_result) = remove_tasks.join_next().await
+impl LiveMirrorIo {
+    async fn copy_local_to_remote(
+        &self,
+        source_path: &Path,
+        target_path: &RemotePath,
+        operation: &MirrorCopyOperation,
+    ) -> rc_core::Result<u64> {
+        validate_local_entry(&operation.source)?;
+        let staged = stage_local_source(source_path).await?;
+        async {
+            validate_local_entry(&operation.source)?;
+            let staged_size = tokio::fs::metadata(&staged).await?.len();
+            if operation
+                .source
+                .snapshot
+                .size_bytes
+                .is_some_and(|expected| expected != staged_size)
             {
-                record_mirror_task(task_result, &remove_context, &mut removed, &mut errors);
+                return Err(Error::Conflict(format!(
+                    "Source changed during mirror: {}",
+                    operation.relative_path
+                )));
             }
-        }
+            match self.target_disposition(operation).await? {
+                TargetDisposition::AlreadyComplete => {
+                    return Ok(operation.source.snapshot.size_bytes.unwrap_or_default());
+                }
+                TargetDisposition::Ready => {}
+            }
 
-        while let Some(task_result) = remove_tasks.join_next().await {
-            record_mirror_task(task_result, &remove_context, &mut removed, &mut errors);
+            let RuntimeEndpoint::Remote { client, .. } = &self.target else {
+                return Err(Error::General(
+                    "Remote mirror target client is unavailable".to_string(),
+                ));
+            };
+            let content_type = mime_guess::from_path(source_path)
+                .first()
+                .map(|value| value.essence_str().to_string());
+            let size = operation.source.snapshot.size_bytes.unwrap_or_default();
+            let condition = remote_write_condition(operation)?;
+            let info = client
+                .mirror_upload(target_path, &staged, content_type.as_deref(), condition)
+                .await?;
+            Ok(object_size(&info).unwrap_or(size))
         }
-    } else if args.remove && errors > 0 && !formatter.is_json() {
-        formatter.error("Skipping removals because one or more copy operations failed");
+        .await
     }
 
-    if let Some(pb) = overall_pb {
-        pb.finish_with_message("Done");
-    }
-
-    // Output results
-    if formatter.is_json() {
-        let output = MirrorOutput {
-            source: args.source.clone(),
-            target: args.target.clone(),
-            copied,
-            removed,
-            skipped,
-            errors,
-            dry_run: false,
+    async fn copy_remote_to_remote(
+        &self,
+        source_path: &RemotePath,
+        target_path: &RemotePath,
+        operation: &MirrorCopyOperation,
+    ) -> rc_core::Result<u64> {
+        let RuntimeEndpoint::Remote {
+            client: source_client,
+            ..
+        } = &self.source
+        else {
+            return Err(Error::General(
+                "Remote mirror source client is unavailable".to_string(),
+            ));
         };
-        formatter.json(&output);
-    } else {
-        formatter.println("");
-        formatter.println(&format!(
-            "Mirror complete: {copied} copied, {removed} removed, {skipped} skipped, {errors} errors"
-        ));
+        let RuntimeEndpoint::Remote {
+            client: target_client,
+            ..
+        } = &self.target
+        else {
+            return Err(Error::General(
+                "Remote mirror target client is unavailable".to_string(),
+            ));
+        };
+
+        match self.target_disposition(operation).await? {
+            TargetDisposition::AlreadyComplete => {
+                return Ok(operation.source.snapshot.size_bytes.unwrap_or_default());
+            }
+            TargetDisposition::Ready => {}
+        }
+        transfer_remote_to_remote(
+            source_client.as_ref(),
+            target_client.as_ref(),
+            source_path,
+            target_path,
+            operation,
+            remote_write_condition(operation)?,
+        )
+        .await
     }
 
-    if errors > 0 {
-        ExitCode::GeneralError
-    } else {
-        ExitCode::Success
+    async fn copy_remote_to_local(
+        &self,
+        source_path: &RemotePath,
+        target_path: &Path,
+        operation: &MirrorCopyOperation,
+    ) -> rc_core::Result<u64> {
+        let RuntimeEndpoint::Remote {
+            client: source_client,
+            ..
+        } = &self.source
+        else {
+            return Err(Error::General(
+                "Remote mirror source client is unavailable".to_string(),
+            ));
+        };
+        let RuntimeEndpoint::Local { root } = &self.target else {
+            return Err(Error::General(
+                "Local mirror target root is unavailable".to_string(),
+            ));
+        };
+
+        let before = source_client.head_object(source_path).await?;
+        ensure_snapshot_matches(&operation.source, &before)?;
+        match self.target_disposition(operation).await? {
+            TargetDisposition::AlreadyComplete => {
+                return Ok(operation.source.snapshot.size_bytes.unwrap_or_default());
+            }
+            TargetDisposition::Ready => {}
+        }
+
+        let destination = secure_local_path(root, &operation.relative_path, true).await?;
+        if destination != target_path {
+            return Err(Error::InvalidPath(format!(
+                "Download target escaped mirror root: {}",
+                target_path.display()
+            )));
+        }
+        let staging = mirror_staging_path(target_path)?;
+        let downloaded = source_client
+            .download_object_to_path(source_path, &staging, |_, _| {})
+            .await;
+        let validation = match downloaded {
+            Ok(bytes) => {
+                if operation
+                    .source
+                    .snapshot
+                    .size_bytes
+                    .is_some_and(|expected| expected != bytes)
+                {
+                    Err(Error::Conflict(format!(
+                        "Source changed during mirror: {}",
+                        operation.relative_path
+                    )))
+                } else {
+                    let after = source_client.head_object(source_path).await;
+                    match after {
+                        Ok(info) => {
+                            ensure_snapshot_matches(&operation.source, &info).map(|()| bytes)
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+            }
+            Err(error) => Err(error),
+        };
+        if validation.is_ok() {
+            match self.target_disposition(operation).await {
+                Ok(TargetDisposition::Ready) => {}
+                Ok(TargetDisposition::AlreadyComplete) => {
+                    return Ok(operation.source.snapshot.size_bytes.unwrap_or_default());
+                }
+                Err(error) => {
+                    return Err(error);
+                }
+            }
+        }
+        finish_staged_download(
+            staging,
+            target_path,
+            validation,
+            operation.source.snapshot.modified,
+            operation.target_before.is_some(),
+        )
+        .await
+    }
+
+    async fn target_disposition(
+        &self,
+        operation: &MirrorCopyOperation,
+    ) -> rc_core::Result<TargetDisposition> {
+        let current = self.target.current_entry(&operation.relative_path).await?;
+        if let Some(current) = &current
+            && source_matches_target(&operation.source, current)
+        {
+            return Ok(TargetDisposition::AlreadyComplete);
+        }
+
+        match (&operation.target_before, current) {
+            (None, None) => Ok(TargetDisposition::Ready),
+            (Some(expected), Some(current)) if expected.snapshot == current.snapshot => {
+                Ok(TargetDisposition::Ready)
+            }
+            _ => Err(Error::Conflict(format!(
+                "Destination changed after mirror planning: {}",
+                operation.relative_path
+            ))),
+        }
     }
 }
 
-fn record_mirror_task(
-    task_result: Result<(String, Result<(), String>), JoinError>,
-    context: &MirrorTaskContext<'_>,
-    succeeded: &mut usize,
-    errors: &mut usize,
-) {
-    match task_result {
-        Ok((key, Ok(()))) => {
-            *succeeded += 1;
-            if !context.quiet && !context.formatter.is_json() {
-                context.formatter.println(&format!(
-                    "{} {}",
-                    context.success_marker,
-                    context.formatter.sanitize_text(&key)
-                ));
-            }
-        }
-        Ok((_, Err(message))) => {
-            *errors += 1;
-            if !context.formatter.is_json() {
-                context.formatter.error(&message);
-            }
-        }
-        Err(join_error) => {
-            *errors += 1;
-            if !context.formatter.is_json() {
-                context.formatter.error(&format!(
-                    "Mirror {} worker failed: {join_error}",
-                    context.operation
-                ));
-            }
-        }
-    }
+enum TargetDisposition {
+    Ready,
+    AlreadyComplete,
+}
 
-    if let Some(progress) = context.progress {
-        progress.inc(1);
+fn remote_write_condition(
+    operation: &MirrorCopyOperation,
+) -> rc_core::Result<RemoteWriteCondition> {
+    match &operation.target_before {
+        None => Ok(RemoteWriteCondition::IfAbsent),
+        Some(target) => target
+            .snapshot
+            .etag
+            .as_ref()
+            .map(|etag| RemoteWriteCondition::IfMatch(etag.clone()))
+            .ok_or_else(|| {
+                Error::Conflict(format!(
+                    "Refusing to overwrite {} because its ETag is unavailable",
+                    operation.relative_path
+                ))
+            }),
     }
 }
 
-// Mirror should preserve source content type when metadata is available, but
-// still fall back to a plain byte copy if metadata lookup fails for any reason.
-async fn copy_object_with_metadata<S, T>(
+async fn transfer_remote_to_remote<S, T>(
     source_client: &S,
     target_client: &T,
     source_path: &RemotePath,
     target_path: &RemotePath,
-    if_absent: bool,
-) -> rc_core::Result<()>
+    operation: &MirrorCopyOperation,
+    condition: RemoteWriteCondition,
+) -> rc_core::Result<u64>
 where
-    S: MirrorCopySource,
-    T: MirrorCopyTarget,
+    S: MirrorRemoteTransfer,
+    T: MirrorRemoteTransfer,
 {
-    let content_type = match source_client.head_object_for_mirror(source_path).await {
-        Ok(source_info) => source_info.content_type,
+    let before = source_client.mirror_head(source_path).await?;
+    ensure_snapshot_matches(&operation.source, &before)?;
+    let staging = temporary_mirror_path("remote-source")?;
+    async {
+        let bytes = source_client.mirror_download(source_path, &staging).await?;
+        if operation
+            .source
+            .snapshot
+            .size_bytes
+            .is_some_and(|expected| expected != bytes)
+        {
+            return Err(Error::Conflict(format!(
+                "Source changed during mirror: {}",
+                operation.relative_path
+            )));
+        }
+        let after = source_client.mirror_head(source_path).await?;
+        ensure_snapshot_matches(&operation.source, &after)?;
+        let content_type = after
+            .content_type
+            .as_deref()
+            .or(before.content_type.as_deref());
+        let info = target_client
+            .mirror_upload(target_path, &staging, content_type, condition)
+            .await?;
+        Ok(object_size(&info)
+            .or(operation.source.snapshot.size_bytes)
+            .unwrap_or(bytes))
+    }
+    .await
+}
+
+/// Execute the mirror command.
+pub async fn execute(args: MirrorArgs, mut output_config: OutputConfig) -> ExitCode {
+    output_config.quiet |= args.quiet;
+    let formatter = Formatter::new(output_config);
+
+    let selection = match build_selection(&args, Timestamp::now()) {
+        Ok(selection) => selection,
+        Err(error) => return formatter.fail(ExitCode::UsageError, &error),
+    };
+    let controls = match build_controls(&args) {
+        Ok(controls) => controls,
+        Err(error) => return formatter.fail(ExitCode::UsageError, &error),
+    };
+    let alias_manager = match AliasManager::new() {
+        Ok(manager) => manager,
         Err(error) => {
-            tracing::warn!(
-                source_alias = %source_path.alias,
-                source_bucket = %source_path.bucket,
-                source_key = %source_path.key,
-                error = %error,
-                "Falling back to mirror upload without source content type"
+            return formatter.fail(
+                ExitCode::GeneralError,
+                &format!("Failed to load aliases: {error}"),
             );
-            None
         }
     };
+    let source = match parse_mirror_path(&args.source, &alias_manager) {
+        Ok(path) => path,
+        Err(error) => {
+            return formatter.fail(
+                ExitCode::UsageError,
+                &format!("Invalid source path: {error}"),
+            );
+        }
+    };
+    let target = match parse_mirror_path(&args.target, &alias_manager) {
+        Ok(path) => path,
+        Err(error) => {
+            return formatter.fail(
+                ExitCode::UsageError,
+                &format!("Invalid target path: {error}"),
+            );
+        }
+    };
+    if matches!(
+        (&source, &target),
+        (ParsedPath::Local(_), ParsedPath::Local(_))
+    ) {
+        return formatter.fail(
+            ExitCode::UnsupportedFeature,
+            "Local-to-local mirror is out of scope; use a filesystem synchronization tool",
+        );
+    }
+    if let Err(error) = validate_remote_overlap(&source, &target, &alias_manager) {
+        return formatter.fail(exit_code_for_error(&error), &error.to_string());
+    }
 
-    let data = source_client.get_object_for_mirror(source_path).await?;
-    target_client
-        .put_object_for_mirror(target_path, data, content_type.as_deref(), if_absent)
-        .await?;
+    let (source_runtime, source_manifest) =
+        match prepare_endpoint(&source, MissingRootPolicy::Error, &alias_manager).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return formatter.fail(
+                    exit_code_for_error(&error),
+                    &format!("Failed to enumerate mirror source: {error}"),
+                );
+            }
+        };
+    let (target_runtime, target_manifest) =
+        match prepare_endpoint(&target, MissingRootPolicy::Empty, &alias_manager).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return formatter.fail(
+                    exit_code_for_error(&error),
+                    &format!("Failed to enumerate mirror destination: {error}"),
+                );
+            }
+        };
+    let copy_plan = match build_copy_plan(
+        &source_manifest,
+        &target_manifest,
+        &target_runtime.spec(),
+        &selection,
+        args.overwrite,
+    ) {
+        Ok(plan) => plan,
+        Err(error) => return formatter.fail(exit_code_for_error(&error), &error.to_string()),
+    };
+    let remove_plan = if args.remove {
+        match build_remove_plan(&source_manifest, &target_manifest, &selection) {
+            Ok(plan) => plan,
+            Err(error) => return formatter.fail(exit_code_for_error(&error), &error.to_string()),
+        }
+    } else {
+        empty_transfer_plan()
+    };
+
+    if args.dry_run {
+        output_dry_run(&formatter, &args, &copy_plan, &remove_plan);
+        return ExitCode::Success;
+    }
+
+    let io = Arc::new(LiveMirrorIo {
+        source: source_runtime,
+        target: target_runtime,
+    });
+    let reports =
+        match execute_operation_plans(io, copy_plan, remove_plan, controls, args.remove).await {
+            Ok(reports) => reports,
+            Err(error) => return formatter.fail(ExitCode::UsageError, &error.to_string()),
+        };
+    output_reports(&formatter, &args, &reports);
+
+    reports
+        .copy
+        .first_failure()
+        .or_else(|| {
+            reports
+                .remove
+                .as_ref()
+                .and_then(TransferReport::first_failure)
+        })
+        .map_or(ExitCode::Success, exit_code_for_error)
+}
+
+fn build_selection(args: &MirrorArgs, now: Timestamp) -> Result<TransferSelection, String> {
+    let newer_than = args
+        .newer_than
+        .as_deref()
+        .map(|value| parse_age_cutoff(value, now))
+        .transpose()?;
+    let older_than = args
+        .older_than
+        .as_deref()
+        .map(|value| parse_age_cutoff(value, now))
+        .transpose()?;
+    TransferSelection::new(&args.include, &args.exclude, newer_than, older_than, None)
+        .map_err(|error| error.to_string())
+}
+
+fn build_controls(args: &MirrorArgs) -> Result<TransferControls, String> {
+    let bytes_per_second = args
+        .rate_limit
+        .as_deref()
+        .map(parse_byte_rate)
+        .transpose()?;
+    let controls = TransferControls {
+        concurrency: args.concurrency,
+        bytes_per_second,
+        retry: RetryConfig {
+            max_attempts: args.retry_attempts,
+            initial_backoff_ms: args.retry_initial_backoff_ms,
+            max_backoff_ms: args.retry_max_backoff_ms,
+        },
+        continue_on_error: args.continue_on_error,
+    };
+    controls.validate().map_err(|error| error.to_string())?;
+    Ok(controls)
+}
+
+fn parse_mirror_path(raw: &str, alias_manager: &AliasManager) -> rc_core::Result<ParsedPath> {
+    let parsed = match parse_path(raw) {
+        Ok(parsed) => parsed,
+        Err(_) if !raw.is_empty() && Path::new(raw).exists() => {
+            return Ok(ParsedPath::Local(PathBuf::from(raw)));
+        }
+        Err(error) => return Err(error),
+    };
+    let ParsedPath::Remote(remote) = &parsed else {
+        return Ok(parsed);
+    };
+    if matches!(alias_manager.exists(&remote.alias), Ok(true)) {
+        return Ok(parsed);
+    }
+    if Path::new(raw).exists() {
+        return Ok(ParsedPath::Local(PathBuf::from(raw)));
+    }
+    Ok(parsed)
+}
+
+fn validate_remote_overlap(
+    source: &ParsedPath,
+    target: &ParsedPath,
+    alias_manager: &AliasManager,
+) -> rc_core::Result<()> {
+    let (ParsedPath::Remote(source), ParsedPath::Remote(target)) = (source, target) else {
+        return Ok(());
+    };
+    let source_alias = alias_manager
+        .get(&source.alias)
+        .map_err(|_| Error::AliasNotFound(source.alias.clone()))?;
+    let target_alias = alias_manager
+        .get(&target.alias)
+        .map_err(|_| Error::AliasNotFound(target.alias.clone()))?;
+    if mirror_locations_overlap(
+        source,
+        target,
+        &source_alias.endpoint,
+        &target_alias.endpoint,
+    )? {
+        return Err(Error::InvalidPath(
+            "Mirror source and destination roots must not overlap".to_string(),
+        ));
+    }
     Ok(())
 }
 
-async fn list_objects_map(
-    client: &S3Client,
-    path: &RemotePath,
-) -> Result<HashMap<String, FileInfo>, rc_core::Error> {
-    let mut objects = HashMap::new();
-    let mut continuation_token: Option<String> = None;
-    let base_prefix = &path.key;
-
-    loop {
-        let options = ListOptions {
-            recursive: true,
-            max_keys: Some(1000),
-            continuation_token: continuation_token.clone(),
-            ..Default::default()
-        };
-
-        let result = client.list_objects(path, options).await?;
-
-        for item in result.items {
-            if item.is_dir {
-                continue;
-            }
-
-            // Get relative key (remove base prefix)
-            let relative_key = item.key.strip_prefix(base_prefix).unwrap_or(&item.key);
-            let relative_key = relative_key.trim_start_matches('/').to_string();
-
-            if relative_key.is_empty() {
-                continue;
-            }
-
-            objects.insert(
-                relative_key,
-                FileInfo {
-                    size: item.size_bytes,
-                    modified: item.last_modified.map(|t| t.to_string()),
-                    etag: item.etag,
-                },
-            );
+async fn prepare_endpoint(
+    parsed: &ParsedPath,
+    missing_root: MissingRootPolicy,
+    alias_manager: &AliasManager,
+) -> rc_core::Result<(RuntimeEndpoint, MirrorManifest)> {
+    match parsed {
+        ParsedPath::Local(root) => {
+            let manifest = enumerate_local_manifest(root, missing_root)?;
+            Ok((RuntimeEndpoint::Local { root: root.clone() }, manifest))
         }
-
-        if result.truncated {
-            continuation_token = result.continuation_token;
-        } else {
-            break;
+        ParsedPath::Remote(root) => {
+            let alias = alias_manager
+                .get(&root.alias)
+                .map_err(|_| Error::AliasNotFound(root.alias.clone()))?;
+            let planning_client = S3Client::new(alias.clone()).await?;
+            let manifest = enumerate_remote_manifest(&planning_client, root).await?;
+            let mut execution_alias = alias;
+            execution_alias.retry = Some(RetryConfig {
+                max_attempts: 1,
+                initial_backoff_ms: 1,
+                max_backoff_ms: 1,
+            });
+            let execution_client = Arc::new(S3Client::new(execution_alias).await?);
+            Ok((
+                RuntimeEndpoint::Remote {
+                    root: root.clone(),
+                    client: execution_client,
+                },
+                manifest,
+            ))
         }
     }
-
-    Ok(objects)
 }
 
-fn compare_objects_internal(
-    source: &HashMap<String, FileInfo>,
-    target: &HashMap<String, FileInfo>,
-) -> Vec<DiffEntry> {
-    let mut entries = Vec::new();
+#[derive(Debug, Clone, Copy)]
+enum MissingRootPolicy {
+    Error,
+    Empty,
+}
 
-    // Check objects in source
-    for (key, source_info) in source {
-        if let Some(target_info) = target.get(key) {
-            // Object exists in both
-            let is_same = source_info.size == target_info.size
-                && matches!(
-                    (&source_info.etag, &target_info.etag),
-                    (Some(source_etag), Some(target_etag)) if source_etag == target_etag
-                );
+fn enumerate_local_manifest(
+    root: &Path,
+    missing_root: MissingRootPolicy,
+) -> rc_core::Result<MirrorManifest> {
+    let metadata = match std::fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && matches!(missing_root, MissingRootPolicy::Empty) =>
+        {
+            return Ok(MirrorManifest::default());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(Error::NotFound(format!(
+                "Local mirror root not found: {}",
+                root.display()
+            )));
+        }
+        Err(error) => return Err(Error::Io(error)),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(Error::InvalidPath(format!(
+            "Local mirror root must not be a symbolic link: {}",
+            root.display()
+        )));
+    }
+    if !metadata.is_dir() {
+        return Err(Error::InvalidPath(format!(
+            "Local mirror root must be a directory: {}",
+            root.display()
+        )));
+    }
 
-            let status = if is_same {
-                DiffStatus::Same
-            } else {
-                DiffStatus::Different
-            };
+    let mut manifest = MirrorManifest::default();
+    enumerate_local_directory(root, root, &mut manifest)?;
+    manifest.protected_paths.sort();
+    manifest.protected_paths.dedup();
+    Ok(manifest)
+}
 
-            entries.push(DiffEntry {
-                key: key.clone(),
-                status,
-                first_size: source_info.size,
-                second_size: target_info.size,
-                first_modified: source_info.modified.clone(),
-                second_modified: target_info.modified.clone(),
-            });
+fn enumerate_local_directory(
+    directory: &Path,
+    root: &Path,
+    manifest: &mut MirrorManifest,
+) -> rc_core::Result<()> {
+    let mut entries = std::fs::read_dir(directory)?.collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let path = entry.path();
+        let relative = local_relative_path(root, &path)?;
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            manifest.protected_paths.push(relative);
+            manifest.ignored += 1;
+            continue;
+        }
+        if file_type.is_dir() {
+            enumerate_local_directory(&path, root, manifest)?;
+            continue;
+        }
+        if !file_type.is_file() {
+            manifest.protected_paths.push(relative);
+            manifest.ignored += 1;
+            continue;
+        }
+        let metadata = entry.metadata()?;
+        insert_manifest_entry(
+            &mut manifest.entries,
+            MirrorEntry {
+                relative_path: relative,
+                location: MirrorLocation::Local(path),
+                snapshot: snapshot_from_metadata(&metadata),
+            },
+        )?;
+    }
+    Ok(())
+}
+
+async fn enumerate_remote_manifest(
+    client: &S3Client,
+    root: &RemotePath,
+) -> rc_core::Result<MirrorManifest> {
+    let prefix = normalized_remote_root_prefix(&root.key)?;
+    let list_root = RemotePath::new(&root.alias, &root.bucket, &prefix);
+    let mut continuation_token = None;
+    let mut manifest = MirrorManifest::default();
+    loop {
+        let result = client
+            .list_objects(
+                &list_root,
+                ListOptions {
+                    recursive: true,
+                    max_keys: Some(1_000),
+                    continuation_token: continuation_token.clone(),
+                    ..ListOptions::default()
+                },
+            )
+            .await?;
+        for object in result
+            .items
+            .into_iter()
+            .filter(|object| !object.is_dir && !object.key.ends_with('/'))
+        {
+            let raw_relative = object.key.strip_prefix(&prefix).ok_or_else(|| {
+                Error::InvalidPath(format!(
+                    "Remote key '{}' is outside mirror root '{}'",
+                    object.key, prefix
+                ))
+            })?;
+            if raw_relative.is_empty() {
+                continue;
+            }
+            let relative_path = normalize_relative_path(raw_relative)?;
+            let snapshot = snapshot_from_object(&object)?;
+            insert_manifest_entry(
+                &mut manifest.entries,
+                MirrorEntry {
+                    relative_path,
+                    location: MirrorLocation::Remote(RemotePath::new(
+                        &root.alias,
+                        &root.bucket,
+                        object.key,
+                    )),
+                    snapshot,
+                },
+            )?;
+        }
+        if !result.truncated {
+            break;
+        }
+        continuation_token = result.continuation_token;
+    }
+    Ok(manifest)
+}
+
+fn insert_manifest_entry(
+    entries: &mut BTreeMap<String, MirrorEntry>,
+    entry: MirrorEntry,
+) -> rc_core::Result<()> {
+    let relative_path = entry.relative_path.clone();
+    if entries.insert(relative_path.clone(), entry).is_some() {
+        return Err(Error::Conflict(format!(
+            "Multiple mirror entries normalize to '{}'",
+            relative_path
+        )));
+    }
+    Ok(())
+}
+
+fn build_copy_plan(
+    source: &MirrorManifest,
+    target: &MirrorManifest,
+    target_endpoint: &MirrorEndpointSpec,
+    selection: &TransferSelection,
+    overwrite: bool,
+) -> rc_core::Result<TransferPlan<MirrorCopyOperation>> {
+    let mut candidates = Vec::with_capacity(source.entries.len());
+    for entry in source.entries.values() {
+        if path_is_protected(&entry.relative_path, &target.protected_paths) {
+            return Err(Error::Conflict(format!(
+                "Destination path crosses a symbolic link or special file: {}",
+                entry.relative_path
+            )));
+        }
+        let target_before = target.entries.get(&entry.relative_path).cloned();
+        let target_location = target_before.as_ref().map_or_else(
+            || target_endpoint.location_for(&entry.relative_path),
+            |target| Ok(target.location.clone()),
+        )?;
+        candidates.push(TransferCandidate {
+            payload: MirrorCopyOperation {
+                relative_path: entry.relative_path.clone(),
+                source: entry.clone(),
+                target: target_location.clone(),
+                target_before,
+            },
+            source: entry.location.to_string(),
+            target: target_location.to_string(),
+            relative_path: entry.relative_path.clone(),
+            modified: entry.snapshot.modified,
+            size_bytes: entry.snapshot.size_bytes,
+        });
+    }
+
+    let selected = TransferPlan::build(candidates, selection);
+    let mut skipped_after_selection = 0usize;
+    let mut items = Vec::new();
+    for candidate in selected.items {
+        let should_copy = match &candidate.payload.target_before {
+            None => true,
+            Some(target) if source_matches_target(&candidate.payload.source, target) => false,
+            Some(_) => overwrite,
+        };
+        if should_copy {
+            items.push(candidate);
         } else {
-            // Only in source
-            entries.push(DiffEntry {
-                key: key.clone(),
-                status: DiffStatus::OnlyFirst,
-                first_size: source_info.size,
-                second_size: None,
-                first_modified: source_info.modified.clone(),
-                second_modified: None,
-            });
+            skipped_after_selection += 1;
+        }
+    }
+    let mut summary = selected.summary;
+    summary.planned = items.len();
+    summary.skipped = summary
+        .skipped
+        .saturating_add(skipped_after_selection)
+        .saturating_add(source.ignored);
+    Ok(TransferPlan { items, summary })
+}
+
+fn build_remove_plan(
+    source: &MirrorManifest,
+    target: &MirrorManifest,
+    selection: &TransferSelection,
+) -> rc_core::Result<TransferPlan<MirrorRemoveOperation>> {
+    let mut protected = 0usize;
+    let candidates = target
+        .entries
+        .values()
+        .filter_map(|entry| {
+            if source.entries.contains_key(&entry.relative_path) {
+                return None;
+            }
+            if path_is_protected(&entry.relative_path, &source.protected_paths) {
+                protected += 1;
+                return None;
+            }
+            Some(TransferCandidate {
+                payload: MirrorRemoveOperation {
+                    relative_path: entry.relative_path.clone(),
+                    target: entry.clone(),
+                },
+                source: entry.location.to_string(),
+                target: entry.location.to_string(),
+                relative_path: entry.relative_path.clone(),
+                modified: entry.snapshot.modified,
+                size_bytes: Some(0),
+            })
+        })
+        .collect();
+    let mut plan = TransferPlan::build(candidates, selection);
+    plan.summary.skipped = plan
+        .summary
+        .skipped
+        .saturating_add(protected)
+        .saturating_add(target.ignored);
+    Ok(plan)
+}
+
+async fn execute_operation_plans<I: MirrorIo>(
+    io: Arc<I>,
+    copy_plan: TransferPlan<MirrorCopyOperation>,
+    remove_plan: TransferPlan<MirrorRemoveOperation>,
+    controls: TransferControls,
+    remove_enabled: bool,
+) -> rc_core::Result<MirrorOperationReports> {
+    let executor = TransferExecutor::new(controls)?;
+    let copy = if copy_plan.items.is_empty() {
+        report_without_execution(copy_plan)
+    } else {
+        executor
+            .execute(copy_plan, {
+                let io = Arc::clone(&io);
+                move |candidate| {
+                    let io = Arc::clone(&io);
+                    async move { io.copy(candidate.payload).await }
+                }
+            })
+            .await
+    };
+    let copies_succeeded = copy.summary.failed == 0 && copy.summary.cancelled == 0;
+    let blocked_removals = if remove_enabled && !copies_succeeded {
+        remove_plan.items.len()
+    } else {
+        0
+    };
+    let remove = if remove_enabled && copies_succeeded {
+        Some(if remove_plan.items.is_empty() {
+            report_without_execution(remove_plan)
+        } else {
+            executor
+                .execute(remove_plan, move |candidate| {
+                    let io = Arc::clone(&io);
+                    async move { io.remove(candidate.payload).await }
+                })
+                .await
+        })
+    } else {
+        None
+    };
+    Ok(MirrorOperationReports {
+        copy,
+        remove,
+        blocked_removals,
+    })
+}
+
+fn report_without_execution<T>(plan: TransferPlan<T>) -> TransferReport<T> {
+    TransferReport {
+        summary: plan.summary,
+        outcomes: Vec::new(),
+        was_cancelled: false,
+    }
+}
+
+fn empty_transfer_plan<T>() -> TransferPlan<T> {
+    TransferPlan {
+        items: Vec::new(),
+        summary: TransferSummary::default(),
+    }
+}
+
+fn output_dry_run(
+    formatter: &Formatter,
+    args: &MirrorArgs,
+    copy_plan: &TransferPlan<MirrorCopyOperation>,
+    remove_plan: &TransferPlan<MirrorRemoveOperation>,
+) {
+    if formatter.is_json() {
+        formatter.json(&MirrorOutput {
+            source: args.source.clone(),
+            target: args.target.clone(),
+            copied: copy_plan.items.len(),
+            removed: remove_plan.items.len(),
+            skipped: copy_plan
+                .summary
+                .skipped
+                .saturating_add(remove_plan.summary.skipped),
+            errors: 0,
+            dry_run: true,
+        });
+        return;
+    }
+    for candidate in &copy_plan.items {
+        formatter.println(&format!(
+            "Would copy: {} -> {}",
+            formatter.style_file(&candidate.source),
+            formatter.style_file(&candidate.target)
+        ));
+    }
+    for candidate in &remove_plan.items {
+        formatter.println(&format!(
+            "Would remove: {}",
+            formatter.style_file(&candidate.target)
+        ));
+    }
+    if args.summary {
+        formatter.println(&format!(
+            "Summary: {} copies, {} removals, {} skipped",
+            copy_plan.items.len(),
+            remove_plan.items.len(),
+            copy_plan
+                .summary
+                .skipped
+                .saturating_add(remove_plan.summary.skipped)
+        ));
+    }
+}
+
+fn output_reports(formatter: &Formatter, args: &MirrorArgs, reports: &MirrorOperationReports) {
+    if !formatter.is_json() {
+        output_outcomes(formatter, "+", &reports.copy);
+        if let Some(remove) = &reports.remove {
+            output_outcomes(formatter, "-", remove);
+        } else if reports.blocked_removals > 0 {
+            formatter.error("Skipping removals because one or more copy operations failed");
+        }
+    }
+    let removed = reports
+        .remove
+        .as_ref()
+        .map_or(0, |report| report.summary.successful);
+    let remove_failed = reports
+        .remove
+        .as_ref()
+        .map_or(0, |report| report.summary.failed);
+    let remove_skipped = reports
+        .remove
+        .as_ref()
+        .map_or(reports.blocked_removals, |report| report.summary.skipped);
+    let output = MirrorOutput {
+        source: args.source.clone(),
+        target: args.target.clone(),
+        copied: reports.copy.summary.successful,
+        removed,
+        skipped: reports.copy.summary.skipped.saturating_add(remove_skipped),
+        errors: reports.copy.summary.failed.saturating_add(remove_failed),
+        dry_run: false,
+    };
+    if formatter.is_json() {
+        formatter.json(&output);
+    } else if args.summary {
+        let remove_cancelled = reports
+            .remove
+            .as_ref()
+            .map_or(0, |report| report.summary.cancelled);
+        let cancelled = reports
+            .copy
+            .summary
+            .cancelled
+            .saturating_add(remove_cancelled);
+        formatter.println(&format_human_summary(
+            &output,
+            cancelled,
+            reports.copy.summary.transferred_bytes,
+        ));
+    }
+}
+
+fn format_human_summary(output: &MirrorOutput, cancelled: usize, transferred_bytes: u64) -> String {
+    format!(
+        "Summary: {} copied, {} removed, {} skipped, {} errors, {} cancelled, {} transferred",
+        output.copied,
+        output.removed,
+        output.skipped,
+        output.errors,
+        cancelled,
+        humansize::format_size(transferred_bytes, humansize::BINARY)
+    )
+}
+
+fn output_outcomes<T>(formatter: &Formatter, marker: &str, report: &TransferReport<T>) {
+    for outcome in &report.outcomes {
+        match &outcome.state {
+            TransferOutcomeState::Success { .. } => formatter.println(&format!(
+                "{marker} {}",
+                formatter.sanitize_text(&outcome.item.relative_path)
+            )),
+            TransferOutcomeState::Failed { error } => formatter.error_with_code(
+                exit_code_for_error(error),
+                &format!(
+                    "Mirror operation failed for '{}': {error}",
+                    formatter.sanitize_text(&outcome.item.relative_path)
+                ),
+            ),
+            TransferOutcomeState::Cancelled { error } => {
+                if let Some(error) = error {
+                    formatter.warning(&format!(
+                        "Cancelled mirror operation: {} ({error})",
+                        formatter.sanitize_text(&outcome.item.relative_path)
+                    ));
+                } else {
+                    formatter.warning(&format!(
+                        "Cancelled before mirror operation: {}",
+                        formatter.sanitize_text(&outcome.item.relative_path)
+                    ));
+                }
+            }
+        }
+    }
+}
+
+fn normalize_relative_path(value: &str) -> rc_core::Result<String> {
+    if value.starts_with(['/', '\\']) || value.contains('\\') {
+        return Err(Error::InvalidPath(format!(
+            "Mirror path must be relative and use '/' separators: {value}"
+        )));
+    }
+    let mut normalized = Vec::new();
+    for component in value.split('/') {
+        if component.is_empty() || component == "." {
+            continue;
+        }
+        if component == ".." {
+            return Err(Error::InvalidPath(
+                "Mirror paths must not contain traversal components".to_string(),
+            ));
+        }
+        validate_portable_component(component)?;
+        normalized.push(component);
+    }
+    if normalized.is_empty() {
+        return Err(Error::InvalidPath(
+            "Mirror path does not contain a file name".to_string(),
+        ));
+    }
+    Ok(normalized.join("/"))
+}
+
+fn validate_portable_component(component: &str) -> rc_core::Result<()> {
+    if component.chars().any(|character| {
+        character.is_control() || matches!(character, ':' | '<' | '>' | '"' | '|' | '?' | '*')
+    }) || component.ends_with(['.', ' '])
+    {
+        return Err(Error::InvalidPath(format!(
+            "Mirror path component is not portable: {component}"
+        )));
+    }
+    let stem = component.split('.').next().unwrap_or_default();
+    let stem = stem.to_ascii_uppercase();
+    if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (stem.len() == 4
+            && (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && matches!(stem.as_bytes()[3], b'1'..=b'9'))
+    {
+        return Err(Error::InvalidPath(format!(
+            "Mirror path uses a reserved device name: {component}"
+        )));
+    }
+    Ok(())
+}
+
+fn local_relative_path(root: &Path, path: &Path) -> rc_core::Result<String> {
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|error| Error::InvalidPath(error.to_string()))?;
+    let mut components = Vec::new();
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            return Err(Error::InvalidPath(format!(
+                "Local mirror entry is not relative to its root: {}",
+                path.display()
+            )));
+        };
+        let component = component.to_str().ok_or_else(|| {
+            Error::InvalidPath(format!(
+                "Local mirror entry is not valid UTF-8: {}",
+                path.display()
+            ))
+        })?;
+        components.push(component);
+    }
+    normalize_relative_path(&components.join("/"))
+}
+
+fn normalized_remote_root_prefix(key: &str) -> rc_core::Result<String> {
+    if key.starts_with('/') {
+        return Err(Error::InvalidPath(
+            "Remote mirror roots must not start with '/'".to_string(),
+        ));
+    }
+    let key = key.trim_end_matches('/');
+    if key.is_empty() {
+        return Ok(String::new());
+    }
+    Ok(format!("{}/", normalize_relative_path(key)?))
+}
+
+fn snapshot_from_metadata(metadata: &std::fs::Metadata) -> MirrorSnapshot {
+    MirrorSnapshot {
+        size_bytes: Some(metadata.len()),
+        modified: metadata
+            .modified()
+            .ok()
+            .and_then(|value| value.try_into().ok()),
+        etag: None,
+    }
+}
+
+fn snapshot_from_object(object: &ObjectInfo) -> rc_core::Result<MirrorSnapshot> {
+    let size_bytes = object
+        .size_bytes
+        .map(|size| {
+            u64::try_from(size).map_err(|_| {
+                Error::Network(format!(
+                    "S3 returned a negative object size for '{}'",
+                    object.key
+                ))
+            })
+        })
+        .transpose()?;
+    Ok(MirrorSnapshot {
+        size_bytes,
+        modified: object.last_modified,
+        etag: object.etag.clone(),
+    })
+}
+
+fn object_size(object: &ObjectInfo) -> Option<u64> {
+    object.size_bytes.and_then(|size| u64::try_from(size).ok())
+}
+
+fn source_matches_target(source: &MirrorEntry, target: &MirrorEntry) -> bool {
+    let (Some(source_size), Some(target_size)) =
+        (source.snapshot.size_bytes, target.snapshot.size_bytes)
+    else {
+        return false;
+    };
+    if source_size != target_size {
+        return false;
+    }
+    if let (Some(source_etag), Some(target_etag)) = (&source.snapshot.etag, &target.snapshot.etag) {
+        return source_etag == target_etag;
+    }
+    match (&source.location, &target.location) {
+        (MirrorLocation::Remote(_), MirrorLocation::Remote(_)) => false,
+        (MirrorLocation::Local(_), MirrorLocation::Remote(_)) => {
+            match (source.snapshot.modified, target.snapshot.modified) {
+                (Some(source_modified), Some(target_modified)) => {
+                    target_modified >= source_modified
+                }
+                _ => false,
+            }
+        }
+        _ => {
+            source.snapshot.modified.is_some()
+                && source.snapshot.modified == target.snapshot.modified
+        }
+    }
+}
+
+fn path_is_protected(relative_path: &str, protected_paths: &[String]) -> bool {
+    protected_paths.iter().any(|protected| {
+        relative_path == protected
+            || relative_path
+                .strip_prefix(protected)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+    })
+}
+
+fn validate_local_entry(entry: &MirrorEntry) -> rc_core::Result<()> {
+    let MirrorLocation::Local(path) = &entry.location else {
+        return Err(Error::General(
+            "Expected a local mirror source entry".to_string(),
+        ));
+    };
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(Error::Conflict(format!(
+            "Source changed during mirror: {}",
+            entry.relative_path
+        )));
+    }
+    if snapshot_from_metadata(&metadata) != entry.snapshot {
+        return Err(Error::Conflict(format!(
+            "Source changed during mirror: {}",
+            entry.relative_path
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_snapshot_matches(entry: &MirrorEntry, object: &ObjectInfo) -> rc_core::Result<()> {
+    if snapshot_from_object(object)? != entry.snapshot {
+        return Err(Error::Conflict(format!(
+            "Source changed during mirror: {}",
+            entry.relative_path
+        )));
+    }
+    Ok(())
+}
+
+async fn stage_local_source(source: &Path) -> rc_core::Result<tempfile::TempPath> {
+    let mut input = tokio::fs::File::open(source).await?;
+    let temporary = tempfile::Builder::new()
+        .prefix("rc-mirror-local-source-")
+        .suffix(".part")
+        .tempfile()?;
+    let (output, staging) = temporary.into_parts();
+    let mut output = tokio::fs::File::from_std(output);
+    if let Err(error) = tokio::io::copy(&mut input, &mut output).await {
+        return Err(Error::Io(error));
+    }
+    if let Err(error) = output.flush().await {
+        return Err(Error::Io(error));
+    }
+    Ok(staging)
+}
+
+fn temporary_mirror_path(label: &str) -> rc_core::Result<tempfile::TempPath> {
+    Ok(tempfile::Builder::new()
+        .prefix(&format!("rc-mirror-{label}-"))
+        .suffix(".part")
+        .tempfile()?
+        .into_temp_path())
+}
+
+fn mirror_staging_path(destination: &Path) -> rc_core::Result<tempfile::TempPath> {
+    let parent = destination.parent().ok_or_else(|| {
+        Error::InvalidPath(format!(
+            "Mirror destination has no parent: {}",
+            destination.display()
+        ))
+    })?;
+    let file_name = destination.file_name().ok_or_else(|| {
+        Error::InvalidPath(format!(
+            "Mirror destination has no file name: {}",
+            destination.display()
+        ))
+    })?;
+    Ok(tempfile::Builder::new()
+        .prefix(&format!(".{}.rc-mirror-", file_name.to_string_lossy()))
+        .tempfile_in(parent)?
+        .into_temp_path())
+}
+
+async fn finish_staged_download(
+    staging: tempfile::TempPath,
+    destination: &Path,
+    validation: rc_core::Result<u64>,
+    modified: Option<Timestamp>,
+    replace_existing: bool,
+) -> rc_core::Result<u64> {
+    let bytes = match validation {
+        Ok(bytes) => bytes,
+        Err(error) => return Err(error),
+    };
+    if let Some(modified) = modified
+        && let Err(error) = set_file_modified(&staging, modified)
+    {
+        return Err(error);
+    }
+    let persisted = if replace_existing {
+        staging.persist(destination)
+    } else {
+        staging.persist_noclobber(destination)
+    };
+    persisted.map_err(|error| {
+        if !replace_existing && error.error.kind() == std::io::ErrorKind::AlreadyExists {
+            Error::Conflict(format!(
+                "Destination appeared before mirror completion: {}",
+                destination.display()
+            ))
+        } else {
+            Error::General(format!(
+                "Failed to atomically replace mirror destination '{}': {}",
+                destination.display(),
+                error.error
+            ))
+        }
+    })?;
+    Ok(bytes)
+}
+
+fn set_file_modified(path: &Path, modified: Timestamp) -> rc_core::Result<()> {
+    let modified: std::time::SystemTime = modified.into();
+    let file = std::fs::OpenOptions::new().write(true).open(path)?;
+    file.set_times(std::fs::FileTimes::new().set_modified(modified))?;
+    Ok(())
+}
+
+async fn inspect_local_entry(
+    root: &Path,
+    relative_path: &str,
+    expected_path: &Path,
+) -> rc_core::Result<Option<MirrorEntry>> {
+    let path = secure_local_path(root, relative_path, false).await?;
+    if path != expected_path {
+        return Err(Error::InvalidPath(format!(
+            "Local mirror target escaped its root: {}",
+            expected_path.display()
+        )));
+    }
+    match tokio::fs::symlink_metadata(&path).await {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(Error::InvalidPath(format!(
+            "Destination is a symbolic link: {}",
+            path.display()
+        ))),
+        Ok(metadata) if metadata.is_file() => Ok(Some(MirrorEntry {
+            relative_path: relative_path.to_string(),
+            location: MirrorLocation::Local(path),
+            snapshot: snapshot_from_metadata(&metadata),
+        })),
+        Ok(_) => Err(Error::InvalidPath(format!(
+            "Destination is not a regular file: {}",
+            path.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(Error::Io(error)),
+    }
+}
+
+async fn secure_local_path(
+    root: &Path,
+    relative_path: &str,
+    create_parents: bool,
+) -> rc_core::Result<PathBuf> {
+    let relative_path = normalize_relative_path(relative_path)?;
+    match tokio::fs::symlink_metadata(root).await {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(Error::InvalidPath(format!(
+                "Local mirror root is a symbolic link: {}",
+                root.display()
+            )));
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(Error::InvalidPath(format!(
+                "Local mirror root is not a directory: {}",
+                root.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && create_parents => {
+            create_local_directory_tree(root).await?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(Error::Io(error)),
+    }
+
+    let components = relative_path.split('/').collect::<Vec<_>>();
+    let mut path = root.to_path_buf();
+    for (index, component) in components.iter().enumerate() {
+        path.push(component);
+        let is_final = index + 1 == components.len();
+        match tokio::fs::symlink_metadata(&path).await {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(Error::InvalidPath(format!(
+                    "Local mirror path component is a symbolic link: {}",
+                    path.display()
+                )));
+            }
+            Ok(metadata) if !is_final && !metadata.is_dir() => {
+                return Err(Error::InvalidPath(format!(
+                    "Local mirror parent is not a directory: {}",
+                    path.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound && create_parents && !is_final =>
+            {
+                match tokio::fs::create_dir(&path).await {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(Error::Io(error)),
+                }
+                let metadata = tokio::fs::symlink_metadata(&path).await?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(Error::InvalidPath(format!(
+                        "Unsafe local mirror parent: {}",
+                        path.display()
+                    )));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(Error::Io(error)),
+        }
+    }
+    Ok(path)
+}
+
+async fn create_local_directory_tree(root: &Path) -> rc_core::Result<()> {
+    let mut missing = Vec::new();
+    let mut cursor = root.to_path_buf();
+    loop {
+        if cursor.as_os_str().is_empty() {
+            cursor = PathBuf::from(".");
+        }
+        match tokio::fs::symlink_metadata(&cursor).await {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(Error::InvalidPath(format!(
+                    "Local mirror directory component is a symbolic link: {}",
+                    cursor.display()
+                )));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(Error::InvalidPath(format!(
+                    "Local mirror directory component is not a directory: {}",
+                    cursor.display()
+                )));
+            }
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(cursor.clone());
+                cursor = cursor.parent().map(Path::to_path_buf).ok_or_else(|| {
+                    Error::InvalidPath(format!(
+                        "Local mirror root has no existing ancestor: {}",
+                        root.display()
+                    ))
+                })?;
+            }
+            Err(error) => return Err(Error::Io(error)),
         }
     }
 
-    // Check objects only in target
-    for (key, target_info) in target {
-        if !source.contains_key(key) {
-            entries.push(DiffEntry {
-                key: key.clone(),
-                status: DiffStatus::OnlySecond,
-                first_size: None,
-                second_size: target_info.size,
-                first_modified: None,
-                second_modified: target_info.modified.clone(),
-            });
+    for directory in missing.into_iter().rev() {
+        match tokio::fs::create_dir(&directory).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(Error::Io(error)),
+        }
+        let metadata = tokio::fs::symlink_metadata(&directory).await?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(Error::InvalidPath(format!(
+                "Unsafe local mirror directory: {}",
+                directory.display()
+            )));
         }
     }
-
-    entries.sort_by(|a, b| a.key.cmp(&b.key));
-    entries
+    Ok(())
 }
 
 fn mirror_locations_overlap(
@@ -664,23 +1755,17 @@ fn mirror_locations_overlap(
     target: &RemotePath,
     source_endpoint: &str,
     target_endpoint: &str,
-) -> bool {
+) -> rc_core::Result<bool> {
     if source.bucket != target.bucket || !same_endpoint(source_endpoint, target_endpoint) {
-        return false;
+        return Ok(false);
     }
-
-    let source = source.key.trim_matches('/');
-    let target = target.key.trim_matches('/');
-    if source.is_empty() || target.is_empty() || source == target {
-        return true;
-    }
-
-    target
-        .strip_prefix(source)
-        .is_some_and(|rest| rest.starts_with('/'))
-        || source
-            .strip_prefix(target)
-            .is_some_and(|rest| rest.starts_with('/'))
+    let source = normalized_remote_root_prefix(&source.key)?;
+    let target = normalized_remote_root_prefix(&target.key)?;
+    Ok(source.is_empty()
+        || target.is_empty()
+        || source == target
+        || source.starts_with(&target)
+        || target.starts_with(&source))
 }
 
 fn same_endpoint(first: &str, second: &str) -> bool {
@@ -698,422 +1783,9 @@ fn same_endpoint(first: &str, second: &str) -> bool {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rc_core::ObjectInfo;
-    use std::sync::Mutex;
-
-    #[derive(Debug)]
-    struct TestMirrorSource {
-        content_type: Option<String>,
-        data: Vec<u8>,
-        head_error: Option<rc_core::Error>,
-        head_calls: Mutex<Vec<String>>,
-        get_calls: Mutex<Vec<String>>,
-    }
-
-    impl TestMirrorSource {
-        fn new(content_type: Option<&str>, data: &[u8]) -> Self {
-            Self {
-                content_type: content_type.map(ToOwned::to_owned),
-                data: data.to_vec(),
-                head_error: None,
-                head_calls: Mutex::new(Vec::new()),
-                get_calls: Mutex::new(Vec::new()),
-            }
-        }
-
-        fn with_head_error(error: rc_core::Error, data: &[u8]) -> Self {
-            Self {
-                content_type: None,
-                data: data.to_vec(),
-                head_error: Some(error),
-                head_calls: Mutex::new(Vec::new()),
-                get_calls: Mutex::new(Vec::new()),
-            }
-        }
-    }
-
-    impl MirrorCopySource for TestMirrorSource {
-        async fn head_object_for_mirror(&self, path: &RemotePath) -> rc_core::Result<ObjectInfo> {
-            self.head_calls
-                .lock()
-                .expect("head call mutex should not be poisoned")
-                .push(path.key.clone());
-            if let Some(error) = &self.head_error {
-                return Err(rc_core::Error::General(error.to_string()));
-            }
-            Ok(ObjectInfo {
-                key: path.key.clone(),
-                size_bytes: Some(self.data.len() as i64),
-                size_human: None,
-                last_modified: None,
-                etag: None,
-                storage_class: None,
-                content_type: self.content_type.clone(),
-                metadata: None,
-                is_dir: false,
-            })
-        }
-
-        async fn get_object_for_mirror(&self, path: &RemotePath) -> rc_core::Result<Vec<u8>> {
-            self.get_calls
-                .lock()
-                .expect("get call mutex should not be poisoned")
-                .push(path.key.clone());
-            Ok(self.data.clone())
-        }
-    }
-
-    #[derive(Debug, PartialEq, Eq)]
-    struct PutCall {
-        key: String,
-        content_type: Option<String>,
-        data: Vec<u8>,
-        if_absent: bool,
-    }
-
-    #[derive(Debug, Default)]
-    struct TestMirrorTarget {
-        put_calls: Mutex<Vec<PutCall>>,
-    }
-
-    impl MirrorCopyTarget for TestMirrorTarget {
-        async fn put_object_for_mirror(
-            &self,
-            path: &RemotePath,
-            data: Vec<u8>,
-            content_type: Option<&str>,
-            if_absent: bool,
-        ) -> rc_core::Result<ObjectInfo> {
-            self.put_calls
-                .lock()
-                .expect("put call mutex should not be poisoned")
-                .push(PutCall {
-                    key: path.key.clone(),
-                    content_type: content_type.map(ToOwned::to_owned),
-                    data: data.clone(),
-                    if_absent,
-                });
-
-            Ok(ObjectInfo::file(path.key.clone(), data.len() as i64))
-        }
-    }
-
-    #[tokio::test]
-    async fn test_copy_object_with_metadata_preserves_content_type() {
-        let source = TestMirrorSource::new(Some("image/jpeg"), b"jpeg-bytes");
-        let target = TestMirrorTarget::default();
-        let source_path = RemotePath::new("stage", "images", "photo.jpg");
-        let target_path = RemotePath::new("prod", "images", "photo.jpg");
-
-        copy_object_with_metadata(&source, &target, &source_path, &target_path, true)
-            .await
-            .expect("copy should succeed");
-
-        assert_eq!(
-            source
-                .head_calls
-                .lock()
-                .expect("head call mutex should not be poisoned")
-                .as_slice(),
-            ["photo.jpg"]
-        );
-        assert_eq!(
-            source
-                .get_calls
-                .lock()
-                .expect("get call mutex should not be poisoned")
-                .as_slice(),
-            ["photo.jpg"]
-        );
-        assert_eq!(
-            target
-                .put_calls
-                .lock()
-                .expect("put call mutex should not be poisoned")
-                .as_slice(),
-            [PutCall {
-                key: "photo.jpg".to_string(),
-                content_type: Some("image/jpeg".to_string()),
-                data: b"jpeg-bytes".to_vec(),
-                if_absent: true,
-            }]
-        );
-    }
-
-    #[tokio::test]
-    async fn test_copy_object_with_metadata_passes_none_when_source_has_no_content_type() {
-        let source = TestMirrorSource::new(None, b"plain-bytes");
-        let target = TestMirrorTarget::default();
-        let source_path = RemotePath::new("stage", "docs", "readme.txt");
-        let target_path = RemotePath::new("prod", "docs", "readme.txt");
-
-        copy_object_with_metadata(&source, &target, &source_path, &target_path, false)
-            .await
-            .expect("copy should succeed");
-
-        assert_eq!(
-            target
-                .put_calls
-                .lock()
-                .expect("put call mutex should not be poisoned")
-                .as_slice(),
-            [PutCall {
-                key: "readme.txt".to_string(),
-                content_type: None,
-                data: b"plain-bytes".to_vec(),
-                if_absent: false,
-            }]
-        );
-    }
-
-    #[tokio::test]
-    async fn test_copy_object_with_metadata_falls_back_when_head_lookup_fails() {
-        let source = TestMirrorSource::with_head_error(
-            rc_core::Error::Network("head failed".to_string()),
-            b"plain-bytes",
-        );
-        let target = TestMirrorTarget::default();
-        let source_path = RemotePath::new("stage", "docs", "readme.txt");
-        let target_path = RemotePath::new("prod", "docs", "readme.txt");
-
-        copy_object_with_metadata(&source, &target, &source_path, &target_path, false)
-            .await
-            .expect("copy should succeed");
-
-        assert_eq!(
-            source
-                .head_calls
-                .lock()
-                .expect("head call mutex should not be poisoned")
-                .as_slice(),
-            ["readme.txt"]
-        );
-        assert_eq!(
-            source
-                .get_calls
-                .lock()
-                .expect("get call mutex should not be poisoned")
-                .as_slice(),
-            ["readme.txt"]
-        );
-        assert_eq!(
-            target
-                .put_calls
-                .lock()
-                .expect("put call mutex should not be poisoned")
-                .as_slice(),
-            [PutCall {
-                key: "readme.txt".to_string(),
-                content_type: None,
-                data: b"plain-bytes".to_vec(),
-                if_absent: false,
-            }]
-        );
-    }
-
-    #[test]
-    fn test_compare_objects_internal() {
-        let mut source = HashMap::new();
-        source.insert(
-            "file1.txt".to_string(),
-            FileInfo {
-                size: Some(100),
-                modified: None,
-                etag: Some("abc".to_string()),
-            },
-        );
-        source.insert(
-            "file2.txt".to_string(),
-            FileInfo {
-                size: Some(200),
-                modified: None,
-                etag: Some("def".to_string()),
-            },
-        );
-
-        let mut target = HashMap::new();
-        target.insert(
-            "file1.txt".to_string(),
-            FileInfo {
-                size: Some(100),
-                modified: None,
-                etag: Some("abc".to_string()),
-            },
-        );
-        target.insert(
-            "file3.txt".to_string(),
-            FileInfo {
-                size: Some(300),
-                modified: None,
-                etag: Some("ghi".to_string()),
-            },
-        );
-
-        let entries = compare_objects_internal(&source, &target);
-        assert_eq!(entries.len(), 3);
-
-        // file1.txt should be Same
-        let f1 = entries.iter().find(|e| e.key == "file1.txt").unwrap();
-        assert_eq!(f1.status, DiffStatus::Same);
-
-        // file2.txt should be OnlyFirst
-        let f2 = entries.iter().find(|e| e.key == "file2.txt").unwrap();
-        assert_eq!(f2.status, DiffStatus::OnlyFirst);
-
-        // file3.txt should be OnlySecond
-        let f3 = entries.iter().find(|e| e.key == "file3.txt").unwrap();
-        assert_eq!(f3.status, DiffStatus::OnlySecond);
-    }
-
-    #[test]
-    fn test_compare_empty_source() {
-        let source: HashMap<String, FileInfo> = HashMap::new();
-        let mut target = HashMap::new();
-        target.insert(
-            "file.txt".to_string(),
-            FileInfo {
-                size: Some(100),
-                modified: None,
-                etag: Some("abc".to_string()),
-            },
-        );
-
-        let entries = compare_objects_internal(&source, &target);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].status, DiffStatus::OnlySecond);
-    }
-
-    #[test]
-    fn test_compare_empty_target() {
-        let mut source = HashMap::new();
-        source.insert(
-            "file.txt".to_string(),
-            FileInfo {
-                size: Some(100),
-                modified: None,
-                etag: Some("abc".to_string()),
-            },
-        );
-        let target: HashMap<String, FileInfo> = HashMap::new();
-
-        let entries = compare_objects_internal(&source, &target);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].status, DiffStatus::OnlyFirst);
-    }
-
-    #[test]
-    fn test_compare_both_empty() {
-        let source: HashMap<String, FileInfo> = HashMap::new();
-        let target: HashMap<String, FileInfo> = HashMap::new();
-
-        let entries = compare_objects_internal(&source, &target);
-        assert!(entries.is_empty());
-    }
-
-    #[test]
-    fn test_compare_different_sizes() {
-        let mut source = HashMap::new();
-        source.insert(
-            "file.txt".to_string(),
-            FileInfo {
-                size: Some(100),
-                modified: None,
-                etag: Some("abc".to_string()),
-            },
-        );
-
-        let mut target = HashMap::new();
-        target.insert(
-            "file.txt".to_string(),
-            FileInfo {
-                size: Some(200), // Different size
-                modified: None,
-                etag: Some("def".to_string()),
-            },
-        );
-
-        let entries = compare_objects_internal(&source, &target);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].status, DiffStatus::Different);
-    }
-
-    #[test]
-    fn test_compare_missing_etag_is_different() {
-        let source = HashMap::from([(
-            "file.txt".to_string(),
-            FileInfo {
-                size: Some(100),
-                modified: None,
-                etag: None,
-            },
-        )]);
-        let target = HashMap::from([(
-            "file.txt".to_string(),
-            FileInfo {
-                size: Some(100),
-                modified: None,
-                etag: Some("target-etag".to_string()),
-            },
-        )]);
-
-        let entries = compare_objects_internal(&source, &target);
-
-        assert_eq!(entries[0].status, DiffStatus::Different);
-    }
-
-    #[test]
-    fn mirror_rejects_overlapping_prefixes_across_aliases_for_same_endpoint() {
-        let source = RemotePath::new("source", "bucket", "data/source");
-        let nested = RemotePath::new("target", "bucket", "data/source/archive");
-        let adjacent = RemotePath::new("target", "bucket", "data/source-archive");
-
-        assert!(mirror_locations_overlap(
-            &source,
-            &nested,
-            "https://s3.example.com/",
-            "https://S3.EXAMPLE.COM:443"
-        ));
-        assert!(!mirror_locations_overlap(
-            &source,
-            &adjacent,
-            "https://s3.example.com",
-            "https://s3.example.com"
-        ));
-    }
-
-    #[test]
-    fn test_mirror_args_defaults() {
-        let args = MirrorArgs {
-            source: "src".to_string(),
-            target: "dst".to_string(),
-            remove: false,
-            overwrite: false,
-            dry_run: false,
-            parallel: 4,
-            quiet: false,
-        };
-        assert_eq!(args.parallel, 4);
-        assert!(!args.remove);
-        assert!(!args.overwrite);
-    }
-
-    #[test]
-    fn test_mirror_output_serialization() {
-        let output = MirrorOutput {
-            source: "src/".to_string(),
-            target: "dst/".to_string(),
-            copied: 10,
-            removed: 2,
-            skipped: 5,
-            errors: 0,
-            dry_run: false,
-        };
-        let json = serde_json::to_string(&output).unwrap();
-        assert!(json.contains("\"copied\":10"));
-        assert!(json.contains("\"removed\":2"));
-        assert!(json.contains("\"dry_run\":false"));
-    }
+fn exit_code_for_error(error: &Error) -> ExitCode {
+    ExitCode::from_i32(error.exit_code()).unwrap_or(ExitCode::GeneralError)
 }
+
+#[cfg(test)]
+mod roadmap_tests;

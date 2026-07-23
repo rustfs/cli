@@ -1,0 +1,24 @@
+{
+  "schema_version": 3,
+  "type": "bucket_operations",
+  "status": "error",
+  "error": {
+    "type": "conflict",
+    "message": "Object Lock is not enabled; it cannot be enabled retroactively",
+    "retryable": false
+  },
+  "data": {
+    "operation": "create",
+    "bucket": "archive",
+    "outcome": "partial",
+    "created": true,
+    "requested": {
+      "versioning_enabled": true,
+      "object_lock_enabled": true
+    },
+    "effective_versioning": true,
+    "effective_object_lock": false,
+    "completed_stages": ["bucket_created", "versioning_verified"],
+    "failed_stage": "verify_object_lock"
+  }
+}

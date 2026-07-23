@@ -7,6 +7,7 @@ use rc_core::{AliasManager, ObjectStore as _};
 use rc_s3::S3Client;
 use serde::Serialize;
 
+use super::rm::{self, RmArgs};
 use crate::exit_code::ExitCode;
 use crate::output::{Formatter, OutputConfig};
 
@@ -17,7 +18,7 @@ pub struct RbArgs {
     pub target: String,
 
     /// Force remove even if bucket is not empty (deletes all objects first)
-    #[arg(long, hide = true)]
+    #[arg(long)]
     pub force: bool,
 
     /// Remove bucket even if it has incomplete multipart uploads
@@ -37,8 +38,11 @@ struct RbOutput {
 pub async fn execute(args: RbArgs, output_config: OutputConfig) -> ExitCode {
     let formatter = Formatter::new(output_config);
 
-    if let Err(message) = validate_force_options(args.force, args.dangerous) {
-        return formatter.fail(ExitCode::UnsupportedFeature, message);
+    if args.dangerous {
+        return formatter.fail(
+            ExitCode::UnsupportedFeature,
+            "--dangerous is not implemented for bucket removal",
+        );
     }
 
     // Parse the target path
@@ -89,6 +93,26 @@ pub async fn execute(args: RbArgs, output_config: OutputConfig) -> ExitCode {
         }
     }
 
+    if args.force {
+        let rm_args = RmArgs {
+            paths: vec![format!("{alias_name}/{bucket}")],
+            recursive: true,
+            force: true,
+            dry_run: false,
+            incomplete: false,
+            versions: true,
+            version_id: None,
+            bypass: false,
+            purge: true,
+        };
+
+        if let Err(error) =
+            rm::delete_recursive(&client, &alias_name, &bucket, "", &rm_args, &formatter).await
+        {
+            return error.code;
+        }
+    }
+
     // Delete the bucket
     match client.delete_bucket(&bucket).await {
         Ok(()) => {
@@ -126,14 +150,6 @@ pub async fn execute(args: RbArgs, output_config: OutputConfig) -> ExitCode {
                 ExitCode::NetworkError
             }
         }
-    }
-}
-
-fn validate_force_options(force: bool, dangerous: bool) -> Result<(), &'static str> {
-    if force || dangerous {
-        Err("--force and --dangerous are unavailable until safe bucket-wide cleanup is supported")
-    } else {
-        Ok(())
     }
 }
 
@@ -189,11 +205,5 @@ mod tests {
     #[test]
     fn test_parse_rb_path_empty() {
         assert!(parse_rb_path("").is_err());
-    }
-
-    #[test]
-    fn force_cleanup_is_rejected_until_safe_discovery_is_available() {
-        assert!(validate_force_options(true, false).is_err());
-        assert!(validate_force_options(true, true).is_err());
     }
 }

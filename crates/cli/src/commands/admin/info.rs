@@ -6,10 +6,13 @@ use clap::Subcommand;
 use serde::Serialize;
 use std::collections::BTreeSet;
 
-use super::get_admin_client;
+use super::{emit_observability_error, get_admin_client};
 use crate::exit_code::ExitCode;
 use crate::output::Formatter;
-use rc_core::admin::{AdminApi, ClusterInfo, DiskInfo, ServerInfo};
+use rc_core::admin::{
+    AdminApi, ClusterInfo, DiskInfo, ObservabilityApi, ServerInfo, StorageBackend, StorageDisk,
+    StorageInfo,
+};
 
 /// Info subcommands
 #[derive(Subcommand, Debug)]
@@ -25,6 +28,10 @@ pub enum InfoCommands {
     /// Display disk information
     #[command(name = "disk")]
     Disk(DiskArgs),
+
+    /// Display storage topology and capacity information
+    #[command(name = "storage")]
+    Storage(StorageArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -51,6 +58,63 @@ pub struct DiskArgs {
     /// Show only healing disks
     #[arg(long)]
     pub healing: bool,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct StorageArgs {
+    /// Alias name of the server
+    pub alias: String,
+}
+
+#[derive(Debug, Serialize)]
+struct StorageSuccessOutput<'a> {
+    schema_version: u8,
+    #[serde(rename = "type")]
+    output_type: &'static str,
+    status: &'static str,
+    data: StorageOutput<'a>,
+}
+
+#[derive(Debug, Serialize)]
+struct StorageOutput<'a> {
+    summary: StorageSummary,
+    backend: StorageBackendOutput<'a>,
+    disks: Vec<StorageDiskOutput<'a>>,
+}
+
+#[derive(Debug, Serialize)]
+struct StorageSummary {
+    backend: String,
+    total_disks: usize,
+    online_disks: usize,
+    offline_disks: usize,
+    total_capacity_bytes: u64,
+    used_capacity_bytes: u64,
+    available_capacity_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct StorageBackendOutput<'a> {
+    kind: rc_core::admin::StorageBackendKind,
+    online_disks: &'a std::collections::BTreeMap<String, usize>,
+    offline_disks: &'a std::collections::BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct StorageDiskOutput<'a> {
+    endpoint: &'a str,
+    path: &'a str,
+    state: &'a str,
+    runtime_state: Option<&'a str>,
+    total_space: u64,
+    used_space: u64,
+    available_space: u64,
+    healing: bool,
+    scanning: bool,
+    pool_index: i32,
+    set_index: i32,
+    disk_index: i32,
+    offline_duration_seconds: Option<u64>,
 }
 
 /// JSON output for cluster info
@@ -154,6 +218,116 @@ pub async fn execute(cmd: InfoCommands, formatter: &Formatter) -> ExitCode {
         InfoCommands::Cluster(args) => execute_cluster(args, formatter).await,
         InfoCommands::Server(args) => execute_server(args, formatter).await,
         InfoCommands::Disk(args) => execute_disk(args, formatter).await,
+        InfoCommands::Storage(args) => execute_storage(args, formatter).await,
+    }
+}
+
+async fn execute_storage(args: StorageArgs, formatter: &Formatter) -> ExitCode {
+    let client = match get_admin_client(&args.alias, formatter) {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
+
+    match client.storage_info().await {
+        Ok(info) => {
+            if formatter.is_json() {
+                formatter.json(&storage_success_output(&info));
+            } else {
+                print_storage_info(&info, formatter);
+            }
+            ExitCode::Success
+        }
+        Err(error) => emit_observability_error(
+            "storage_info",
+            "admin.storage-info",
+            "Failed to get storage information",
+            &error,
+            formatter,
+        ),
+    }
+}
+
+fn storage_success_output(info: &StorageInfo) -> StorageSuccessOutput<'_> {
+    let online_disks = info.online_disks();
+    let total_capacity = info.total_capacity();
+    let used_capacity = info.used_capacity();
+    StorageSuccessOutput {
+        schema_version: 3,
+        output_type: "storage_info",
+        status: "success",
+        data: StorageOutput {
+            summary: StorageSummary {
+                backend: info.backend.kind.to_string(),
+                total_disks: info.disks.len(),
+                online_disks,
+                offline_disks: info.disks.len().saturating_sub(online_disks),
+                total_capacity_bytes: total_capacity,
+                used_capacity_bytes: used_capacity,
+                available_capacity_bytes: total_capacity.saturating_sub(used_capacity),
+            },
+            backend: storage_backend_output(&info.backend),
+            disks: info.disks.iter().map(storage_disk_output).collect(),
+        },
+    }
+}
+
+fn storage_backend_output(backend: &StorageBackend) -> StorageBackendOutput<'_> {
+    StorageBackendOutput {
+        kind: backend.kind,
+        online_disks: &backend.online_disks,
+        offline_disks: &backend.offline_disks,
+    }
+}
+
+fn storage_disk_output(disk: &StorageDisk) -> StorageDiskOutput<'_> {
+    StorageDiskOutput {
+        endpoint: &disk.endpoint,
+        path: &disk.drive_path,
+        state: &disk.state,
+        runtime_state: disk.runtime_state.as_deref(),
+        total_space: disk.total_space,
+        used_space: disk.used_space,
+        available_space: disk.available_space,
+        healing: disk.healing,
+        scanning: disk.scanning,
+        pool_index: disk.pool_index,
+        set_index: disk.set_index,
+        disk_index: disk.disk_index,
+        offline_duration_seconds: disk.offline_duration_seconds,
+    }
+}
+
+fn print_storage_info(info: &StorageInfo, formatter: &Formatter) {
+    let online = info.online_disks();
+    let offline = info.disks.len().saturating_sub(online);
+    formatter.println(&formatter.style_name("Storage Information"));
+    formatter.println("");
+    formatter.println(&format!("Backend:        {}", info.backend.kind));
+    formatter.println(&format!(
+        "Disks:          {} ({} online, {} offline)",
+        info.disks.len(),
+        online,
+        offline
+    ));
+    formatter.println(&format!(
+        "Capacity:       {} used / {} total",
+        format_bytes(info.used_capacity()),
+        format_bytes(info.total_capacity())
+    ));
+    if !info.disks.is_empty() {
+        formatter.println("");
+        formatter.println("STATE      ENDPOINT                 PATH                 USED / TOTAL");
+        for disk in &info.disks {
+            let state = disk.runtime_state.as_deref().unwrap_or(&disk.state);
+            formatter.println(&format!(
+                "{:<10} {:<24} {:<20} {} / {}",
+                formatter.sanitize_text(state),
+                formatter.sanitize_text(&disk.endpoint),
+                formatter.sanitize_text(&disk.drive_path),
+                format_bytes(disk.used_space),
+                format_bytes(disk.total_space)
+            ));
+        }
     }
 }
 
