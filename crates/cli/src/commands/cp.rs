@@ -8,19 +8,21 @@ use rc_core::alias::RetryConfig;
 use rc_core::{
     AliasManager, CopyObjectOptions, Error, MultipartCopyCancellation, MultipartCopyOptions,
     ObjectAttributes, ObjectEncryptionRequest, ObjectInfo, ObjectStore as _, ObjectWriteEncryption,
-    ObjectWriteOptions, ParsedPath, RemotePath, TransferCancellation, TransferCandidate,
-    TransferControls, TransferCopyOptions, TransferExecutor, TransferOutcomeState, TransferPlan,
-    TransferReadOptions, TransferSelection, parse_path,
+    ObjectWriteOptions, ParsedPath, RemotePath, SseCustomerKey, TransferCancellation,
+    TransferCandidate, TransferControls, TransferCopyOptions, TransferExecutor,
+    TransferOutcomeState, TransferPlan, TransferReadOptions, TransferSelection, parse_path,
 };
 use rc_s3::S3Client;
 use serde::Serialize;
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::exit_code::ExitCode;
 use crate::output::{Formatter, OutputConfig, ProgressBar, V3SuccessEnvelope};
+use crate::secret_input::{SecretLocator, resolve_secret_locator};
 
 const CP_AFTER_HELP: &str = "\
 Examples:
@@ -38,7 +40,7 @@ const DEFAULT_RETRY_MAX_BACKOFF_MS: u64 = 10_000;
 const MAX_SINGLE_COPY_SIZE: u64 = rc_core::S3_SINGLE_COPY_MAX_SIZE;
 
 /// Copy objects
-#[derive(Args, Clone, Debug)]
+#[derive(Args, Clone)]
 #[command(after_help = CP_AFTER_HELP)]
 pub struct CpArgs {
     /// Source paths (local paths or alias/bucket/key)
@@ -94,6 +96,28 @@ pub struct CpArgs {
     #[arg(long = "enc-kms")]
     pub enc_kms: Vec<String>,
 
+    /// Read a 32-byte SSE-C source key from a protected file
+    #[arg(long = "enc-c-source-key-file")]
+    pub enc_c_source_key_file: Option<PathBuf>,
+
+    /// Read a 32-byte SSE-C source key from the named environment variable
+    #[arg(long = "enc-c-source-key-env")]
+    pub enc_c_source_key_env: Option<String>,
+
+    /// Read a 32-byte SSE-C destination key from a protected file
+    #[arg(long = "enc-c-destination-key-file")]
+    pub enc_c_destination_key_file: Option<PathBuf>,
+
+    /// Read a 32-byte SSE-C destination key from the named environment variable
+    #[arg(long = "enc-c-destination-key-env")]
+    pub enc_c_destination_key_env: Option<String>,
+
+    #[arg(skip)]
+    pub(crate) source_customer_key: Option<SseCustomerKey>,
+
+    #[arg(skip)]
+    pub(crate) destination_customer_key: Option<SseCustomerKey>,
+
     /// Include source-relative paths matching this glob (repeatable)
     #[arg(long)]
     pub include: Vec<String>,
@@ -143,6 +167,12 @@ pub struct CpArgs {
     pub summary: bool,
 }
 
+impl fmt::Debug for CpArgs {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CpArgs { .. }")
+    }
+}
+
 impl CpArgs {
     pub(crate) fn single(source: impl Into<String>, target: impl Into<String>) -> Self {
         Self {
@@ -158,6 +188,12 @@ impl CpArgs {
             content_type: None,
             enc_s3: Vec::new(),
             enc_kms: Vec::new(),
+            enc_c_source_key_file: None,
+            enc_c_source_key_env: None,
+            enc_c_destination_key_file: None,
+            enc_c_destination_key_env: None,
+            source_customer_key: None,
+            destination_customer_key: None,
             include: Vec::new(),
             exclude: Vec::new(),
             newer_than: None,
@@ -201,7 +237,7 @@ struct VersionCopyData {
 }
 
 /// Execute the cp command
-pub async fn execute(args: CpArgs, output_config: OutputConfig) -> ExitCode {
+pub async fn execute(mut args: CpArgs, output_config: OutputConfig) -> ExitCode {
     let formatter = Formatter::new(output_config);
 
     if args.preserve {
@@ -257,6 +293,40 @@ pub async fn execute(args: CpArgs, output_config: OutputConfig) -> ExitCode {
             );
         }
     };
+    let source_key_locator = match resolve_secret_locator(
+        args.enc_c_source_key_file.clone(),
+        args.enc_c_source_key_env.clone(),
+    ) {
+        Ok(locator) => locator,
+        Err(error) => {
+            return formatter.fail(exit_code_for_core_error(&error), &error.to_string());
+        }
+    };
+    let destination_key_locator = match resolve_secret_locator(
+        args.enc_c_destination_key_file.clone(),
+        args.enc_c_destination_key_env.clone(),
+    ) {
+        Ok(locator) => locator,
+        Err(error) => {
+            return formatter.fail(exit_code_for_core_error(&error), &error.to_string());
+        }
+    };
+    if source_key_locator.is_some()
+        && sources
+            .iter()
+            .any(|path| matches!(path, ParsedPath::Local(_)))
+    {
+        return formatter.fail(
+            ExitCode::UsageError,
+            "SSE-C source keys require every source to be remote",
+        );
+    }
+    if destination_key_locator.is_some() && matches!(target, ParsedPath::Local(_)) {
+        return formatter.fail(
+            ExitCode::UsageError,
+            "SSE-C destination keys require a remote destination",
+        );
+    }
     if args.storage_class.is_some() && matches!(target, ParsedPath::Local(_)) {
         return formatter.fail(
             ExitCode::UsageError,
@@ -277,6 +347,38 @@ pub async fn execute(args: CpArgs, output_config: OutputConfig) -> ExitCode {
         Ok(encryption) => encryption,
         Err(error) => return formatter.fail(ExitCode::UsageError, &error),
     };
+    if destination_key_locator.is_some() && target_encryption.is_some() {
+        return formatter.fail(
+            ExitCode::UsageError,
+            "SSE-C destination keys cannot be combined with --enc-s3 or --enc-kms",
+        );
+    }
+    if !args.dry_run
+        && (source_key_locator.is_some() || destination_key_locator.is_some())
+        && sources
+            .iter()
+            .all(|path| matches!(path, ParsedPath::Remote(_)))
+        && matches!(target, ParsedPath::Remote(_))
+    {
+        return formatter.fail(
+            ExitCode::UnsupportedFeature,
+            "RustFS beta.10 server-side SSE-C copy is not compatibility-proven; tracked by rustfs/backlog#1467",
+        );
+    }
+    if !args.dry_run {
+        args.source_customer_key = match load_customer_key(source_key_locator.as_ref()) {
+            Ok(key) => key,
+            Err(error) => {
+                return formatter.fail(exit_code_for_core_error(&error), &error.to_string());
+            }
+        };
+        args.destination_customer_key = match load_customer_key(destination_key_locator.as_ref()) {
+            Ok(key) => key,
+            Err(error) => {
+                return formatter.fail(exit_code_for_core_error(&error), &error.to_string());
+            }
+        };
+    }
 
     let single_local_to_local = matches!(
         (sources.as_slice(), &target),
@@ -367,6 +469,7 @@ pub(super) fn validate_destination_storage_class(value: Option<&str>) -> rc_core
 fn object_write_options(
     content_type: Option<&str>,
     encryption: Option<&ObjectEncryptionRequest>,
+    customer_key: Option<&SseCustomerKey>,
     storage_class: Option<String>,
 ) -> ObjectWriteOptions {
     ObjectWriteOptions {
@@ -375,9 +478,16 @@ fn object_write_options(
             ..ObjectAttributes::default()
         }),
         storage_class,
-        encryption: encryption.cloned().map(ObjectWriteEncryption::Managed),
+        encryption: customer_key
+            .cloned()
+            .map(|key| ObjectWriteEncryption::SseCustomer { key })
+            .or_else(|| encryption.cloned().map(ObjectWriteEncryption::Managed)),
         ..ObjectWriteOptions::default()
     }
+}
+
+fn load_customer_key(locator: Option<&SecretLocator>) -> rc_core::Result<Option<SseCustomerKey>> {
+    locator.map(SecretLocator::load_customer_key).transpose()
 }
 
 async fn execute_single_copy(
@@ -497,6 +607,7 @@ async fn execute_transfer_plan(
         target_is_container,
         args.recursive,
         encryption,
+        args.source_customer_key.as_ref(),
         alias_manager,
     )
     .await
@@ -540,7 +651,13 @@ async fn execute_transfer_plan(
         }
     };
     let skipped_existing = if args.skip_existing || !args.overwrite {
-        match skip_existing_remote_targets(&mut plan, &clients).await {
+        match skip_existing_remote_targets(
+            &mut plan,
+            &clients,
+            args.destination_customer_key.as_ref(),
+        )
+        .await
+        {
             Ok(skipped) => skipped,
             Err(error) => {
                 return formatter.fail(
@@ -761,6 +878,7 @@ async fn execute_planned_operation(
                 args.storage_class.as_deref(),
                 multipart_cancellation,
                 &|bytes| copy_progress.set(&progress_key, bytes),
+                args,
             )
             .await?;
             copy_progress.set(&progress_key, result.bytes_copied);
@@ -801,14 +919,24 @@ async fn perform_planned_upload(
             ));
         }
         let data = tokio::fs::read(source).await?;
-        let options =
-            object_write_options(content_type, encryption, Some(storage_class.to_string()));
+        let options = object_write_options(
+            content_type,
+            encryption,
+            args.destination_customer_key.as_ref(),
+            Some(storage_class.to_string()),
+        );
         client
             .put_object_with_options(target, data, &options)
             .await?
     } else {
+        let options = object_write_options(
+            content_type,
+            encryption,
+            args.destination_customer_key.as_ref(),
+            None,
+        );
         client
-            .put_object_from_path(target, source, content_type, encryption, |_| {})
+            .put_object_from_path_with_options(target, source, &options, |_| {})
             .await?
     };
     Ok(info
@@ -833,7 +961,15 @@ async fn perform_planned_download(
         tokio::fs::create_dir_all(parent).await?;
     }
     client
-        .download_object_to_path(source, target, |_, _| {})
+        .download_object_to_path_with_transfer_options(
+            source,
+            target,
+            &TransferReadOptions {
+                customer_key: args.source_customer_key.clone(),
+                ..TransferReadOptions::default()
+            },
+            |_, _| {},
+        )
         .await
 }
 
@@ -855,10 +991,17 @@ async fn perform_planned_remote_copy(
     storage_class: Option<&str>,
     cancellation: &MultipartCopyCancellation,
     on_progress: &(dyn Fn(u64) + Send + Sync),
+    args: &CpArgs,
 ) -> rc_core::Result<PlannedRemoteCopyResult> {
     if source.alias != target.alias {
         return Err(Error::UnsupportedFeature(
             "Cross-alias S3-to-S3 copy is not supported".to_string(),
+        ));
+    }
+    if args.source_customer_key.is_some() || args.destination_customer_key.is_some() {
+        return Err(Error::UnsupportedFeature(
+            "RustFS beta.10 server-side SSE-C copy is not compatibility-proven; tracked by rustfs/backlog#1467"
+                .to_string(),
         ));
     }
     let planned_size = source_info
@@ -915,6 +1058,7 @@ async fn perform_planned_remote_copy(
                     destination: object_write_options(
                         None,
                         encryption,
+                        args.destination_customer_key.as_ref(),
                         Some(storage_class.to_string()),
                     ),
                     ..TransferCopyOptions::default()
@@ -1230,6 +1374,7 @@ async fn build_transfer_candidates(
     target_is_container: bool,
     recursive: bool,
     encryption: Option<ObjectEncryptionRequest>,
+    source_customer_key: Option<&SseCustomerKey>,
     alias_manager: &AliasManager,
 ) -> rc_core::Result<Vec<TransferCandidate<CpOperation>>> {
     let mut candidates = Vec::new();
@@ -1255,6 +1400,7 @@ async fn build_transfer_candidates(
                     recursive,
                     multiple_sources,
                     encryption.clone(),
+                    source_customer_key,
                     alias_manager,
                     &mut planning_clients,
                     &mut candidates,
@@ -1291,6 +1437,7 @@ fn validate_plan_targets(plan: &TransferPlan<CpOperation>) -> rc_core::Result<()
 async fn skip_existing_remote_targets(
     plan: &mut TransferPlan<CpOperation>,
     clients: &HashMap<String, Arc<S3Client>>,
+    destination_customer_key: Option<&SseCustomerKey>,
 ) -> rc_core::Result<Vec<TransferCandidate<CpOperation>>> {
     let mut retained = Vec::with_capacity(plan.items.len());
     let mut skipped = Vec::new();
@@ -1305,7 +1452,16 @@ async fn skip_existing_remote_targets(
             continue;
         };
         let client = planned_client(clients, &destination.alias)?;
-        match client.head_object(destination).await {
+        match client
+            .head_object_with_transfer_options(
+                destination,
+                &TransferReadOptions {
+                    customer_key: destination_customer_key.cloned(),
+                    ..TransferReadOptions::default()
+                },
+            )
+            .await
+        {
             Ok(_) => skipped.push(candidate),
             Err(Error::NotFound(_)) | Err(Error::VersionNotFound { .. }) => {
                 retained.push(candidate);
@@ -1463,6 +1619,7 @@ async fn build_remote_candidates(
     recursive: bool,
     multiple_sources: bool,
     encryption: Option<ObjectEncryptionRequest>,
+    source_customer_key: Option<&SseCustomerKey>,
     alias_manager: &AliasManager,
     planning_clients: &mut HashMap<String, Arc<S3Client>>,
     candidates: &mut Vec<TransferCandidate<CpOperation>>,
@@ -1585,7 +1742,15 @@ async fn build_remote_candidates(
         return Ok(());
     }
 
-    let object = client.head_object(source).await?;
+    let object = client
+        .head_object_with_transfer_options(
+            source,
+            &TransferReadOptions {
+                customer_key: source_customer_key.cloned(),
+                ..TransferReadOptions::default()
+            },
+        )
+        .await?;
     let name = source
         .key
         .rsplit('/')
@@ -1933,8 +2098,12 @@ async fn upload_file(
     let upload_result = if let Some(storage_class) = args.storage_class.as_deref() {
         match tokio::fs::read(src).await {
             Ok(data) => {
-                let options =
-                    object_write_options(content_type, encryption, Some(storage_class.to_string()));
+                let options = object_write_options(
+                    content_type,
+                    encryption,
+                    args.destination_customer_key.as_ref(),
+                    Some(storage_class.to_string()),
+                );
                 client
                     .put_object_with_options(&target, data, &options)
                     .await
@@ -1942,8 +2111,14 @@ async fn upload_file(
             Err(error) => Err(Error::Io(error)),
         }
     } else {
+        let options = object_write_options(
+            content_type,
+            encryption,
+            args.destination_customer_key.as_ref(),
+            None,
+        );
         client
-            .put_object_from_path(&target, src, content_type, encryption, |bytes_sent| {
+            .put_object_from_path_with_options(&target, src, &options, |bytes_sent| {
                 if let Some(ref pb) = progress {
                     pb.set_position(bytes_sent);
                 }
@@ -2166,9 +2341,22 @@ pub(super) async fn download_file(
 
     // Download object
     let result = client
-        .download_object_to_path(src, &dst_path, |bytes_downloaded, total_size| {
-            update_download_progress(&mut progress, &output_config, bytes_downloaded, total_size);
-        })
+        .download_object_to_path_with_transfer_options(
+            src,
+            &dst_path,
+            &TransferReadOptions {
+                customer_key: args.source_customer_key.clone(),
+                ..TransferReadOptions::default()
+            },
+            |bytes_downloaded, total_size| {
+                update_download_progress(
+                    &mut progress,
+                    &output_config,
+                    bytes_downloaded,
+                    total_size,
+                );
+            },
+        )
         .await;
 
     if let Some(ref pb) = progress {
@@ -2396,6 +2584,13 @@ async fn copy_s3_to_s3_prepared(
     formatter: &Formatter,
     encryption: Option<&ObjectEncryptionRequest>,
 ) -> ExitCode {
+    if args.source_customer_key.is_some() || args.destination_customer_key.is_some() {
+        return formatter.fail(
+            ExitCode::UnsupportedFeature,
+            "RustFS beta.10 server-side SSE-C copy is not compatibility-proven; tracked by rustfs/backlog#1467",
+        );
+    }
+
     // For S3-to-S3, we need to handle same or different aliases
     let alias_manager = match AliasManager::new() {
         Ok(am) => am,
@@ -2501,6 +2696,7 @@ async fn copy_s3_to_s3_prepared(
         args.storage_class.as_deref(),
         &cancellation,
         &ignore_progress,
+        args,
     );
     tokio::pin!(copy);
     let result = tokio::select! {
@@ -3184,6 +3380,7 @@ mod tests {
             &ParsedPath::Remote(RemotePath::new("target", "bucket", "prefix/")),
             true,
             false,
+            None,
             None,
             &alias_manager,
         )

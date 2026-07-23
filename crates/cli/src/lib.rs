@@ -5,3 +5,4 @@
 pub mod commands;
 pub mod exit_code;
 pub mod output;
+pub(crate) mod secret_input;

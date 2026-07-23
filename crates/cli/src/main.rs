@@ -9,6 +9,7 @@ use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 mod commands;
 mod exit_code;
 mod output;
+mod secret_input;
 
 use commands::Cli;
 use exit_code::ExitCode;

@@ -10,6 +10,10 @@ ACCESS_KEY="${TEST_S3_ACCESS_KEY:?TEST_S3_ACCESS_KEY is required}"
 SECRET_KEY="${TEST_S3_SECRET_KEY:?TEST_S3_SECRET_KEY is required}"
 REGION="${TEST_S3_REGION:-us-east-1}"
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CURL_TLS_ARGS=()
+if [[ -n "${TEST_S3_CA_BUNDLE:-}" ]]; then
+  CURL_TLS_ARGS+=(--cacert "$TEST_S3_CA_BUNDLE")
+fi
 PROBES="$(mktemp)"
 RESPONSE="$(mktemp)"
 trap 'rm -f "$PROBES" "$RESPONSE"' EXIT
@@ -20,6 +24,7 @@ record() {
 
 signed_curl() {
   curl --silent --show-error --globoff \
+    "${CURL_TLS_ARGS[@]}" \
     --aws-sigv4 "aws:amz:${REGION}:s3" \
     --user "${ACCESS_KEY}:${SECRET_KEY}" \
     "$@"

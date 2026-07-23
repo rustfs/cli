@@ -15,7 +15,7 @@ use rc_s3::S3Client;
 #[derive(Subcommand, Debug)]
 pub enum AliasCommands {
     /// Add or update an alias
-    Set(SetArgs),
+    Set(Box<SetArgs>),
 
     /// List all configured aliases
     List(ListArgs),
@@ -66,6 +66,10 @@ pub struct SetArgs {
     /// Allow insecure TLS connections
     #[arg(long, default_value = "false")]
     pub insecure: bool,
+
+    /// Path to a PEM CA bundle used to verify the endpoint certificate
+    #[arg(long)]
+    pub ca_bundle: Option<String>,
 }
 
 /// Arguments for the `alias list` command
@@ -138,7 +142,7 @@ pub async fn execute(cmd: AliasCommands, output_config: OutputConfig) -> ExitCod
     };
 
     match cmd {
-        AliasCommands::Set(args) => execute_set(args, &alias_manager, &formatter).await,
+        AliasCommands::Set(args) => execute_set(*args, &alias_manager, &formatter).await,
         AliasCommands::List(args) => execute_list(args, &alias_manager, &formatter).await,
         AliasCommands::Remove(args) => execute_remove(args, &alias_manager, &formatter).await,
     }
@@ -221,6 +225,7 @@ async fn execute_set(args: SetArgs, manager: &AliasManager, formatter: &Formatte
     alias.signature = args.signature;
     alias.bucket_lookup = args.bucket_lookup;
     alias.insecure = args.insecure;
+    alias.ca_bundle = args.ca_bundle;
 
     if let Err(e) = validate_alias_credentials(&alias).await {
         let code = exit_code_from_error(&e);
@@ -405,6 +410,7 @@ mod tests {
             signature: "v4".to_string(),
             bucket_lookup: "auto".to_string(),
             insecure: false,
+            ca_bundle: None,
         };
 
         assert_eq!(args.region, "us-east-1");
@@ -500,6 +506,7 @@ mod tests {
             signature: "v4".to_string(),
             bucket_lookup: "auto".to_string(),
             insecure: false,
+            ca_bundle: None,
         }
     }
 

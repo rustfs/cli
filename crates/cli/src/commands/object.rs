@@ -35,7 +35,7 @@ pub enum ObjectCommands {
     List(ls::LsArgs),
 
     /// Copy objects between local and remote locations
-    Copy(cp::CpArgs),
+    Copy(Box<cp::CpArgs>),
 
     /// Move objects between local and remote locations
     Move(mv::MvArgs),
@@ -73,7 +73,7 @@ pub enum ObjectCommands {
 pub async fn execute(args: ObjectArgs, output_config: OutputConfig) -> ExitCode {
     match args.command {
         ObjectCommands::List(args) => ls::execute(args, output_config).await,
-        ObjectCommands::Copy(args) => cp::execute(args, output_config).await,
+        ObjectCommands::Copy(args) => cp::execute(*args, output_config).await,
         ObjectCommands::Move(args) => mv::execute(args, output_config).await,
         ObjectCommands::Remove(args) => rm::execute(args, output_config).await,
         ObjectCommands::Stat(args) => stat::execute(args, output_config).await,

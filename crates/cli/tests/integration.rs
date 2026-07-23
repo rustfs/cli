@@ -69,6 +69,24 @@ fn run_rc(args: &[&str], config_dir: &std::path::Path) -> Output {
     cmd.output().expect("Failed to execute rc command")
 }
 
+fn run_rc_with_environment(
+    args: &[&str],
+    config_dir: &std::path::Path,
+    environment: &[(&str, &str)],
+) -> Output {
+    let mut cmd = Command::new(rc_binary());
+    cmd.args(args);
+
+    for (key, value) in setup_test_env(config_dir) {
+        cmd.env(key, value);
+    }
+    for (key, value) in environment {
+        cmd.env(key, value);
+    }
+
+    cmd.output().expect("Failed to execute rc command")
+}
+
 /// Run rc command with piped stdin in the test environment
 fn run_rc_with_stdin(args: &[&str], config_dir: &std::path::Path, stdin: &str) -> Output {
     let mut cmd = Command::new(rc_binary());
@@ -114,6 +132,28 @@ fn get_test_config() -> Option<(String, String, String)> {
     Some((endpoint, access_key, secret_key))
 }
 
+fn alias_set_args(config: &(String, String, String)) -> Vec<String> {
+    let mut args = vec![
+        "alias".to_string(),
+        "set".to_string(),
+        "test".to_string(),
+        config.0.clone(),
+        config.1.clone(),
+        config.2.clone(),
+        "--bucket-lookup".to_string(),
+        "path".to_string(),
+    ];
+    if let Ok(ca_bundle) = std::env::var("TEST_S3_CA_BUNDLE") {
+        args.push("--ca-bundle".to_string());
+        args.push(ca_bundle);
+    }
+    args
+}
+
+fn apply_test_tls(alias: &mut rc_core::Alias) {
+    alias.ca_bundle = std::env::var("TEST_S3_CA_BUNDLE").ok();
+}
+
 /// Test helper: setup alias and return config directory
 fn setup_with_alias(bucket: &str) -> Option<(TempDir, String)> {
     let config = get_test_config()?;
@@ -121,19 +161,9 @@ fn setup_with_alias(bucket: &str) -> Option<(TempDir, String)> {
     let bucket_name = format!("test-{}-{}", bucket, uuid_suffix());
 
     // Set up alias
-    let output = run_rc(
-        &[
-            "alias",
-            "set",
-            "test",
-            &config.0,
-            &config.1,
-            &config.2,
-            "--bucket-lookup",
-            "path",
-        ],
-        config_dir.path(),
-    );
+    let args = alias_set_args(&config);
+    let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let output = run_rc(&args, config_dir.path());
 
     if !output.status.success() {
         eprintln!(
@@ -167,19 +197,9 @@ fn setup_alias_only() -> Option<TempDir> {
     let config = get_test_config()?;
     let config_dir = tempfile::tempdir().ok()?;
 
-    let output = run_rc(
-        &[
-            "alias",
-            "set",
-            "test",
-            &config.0,
-            &config.1,
-            &config.2,
-            "--bucket-lookup",
-            "path",
-        ],
-        config_dir.path(),
-    );
+    let args = alias_set_args(&config);
+    let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let output = run_rc(&args, config_dir.path());
 
     if !output.status.success() {
         eprintln!(
@@ -231,6 +251,7 @@ mod checksum_operations {
             get_test_config().expect("S3 integration test setup failed");
         let mut alias = Alias::new("test", endpoint, access_key, secret_key);
         alias.bucket_lookup = "path".to_string();
+        apply_test_tls(&mut alias);
         alias
     }
 
@@ -293,6 +314,216 @@ mod checksum_operations {
         ));
 
         cleanup_bucket(config_dir.path(), &bucket_name);
+    }
+}
+
+mod sse_customer_operations {
+    use super::*;
+    use rc_core::{Alias, ObjectStore, RemotePath, SseCustomerKey, TransferReadOptions};
+    use rc_s3::S3Client;
+
+    fn test_alias() -> Alias {
+        let (endpoint, access_key, secret_key) =
+            get_test_config().expect("S3 integration test setup failed");
+        let mut alias = Alias::new("test", endpoint, access_key, secret_key);
+        alias.bucket_lookup = "path".to_string();
+        apply_test_tls(&mut alias);
+        alias
+    }
+
+    #[tokio::test]
+    async fn test_beta10_sse_customer_put_head_get_wrong_key_and_multipart() {
+        let (config_dir, bucket_name) =
+            setup_with_alias("sse-c").expect("S3 integration test setup failed");
+        let client = S3Client::new(test_alias())
+            .await
+            .expect("create SSE-C test client");
+        let key = SseCustomerKey::new(b"0123456789abcdef0123456789abcdef".to_vec())
+            .expect("valid customer key");
+        let wrong_key = SseCustomerKey::new(b"abcdef0123456789abcdef0123456789".to_vec())
+            .expect("valid wrong customer key");
+        let read = TransferReadOptions {
+            customer_key: Some(key.clone()),
+            ..TransferReadOptions::default()
+        };
+
+        let raw_key = "0123456789abcdef0123456789abcdef";
+        let encoded_key = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=";
+        let key_md5 = "hRasmdxgYDKV3nvbahU1MA==";
+        let key_file = tempfile::NamedTempFile::new().expect("create SSE-C key file");
+        std::fs::write(key_file.path(), raw_key).expect("write SSE-C key file");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            std::fs::set_permissions(key_file.path(), std::fs::Permissions::from_mode(0o600))
+                .expect("protect SSE-C key file");
+        }
+
+        let source = tempfile::NamedTempFile::new().expect("create SSE-C source");
+        let payload = b"rustfs-sse-c".to_vec();
+        std::fs::write(source.path(), &payload).expect("write SSE-C source");
+        let put_target = format!("test/{bucket_name}/sse-c-put.bin");
+        let upload = run_rc(
+            &[
+                "cp",
+                source.path().to_str().expect("source path is UTF-8"),
+                &put_target,
+                "--enc-c-destination-key-file",
+                key_file.path().to_str().expect("key path is UTF-8"),
+                "--debug",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            upload.status.success(),
+            "SSE-C CLI upload failed: {}",
+            String::from_utf8_lossy(&upload.stderr)
+        );
+        assert_secret_absent(&upload, raw_key, encoded_key, key_md5);
+
+        let put_path = RemotePath::new("test", &bucket_name, "sse-c-put.bin");
+        client
+            .head_object_with_transfer_options(&put_path, &read)
+            .await
+            .expect("beta.10 HeadObject SSE-C should succeed");
+        let downloaded = client
+            .get_object_with_transfer_options(&put_path, &read)
+            .await
+            .expect("beta.10 GetObject SSE-C should succeed");
+        assert_eq!(downloaded, payload);
+
+        let download_path = config_dir.path().join("sse-c-downloaded.bin");
+        let download = run_rc_with_environment(
+            &[
+                "cp",
+                &put_target,
+                download_path.to_str().expect("download path is UTF-8"),
+                "--enc-c-source-key-env",
+                "RC_TEST_SSE_C_KEY",
+                "--json",
+            ],
+            config_dir.path(),
+            &[("RC_TEST_SSE_C_KEY", raw_key)],
+        );
+        assert!(
+            download.status.success(),
+            "SSE-C CLI download failed: {}",
+            String::from_utf8_lossy(&download.stderr)
+        );
+        assert_secret_absent(&download, raw_key, encoded_key, key_md5);
+        assert_eq!(
+            std::fs::read(download_path).expect("read SSE-C CLI download"),
+            payload
+        );
+
+        let wrong_read = TransferReadOptions {
+            customer_key: Some(wrong_key),
+            ..TransferReadOptions::default()
+        };
+        let error = client
+            .get_object_with_transfer_options(&put_path, &wrong_read)
+            .await
+            .expect_err("beta.10 must reject the wrong SSE-C key");
+        let message = error.to_string();
+        assert!(!message.contains("abcdef0123456789abcdef0123456789"));
+        assert!(!message.contains("YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODk="));
+        assert!(!message.contains("Gr+pE+MuAh0hg7O1uwuKoQ=="));
+
+        let wrong_download_path = config_dir.path().join("wrong-key-download.bin");
+        let wrong_download = run_rc_with_environment(
+            &[
+                "cp",
+                &put_target,
+                wrong_download_path
+                    .to_str()
+                    .expect("wrong download path is UTF-8"),
+                "--enc-c-source-key-env",
+                "RC_TEST_WRONG_SSE_C_KEY",
+                "--debug",
+            ],
+            config_dir.path(),
+            &[(
+                "RC_TEST_WRONG_SSE_C_KEY",
+                "abcdef0123456789abcdef0123456789",
+            )],
+        );
+        assert!(!wrong_download.status.success());
+        assert_secret_absent(
+            &wrong_download,
+            "abcdef0123456789abcdef0123456789",
+            "YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODk=",
+            "Gr+pE+MuAh0hg7O1uwuKoQ==",
+        );
+
+        let multipart_path = RemotePath::new("test", &bucket_name, "sse-c-multipart.bin");
+        let multipart_source =
+            tempfile::NamedTempFile::new().expect("create multipart SSE-C source");
+        multipart_source
+            .as_file()
+            .set_len(rc_s3::multipart::DEFAULT_PART_SIZE + 1)
+            .expect("size multipart SSE-C source");
+        let multipart_target = format!("test/{bucket_name}/sse-c-multipart.bin");
+        let multipart_upload = run_rc(
+            &[
+                "cp",
+                multipart_source
+                    .path()
+                    .to_str()
+                    .expect("multipart path is UTF-8"),
+                &multipart_target,
+                "--enc-c-destination-key-file",
+                key_file.path().to_str().expect("key path is UTF-8"),
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            multipart_upload.status.success(),
+            "SSE-C multipart CLI upload failed: {}",
+            String::from_utf8_lossy(&multipart_upload.stderr)
+        );
+        assert_secret_absent(&multipart_upload, raw_key, encoded_key, key_md5);
+        let multipart_info = client
+            .head_object_with_transfer_options(&multipart_path, &read)
+            .await
+            .expect("beta.10 multipart SSE-C object should be readable");
+        assert_eq!(
+            multipart_info.size_bytes,
+            Some((rc_s3::multipart::DEFAULT_PART_SIZE + 1) as i64)
+        );
+
+        let reencrypt = run_rc_with_environment(
+            &[
+                "cp",
+                &put_target,
+                &format!("test/{bucket_name}/sse-c-reencrypted.bin"),
+                "--enc-c-source-key-env",
+                "RC_TEST_SSE_C_KEY",
+                "--enc-c-destination-key-env",
+                "RC_TEST_SSE_C_KEY",
+                "--json",
+            ],
+            config_dir.path(),
+            &[("RC_TEST_SSE_C_KEY", raw_key)],
+        );
+        assert_eq!(reencrypt.status.code(), Some(7));
+        assert_secret_absent(&reencrypt, raw_key, encoded_key, key_md5);
+
+        cleanup_bucket(config_dir.path(), &bucket_name);
+    }
+
+    fn assert_secret_absent(output: &Output, raw: &str, encoded: &str, md5: &str) {
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for secret in [raw, encoded, md5] {
+            assert!(
+                !combined.contains(secret),
+                "SSE-C key material was disclosed"
+            );
+        }
     }
 }
 
@@ -1438,6 +1669,7 @@ mod multipart_operations {
             let destination = RemotePath::new("test", &bucket, "destination.bin");
             let mut alias = Alias::new("test", endpoint, access_key, secret_key);
             alias.bucket_lookup = "path".to_string();
+            apply_test_tls(&mut alias);
             let client = S3Client::new(alias).await.expect("create direct S3 client");
             client
                 .create_bucket(&bucket)

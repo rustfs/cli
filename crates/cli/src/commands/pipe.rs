@@ -9,15 +9,18 @@ use rc_core::{
 };
 use rc_s3::S3Client;
 use serde::Serialize;
+use std::fmt;
 use std::io::Read;
+use std::path::PathBuf;
 
 use crate::exit_code::ExitCode;
 use crate::output::{Formatter, OutputConfig};
+use crate::secret_input::resolve_secret_locator;
 
 use super::cp::{exit_code_for_core_error, validate_destination_storage_class};
 
 /// Stream stdin to an object
-#[derive(Args, Debug)]
+#[derive(Args)]
 pub struct PipeArgs {
     /// Destination path (alias/bucket/key)
     pub target: String,
@@ -37,6 +40,20 @@ pub struct PipeArgs {
     /// Apply SSE-KMS to the upload target
     #[arg(long = "enc-kms")]
     pub enc_kms: Option<String>,
+
+    /// Read a 32-byte SSE-C destination key from a protected file
+    #[arg(long = "enc-c-key-file")]
+    pub enc_c_key_file: Option<PathBuf>,
+
+    /// Read a 32-byte SSE-C destination key from the named environment variable
+    #[arg(long = "enc-c-key-env")]
+    pub enc_c_key_env: Option<String>,
+}
+
+impl fmt::Debug for PipeArgs {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PipeArgs { .. }")
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -55,18 +72,46 @@ pub async fn execute(args: PipeArgs, output_config: OutputConfig) -> ExitCode {
     if let Err(error) = validate_destination_storage_class(args.storage_class.as_deref()) {
         return formatter.fail(exit_code_for_core_error(&error), &error.to_string());
     }
-    let encryption = match (args.enc_s3, args.enc_kms.as_deref()) {
-        (true, None) => Some(ObjectEncryptionRequest::SseS3),
-        (false, Some(key_id)) => Some(ObjectEncryptionRequest::SseKms {
-            key_id: key_id.to_string(),
-        }),
-        (false, None) => None,
-        (true, Some(_)) => {
-            return formatter.fail(
-                ExitCode::UsageError,
-                "--enc-s3 and --enc-kms cannot be used together",
-            );
+    let customer_key_locator =
+        match resolve_secret_locator(args.enc_c_key_file.clone(), args.enc_c_key_env.clone()) {
+            Ok(locator) => locator,
+            Err(error) => {
+                return formatter.fail(exit_code_for_core_error(&error), &error.to_string());
+            }
+        };
+    if customer_key_locator.is_some() && (args.enc_s3 || args.enc_kms.is_some()) {
+        return formatter.fail(
+            ExitCode::UsageError,
+            "--enc-s3, --enc-kms, and SSE-C destination key options cannot be combined",
+        );
+    }
+    if args.enc_s3 && args.enc_kms.is_some() {
+        return formatter.fail(
+            ExitCode::UsageError,
+            "--enc-s3, --enc-kms, and SSE-C destination key options cannot be combined",
+        );
+    }
+    let customer_key = match customer_key_locator
+        .map(|locator| locator.load_customer_key())
+        .transpose()
+    {
+        Ok(key) => key,
+        Err(error) => {
+            return formatter.fail(exit_code_for_core_error(&error), &error.to_string());
         }
+    };
+    let encryption = match (args.enc_s3, args.enc_kms.as_deref(), customer_key) {
+        (true, None, None) => Some(ObjectWriteEncryption::Managed(
+            ObjectEncryptionRequest::SseS3,
+        )),
+        (false, Some(key_id), None) => Some(ObjectWriteEncryption::Managed(
+            ObjectEncryptionRequest::SseKms {
+                key_id: key_id.to_string(),
+            },
+        )),
+        (false, None, Some(key)) => Some(ObjectWriteEncryption::SseCustomer { key }),
+        (false, None, None) => None,
+        _ => unreachable!("encryption combinations are validated before loading the key"),
     };
 
     // Parse the target path
@@ -127,7 +172,7 @@ pub async fn execute(args: PipeArgs, output_config: OutputConfig) -> ExitCode {
             ..ObjectAttributes::default()
         }),
         storage_class: args.storage_class.clone(),
-        encryption: encryption.map(ObjectWriteEncryption::Managed),
+        encryption,
         ..ObjectWriteOptions::default()
     };
     match client
@@ -226,6 +271,8 @@ mod tests {
             storage_class: None,
             enc_s3: true,
             enc_kms: Some("kms-key".to_string()),
+            enc_c_key_file: None,
+            enc_c_key_env: None,
         };
 
         let code = execute(args, OutputConfig::default()).await;
@@ -244,6 +291,8 @@ mod tests {
                 storage_class: Some(storage_class.to_string()),
                 enc_s3: false,
                 enc_kms: None,
+                enc_c_key_file: None,
+                enc_c_key_env: None,
             };
 
             assert_eq!(execute(args, OutputConfig::default()).await, expected);

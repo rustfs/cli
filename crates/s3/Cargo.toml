@@ -49,6 +49,7 @@ http.workspace = true
 http-body.workspace = true
 http-body-util.workspace = true
 sha2.workspace = true
+md-5.workspace = true
 hex.workspace = true
 urlencoding.workspace = true
 tempfile.workspace = true

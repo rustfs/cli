@@ -28,6 +28,7 @@ use futures::TryStreamExt as _;
 use http_body::Frame;
 use http_body_util::StreamBody;
 use jiff::Timestamp;
+use md5::Md5;
 use quick_xml::de::from_str as from_xml_str;
 pub use rc_core::DeleteRequestOptions;
 use rc_core::admin::KmsDiagnosticStore;
@@ -44,7 +45,8 @@ use rc_core::{
     RemotePath, ReplicationConfiguration, ReplicationResyncStartOptions,
     ReplicationResyncStartResult, ReplicationResyncState, ReplicationResyncStatus,
     ReplicationResyncTargetStatus, RequestHeader, Result, RetentionDuration, RetentionDurationUnit,
-    RetentionMode, SelectOptions, TransferCopyOptions, TransferReadOptions, global_request_headers,
+    RetentionMode, SelectOptions, SseCustomerKey, TransferCopyOptions, TransferReadOptions,
+    global_request_headers,
 };
 use reqwest::Method;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
@@ -625,6 +627,118 @@ fn apply_object_encryption_to_multipart_create_request(
     }
 }
 
+struct SseCustomerHeaders {
+    raw: Zeroizing<String>,
+    key: Zeroizing<String>,
+    key_md5: Zeroizing<String>,
+}
+
+impl SseCustomerHeaders {
+    fn new(key: &SseCustomerKey) -> Self {
+        let raw = Zeroizing::new(String::from_utf8_lossy(key.expose_secret()).into_owned());
+        let encoded = Zeroizing::new(BASE64_STANDARD.encode(key.expose_secret()));
+        let key_md5 = Zeroizing::new(BASE64_STANDARD.encode(Md5::digest(key.expose_secret())));
+        Self {
+            raw,
+            key: encoded,
+            key_md5,
+        }
+    }
+
+    fn redaction_values(&self) -> [&str; 3] {
+        [self.raw.as_str(), self.key.as_str(), self.key_md5.as_str()]
+    }
+}
+
+fn apply_object_write_encryption_to_put_request(
+    request: aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder,
+    encryption: Option<&ObjectWriteEncryption>,
+) -> aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder {
+    match encryption {
+        Some(ObjectWriteEncryption::Managed(encryption)) => {
+            apply_object_encryption_to_put_request(request, Some(encryption))
+        }
+        Some(ObjectWriteEncryption::SseCustomer { key }) => {
+            let headers = SseCustomerHeaders::new(key);
+            request
+                .sse_customer_algorithm("AES256")
+                .sse_customer_key(headers.key.to_string())
+                .sse_customer_key_md5(headers.key_md5.to_string())
+        }
+        None => request,
+    }
+}
+
+fn apply_object_write_encryption_to_multipart_create_request(
+    request: aws_sdk_s3::operation::create_multipart_upload::builders::CreateMultipartUploadFluentBuilder,
+    encryption: Option<&ObjectWriteEncryption>,
+) -> aws_sdk_s3::operation::create_multipart_upload::builders::CreateMultipartUploadFluentBuilder {
+    match encryption {
+        Some(ObjectWriteEncryption::Managed(encryption)) => {
+            apply_object_encryption_to_multipart_create_request(request, Some(encryption))
+        }
+        Some(ObjectWriteEncryption::SseCustomer { key }) => {
+            let headers = SseCustomerHeaders::new(key);
+            request
+                .sse_customer_algorithm("AES256")
+                .sse_customer_key(headers.key.to_string())
+                .sse_customer_key_md5(headers.key_md5.to_string())
+        }
+        None => request,
+    }
+}
+
+fn apply_sse_customer_to_upload_part_request(
+    request: aws_sdk_s3::operation::upload_part::builders::UploadPartFluentBuilder,
+    key: Option<&SseCustomerKey>,
+) -> aws_sdk_s3::operation::upload_part::builders::UploadPartFluentBuilder {
+    let Some(key) = key else {
+        return request;
+    };
+    let headers = SseCustomerHeaders::new(key);
+    request
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(headers.key.to_string())
+        .sse_customer_key_md5(headers.key_md5.to_string())
+}
+
+fn apply_sse_customer_to_head_request(
+    request: aws_sdk_s3::operation::head_object::builders::HeadObjectFluentBuilder,
+    key: Option<&SseCustomerKey>,
+) -> aws_sdk_s3::operation::head_object::builders::HeadObjectFluentBuilder {
+    let Some(key) = key else {
+        return request;
+    };
+    let headers = SseCustomerHeaders::new(key);
+    request
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(headers.key.to_string())
+        .sse_customer_key_md5(headers.key_md5.to_string())
+}
+
+fn apply_sse_customer_to_get_request(
+    request: aws_sdk_s3::operation::get_object::builders::GetObjectFluentBuilder,
+    key: Option<&SseCustomerKey>,
+) -> aws_sdk_s3::operation::get_object::builders::GetObjectFluentBuilder {
+    let Some(key) = key else {
+        return request;
+    };
+    let headers = SseCustomerHeaders::new(key);
+    request
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(headers.key.to_string())
+        .sse_customer_key_md5(headers.key_md5.to_string())
+}
+
+fn destination_sse_customer_key(
+    encryption: Option<&ObjectWriteEncryption>,
+) -> Option<&SseCustomerKey> {
+    match encryption {
+        Some(ObjectWriteEncryption::SseCustomer { key }) => Some(key),
+        _ => None,
+    }
+}
+
 fn apply_object_attributes_to_put_request(
     request: aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder,
     attributes: Option<&ObjectAttributes>,
@@ -777,7 +891,6 @@ fn validate_attribute_tag_write_options(options: &ObjectWriteOptions) -> Result<
             "Object-lock writes are tracked by rustfs/backlog#1460".to_string(),
         ));
     }
-    managed_object_encryption(options)?;
     Ok(())
 }
 
@@ -790,10 +903,20 @@ fn validate_beta10_copy_options(options: &TransferCopyOptions) -> Result<()> {
     }
     if options.source.customer_key.is_some() {
         return Err(Error::UnsupportedFeature(
-            "SSE-C copies are tracked by rustfs/backlog#1459".to_string(),
+            "RustFS beta.10 server-side copies from SSE-C sources are not compatibility-proven; tracked by rustfs/backlog#1467"
+                .to_string(),
         ));
     }
     validate_attribute_tag_write_options(&options.destination)?;
+    if matches!(
+        options.destination.encryption,
+        Some(ObjectWriteEncryption::SseCustomer { .. })
+    ) {
+        return Err(Error::UnsupportedFeature(
+            "RustFS beta.10 server-side copies to SSE-C destinations are not compatibility-proven; tracked by rustfs/backlog#1467"
+                .to_string(),
+        ));
+    }
     if options.destination.checksum.is_some() {
         return Err(Error::UnsupportedFeature(
             "RustFS beta.10 does not preserve CopyObject checksum selection; tracked by rustfs/backlog#1466"
@@ -1437,6 +1560,32 @@ impl S3Client {
         })
     }
 
+    fn ensure_sse_customer_transport(&self, key: Option<&SseCustomerKey>) -> Result<()> {
+        if key.is_none() {
+            return Ok(());
+        }
+        if self.alias.insecure
+            || !self
+                .alias
+                .endpoint
+                .to_ascii_lowercase()
+                .starts_with("https://")
+        {
+            return Err(Error::UnsupportedFeature(
+                "SSE-C requires an HTTPS endpoint with certificate verification enabled"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn ensure_write_sse_customer_transport(
+        &self,
+        encryption: Option<&ObjectWriteEncryption>,
+    ) -> Result<()> {
+        self.ensure_sse_customer_transport(destination_sse_customer_key(encryption))
+    }
+
     /// Get the underlying aws-sdk-s3 client
     pub fn inner(&self) -> &aws_sdk_s3::Client {
         &self.inner
@@ -1634,23 +1783,43 @@ impl S3Client {
         &self,
         path: &RemotePath,
         destination: &std::path::Path,
+        on_progress: impl FnMut(u64, Option<u64>) + Send,
+    ) -> Result<u64> {
+        self.download_object_to_path_with_transfer_options(
+            path,
+            destination,
+            &TransferReadOptions::default(),
+            on_progress,
+        )
+        .await
+    }
+
+    /// Download an object to a local path with version and SSE-C source options.
+    pub async fn download_object_to_path_with_transfer_options(
+        &self,
+        path: &RemotePath,
+        destination: &std::path::Path,
+        options: &TransferReadOptions,
         mut on_progress: impl FnMut(u64, Option<u64>) + Send,
     ) -> Result<u64> {
-        let response = self
-            .inner
-            .get_object()
-            .bucket(&path.bucket)
-            .key(&path.key)
-            .send()
-            .await
-            .map_err(|error| {
-                let message = error.to_string();
-                if message.contains("NotFound") || message.contains("NoSuchKey") {
-                    Error::NotFound(path.to_string())
-                } else {
-                    Error::Network(message)
-                }
-            })?;
+        options.validate()?;
+        self.ensure_sse_customer_transport(options.customer_key.as_ref())?;
+        let mut request = apply_sse_customer_to_get_request(
+            self.inner.get_object().bucket(&path.bucket).key(&path.key),
+            options.customer_key.as_ref(),
+        );
+        if let Some(version_id) = &options.version_id {
+            request = request.version_id(version_id);
+        }
+        if options.checksum_mode {
+            request = request.checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled);
+        }
+        let response = request.send().await.map_err(|error| {
+            self.redact_sse_customer_error(
+                Self::map_object_request_error(&error, path, options.version_id.as_deref()),
+                options.customer_key.as_ref(),
+            )
+        })?;
         let content_length = response
             .content_length()
             .and_then(|length| u64::try_from(length).ok());
@@ -1683,7 +1852,10 @@ impl S3Client {
         while let Some(chunk) = match body.try_next().await {
             Ok(chunk) => chunk,
             Err(error) => {
-                return Err(Error::Network(error.to_string()));
+                return Err(self.redact_sse_customer_error(
+                    Error::Network(error.to_string()),
+                    options.customer_key.as_ref(),
+                ));
             }
         } {
             if let Err(error) = file.write_all(&chunk).await {
@@ -2256,6 +2428,53 @@ impl S3Client {
                 Error::RequestRejected(self.redact_sensitive_text(message))
             }
             Error::Interrupted(message) => Error::Interrupted(self.redact_sensitive_text(message)),
+            other => other,
+        }
+    }
+
+    fn redact_sse_customer_error(
+        &self,
+        error: Error,
+        customer_key: Option<&SseCustomerKey>,
+    ) -> Error {
+        let error = self.redact_sensitive_error(error);
+        let Some(customer_key) = customer_key else {
+            return error;
+        };
+        let headers = SseCustomerHeaders::new(customer_key);
+        let redact = |mut message: String| {
+            for value in headers.redaction_values() {
+                if !value.is_empty() {
+                    message = message.replace(value, "[REDACTED]");
+                }
+            }
+            message
+        };
+        match error {
+            Error::Config(message) => Error::Config(redact(message)),
+            Error::InvalidPath(message) => Error::InvalidPath(redact(message)),
+            Error::AliasNotFound(message) => Error::AliasNotFound(redact(message)),
+            Error::AliasExists(message) => Error::AliasExists(redact(message)),
+            Error::Auth(message) => Error::Auth(redact(message)),
+            Error::VersionNotFound { path, version_id } => Error::VersionNotFound {
+                path: redact(path),
+                version_id: redact(version_id),
+            },
+            Error::DeleteMarker { path, version_id } => Error::DeleteMarker {
+                path: redact(path),
+                version_id: redact(version_id),
+            },
+            Error::GovernanceDenied { path, version_id } => Error::GovernanceDenied {
+                path: redact(path),
+                version_id: version_id.map(redact),
+            },
+            Error::Network(message) => Error::Network(redact(message)),
+            Error::Conflict(message) => Error::Conflict(redact(message)),
+            Error::UnsupportedFeature(message) => Error::UnsupportedFeature(redact(message)),
+            Error::General(message) => Error::General(redact(message)),
+            Error::NotFound(message) => Error::NotFound(redact(message)),
+            Error::RequestRejected(message) => Error::RequestRejected(redact(message)),
+            Error::Interrupted(message) => Error::Interrupted(redact(message)),
             other => other,
         }
     }
@@ -2952,6 +3171,7 @@ impl S3Client {
         path: &RemotePath,
         version_id: Option<String>,
         expected: &str,
+        customer_key: Option<&SseCustomerKey>,
     ) -> Result<()> {
         let persisted = self
             .head_object_transfer_metadata(
@@ -2959,7 +3179,7 @@ impl S3Client {
                 &TransferReadOptions {
                     version_id,
                     checksum_mode: true,
-                    ..TransferReadOptions::default()
+                    customer_key: customer_key.cloned(),
                 },
             )
             .await?
@@ -2992,17 +3212,16 @@ impl S3Client {
             .map_err(|e| Error::General(format!("read file '{}': {e}", file_path.display())))?;
         let requested_checksum = requested_sha256_checksum(&data, options.write.checksum.as_ref())?;
         let body = aws_sdk_s3::primitives::ByteStream::from(data);
-        let encryption = managed_object_encryption(options.write)?;
         let storage_class = rustfs_storage_class(options.write.storage_class.as_deref())?;
 
         let mut request = apply_object_attributes_to_put_request(
-            apply_object_encryption_to_put_request(
+            apply_object_write_encryption_to_put_request(
                 self.inner
                     .put_object()
                     .bucket(&path.bucket)
                     .key(&path.key)
                     .body(body),
-                encryption,
+                options.write.encryption.as_ref(),
             ),
             options.write.attributes.as_ref(),
         )?
@@ -3023,14 +3242,18 @@ impl S3Client {
         };
 
         let response = request.send().await.map_err(|error| {
-            if !matches!(options.precondition, ObjectWritePrecondition::None)
+            let mapped = if !matches!(options.precondition, ObjectWritePrecondition::None)
                 && let aws_sdk_s3::error::SdkError::ServiceError(service_error) = &error
                 && matches!(service_error.raw().status().as_u16(), 409 | 412)
             {
                 Error::Conflict(format!("Object changed before upload: {path}"))
             } else {
                 Self::map_object_request_error(&error, path, None)
-            }
+            };
+            self.redact_sse_customer_error(
+                mapped,
+                destination_sse_customer_key(options.write.encryption.as_ref()),
+            )
         })?;
 
         let mut info = ObjectInfo::file(&path.key, file_size as i64);
@@ -3042,8 +3265,13 @@ impl S3Client {
         info.storage_class = options.write.storage_class.clone();
 
         if let Some(checksum) = requested_checksum {
-            self.verify_persisted_sha256(path, info.version_id.clone(), &checksum)
-                .await?;
+            self.verify_persisted_sha256(
+                path,
+                info.version_id.clone(),
+                &checksum,
+                destination_sse_customer_key(options.write.encryption.as_ref()),
+            )
+            .await?;
         }
         Ok(info)
     }
@@ -3114,16 +3342,14 @@ impl S3Client {
                 "Precomputed SHA-256 checksums are not supported for multipart uploads".to_string(),
             ));
         }
-        let encryption = managed_object_encryption(options.write)?;
-
         tracing::debug!(file_size, part_size, "Starting multipart upload");
 
-        let mut create_request = apply_object_encryption_to_multipart_create_request(
+        let mut create_request = apply_object_write_encryption_to_multipart_create_request(
             self.inner
                 .create_multipart_upload()
                 .bucket(&path.bucket)
                 .key(&path.key),
-            encryption,
+            options.write.encryption.as_ref(),
         );
         if let Some(attributes) = &options.write.attributes {
             create_request =
@@ -3137,10 +3363,12 @@ impl S3Client {
                 create_request.checksum_algorithm(aws_sdk_s3::types::ChecksumAlgorithm::Sha256);
         }
 
-        let create_response = create_request
-            .send()
-            .await
-            .map_err(|error| Self::map_object_request_error(&error, path, None))?;
+        let create_response = create_request.send().await.map_err(|error| {
+            self.redact_sse_customer_error(
+                Self::map_object_request_error(&error, path, None),
+                destination_sse_customer_key(options.write.encryption.as_ref()),
+            )
+        })?;
 
         let upload_id = create_response
             .upload_id()
@@ -3178,14 +3406,16 @@ impl S3Client {
                 BASE64_STANDARD.encode(digest)
             });
             let body = aws_sdk_s3::primitives::ByteStream::from(chunk[..bytes_read].to_vec());
-            let mut upload_part_request = self
-                .inner
-                .upload_part()
-                .bucket(&path.bucket)
-                .key(&path.key)
-                .upload_id(&upload_id)
-                .part_number(part_number)
-                .body(body);
+            let mut upload_part_request = apply_sse_customer_to_upload_part_request(
+                self.inner
+                    .upload_part()
+                    .bucket(&path.bucket)
+                    .key(&path.key)
+                    .upload_id(&upload_id)
+                    .part_number(part_number)
+                    .body(body),
+                destination_sse_customer_key(options.write.encryption.as_ref()),
+            );
             if let Some(checksum) = &part_checksum {
                 upload_part_request = upload_part_request
                     .checksum_algorithm(aws_sdk_s3::types::ChecksumAlgorithm::Sha256)
@@ -3201,7 +3431,10 @@ impl S3Client {
                         part_number,
                         "Aborting multipart upload due to error"
                     );
-                    let primary = Self::map_object_request_error(&e, path, None);
+                    let primary = self.redact_sse_customer_error(
+                        Self::map_object_request_error(&e, path, None),
+                        destination_sse_customer_key(options.write.encryption.as_ref()),
+                    );
                     return Err(self
                         .abort_multipart_upload_with_error(path, &upload_id, primary)
                         .await);
@@ -3284,7 +3517,10 @@ impl S3Client {
                 {
                     Error::Conflict(format!("Object changed before upload: {path}"))
                 } else {
-                    Self::map_object_request_error(&error, path, None)
+                    self.redact_sse_customer_error(
+                        Self::map_object_request_error(&error, path, None),
+                        destination_sse_customer_key(options.write.encryption.as_ref()),
+                    )
                 };
                 return Err(self
                     .abort_multipart_upload_with_error(path, &upload_id, primary)
@@ -3303,8 +3539,13 @@ impl S3Client {
 
         if checksum_requested {
             let expected_checksum = composite_sha256_checksum(&part_digests);
-            self.verify_persisted_sha256(path, info.version_id.clone(), &expected_checksum)
-                .await?;
+            self.verify_persisted_sha256(
+                path,
+                info.version_id.clone(),
+                &expected_checksum,
+                destination_sse_customer_key(options.write.encryption.as_ref()),
+            )
+            .await?;
         }
         Ok(info)
     }
@@ -3427,6 +3668,7 @@ impl S3Client {
         on_progress: impl Fn(u64) + Send,
     ) -> Result<ObjectInfo> {
         validate_attribute_tag_write_options(write)?;
+        self.ensure_write_sse_customer_transport(write.encryption.as_ref())?;
         let metadata = tokio::fs::metadata(file_path).await.map_err(|e| {
             Error::General(format!("read metadata for '{}': {e}", file_path.display()))
         })?;
@@ -3923,19 +4165,17 @@ impl ObjectStore for S3Client {
         Ok(info)
     }
 
-    async fn head_object_transfer_metadata(
+    async fn head_object_with_transfer_options(
         &self,
         path: &RemotePath,
         options: &TransferReadOptions,
-    ) -> Result<ObjectTransferMetadata> {
+    ) -> Result<ObjectInfo> {
         options.validate()?;
-        if options.customer_key.is_some() {
-            return Err(Error::UnsupportedFeature(
-                "SSE-C metadata reads are tracked by rustfs/backlog#1459".to_string(),
-            ));
-        }
-
-        let mut request = self.inner.head_object().bucket(&path.bucket).key(&path.key);
+        self.ensure_sse_customer_transport(options.customer_key.as_ref())?;
+        let mut request = apply_sse_customer_to_head_request(
+            self.inner.head_object().bucket(&path.bucket).key(&path.key),
+            options.customer_key.as_ref(),
+        );
         if let Some(version_id) = &options.version_id {
             request = request.version_id(version_id);
         }
@@ -3943,7 +4183,66 @@ impl ObjectStore for S3Client {
             request = request.checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled);
         }
         let response = request.send().await.map_err(|error| {
-            Self::map_object_request_error(&error, path, options.version_id.as_deref())
+            self.redact_sse_customer_error(
+                Self::map_object_request_error(&error, path, options.version_id.as_deref()),
+                options.customer_key.as_ref(),
+            )
+        })?;
+        if response.delete_marker().unwrap_or(false) {
+            return Err(Error::DeleteMarker {
+                path: path.to_string(),
+                version_id: response
+                    .version_id()
+                    .or(options.version_id.as_deref())
+                    .unwrap_or("unknown")
+                    .to_string(),
+            });
+        }
+
+        let mut info = ObjectInfo::file(&path.key, response.content_length().unwrap_or(0));
+        info.last_modified = response
+            .last_modified()
+            .and_then(|value| jiff::Timestamp::from_second(value.secs()).ok());
+        info.etag = response
+            .e_tag()
+            .map(|value| value.trim_matches('"').to_string());
+        info.content_type = response.content_type().map(ToString::to_string);
+        info.storage_class = response
+            .storage_class()
+            .map(|value| value.as_str().to_string());
+        info.metadata = response
+            .metadata()
+            .filter(|metadata| !metadata.is_empty())
+            .cloned();
+        info.version_id = response
+            .version_id()
+            .or(options.version_id.as_deref())
+            .map(ToString::to_string);
+        Ok(info)
+    }
+
+    async fn head_object_transfer_metadata(
+        &self,
+        path: &RemotePath,
+        options: &TransferReadOptions,
+    ) -> Result<ObjectTransferMetadata> {
+        options.validate()?;
+        self.ensure_sse_customer_transport(options.customer_key.as_ref())?;
+        let mut request = apply_sse_customer_to_head_request(
+            self.inner.head_object().bucket(&path.bucket).key(&path.key),
+            options.customer_key.as_ref(),
+        );
+        if let Some(version_id) = &options.version_id {
+            request = request.version_id(version_id);
+        }
+        if options.checksum_mode {
+            request = request.checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled);
+        }
+        let response = request.send().await.map_err(|error| {
+            self.redact_sse_customer_error(
+                Self::map_object_request_error(&error, path, options.version_id.as_deref()),
+                options.customer_key.as_ref(),
+            )
         })?;
         if response.delete_marker().unwrap_or(false) {
             return Err(Error::DeleteMarker {
@@ -4140,6 +4439,52 @@ impl ObjectStore for S3Client {
             .await
     }
 
+    async fn get_object_with_transfer_options(
+        &self,
+        path: &RemotePath,
+        options: &TransferReadOptions,
+    ) -> Result<Vec<u8>> {
+        options.validate()?;
+        self.ensure_sse_customer_transport(options.customer_key.as_ref())?;
+        let mut request = apply_sse_customer_to_get_request(
+            self.inner.get_object().bucket(&path.bucket).key(&path.key),
+            options.customer_key.as_ref(),
+        );
+        if let Some(version_id) = &options.version_id {
+            request = request.version_id(version_id);
+        }
+        if options.checksum_mode {
+            request = request.checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled);
+        }
+        let response = request.send().await.map_err(|error| {
+            self.redact_sse_customer_error(
+                Self::map_object_request_error(&error, path, options.version_id.as_deref()),
+                options.customer_key.as_ref(),
+            )
+        })?;
+        if response.delete_marker().unwrap_or(false) {
+            return Err(Error::DeleteMarker {
+                path: path.to_string(),
+                version_id: response
+                    .version_id()
+                    .or(options.version_id.as_deref())
+                    .unwrap_or("unknown")
+                    .to_string(),
+            });
+        }
+        let mut data = Vec::new();
+        let mut body = response.body;
+        while let Some(chunk) = body.try_next().await.map_err(|error| {
+            self.redact_sse_customer_error(
+                Error::Network(error.to_string()),
+                options.customer_key.as_ref(),
+            )
+        })? {
+            data.extend_from_slice(&chunk);
+        }
+        Ok(data)
+    }
+
     async fn write_object_to_with_options(
         &self,
         path: &RemotePath,
@@ -4148,6 +4493,61 @@ impl ObjectStore for S3Client {
         max_bytes: Option<u64>,
     ) -> Result<u64> {
         S3Client::write_object_to_with_options(self, path, options, writer, max_bytes).await
+    }
+
+    async fn write_object_to_with_transfer_options(
+        &self,
+        path: &RemotePath,
+        options: &TransferReadOptions,
+        writer: &mut (dyn AsyncWrite + Send + Unpin),
+        max_bytes: Option<u64>,
+    ) -> Result<u64> {
+        options.validate()?;
+        self.ensure_sse_customer_transport(options.customer_key.as_ref())?;
+        if matches!(max_bytes, Some(0)) {
+            self.head_object_with_transfer_options(path, options)
+                .await?;
+            return Ok(0);
+        }
+        let mut request = apply_sse_customer_to_get_request(
+            self.inner.get_object().bucket(&path.bucket).key(&path.key),
+            options.customer_key.as_ref(),
+        );
+        if let Some(version_id) = &options.version_id {
+            request = request.version_id(version_id);
+        }
+        if options.checksum_mode {
+            request = request.checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled);
+        }
+        if let Some(max_bytes) = max_bytes {
+            request = request.range(format!("bytes=0-{}", max_bytes - 1));
+        }
+        let response = request.send().await.map_err(|error| {
+            self.redact_sse_customer_error(
+                Self::map_object_request_error(&error, path, options.version_id.as_deref()),
+                options.customer_key.as_ref(),
+            )
+        })?;
+        let mut body = response.body;
+        let mut bytes_written = 0u64;
+        while let Some(chunk) = body.try_next().await.map_err(|error| {
+            self.redact_sse_customer_error(
+                Error::Network(error.to_string()),
+                options.customer_key.as_ref(),
+            )
+        })? {
+            let remaining = max_bytes
+                .map(|limit| limit.saturating_sub(bytes_written))
+                .unwrap_or(chunk.len() as u64);
+            let write_len = chunk.len().min(remaining as usize);
+            writer.write_all(&chunk[..write_len]).await?;
+            bytes_written += write_len as u64;
+            if max_bytes.is_some_and(|limit| bytes_written >= limit) {
+                break;
+            }
+        }
+        writer.flush().await?;
+        Ok(bytes_written)
     }
 
     async fn put_object(
@@ -4195,18 +4595,18 @@ impl ObjectStore for S3Client {
         options: &ObjectWriteOptions,
     ) -> Result<ObjectInfo> {
         validate_attribute_tag_write_options(options)?;
+        self.ensure_write_sse_customer_transport(options.encryption.as_ref())?;
         let size = data.len() as i64;
         let requested_checksum = requested_sha256_checksum(&data, options.checksum.as_ref())?;
         let body = aws_sdk_s3::primitives::ByteStream::from(data);
-        let encryption = managed_object_encryption(options)?;
         let storage_class = rustfs_storage_class(options.storage_class.as_deref())?;
-        let request = apply_object_encryption_to_put_request(
+        let request = apply_object_write_encryption_to_put_request(
             self.inner
                 .put_object()
                 .bucket(&path.bucket)
                 .key(&path.key)
                 .body(body),
-            encryption,
+            options.encryption.as_ref(),
         )
         .set_storage_class(storage_class);
         let mut request =
@@ -4220,7 +4620,10 @@ impl ObjectStore for S3Client {
                 .checksum_sha256(checksum);
         }
         let response = request.send().await.map_err(|error| {
-            self.redact_sensitive_error(Self::map_object_request_error(&error, path, None))
+            self.redact_sse_customer_error(
+                Self::map_object_request_error(&error, path, None),
+                destination_sse_customer_key(options.encryption.as_ref()),
+            )
         })?;
 
         let mut info = ObjectInfo::file(&path.key, size);
@@ -4236,8 +4639,13 @@ impl ObjectStore for S3Client {
         info.version_id = response.version_id().map(ToString::to_string);
         info.last_modified = Some(jiff::Timestamp::now());
         if let Some(requested_checksum) = requested_checksum {
-            self.verify_persisted_sha256(path, info.version_id.clone(), &requested_checksum)
-                .await?;
+            self.verify_persisted_sha256(
+                path,
+                info.version_id.clone(),
+                &requested_checksum,
+                destination_sse_customer_key(options.encryption.as_ref()),
+            )
+            .await?;
         }
         Ok(info)
     }
@@ -7339,6 +7747,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multipart_path_upload_applies_sse_customer_headers_to_create_and_parts() {
+        let complete_response = http::Response::builder()
+            .status(200)
+            .header("content-type", "application/xml")
+            .body(SdkBody::from(
+                r#"<CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>bucket</Bucket><Key>key.txt</Key><ETag>"final-etag"</ETag></CompleteMultipartUploadResult>"#,
+            ))
+            .expect("build multipart complete response");
+        let (client, replay) = test_s3_client_with_response_sequence(vec![
+            multipart_create_response(),
+            multipart_part_response(),
+            complete_response,
+        ]);
+        let path = RemotePath::new("test", "bucket", "key.txt");
+        let mut source = tempfile::NamedTempFile::new().expect("create multipart source");
+        source.write_all(b"data").expect("write multipart source");
+        let write = ObjectWriteOptions {
+            encryption: Some(ObjectWriteEncryption::SseCustomer {
+                key: test_sse_customer_key(),
+            }),
+            ..ObjectWriteOptions::default()
+        };
+
+        client
+            .put_object_multipart_from_path(
+                &path,
+                source.path(),
+                4,
+                PathUploadOptions {
+                    write: &write,
+                    precondition: ObjectWritePrecondition::None,
+                },
+                |_| {},
+            )
+            .await
+            .expect("upload SSE-C multipart object");
+
+        let requests = replay.actual_requests().collect::<Vec<_>>();
+        assert_eq!(requests.len(), 3);
+        for request in &requests[..2] {
+            assert_eq!(
+                request
+                    .headers()
+                    .get("x-amz-server-side-encryption-customer-algorithm"),
+                Some("AES256")
+            );
+            assert_eq!(
+                request
+                    .headers()
+                    .get("x-amz-server-side-encryption-customer-key-md5"),
+                Some("hRasmdxgYDKV3nvbahU1MA==")
+            );
+        }
+        assert!(
+            requests[2]
+                .headers()
+                .get("x-amz-server-side-encryption-customer-key")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn multipart_path_upload_streams_and_verifies_composite_sha256() {
         let part_raw = Sha256::digest(b"data");
         let part_checksum = BASE64_STANDARD.encode(part_raw);
@@ -8724,6 +9194,133 @@ mod tests {
         invalid_requests.expect_request();
     }
 
+    fn test_sse_customer_key() -> SseCustomerKey {
+        SseCustomerKey::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("valid SSE-C key")
+    }
+
+    #[test]
+    fn sse_customer_headers_match_known_vectors() {
+        let key = test_sse_customer_key();
+        let headers = SseCustomerHeaders::new(&key);
+        assert_eq!(
+            headers.key.as_str(),
+            "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+        );
+        assert_eq!(headers.key_md5.as_str(), "hRasmdxgYDKV3nvbahU1MA==");
+    }
+
+    #[tokio::test]
+    async fn sse_customer_put_head_and_get_send_derived_headers() {
+        let put_response = http::Response::builder()
+            .status(200)
+            .body(SdkBody::empty())
+            .expect("build SSE-C put response");
+        let head_response = http::Response::builder()
+            .status(200)
+            .header("content-length", "7")
+            .body(SdkBody::empty())
+            .expect("build SSE-C head response");
+        let get_response = http::Response::builder()
+            .status(200)
+            .header("content-length", "7")
+            .body(SdkBody::from("payload"))
+            .expect("build SSE-C get response");
+        let (client, replay) =
+            test_s3_client_with_response_sequence(vec![put_response, head_response, get_response]);
+        let path = RemotePath::new("test", "bucket", "secret.bin");
+        let key = test_sse_customer_key();
+
+        client
+            .put_object_with_options(
+                &path,
+                b"payload".to_vec(),
+                &ObjectWriteOptions {
+                    encryption: Some(ObjectWriteEncryption::SseCustomer { key: key.clone() }),
+                    ..ObjectWriteOptions::default()
+                },
+            )
+            .await
+            .expect("put SSE-C object");
+        client
+            .head_object_with_transfer_options(
+                &path,
+                &TransferReadOptions {
+                    version_id: Some("v1".to_string()),
+                    customer_key: Some(key.clone()),
+                    ..TransferReadOptions::default()
+                },
+            )
+            .await
+            .expect("head SSE-C object");
+        let body = client
+            .get_object_with_transfer_options(
+                &path,
+                &TransferReadOptions {
+                    customer_key: Some(key),
+                    ..TransferReadOptions::default()
+                },
+            )
+            .await
+            .expect("get SSE-C object");
+        assert_eq!(body, b"payload");
+
+        let requests = replay.actual_requests().collect::<Vec<_>>();
+        assert_eq!(requests.len(), 3);
+        for request in &requests {
+            assert_eq!(
+                request
+                    .headers()
+                    .get("x-amz-server-side-encryption-customer-algorithm"),
+                Some("AES256")
+            );
+            assert_eq!(
+                request
+                    .headers()
+                    .get("x-amz-server-side-encryption-customer-key"),
+                Some("MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=")
+            );
+            assert_eq!(
+                request
+                    .headers()
+                    .get("x-amz-server-side-encryption-customer-key-md5"),
+                Some("hRasmdxgYDKV3nvbahU1MA==")
+            );
+        }
+        assert!(requests[1].uri().contains("versionId=v1"));
+    }
+
+    #[tokio::test]
+    async fn sse_customer_service_errors_redact_all_key_forms() {
+        let encoded = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=";
+        let response = http::Response::builder()
+            .status(400)
+            .header("x-amz-error-code", "InvalidRequest")
+            .body(SdkBody::from(format!(
+                "<Error><Code>InvalidRequest</Code><Message>0123456789abcdef0123456789abcdef {encoded} hRasmdxgYDKV3nvbahU1MA==</Message></Error>"
+            )))
+            .expect("build sensitive SSE-C error");
+        let (client, _) = test_s3_client(Some(response));
+        let path = RemotePath::new("test", "bucket", "secret.bin");
+
+        let error = client
+            .put_object_with_options(
+                &path,
+                b"payload".to_vec(),
+                &ObjectWriteOptions {
+                    encryption: Some(ObjectWriteEncryption::SseCustomer {
+                        key: test_sse_customer_key(),
+                    }),
+                    ..ObjectWriteOptions::default()
+                },
+            )
+            .await
+            .expect_err("service failure must be redacted");
+        let message = format!("{error:?} {error}");
+        assert!(!message.contains("0123456789abcdef0123456789abcdef"));
+        assert!(!message.contains(encoded));
+        assert!(!message.contains("hRasmdxgYDKV3nvbahU1MA=="));
+    }
+
     #[test]
     fn sha256_checksum_matches_known_vector() {
         assert_eq!(
@@ -9003,24 +9600,49 @@ mod tests {
         assert!(matches!(checksum_copy_error, Error::UnsupportedFeature(_)));
         checksum_copy_requests.expect_no_request();
 
-        let (read_client, read_requests) = test_s3_client(None);
-        let read_store: &dyn ObjectStore = &read_client;
-        let read_options = TransferReadOptions {
-            customer_key: Some(SseCustomerKey::new(vec![9; 32]).expect("valid customer key")),
-            ..TransferReadOptions::default()
-        };
-        let read_error = read_store
-            .get_object_with_transfer_options(&path, &read_options)
-            .await
-            .expect_err("advanced read must not silently degrade");
-        assert!(matches!(read_error, Error::UnsupportedFeature(_)));
-        let mut sink = tokio::io::sink();
-        let stream_error = read_store
-            .write_object_to_with_transfer_options(&path, &read_options, &mut sink, None)
-            .await
-            .expect_err("advanced streaming read must not silently degrade");
-        assert!(matches!(stream_error, Error::UnsupportedFeature(_)));
-        read_requests.expect_no_request();
+        for options in [
+            TransferCopyOptions {
+                source: TransferReadOptions {
+                    customer_key: Some(test_sse_customer_key()),
+                    ..TransferReadOptions::default()
+                },
+                ..TransferCopyOptions::default()
+            },
+            TransferCopyOptions {
+                destination: ObjectWriteOptions {
+                    encryption: Some(ObjectWriteEncryption::SseCustomer {
+                        key: test_sse_customer_key(),
+                    }),
+                    ..ObjectWriteOptions::default()
+                },
+                ..TransferCopyOptions::default()
+            },
+            TransferCopyOptions {
+                source: TransferReadOptions {
+                    customer_key: Some(test_sse_customer_key()),
+                    ..TransferReadOptions::default()
+                },
+                destination: ObjectWriteOptions {
+                    encryption: Some(ObjectWriteEncryption::SseCustomer {
+                        key: test_sse_customer_key(),
+                    }),
+                    ..ObjectWriteOptions::default()
+                },
+                ..TransferCopyOptions::default()
+            },
+        ] {
+            let (sse_copy_client, sse_copy_requests) = test_s3_client(None);
+            let error = sse_copy_client
+                .copy_object_with_transfer_options(
+                    &path,
+                    &RemotePath::new("test", "bucket", "sse-copy.txt"),
+                    &options,
+                )
+                .await
+                .expect_err("beta.10 SSE-C copy must fail before mutation");
+            assert!(matches!(error, Error::UnsupportedFeature(_)));
+            sse_copy_requests.expect_no_request();
+        }
 
         let (copy_client, copy_requests) = test_s3_client(None);
         let copy_store: &dyn ObjectStore = &copy_client;
@@ -9041,6 +9663,31 @@ mod tests {
             .expect_err("unsupported tag replacement must not silently degrade");
         assert!(matches!(copy_error, Error::UnsupportedFeature(_)));
         copy_requests.expect_no_request();
+    }
+
+    #[tokio::test]
+    async fn sse_customer_rejects_untrusted_transport_before_backend_requests() {
+        let path = RemotePath::new("test", "bucket", "secret.bin");
+        for (endpoint, insecure) in [("http://example.com", false), ("https://example.com", true)] {
+            let (mut client, requests) = test_s3_client_with_endpoint(endpoint, None);
+            client.alias.insecure = insecure;
+            let error = client
+                .put_object_with_options(
+                    &path,
+                    b"payload".to_vec(),
+                    &ObjectWriteOptions {
+                        encryption: Some(ObjectWriteEncryption::SseCustomer {
+                            key: test_sse_customer_key(),
+                        }),
+                        ..ObjectWriteOptions::default()
+                    },
+                )
+                .await
+                .expect_err("untrusted SSE-C transport must fail");
+
+            assert!(matches!(error, Error::UnsupportedFeature(_)));
+            requests.expect_no_request();
+        }
     }
 
     #[tokio::test]

@@ -56,7 +56,28 @@ jobs:
 
       - name: Start RustFS ${{ matrix.version }}
         run: |
+          set -euo pipefail
           docker pull "${{ matrix.image }}"
+          tls_args=()
+          if [[ "${{ matrix.version }}" == "1.0.0-beta.10" ]]; then
+            mkdir -p "$PWD/tls"
+            openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+              -keyout "$PWD/tls/rustfs_key.pem" \
+              -out "$PWD/tls/rustfs_cert.pem" \
+              -subj "/CN=localhost" \
+              -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+            sudo chown 10001:10001 "$PWD/tls/rustfs_key.pem"
+            chmod 0600 "$PWD/tls/rustfs_key.pem"
+            chmod 0644 "$PWD/tls/rustfs_cert.pem"
+            tls_args+=(
+              -v "$PWD/tls:/opt/tls:ro"
+              -e RUSTFS_TLS_PATH=/opt/tls
+            )
+            {
+              echo "TEST_S3_ENDPOINT=https://localhost:9000"
+              echo "TEST_S3_CA_BUNDLE=$PWD/tls/rustfs_cert.pem"
+            } >> "$GITHUB_ENV"
+          fi
           docker run -d --name rustfs \
             -p 9000:9000 \
             -p 9001:9001 \
@@ -69,6 +90,7 @@ jobs:
             -e RUSTFS_ADDRESS=":9000" \
             -e RUSTFS_CONSOLE_ENABLE="true" \
             -e RUSTFS_CONSOLE_ADDRESS=":9001" \
+            "${tls_args[@]}" \
             "${{ matrix.image }}"
 
       - name: Prove selected RustFS image
@@ -84,7 +106,11 @@ jobs:
       - name: Wait for RustFS
         run: |
           for i in {1..60}; do
-            if curl -sf http://localhost:9000/health > /dev/null 2>&1; then
+            curl_args=(-sf)
+            if [[ -n "${TEST_S3_CA_BUNDLE:-}" ]]; then
+              curl_args+=(--cacert "$TEST_S3_CA_BUNDLE")
+            fi
+            if curl "${curl_args[@]}" "$TEST_S3_ENDPOINT/health" > /dev/null 2>&1; then
               echo "RustFS is ready"
               exit 0
             fi
@@ -112,6 +138,7 @@ jobs:
           if [[ "${{ matrix.version }}" == "1.0.0-beta.10" ]]; then
             TESTS+=(
               "checksum_operations::test_beta10_checksum_put_multipart_and_rejection"
+              "sse_customer_operations::test_beta10_sse_customer_put_head_get_wrong_key_and_multipart"
               "multipart_operations::test_multipart_server_side_copy_direct_primitive"
               "recursive_operations::test_recursive_copy"
             )
@@ -161,16 +188,32 @@ jobs:
 
       - name: Start RustFS 1.0.0-beta.10
         run: |
+          set -euo pipefail
           docker pull rustfs/rustfs:1.0.0-beta.10
+          mkdir -p "$PWD/tls"
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+            -keyout "$PWD/tls/rustfs_key.pem" \
+            -out "$PWD/tls/rustfs_cert.pem" \
+            -subj "/CN=localhost" \
+            -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+          sudo chown 10001:10001 "$PWD/tls/rustfs_key.pem"
+          chmod 0600 "$PWD/tls/rustfs_key.pem"
+          chmod 0644 "$PWD/tls/rustfs_cert.pem"
+          {
+            echo "TEST_S3_ENDPOINT=https://localhost:9000"
+            echo "TEST_S3_CA_BUNDLE=$PWD/tls/rustfs_cert.pem"
+          } >> "$GITHUB_ENV"
           docker run -d --name rustfs \
             -p 9000:9000 \
             -p 9001:9001 \
             -v rustfs-data:/data \
+            -v "$PWD/tls:/opt/tls:ro" \
             -e RUSTFS_ROOT_USER=accesskey \
             -e RUSTFS_ROOT_PASSWORD=secretkey \
             -e RUSTFS_ACCESS_KEY=accesskey \
             -e RUSTFS_SECRET_KEY=secretkey \
             -e RUSTFS_VOLUMES=/data \
+            -e RUSTFS_TLS_PATH=/opt/tls \
             -e RUSTFS_ADDRESS=":9000" \
             -e RUSTFS_CONSOLE_ENABLE="true" \
             -e RUSTFS_CONSOLE_ADDRESS=":9001" \
@@ -186,7 +229,8 @@ jobs:
       - name: Wait for RustFS
         run: |
           for i in {1..60}; do
-            if curl -sf http://localhost:9000/health > /dev/null 2>&1; then
+            if curl -sf --cacert "$TEST_S3_CA_BUNDLE" \
+              "$TEST_S3_ENDPOINT/health" > /dev/null 2>&1; then
               echo "RustFS is ready"
               exit 0
             fi
