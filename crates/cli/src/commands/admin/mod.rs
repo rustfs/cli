@@ -5,6 +5,7 @@
 
 mod access_key;
 mod capabilities;
+mod config;
 mod decommission;
 mod diagnostics;
 mod expand;
@@ -40,6 +41,10 @@ pub enum AdminCommands {
     /// Read bounded snapshots or run explicitly confirmed RustFS diagnostic probes
     #[command(subcommand)]
     Diagnostics(diagnostics::DiagnosticsCommands),
+
+    /// Manage RustFS server configuration
+    #[command(subcommand)]
+    Config(config::ConfigCommands),
 
     /// Query bounded RustFS realtime metrics
     Metrics(metrics::MetricsArgs),
@@ -112,6 +117,7 @@ pub async fn execute(cmd: AdminCommands, output_config: OutputConfig) -> ExitCod
     match cmd {
         AdminCommands::Capabilities(args) => capabilities::execute(args, &formatter).await,
         AdminCommands::Diagnostics(command) => diagnostics::execute(command, &formatter).await,
+        AdminCommands::Config(config_cmd) => config::execute(config_cmd, &formatter).await,
         AdminCommands::Metrics(args) => metrics::execute(args, &formatter).await,
         AdminCommands::Kms(kms_cmd) => kms::execute(kms_cmd, &formatter).await,
         AdminCommands::Scanner(scanner_cmd) => scanner::execute(scanner_cmd, &formatter).await,

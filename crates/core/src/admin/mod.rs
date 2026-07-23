@@ -5,6 +5,7 @@
 
 mod capabilities;
 mod cluster;
+mod configuration;
 mod diagnostics;
 mod kms;
 mod kms_diagnostic;
@@ -27,6 +28,12 @@ pub use cluster::{
     PoolDecommissionInfo, PoolErasureSetInfo, PoolStatus, PoolTarget, RebalanceCleanupWarnings,
     RebalancePoolProgress, RebalancePoolStatus, RebalanceStartResult, RebalanceStatus, ServerInfo,
     UsageInfo,
+};
+pub use configuration::{
+    ConfigApi, ConfigChange, ConfigDiff, ConfigDocument, ConfigHelp, ConfigHelpEntry,
+    ConfigHistoryEntry, ConfigMutationResult, ModuleSwitches, config_document_fields,
+    config_import_diff, config_mutation_diff, redact_config_document, validate_config_directive,
+    validate_config_import,
 };
 pub use diagnostics::{
     ClientDevnullRequest, ClientDevnullResult, ClusterComponentSnapshot, ClusterComponentSnapshots,
