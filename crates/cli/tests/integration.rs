@@ -335,13 +335,14 @@ mod atomic_object_lock_operations {
         alias
     }
 
-    fn locked_write(legal_hold: LegalHoldStatus) -> ObjectWriteOptions {
+    fn locked_write(
+        legal_hold: LegalHoldStatus,
+        retain_until: jiff::Timestamp,
+    ) -> ObjectWriteOptions {
         ObjectWriteOptions {
             retention: Some(ObjectRetention {
                 mode: RetentionMode::Governance,
-                retain_until: jiff::Timestamp::now()
-                    .checked_add(jiff::SignedDuration::from_hours(1))
-                    .expect("one-hour retention remains representable"),
+                retain_until,
             }),
             legal_hold: Some(legal_hold),
             ..ObjectWriteOptions::default()
@@ -359,10 +360,6 @@ mod atomic_object_lock_operations {
             .put_object_legal_hold(path, LegalHoldStatus::Off, &lock_options)
             .await
             .expect("clear legal hold");
-        client
-            .put_object_retention(path, None, &lock_options)
-            .await
-            .expect("clear governance retention");
         client
             .delete_object_with_options(
                 path,
@@ -389,13 +386,16 @@ mod atomic_object_lock_operations {
             .create_bucket_with_options(&bucket_name, &create_options)
             .await
             .expect("create Object Lock enabled bucket");
+        let retain_until = jiff::Timestamp::now()
+            .checked_add(jiff::SignedDuration::from_secs(5))
+            .expect("short test retention remains representable");
 
         let put_path = RemotePath::new("test", &bucket_name, "locked-put.bin");
         let put = client
             .put_object_with_options(
                 &put_path,
                 b"atomic-object-lock".to_vec(),
-                &locked_write(LegalHoldStatus::On),
+                &locked_write(LegalHoldStatus::On, retain_until),
             )
             .await
             .expect("atomically lock PutObject");
@@ -425,7 +425,7 @@ mod atomic_object_lock_operations {
                 &put_path,
                 &copy_path,
                 &TransferCopyOptions {
-                    destination: locked_write(LegalHoldStatus::Off),
+                    destination: locked_write(LegalHoldStatus::Off, retain_until),
                     ..TransferCopyOptions::default()
                 },
             )
@@ -462,7 +462,7 @@ mod atomic_object_lock_operations {
             .put_object_from_path_with_options(
                 &multipart_path,
                 multipart_source.path(),
-                &locked_write(LegalHoldStatus::On),
+                &locked_write(LegalHoldStatus::On, retain_until),
                 |_| {},
             )
             .await
@@ -489,6 +489,7 @@ mod atomic_object_lock_operations {
             LegalHoldStatus::On
         );
 
+        tokio::time::sleep(Duration::from_secs(6)).await;
         clear_and_delete_locked_version(&client, &put_path, put_version).await;
         clear_and_delete_locked_version(&client, &copy_path, copy_version).await;
         clear_and_delete_locked_version(&client, &multipart_path, multipart_version).await;
