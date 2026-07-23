@@ -26,6 +26,9 @@ use crate::replication::{
     ReplicationResyncStatus,
 };
 use crate::select::SelectOptions;
+use crate::transfer_options::{
+    ObjectTransferMetadata, ObjectWriteOptions, TransferCopyOptions, TransferReadOptions,
+};
 
 /// Requested behavior for bucket creation.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -460,6 +463,30 @@ pub trait ObjectStore: Send + Sync {
         self.head_object(path).await
     }
 
+    /// Get metadata with checksum-mode and SSE-C support when implemented by the backend.
+    ///
+    /// The default preserves legacy version selection and rejects advanced options explicitly.
+    async fn head_object_with_transfer_options(
+        &self,
+        path: &RemotePath,
+        options: &TransferReadOptions,
+    ) -> Result<ObjectInfo> {
+        let legacy = options.legacy_read_options()?;
+        self.head_object_with_options(path, &legacy).await
+    }
+
+    /// Read complete transfer metadata without changing ObjectInfo's stable output contract.
+    async fn head_object_transfer_metadata(
+        &self,
+        _path: &RemotePath,
+        options: &TransferReadOptions,
+    ) -> Result<ObjectTransferMetadata> {
+        options.validate()?;
+        Err(Error::UnsupportedFeature(
+            "Complete transfer metadata is not implemented by this object store".to_string(),
+        ))
+    }
+
     /// Check if a bucket exists
     async fn bucket_exists(&self, bucket: &str) -> Result<bool>;
 
@@ -516,6 +543,18 @@ pub trait ObjectStore: Send + Sync {
         self.get_object(path).await
     }
 
+    /// Read an object with checksum-mode and SSE-C support when implemented by the backend.
+    ///
+    /// The default preserves legacy version selection and rejects advanced options explicitly.
+    async fn get_object_with_transfer_options(
+        &self,
+        path: &RemotePath,
+        options: &TransferReadOptions,
+    ) -> Result<Vec<u8>> {
+        let legacy = options.legacy_read_options()?;
+        self.get_object_with_options(path, &legacy).await
+    }
+
     /// Stream current object content or an exact historical version to a writer.
     async fn write_object_to_with_options(
         &self,
@@ -534,6 +573,21 @@ pub trait ObjectStore: Send + Sync {
         Ok(write_len as u64)
     }
 
+    /// Stream an object with checksum-mode and SSE-C support when implemented by the backend.
+    ///
+    /// The default preserves legacy version selection and rejects advanced options explicitly.
+    async fn write_object_to_with_transfer_options(
+        &self,
+        path: &RemotePath,
+        options: &TransferReadOptions,
+        writer: &mut (dyn AsyncWrite + Send + Unpin),
+        max_bytes: Option<u64>,
+    ) -> Result<u64> {
+        let legacy = options.legacy_read_options()?;
+        self.write_object_to_with_options(path, &legacy, writer, max_bytes)
+            .await
+    }
+
     /// Upload object from bytes
     async fn put_object(
         &self,
@@ -542,6 +596,20 @@ pub trait ObjectStore: Send + Sync {
         content_type: Option<&str>,
         encryption: Option<&ObjectEncryptionRequest>,
     ) -> Result<ObjectInfo>;
+
+    /// Upload an object with complete transfer-fidelity options.
+    ///
+    /// The default delegates Content-Type and managed encryption to the legacy API and rejects
+    /// every option that cannot be represented there.
+    async fn put_object_with_options(
+        &self,
+        path: &RemotePath,
+        data: Vec<u8>,
+        options: &ObjectWriteOptions,
+    ) -> Result<ObjectInfo> {
+        let (content_type, encryption) = options.legacy_put_arguments()?;
+        self.put_object(path, data, content_type, encryption).await
+    }
 
     /// Delete an object
     async fn delete_object(&self, path: &RemotePath) -> Result<()>;
@@ -606,6 +674,21 @@ pub trait ObjectStore: Send + Sync {
         self.copy_object(src, dst, encryption).await
     }
 
+    /// Copy an object with explicit metadata, tags, checksum, SSE-C, and lock intent.
+    ///
+    /// The default preserves legacy source-version and managed-encryption behavior while
+    /// rejecting every advanced option that the original API cannot represent.
+    async fn copy_object_with_transfer_options(
+        &self,
+        src: &RemotePath,
+        dst: &RemotePath,
+        options: &TransferCopyOptions,
+    ) -> Result<ObjectInfo> {
+        let (legacy, encryption) = options.legacy_copy_arguments()?;
+        self.copy_object_with_options(src, dst, &legacy, encryption)
+            .await
+    }
+
     /// Copy an object with S3's multipart server-side copy lifecycle.
     ///
     /// Backends that do not implement multipart copy fail explicitly. The
@@ -622,6 +705,25 @@ pub trait ObjectStore: Send + Sync {
         Err(Error::UnsupportedFeature(
             "Multipart server-side copy is not implemented by this object store".to_string(),
         ))
+    }
+
+    /// Copy an object through the multipart lifecycle with transfer-fidelity options.
+    ///
+    /// The default delegates only when all requested fidelity can be represented by the legacy
+    /// multipart API. Implementations must override this method before accepting advanced fields.
+    async fn multipart_copy_with_transfer_options(
+        &self,
+        src: &RemotePath,
+        dst: &RemotePath,
+        multipart: &MultipartCopyOptions,
+        transfer: &TransferCopyOptions,
+        cancellation: &MultipartCopyCancellation,
+        on_progress: &MultipartCopyProgress<'_>,
+    ) -> Result<MultipartCopyResult> {
+        transfer.validate_multipart_source_version(multipart.source_version_id.as_deref())?;
+        let (_, encryption) = transfer.legacy_copy_arguments()?;
+        self.multipart_copy(src, dst, multipart, cancellation, encryption, on_progress)
+            .await
     }
 
     /// Generate a presigned URL for an object

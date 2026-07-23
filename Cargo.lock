@@ -2647,10 +2647,12 @@ version = "0.1.24"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64",
  "dirs",
  "futures",
  "getrandom 0.4.3",
  "glob",
+ "http 1.4.2",
  "humansize",
  "jiff",
  "mockall",

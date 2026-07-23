@@ -25,6 +25,7 @@ pub mod retry;
 pub mod select;
 pub mod traits;
 pub mod transfer;
+pub mod transfer_options;
 pub mod undo;
 pub mod watch;
 
@@ -76,6 +77,11 @@ pub use traits::{
 pub use transfer::{
     TransferCancellation, TransferCandidate, TransferControls, TransferExecutor, TransferOutcome,
     TransferOutcomeState, TransferPlan, TransferReport, TransferSelection, TransferSummary,
+};
+pub use transfer_options::{
+    ChecksumAlgorithm, ChecksumRequest, MetadataDirective, ObjectAttributes, ObjectChecksum,
+    ObjectTransferMetadata, ObjectWriteEncryption, ObjectWriteOptions, SseCustomerKey,
+    TaggingDirective, TransferCopyOptions, TransferReadOptions,
 };
 pub use undo::{
     UndoAction, UndoObjectResult, UndoOutcome, UndoPlan, UndoPlanItem, plan_object_undo,

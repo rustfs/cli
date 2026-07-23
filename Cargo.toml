@@ -77,6 +77,7 @@ http-body = "1.0"
 http-body-util = "0.1"
 sha2 = "0.10"
 hex = "0.4"
+base64 = "0.22"
 urlencoding = "2.1"
 
 # Testing

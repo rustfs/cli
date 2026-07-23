@@ -5109,7 +5109,11 @@ mod tests {
     use aws_smithy_http_client::test_util::{
         CaptureRequestReceiver, ReplayEvent, StaticReplayClient, capture_request,
     };
-    use rc_core::S3_MULTIPART_COPY_MIN_PART_SIZE;
+    use rc_core::{
+        ChecksumAlgorithm, ChecksumRequest, MetadataDirective, ObjectAttributes,
+        ObjectWriteEncryption, ObjectWriteOptions, S3_MULTIPART_COPY_MIN_PART_SIZE, SseCustomerKey,
+        TransferCopyOptions, TransferReadOptions,
+    };
     use std::collections::HashMap;
     use std::collections::VecDeque;
     use std::io::{Read, Write};
@@ -6933,6 +6937,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transfer_read_default_delegates_version_through_trait_object() {
+        let response = http::Response::builder()
+            .status(200)
+            .header("content-length", "3")
+            .header("x-amz-version-id", "v1")
+            .body(SdkBody::from(""))
+            .expect("build versioned head response");
+        let (client, request_receiver) = test_s3_client(Some(response));
+        let path = RemotePath::new("test", "bucket", "key.txt");
+        let store: &dyn ObjectStore = &client;
+        let options = TransferReadOptions {
+            version_id: Some("v1".to_string()),
+            ..TransferReadOptions::default()
+        };
+
+        let info = store
+            .head_object_with_transfer_options(&path, &options)
+            .await
+            .expect("legacy-compatible transfer metadata read");
+
+        let request = request_receiver.expect_request();
+        assert!(request.uri().to_string().contains("versionId=v1"));
+        assert_eq!(info.version_id.as_deref(), Some("v1"));
+    }
+
+    #[tokio::test]
     async fn exact_version_errors_distinguish_missing_versions_and_delete_markers() {
         let missing_response = http::Response::builder()
             .status(404)
@@ -7578,6 +7608,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transfer_put_default_delegates_through_object_store_trait_object() {
+        let response = http::Response::builder()
+            .status(200)
+            .body(SdkBody::from(""))
+            .expect("build put response");
+        let (client, request_receiver) = test_s3_client(Some(response));
+        let path = RemotePath::new("test", "bucket", "file.txt");
+        let store: &dyn ObjectStore = &client;
+        let options = ObjectWriteOptions {
+            attributes: Some(ObjectAttributes {
+                content_type: Some("text/plain".to_string()),
+                ..ObjectAttributes::default()
+            }),
+            ..ObjectWriteOptions::default()
+        };
+
+        store
+            .put_object_with_options(&path, b"payload".to_vec(), &options)
+            .await
+            .expect("legacy-compatible transfer put");
+
+        let request = request_receiver.expect_request();
+        assert_eq!(request.headers().get("content-type"), Some("text/plain"));
+    }
+
+    #[tokio::test]
+    async fn advanced_transfer_defaults_reject_before_backend_requests() {
+        let path = RemotePath::new("test", "bucket", "file.txt");
+
+        let (put_client, put_requests) = test_s3_client(None);
+        let put_store: &dyn ObjectStore = &put_client;
+        let put_error = put_store
+            .put_object_with_options(
+                &path,
+                b"payload".to_vec(),
+                &ObjectWriteOptions {
+                    checksum: Some(ChecksumRequest::Calculate(ChecksumAlgorithm::Sha256)),
+                    ..ObjectWriteOptions::default()
+                },
+            )
+            .await
+            .expect_err("advanced put must not silently degrade");
+        assert!(matches!(put_error, Error::UnsupportedFeature(_)));
+        put_requests.expect_no_request();
+
+        let (read_client, read_requests) = test_s3_client(None);
+        let read_store: &dyn ObjectStore = &read_client;
+        let read_options = TransferReadOptions {
+            customer_key: Some(SseCustomerKey::new(vec![9; 32]).expect("valid customer key")),
+            ..TransferReadOptions::default()
+        };
+        let read_error = read_store
+            .get_object_with_transfer_options(&path, &read_options)
+            .await
+            .expect_err("advanced read must not silently degrade");
+        assert!(matches!(read_error, Error::UnsupportedFeature(_)));
+        let mut sink = tokio::io::sink();
+        let stream_error = read_store
+            .write_object_to_with_transfer_options(&path, &read_options, &mut sink, None)
+            .await
+            .expect_err("advanced streaming read must not silently degrade");
+        assert!(matches!(stream_error, Error::UnsupportedFeature(_)));
+        let metadata_error = read_store
+            .head_object_transfer_metadata(&path, &TransferReadOptions::default())
+            .await
+            .expect_err("complete transfer metadata needs an explicit backend implementation");
+        assert!(matches!(metadata_error, Error::UnsupportedFeature(_)));
+        read_requests.expect_no_request();
+
+        let (copy_client, copy_requests) = test_s3_client(None);
+        let copy_store: &dyn ObjectStore = &copy_client;
+        let copy_error = copy_store
+            .copy_object_with_transfer_options(
+                &path,
+                &RemotePath::new("test", "bucket", "copy.txt"),
+                &TransferCopyOptions {
+                    metadata_directive: Some(MetadataDirective::Copy),
+                    ..TransferCopyOptions::default()
+                },
+            )
+            .await
+            .expect_err("explicit copy directive must not silently degrade");
+        assert!(matches!(copy_error, Error::UnsupportedFeature(_)));
+        copy_requests.expect_no_request();
+    }
+
+    #[tokio::test]
     async fn kms_diagnostic_put_uses_sse_kms_and_sensitive_body() {
         let response = http::Response::builder()
             .status(200)
@@ -7900,6 +8017,76 @@ mod tests {
 
         assert!(matches!(error, Error::Interrupted(_)));
         assert!(replay.actual_requests().next().is_none());
+    }
+
+    #[tokio::test]
+    async fn multipart_transfer_default_validates_versions_and_delegates() {
+        let src = RemotePath::new("test", "source-bucket", "src.bin");
+        let dst = RemotePath::new("test", "destination-bucket", "dst.bin");
+        let multipart = multipart_copy_options(S3_MULTIPART_COPY_MIN_PART_SIZE);
+        let mismatched = TransferCopyOptions {
+            source: TransferReadOptions {
+                version_id: Some("different-version".to_string()),
+                ..TransferReadOptions::default()
+            },
+            ..TransferCopyOptions::default()
+        };
+        let (mismatch_client, mismatch_replay) = test_s3_client_with_response_sequence(vec![]);
+        let mismatch_store: &dyn ObjectStore = &mismatch_client;
+
+        let mismatch_error = mismatch_store
+            .multipart_copy_with_transfer_options(
+                &src,
+                &dst,
+                &multipart,
+                &mismatched,
+                &MultipartCopyCancellation::new(),
+                &|_| {},
+            )
+            .await
+            .expect_err("mismatched versions must fail before multipart create");
+        assert!(matches!(mismatch_error, Error::InvalidPath(_)));
+        assert!(mismatch_replay.actual_requests().next().is_none());
+
+        let (client, replay) = test_s3_client_with_response_sequence(vec![
+            multipart_copy_create_response("transfer-upload-id"),
+            multipart_copy_part_response("part-1", Some("source v1+/?")),
+            multipart_copy_complete_response(),
+        ]);
+        let store: &dyn ObjectStore = &client;
+        let transfer = TransferCopyOptions {
+            source: TransferReadOptions {
+                version_id: multipart.source_version_id.clone(),
+                ..TransferReadOptions::default()
+            },
+            destination: ObjectWriteOptions {
+                encryption: Some(ObjectWriteEncryption::Managed(
+                    ObjectEncryptionRequest::SseS3,
+                )),
+                ..ObjectWriteOptions::default()
+            },
+            ..TransferCopyOptions::default()
+        };
+
+        let result = store
+            .multipart_copy_with_transfer_options(
+                &src,
+                &dst,
+                &multipart,
+                &transfer,
+                &MultipartCopyCancellation::new(),
+                &|_| {},
+            )
+            .await
+            .expect("legacy-compatible multipart transfer");
+
+        assert_eq!(result.upload_id, "transfer-upload-id");
+        let requests = replay.actual_requests().collect::<Vec<_>>();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            requests[0].headers().get("x-amz-server-side-encryption"),
+            Some("AES256")
+        );
     }
 
     #[tokio::test]

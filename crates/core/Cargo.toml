@@ -40,6 +40,8 @@ rustls-pki-types.workspace = true
 x509-parser.workspace = true
 zeroize.workspace = true
 getrandom.workspace = true
+base64.workspace = true
+http.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
