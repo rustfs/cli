@@ -346,6 +346,15 @@ impl ObjectWriteOptions {
         if let Some(checksum) = &self.checksum {
             checksum.validate()?;
         }
+        if self
+            .retention
+            .as_ref()
+            .is_some_and(|retention| retention.retain_until <= jiff::Timestamp::now())
+        {
+            return Err(Error::InvalidPath(
+                "Object retention date must be in the future".to_string(),
+            ));
+        }
         if matches!(
             self.encryption.as_ref(),
             Some(ObjectWriteEncryption::Managed(

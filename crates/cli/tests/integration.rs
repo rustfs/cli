@@ -317,6 +317,189 @@ mod checksum_operations {
     }
 }
 
+mod atomic_object_lock_operations {
+    use super::*;
+    use rc_core::{
+        Alias, CreateBucketOptions, DeleteRequestOptions, LegalHoldStatus, ObjectLockOptions,
+        ObjectRetention, ObjectStore, ObjectWriteOptions, RemotePath, RetentionMode,
+        TransferCopyOptions,
+    };
+    use rc_s3::S3Client;
+
+    fn test_alias() -> Alias {
+        let (endpoint, access_key, secret_key) =
+            get_test_config().expect("S3 integration test setup failed");
+        let mut alias = Alias::new("test", endpoint, access_key, secret_key);
+        alias.bucket_lookup = "path".to_string();
+        apply_test_tls(&mut alias);
+        alias
+    }
+
+    fn locked_write(legal_hold: LegalHoldStatus) -> ObjectWriteOptions {
+        ObjectWriteOptions {
+            retention: Some(ObjectRetention {
+                mode: RetentionMode::Governance,
+                retain_until: jiff::Timestamp::now()
+                    .checked_add(jiff::SignedDuration::from_hours(1))
+                    .expect("one-hour retention remains representable"),
+            }),
+            legal_hold: Some(legal_hold),
+            ..ObjectWriteOptions::default()
+        }
+    }
+
+    async fn clear_and_delete_locked_version(
+        client: &S3Client,
+        path: &RemotePath,
+        version_id: String,
+    ) {
+        let lock_options =
+            ObjectLockOptions::new(Some(version_id.clone()), true).expect("valid lock selection");
+        client
+            .put_object_legal_hold(path, LegalHoldStatus::Off, &lock_options)
+            .await
+            .expect("clear legal hold");
+        client
+            .put_object_retention(path, None, &lock_options)
+            .await
+            .expect("clear governance retention");
+        client
+            .delete_object_with_options(
+                path,
+                DeleteRequestOptions {
+                    version_id: Some(version_id),
+                    bypass_governance: true,
+                    force_delete: true,
+                },
+            )
+            .await
+            .expect("delete unlocked object version");
+    }
+
+    #[tokio::test]
+    async fn test_beta10_atomic_object_lock_put_copy_and_multipart() {
+        let config_dir = setup_alias_only().expect("S3 integration test setup failed");
+        let bucket_name = format!("test-object-lock-{}", uuid_suffix());
+        let client = S3Client::new(test_alias())
+            .await
+            .expect("create Object Lock test client");
+        let create_options =
+            CreateBucketOptions::for_cli(None, true, true).expect("valid locked bucket options");
+        client
+            .create_bucket_with_options(&bucket_name, &create_options)
+            .await
+            .expect("create Object Lock enabled bucket");
+
+        let put_path = RemotePath::new("test", &bucket_name, "locked-put.bin");
+        let put = client
+            .put_object_with_options(
+                &put_path,
+                b"atomic-object-lock".to_vec(),
+                &locked_write(LegalHoldStatus::On),
+            )
+            .await
+            .expect("atomically lock PutObject");
+        let put_version = put.version_id.expect("locked put returns a version");
+        let put_selection = ObjectLockOptions::new(Some(put_version.clone()), false)
+            .expect("valid put version selection");
+        assert_eq!(
+            client
+                .get_object_retention(&put_path, &put_selection)
+                .await
+                .expect("read put retention")
+                .expect("put retention is present")
+                .mode,
+            RetentionMode::Governance
+        );
+        assert_eq!(
+            client
+                .get_object_legal_hold(&put_path, &put_selection)
+                .await
+                .expect("read put legal hold"),
+            LegalHoldStatus::On
+        );
+
+        let copy_path = RemotePath::new("test", &bucket_name, "locked-copy.bin");
+        let copy = client
+            .copy_object_with_transfer_options(
+                &put_path,
+                &copy_path,
+                &TransferCopyOptions {
+                    destination: locked_write(LegalHoldStatus::Off),
+                    ..TransferCopyOptions::default()
+                },
+            )
+            .await
+            .expect("atomically lock CopyObject");
+        let copy_version = copy.version_id.expect("locked copy returns a version");
+        let copy_selection = ObjectLockOptions::new(Some(copy_version.clone()), false)
+            .expect("valid copy version selection");
+        assert_eq!(
+            client
+                .get_object_retention(&copy_path, &copy_selection)
+                .await
+                .expect("read copy retention")
+                .expect("copy retention is present")
+                .mode,
+            RetentionMode::Governance
+        );
+        assert_eq!(
+            client
+                .get_object_legal_hold(&copy_path, &copy_selection)
+                .await
+                .expect("read copy legal hold"),
+            LegalHoldStatus::Off
+        );
+
+        let multipart_path = RemotePath::new("test", &bucket_name, "locked-multipart.bin");
+        let multipart_source =
+            tempfile::NamedTempFile::new().expect("create locked multipart source");
+        multipart_source
+            .as_file()
+            .set_len(rc_s3::multipart::DEFAULT_PART_SIZE + 1)
+            .expect("size locked multipart source");
+        let multipart = client
+            .put_object_from_path_with_options(
+                &multipart_path,
+                multipart_source.path(),
+                &locked_write(LegalHoldStatus::On),
+                |_| {},
+            )
+            .await
+            .expect("atomically lock multipart upload");
+        let multipart_version = multipart
+            .version_id
+            .expect("locked multipart upload returns a version");
+        let multipart_selection = ObjectLockOptions::new(Some(multipart_version.clone()), false)
+            .expect("valid multipart version selection");
+        assert_eq!(
+            client
+                .get_object_retention(&multipart_path, &multipart_selection)
+                .await
+                .expect("read multipart retention")
+                .expect("multipart retention is present")
+                .mode,
+            RetentionMode::Governance
+        );
+        assert_eq!(
+            client
+                .get_object_legal_hold(&multipart_path, &multipart_selection)
+                .await
+                .expect("read multipart legal hold"),
+            LegalHoldStatus::On
+        );
+
+        clear_and_delete_locked_version(&client, &put_path, put_version).await;
+        clear_and_delete_locked_version(&client, &copy_path, copy_version).await;
+        clear_and_delete_locked_version(&client, &multipart_path, multipart_version).await;
+        client
+            .delete_bucket(&bucket_name)
+            .await
+            .expect("delete Object Lock test bucket");
+        drop(config_dir);
+    }
+}
+
 mod sse_customer_operations {
     use super::*;
     use rc_core::{Alias, ObjectStore, RemotePath, SseCustomerKey, TransferReadOptions};

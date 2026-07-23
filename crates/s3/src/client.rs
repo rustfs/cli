@@ -688,6 +688,67 @@ fn apply_object_write_encryption_to_multipart_create_request(
     }
 }
 
+fn sdk_legal_hold_status(status: LegalHoldStatus) -> aws_sdk_s3::types::ObjectLockLegalHoldStatus {
+    match status {
+        LegalHoldStatus::Off => aws_sdk_s3::types::ObjectLockLegalHoldStatus::Off,
+        LegalHoldStatus::On => aws_sdk_s3::types::ObjectLockLegalHoldStatus::On,
+    }
+}
+
+fn sdk_object_lock_mode(mode: RetentionMode) -> aws_sdk_s3::types::ObjectLockMode {
+    match mode {
+        RetentionMode::Governance => aws_sdk_s3::types::ObjectLockMode::Governance,
+        RetentionMode::Compliance => aws_sdk_s3::types::ObjectLockMode::Compliance,
+    }
+}
+
+fn apply_object_lock_to_put_request(
+    mut request: aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder,
+    options: &ObjectWriteOptions,
+) -> Result<aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder> {
+    if let Some(retention) = &options.retention {
+        request = request
+            .object_lock_mode(sdk_object_lock_mode(retention.mode))
+            .object_lock_retain_until_date(sdk_timestamp(retention.retain_until)?);
+    }
+    if let Some(status) = options.legal_hold {
+        request = request.object_lock_legal_hold_status(sdk_legal_hold_status(status));
+    }
+    Ok(request)
+}
+
+fn apply_object_lock_to_copy_request(
+    mut request: aws_sdk_s3::operation::copy_object::builders::CopyObjectFluentBuilder,
+    options: &ObjectWriteOptions,
+) -> Result<aws_sdk_s3::operation::copy_object::builders::CopyObjectFluentBuilder> {
+    if let Some(retention) = &options.retention {
+        request = request
+            .object_lock_mode(sdk_object_lock_mode(retention.mode))
+            .object_lock_retain_until_date(sdk_timestamp(retention.retain_until)?);
+    }
+    if let Some(status) = options.legal_hold {
+        request = request.object_lock_legal_hold_status(sdk_legal_hold_status(status));
+    }
+    Ok(request)
+}
+
+fn apply_object_lock_to_multipart_create_request(
+    mut request: aws_sdk_s3::operation::create_multipart_upload::builders::CreateMultipartUploadFluentBuilder,
+    options: &ObjectWriteOptions,
+) -> Result<
+    aws_sdk_s3::operation::create_multipart_upload::builders::CreateMultipartUploadFluentBuilder,
+> {
+    if let Some(retention) = &options.retention {
+        request = request
+            .object_lock_mode(sdk_object_lock_mode(retention.mode))
+            .object_lock_retain_until_date(sdk_timestamp(retention.retain_until)?);
+    }
+    if let Some(status) = options.legal_hold {
+        request = request.object_lock_legal_hold_status(sdk_legal_hold_status(status));
+    }
+    Ok(request)
+}
+
 fn apply_sse_customer_to_upload_part_request(
     request: aws_sdk_s3::operation::upload_part::builders::UploadPartFluentBuilder,
     key: Option<&SseCustomerKey>,
@@ -886,11 +947,6 @@ fn validate_attribute_tag_write_options(options: &ObjectWriteOptions) -> Result<
     options.validate()?;
     rustfs_storage_class(options.storage_class.as_deref())?;
     validate_sha256_checksum_request(options.checksum.as_ref())?;
-    if options.retention.is_some() || options.legal_hold.is_some() {
-        return Err(Error::UnsupportedFeature(
-            "Object-lock writes are tracked by rustfs/backlog#1460".to_string(),
-        ));
-    }
     Ok(())
 }
 
@@ -2349,6 +2405,88 @@ impl S3Client {
         Error::Network(formatted)
     }
 
+    fn map_object_lock_write_error<E>(
+        error: &aws_sdk_s3::error::SdkError<E>,
+        destination: &RemotePath,
+        fallback_path: &RemotePath,
+        fallback_version: Option<&str>,
+    ) -> Error
+    where
+        E: ProvideErrorMetadata + std::fmt::Display,
+    {
+        if let aws_sdk_s3::error::SdkError::ServiceError(service_error) = error {
+            let raw = service_error.raw();
+            let code = service_error.err().code().or_else(|| {
+                raw.headers()
+                    .get("x-amz-error-code")
+                    .and_then(|value| std::str::from_utf8(value.as_bytes()).ok())
+            });
+            let status = raw.status().as_u16();
+            let formatted = Self::format_sdk_error(error);
+            let message = service_error
+                .err()
+                .message()
+                .unwrap_or(formatted.as_str())
+                .to_ascii_lowercase();
+
+            if status == 501 || matches!(code, Some("NotImplemented")) {
+                return Error::UnsupportedFeature(
+                    "The S3 endpoint does not support atomic Object Lock writes".to_string(),
+                );
+            }
+            if matches!(code, Some("ObjectLockConfigurationNotFoundError"))
+                || (matches!(code, Some("InvalidRequest") | Some("InvalidBucketState"))
+                    && message.contains("object lock")
+                    && (message.contains("not enabled")
+                        || message.contains("not configured")
+                        || message.contains("configuration")))
+            {
+                return Error::UnsupportedFeature(
+                    "Object Lock is not enabled for the destination bucket".to_string(),
+                );
+            }
+            if status == 401
+                || status == 403
+                || matches!(
+                    code,
+                    Some("Unauthorized") | Some("AccessDenied") | Some("Forbidden")
+                )
+            {
+                return Error::Auth(formatted);
+            }
+            if message.contains("compliance") {
+                return Error::Conflict(format!(
+                    "Compliance retention rejected object creation: {destination}"
+                ));
+            }
+            if message.contains("governance")
+                || message.contains("retention")
+                || message.contains("object lock")
+                || message.contains("worm")
+            {
+                return Error::Conflict(format!(
+                    "Object Lock policy rejected object creation: {destination}"
+                ));
+            }
+        }
+        Self::map_object_request_error(error, fallback_path, fallback_version)
+    }
+
+    fn map_transfer_write_error<E>(
+        error: &aws_sdk_s3::error::SdkError<E>,
+        destination: &RemotePath,
+        options: &ObjectWriteOptions,
+    ) -> Error
+    where
+        E: ProvideErrorMetadata + std::fmt::Display,
+    {
+        if options.retention.is_some() || options.legal_hold.is_some() {
+            Self::map_object_lock_write_error(error, destination, destination, None)
+        } else {
+            Self::map_object_request_error(error, destination, None)
+        }
+    }
+
     fn map_bucket_object_lock_error<E>(
         error: &aws_sdk_s3::error::SdkError<E>,
         bucket: &str,
@@ -3235,6 +3373,7 @@ impl S3Client {
                 .checksum_algorithm(aws_sdk_s3::types::ChecksumAlgorithm::Sha256)
                 .checksum_sha256(checksum);
         }
+        request = apply_object_lock_to_put_request(request, options.write)?;
         request = match options.precondition {
             ObjectWritePrecondition::None => request,
             ObjectWritePrecondition::IfAbsent => request.if_none_match("*"),
@@ -3248,7 +3387,7 @@ impl S3Client {
             {
                 Error::Conflict(format!("Object changed before upload: {path}"))
             } else {
-                Self::map_object_request_error(&error, path, None)
+                Self::map_transfer_write_error(&error, path, options.write)
             };
             self.redact_sse_customer_error(
                 mapped,
@@ -3362,10 +3501,12 @@ impl S3Client {
             create_request =
                 create_request.checksum_algorithm(aws_sdk_s3::types::ChecksumAlgorithm::Sha256);
         }
+        create_request =
+            apply_object_lock_to_multipart_create_request(create_request, options.write)?;
 
         let create_response = create_request.send().await.map_err(|error| {
             self.redact_sse_customer_error(
-                Self::map_object_request_error(&error, path, None),
+                Self::map_transfer_write_error(&error, path, options.write),
                 destination_sse_customer_key(options.write.encryption.as_ref()),
             )
         })?;
@@ -4619,9 +4760,10 @@ impl ObjectStore for S3Client {
                 .checksum_algorithm(aws_sdk_s3::types::ChecksumAlgorithm::Sha256)
                 .checksum_sha256(checksum);
         }
+        request = apply_object_lock_to_put_request(request, options)?;
         let response = request.send().await.map_err(|error| {
             self.redact_sse_customer_error(
-                Self::map_object_request_error(&error, path, None),
+                Self::map_transfer_write_error(&error, path, options),
                 destination_sse_customer_key(options.encryption.as_ref()),
             )
         })?;
@@ -4749,8 +4891,18 @@ impl ObjectStore for S3Client {
         if matches!(options.metadata_directive, Some(MetadataDirective::Copy)) {
             request = request.metadata_directive(aws_sdk_s3::types::MetadataDirective::Copy);
         }
+        request = apply_object_lock_to_copy_request(request, &options.destination)?;
         let response = request.send().await.map_err(|error| {
-            Self::map_object_request_error(&error, src, options.source.version_id.as_deref())
+            if options.destination.retention.is_some() || options.destination.legal_hold.is_some() {
+                Self::map_object_lock_write_error(
+                    &error,
+                    dst,
+                    src,
+                    options.source.version_id.as_deref(),
+                )
+            } else {
+                Self::map_object_request_error(&error, src, options.source.version_id.as_deref())
+            }
         })?;
 
         let mut result = self.head_object(dst).await?;
@@ -4891,8 +5043,14 @@ impl ObjectStore for S3Client {
         );
         let create_request =
             apply_object_attributes_to_multipart_create_request(create_request, &attributes)?;
+        let create_request =
+            apply_object_lock_to_multipart_create_request(create_request, &transfer.destination)?;
         let create_response = create_request.send().await.map_err(|error| {
-            self.redact_sensitive_error(Self::map_object_request_error(&error, dst, None))
+            self.redact_sensitive_error(Self::map_transfer_write_error(
+                &error,
+                dst,
+                &transfer.destination,
+            ))
         })?;
         let upload_id = create_response
             .upload_id()
@@ -7746,6 +7904,84 @@ mod tests {
             .expect("build multipart part response")
     }
 
+    fn test_object_retention(mode: RetentionMode) -> ObjectRetention {
+        ObjectRetention {
+            mode,
+            retain_until: Timestamp::from_second(4_102_444_800)
+                .expect("valid 2100 retention timestamp"),
+        }
+    }
+
+    #[tokio::test]
+    async fn multipart_object_lock_headers_are_sent_only_during_create() {
+        let complete_response = http::Response::builder()
+            .status(200)
+            .header("content-type", "application/xml")
+            .body(SdkBody::from(
+                r#"<CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>bucket</Bucket><Key>key.txt</Key><ETag>"final-etag"</ETag></CompleteMultipartUploadResult>"#,
+            ))
+            .expect("build multipart complete response");
+        let (client, replay) = test_s3_client_with_response_sequence(vec![
+            multipart_create_response(),
+            multipart_part_response(),
+            complete_response,
+        ]);
+        let path = RemotePath::new("test", "bucket", "key.txt");
+        let mut source = tempfile::NamedTempFile::new().expect("create multipart source");
+        source.write_all(b"data").expect("write multipart source");
+        let write = ObjectWriteOptions {
+            retention: Some(test_object_retention(RetentionMode::Governance)),
+            legal_hold: Some(LegalHoldStatus::On),
+            ..ObjectWriteOptions::default()
+        };
+
+        client
+            .put_object_multipart_from_path(
+                &path,
+                source.path(),
+                4,
+                PathUploadOptions {
+                    write: &write,
+                    precondition: ObjectWritePrecondition::None,
+                },
+                |_| {},
+            )
+            .await
+            .expect("upload locked multipart object");
+
+        let requests = replay.actual_requests().collect::<Vec<_>>();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            requests[0].headers().get("x-amz-object-lock-mode"),
+            Some("GOVERNANCE")
+        );
+        assert_eq!(
+            requests[0]
+                .headers()
+                .get("x-amz-object-lock-retain-until-date"),
+            Some("2100-01-01T00:00:00Z")
+        );
+        assert_eq!(
+            requests[0].headers().get("x-amz-object-lock-legal-hold"),
+            Some("ON")
+        );
+        for request in &requests[1..] {
+            assert!(request.headers().get("x-amz-object-lock-mode").is_none());
+            assert!(
+                request
+                    .headers()
+                    .get("x-amz-object-lock-retain-until-date")
+                    .is_none()
+            );
+            assert!(
+                request
+                    .headers()
+                    .get("x-amz-object-lock-legal-hold")
+                    .is_none()
+            );
+        }
+    }
+
     #[tokio::test]
     async fn multipart_path_upload_applies_sse_customer_headers_to_create_and_parts() {
         let complete_response = http::Response::builder()
@@ -9915,6 +10151,202 @@ mod tests {
             request.headers().get("x-amz-storage-class"),
             Some("STANDARD")
         );
+    }
+
+    #[tokio::test]
+    async fn transfer_put_and_copy_send_atomic_object_lock_headers() {
+        for (mode, legal_hold, expected_mode, expected_hold) in [
+            (
+                RetentionMode::Governance,
+                LegalHoldStatus::On,
+                "GOVERNANCE",
+                "ON",
+            ),
+            (
+                RetentionMode::Compliance,
+                LegalHoldStatus::Off,
+                "COMPLIANCE",
+                "OFF",
+            ),
+        ] {
+            let response = http::Response::builder()
+                .status(400)
+                .header("x-amz-error-code", "InvalidRequest")
+                .body(SdkBody::from(
+                    r#"<?xml version="1.0" encoding="UTF-8"?><Error><Code>InvalidRequest</Code><Message>test rejection</Message></Error>"#,
+                ))
+                .expect("build object write response");
+            let options = ObjectWriteOptions {
+                retention: Some(test_object_retention(mode)),
+                legal_hold: Some(legal_hold),
+                ..ObjectWriteOptions::default()
+            };
+            let path = RemotePath::new("test", "bucket", "object.txt");
+
+            let (put_client, put_requests) = test_s3_client(Some(response));
+            let _ = put_client
+                .put_object_with_options(&path, b"payload".to_vec(), &options)
+                .await;
+            let put = put_requests.expect_request();
+            assert_eq!(
+                put.headers().get("x-amz-object-lock-mode"),
+                Some(expected_mode)
+            );
+            assert_eq!(
+                put.headers().get("x-amz-object-lock-legal-hold"),
+                Some(expected_hold)
+            );
+            assert_eq!(
+                put.headers().get("x-amz-object-lock-retain-until-date"),
+                Some("2100-01-01T00:00:00Z")
+            );
+
+            let copy_response = http::Response::builder()
+                .status(400)
+                .header("x-amz-error-code", "InvalidRequest")
+                .body(SdkBody::from(
+                    r#"<?xml version="1.0" encoding="UTF-8"?><Error><Code>InvalidRequest</Code><Message>test rejection</Message></Error>"#,
+                ))
+                .expect("build copy object response");
+            let (copy_client, copy_requests) = test_s3_client(Some(copy_response));
+            let _ = copy_client
+                .copy_object_with_transfer_options(
+                    &path,
+                    &RemotePath::new("test", "bucket", "copy.txt"),
+                    &TransferCopyOptions {
+                        destination: options,
+                        ..TransferCopyOptions::default()
+                    },
+                )
+                .await;
+            let copy = copy_requests.expect_request();
+            assert_eq!(
+                copy.headers().get("x-amz-object-lock-mode"),
+                Some(expected_mode)
+            );
+            assert_eq!(
+                copy.headers().get("x-amz-object-lock-legal-hold"),
+                Some(expected_hold)
+            );
+            assert_eq!(
+                copy.headers().get("x-amz-object-lock-retain-until-date"),
+                Some("2100-01-01T00:00:00Z")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn object_lock_write_validation_and_service_errors_are_typed() {
+        let path = RemotePath::new("test", "bucket", "object.txt");
+        let (expired_client, expired_requests) = test_s3_client(None);
+        let expired = expired_client
+            .put_object_with_options(
+                &path,
+                b"payload".to_vec(),
+                &ObjectWriteOptions {
+                    retention: Some(ObjectRetention {
+                        mode: RetentionMode::Governance,
+                        retain_until: Timestamp::from_second(1).expect("valid expired timestamp"),
+                    }),
+                    ..ObjectWriteOptions::default()
+                },
+            )
+            .await
+            .expect_err("expired retention must fail before mutation");
+        assert!(matches!(expired, Error::InvalidPath(_)));
+        expired_requests.expect_no_request();
+
+        for (status, code, message, expected) in [
+            (
+                400,
+                "ObjectLockConfigurationNotFoundError",
+                "configuration unavailable",
+                "unsupported",
+            ),
+            (
+                403,
+                "AccessDenied",
+                "not authorized to perform s3:PutObjectRetention",
+                "auth",
+            ),
+            (
+                409,
+                "InvalidRequest",
+                "governance retention policy denied the write",
+                "governance",
+            ),
+            (
+                409,
+                "InvalidRequest",
+                "compliance retention cannot be shortened",
+                "compliance",
+            ),
+        ] {
+            let response = http::Response::builder()
+                .status(status)
+                .header("x-amz-error-code", code)
+                .body(SdkBody::from(format!(
+                    "<Error><Code>{code}</Code><Message>{message}</Message></Error>"
+                )))
+                .expect("build object lock rejection");
+            let (client, requests) = test_s3_client(Some(response));
+            let error = client
+                .put_object_with_options(
+                    &path,
+                    b"payload".to_vec(),
+                    &ObjectWriteOptions {
+                        legal_hold: Some(LegalHoldStatus::On),
+                        ..ObjectWriteOptions::default()
+                    },
+                )
+                .await
+                .expect_err("object lock rejection must remain typed");
+            match expected {
+                "unsupported" => assert!(matches!(error, Error::UnsupportedFeature(_))),
+                "auth" => assert!(matches!(error, Error::Auth(_))),
+                "governance" => assert!(matches!(error, Error::Conflict(_))),
+                "compliance" => assert!(matches!(error, Error::Conflict(_))),
+                _ => unreachable!("fixed error class"),
+            }
+            requests.expect_request();
+        }
+
+        let missing_response = http::Response::builder()
+            .status(404)
+            .header("x-amz-error-code", "NoSuchVersion")
+            .body(SdkBody::from(
+                "<Error><Code>NoSuchVersion</Code><Message>missing source</Message></Error>",
+            ))
+            .expect("build missing locked-copy source response");
+        let (copy_client, copy_requests) = test_s3_client(Some(missing_response));
+        let source = RemotePath::new("test", "source-bucket", "missing.txt");
+        let destination = RemotePath::new("test", "destination-bucket", "locked.txt");
+        let error = copy_client
+            .copy_object_with_transfer_options(
+                &source,
+                &destination,
+                &TransferCopyOptions {
+                    source: TransferReadOptions {
+                        version_id: Some("missing-v1".to_string()),
+                        ..TransferReadOptions::default()
+                    },
+                    destination: ObjectWriteOptions {
+                        legal_hold: Some(LegalHoldStatus::On),
+                        ..ObjectWriteOptions::default()
+                    },
+                    ..TransferCopyOptions::default()
+                },
+            )
+            .await
+            .expect_err("locked copy must preserve missing source context");
+        assert!(matches!(
+            error,
+            Error::VersionNotFound {
+                path,
+                version_id
+            } if path == source.to_string() && version_id == "missing-v1"
+        ));
+        copy_requests.expect_request();
     }
 
     #[tokio::test]

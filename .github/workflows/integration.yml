@@ -155,6 +155,7 @@ jobs:
           if [[ "${{ matrix.version }}" == "1.0.0-beta.10" ]]; then
             TESTS+=(
               "checksum_operations::test_beta10_checksum_put_multipart_and_rejection"
+              "atomic_object_lock_operations::test_beta10_atomic_object_lock_put_copy_and_multipart"
               "sse_customer_operations::test_beta10_sse_customer_put_head_get_wrong_key_and_multipart"
               "multipart_operations::test_multipart_server_side_copy_direct_primitive"
               "recursive_operations::test_recursive_copy"
