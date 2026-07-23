@@ -1,1 +1,1 @@
-{"schema_version":3,"type":"metrics","status":"success","data":{"scope":"cluster","collected_at":"2026-07-21T04:00:00Z","samples":[{"name":"rustfs_objects_total","value":42,"unit":"objects","labels":{"node":"node-1"}}]}}
+{"schema_version":3,"type":"metrics","status":"success","data":{"scope":"cluster","collected_at":"2026-07-21T04:00:00Z","samples":[{"name":"rustfs_objects_total","value":42,"unit":"objects","labels":{"node":"node-1"},"collected_at":"2026-07-21T04:00:00Z"}],"errors":[],"partial":false,"final":true,"raw":{}}}

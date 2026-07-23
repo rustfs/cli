@@ -22,20 +22,27 @@ mod completions;
 mod cors;
 pub mod cp;
 pub mod diff;
+mod du;
 mod encryption;
 mod event;
 mod find;
 mod head;
 mod ilm;
+mod legalhold;
+mod lock;
 mod ls;
 mod mb;
 mod mirror;
 mod mv;
 mod object;
+mod ops_output;
+mod ping;
 mod pipe;
 mod quota;
 mod rb;
+mod ready;
 mod replicate;
+mod retention;
 mod rm;
 mod share;
 mod sql;
@@ -43,6 +50,21 @@ mod stat;
 mod tag;
 mod tree;
 mod version;
+mod watch;
+
+fn exit_code_for_core_error(error: &rc_core::Error) -> ExitCode {
+    ExitCode::from_i32(error.exit_code()).unwrap_or(ExitCode::GeneralError)
+}
+
+fn validate_version_selector(version_id: Option<&str>, rewind: Option<&str>) -> Result<(), String> {
+    if version_id.is_some() && rewind.is_some() {
+        return Err("--version-id cannot be combined with --rewind".to_string());
+    }
+    if version_id.is_some_and(str::is_empty) {
+        return Err("--version-id cannot be empty".to_string());
+    }
+    Ok(())
+}
 
 /// rc - Rust S3 CLI Client
 ///
@@ -86,7 +108,17 @@ pub struct Cli {
 }
 
 fn parse_request_header(value: &str) -> Result<RequestHeader, String> {
-    RequestHeader::parse(value).map_err(|error| error.to_string())
+    let header = RequestHeader::parse(value).map_err(|error| error.to_string())?;
+    if header
+        .name
+        .eq_ignore_ascii_case("x-amz-bypass-governance-retention")
+    {
+        return Err(
+            "Use the retention or remove command's explicit --bypass flag for governance retention bypass"
+                .to_string(),
+        );
+    }
+    Ok(header)
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -273,13 +305,27 @@ pub enum Commands {
     /// Deprecated: use `rc bucket replication`
     Replicate(replicate::ReplicateArgs),
 
+    /// Manage object retention with mc-compatible command syntax
+    Retention(retention::RetentionArgs),
+
+    /// Manage object legal hold with mc-compatible command syntax
+    Legalhold(legalhold::LegalHoldArgs),
+
     // Phase 6: Utilities
     /// Generate shell completion scripts
     Completions(completions::CompletionsArgs),
-    // /// Manage object retention
-    // Retention(retention::RetentionArgs),
-    // /// Watch for object events
-    // Watch(watch::WatchArgs),
+
+    /// Summarize storage usage
+    Du(du::DuArgs),
+
+    /// Check service liveness and round-trip latency
+    Ping(ping::PingArgs),
+
+    /// Check whether required dependencies are ready
+    Ready(ready::ReadyArgs),
+
+    /// Stream live object notifications
+    Watch(watch::WatchArgs),
 }
 
 /// Execute the CLI command and return an exit code
@@ -436,7 +482,33 @@ pub async fn execute(cli: Cli) -> ExitCode {
         Commands::Replicate(args) => {
             replicate::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
         }
+        Commands::Retention(args) => {
+            retention::execute(
+                args,
+                output_options.resolve(OutputBehavior::StructuredDefault),
+            )
+            .await
+        }
+        Commands::Legalhold(args) => {
+            legalhold::execute(
+                args,
+                output_options.resolve(OutputBehavior::StructuredDefault),
+            )
+            .await
+        }
         Commands::Completions(args) => completions::execute(args),
+        Commands::Watch(args) => {
+            watch::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
+        Commands::Du(args) => {
+            du::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
+        Commands::Ping(args) => {
+            ping::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
+        Commands::Ready(args) => {
+            ready::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
     }
 }
 
@@ -591,6 +663,42 @@ mod tests {
                 .to_string()
                 .contains("Only x-amz-* custom request headers are supported")
         );
+    }
+
+    #[test]
+    fn cli_accepts_repeatable_watch_event_filters() {
+        let cli = Cli::try_parse_from([
+            "rc",
+            "watch",
+            "local/photos",
+            "--event",
+            "put,delete",
+            "--event",
+            "get",
+            "--prefix",
+            "incoming/",
+        ])
+        .expect("parse watch command");
+
+        let Commands::Watch(args) = cli.command else {
+            panic!("expected watch command");
+        };
+        assert_eq!(args.events, vec!["put,delete", "get"]);
+        assert_eq!(args.prefix.as_deref(), Some("incoming/"));
+    }
+
+    #[test]
+    fn cli_requires_bypass_flag_instead_of_custom_governance_header() {
+        let error = Cli::try_parse_from([
+            "rc",
+            "-H",
+            "x-amz-bypass-governance-retention:true",
+            "rm",
+            "local/bucket/key.txt",
+        ])
+        .expect_err("governance bypass header should require --bypass");
+
+        assert!(error.to_string().contains("explicit --bypass flag"));
     }
 
     #[test]
@@ -929,6 +1037,33 @@ mod tests {
     }
 
     #[test]
+    fn cli_accepts_bucket_replication_diff_prefix() {
+        let cli = Cli::try_parse_from([
+            "rc",
+            "bucket",
+            "replication",
+            "diff",
+            "local/my-bucket",
+            "--prefix",
+            "reports/2026/",
+        ])
+        .expect("parse bucket replication diff");
+
+        match cli.command {
+            Commands::Bucket(args) => match args.command {
+                bucket::BucketCommands::Replication(replicate::ReplicateArgs {
+                    command: replicate::ReplicateCommands::Diff(arg),
+                }) => {
+                    assert_eq!(arg.path, "local/my-bucket");
+                    assert_eq!(arg.prefix.as_deref(), Some("reports/2026/"));
+                }
+                other => panic!("expected bucket replication diff command, got {:?}", other),
+            },
+            other => panic!("expected bucket command, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn cli_accepts_bucket_replication_add_tls_flags() {
         let cli = Cli::try_parse_from([
             "rc",
@@ -954,6 +1089,103 @@ mod tests {
                 other => panic!("expected bucket replication add command, got {:?}", other),
             },
             other => panic!("expected bucket command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_bucket_replication_check_confirmation() {
+        let cli = Cli::try_parse_from([
+            "rc",
+            "bucket",
+            "replication",
+            "check",
+            "local/my-bucket",
+            "--yes",
+            "--force",
+        ])
+        .expect("parse bucket replication check");
+
+        match cli.command {
+            Commands::Bucket(args) => match args.command {
+                bucket::BucketCommands::Replication(replicate::ReplicateArgs {
+                    command: replicate::ReplicateCommands::Check(arg),
+                }) => {
+                    assert_eq!(arg.path, "local/my-bucket");
+                    assert!(arg.yes);
+                    assert!(arg.force);
+                }
+                other => panic!("expected bucket replication check command, got {other:?}"),
+            },
+            other => panic!("expected bucket command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_bucket_replication_resync_lifecycle() {
+        let start = Cli::try_parse_from([
+            "rc",
+            "bucket",
+            "replication",
+            "resync",
+            "start",
+            "local/my-bucket",
+            "--target-arn",
+            "arn:rustfs:replication::id:backup",
+            "--older-than",
+            "7d",
+            "--reset-id",
+            "caller-id",
+            "--yes",
+        ])
+        .expect("parse bucket replication resync start");
+
+        match start.command {
+            Commands::Bucket(args) => match args.command {
+                bucket::BucketCommands::Replication(replicate::ReplicateArgs {
+                    command:
+                        replicate::ReplicateCommands::Resync(replicate::ResyncCommands::Start(arg)),
+                }) => {
+                    assert_eq!(arg.path, "local/my-bucket");
+                    assert_eq!(
+                        arg.target_arn.as_deref(),
+                        Some("arn:rustfs:replication::id:backup")
+                    );
+                    assert_eq!(arg.older_than.as_deref(), Some("7d"));
+                    assert_eq!(arg.reset_id.as_deref(), Some("caller-id"));
+                    assert!(arg.yes);
+                }
+                other => panic!("expected bucket replication resync start, got {other:?}"),
+            },
+            other => panic!("expected bucket command, got {other:?}"),
+        }
+
+        let status = Cli::try_parse_from([
+            "rc",
+            "bucket",
+            "replication",
+            "resync",
+            "status",
+            "local/my-bucket",
+            "--target-arn",
+            "arn:rustfs:replication::id:backup",
+        ])
+        .expect("parse bucket replication resync status");
+
+        match status.command {
+            Commands::Bucket(args) => match args.command {
+                bucket::BucketCommands::Replication(replicate::ReplicateArgs {
+                    command:
+                        replicate::ReplicateCommands::Resync(replicate::ResyncCommands::Status(arg)),
+                }) => {
+                    assert_eq!(arg.path, "local/my-bucket");
+                    assert_eq!(
+                        arg.target_arn.as_deref(),
+                        Some("arn:rustfs:replication::id:backup")
+                    );
+                }
+                other => panic!("expected bucket replication resync status, got {other:?}"),
+            },
+            other => panic!("expected bucket command, got {other:?}"),
         }
     }
 
@@ -1092,7 +1324,7 @@ mod tests {
         match cli.command {
             Commands::Object(args) => match args.command {
                 object::ObjectCommands::Copy(arg) => {
-                    assert_eq!(arg.source, "./report.json");
+                    assert_eq!(arg.sources, ["./report.json"]);
                     assert_eq!(arg.target, "local/my-bucket/reports/");
                     assert_eq!(arg.content_type.as_deref(), Some("application/json"));
                     assert_eq!(arg.storage_class.as_deref(), Some("STANDARD_IA"));
@@ -1101,6 +1333,48 @@ mod tests {
                 other => panic!("expected object copy command, got {:?}", other),
             },
             other => panic!("expected object command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_multiple_copy_sources_and_global_transfer_controls() {
+        let cli = Cli::try_parse_from([
+            "rc",
+            "cp",
+            "./a.csv",
+            "./b.csv",
+            "local/reports/",
+            "--include",
+            "*.csv",
+            "--exclude",
+            "private-*",
+            "--newer-than",
+            "1h",
+            "--concurrency",
+            "8",
+            "--rate-limit",
+            "10MiB/s",
+            "--retry-attempts",
+            "5",
+            "--continue-on-error",
+            "--summary",
+        ])
+        .expect("parse multi-source transfer controls");
+
+        match cli.command {
+            Commands::Cp(args) => {
+                assert_eq!(args.sources, ["./a.csv", "./b.csv"]);
+                assert_eq!(args.target, "local/reports/");
+                assert_eq!(args.include, ["*.csv"]);
+                assert_eq!(args.exclude, ["private-*"]);
+                assert_eq!(args.newer_than.as_deref(), Some("1h"));
+                assert_eq!(args.concurrency, Some(8));
+                assert_eq!(args.rate_limit.as_deref(), Some("10MiB/s"));
+                assert_eq!(args.retry_attempts, Some(5));
+                assert!(args.continue_on_error);
+                assert!(args.summary);
+            }
+            other => panic!("expected cp command, got {other:?}"),
         }
     }
 
@@ -1241,5 +1515,35 @@ mod tests {
             },
             other => panic!("expected object command, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn version_selector_rejects_ambiguous_or_empty_values() {
+        assert!(validate_version_selector(Some("v1"), None).is_ok());
+        assert!(validate_version_selector(None, Some("1h")).is_ok());
+        assert!(validate_version_selector(Some("v1"), Some("1h")).is_err());
+        assert!(validate_version_selector(Some(""), None).is_err());
+    }
+
+    #[test]
+    fn versioning_errors_map_to_stable_exit_codes() {
+        assert_eq!(
+            exit_code_for_core_error(&rc_core::Error::VersionNotFound {
+                path: "local/bucket/key".to_string(),
+                version_id: "v1".to_string(),
+            }),
+            ExitCode::NotFound
+        );
+        assert_eq!(
+            exit_code_for_core_error(&rc_core::Error::Auth("denied".to_string())),
+            ExitCode::AuthError
+        );
+        assert_eq!(
+            exit_code_for_core_error(&rc_core::Error::GovernanceDenied {
+                path: "local/bucket/key".to_string(),
+                version_id: Some("v1".to_string()),
+            }),
+            ExitCode::Conflict
+        );
     }
 }

@@ -5,6 +5,7 @@
 
 mod formatter;
 mod progress;
+mod v3;
 
 // These exports will be used in Phase 2+ when commands are implemented
 #[allow(unused_imports)]
@@ -13,6 +14,7 @@ pub use formatter::Formatter;
 pub use formatter::Theme;
 #[allow(unused_imports)]
 pub use progress::ProgressBar;
+pub use v3::{V3ErrorEnvelope, V3PartialErrorEnvelope, V3SuccessEnvelope};
 
 /// Output configuration derived from CLI flags
 #[derive(Debug, Clone, Default)]

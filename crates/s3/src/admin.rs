@@ -9,25 +9,45 @@ use aws_sigv4::http_request::{
     SignableBody, SignableRequest, SignatureLocation, SigningSettings, sign,
 };
 use aws_sigv4::sign::v4;
+use bytes::Bytes;
+use futures::StreamExt;
 use rc_core::admin::{
     AccessKeyInfo, AdminApi, BucketQuota, CapabilityApi, CapabilityAvailability, CapabilityEntry,
     CapabilityReport, ClusterInfo, ClusterSnapshotMetadata, ClusterSnapshotSummary,
     CreateServiceAccountRequest, DecommissionPoolStatus, DecommissionStatus, DiagnosticCapability,
     ExtensionsCatalog, Group, GroupStatus, HealRuntimeState, HealScanMode, HealStartRequest,
-    HealStatus, HealTaskRequest, PeerSiteSpec, Policy, PolicyEntity, PolicyInfo, PoolStatus,
-    PoolTarget, RebalanceStartResult, RebalanceStatus, RuntimeCapabilitiesSnapshot,
-    RuntimeCapabilityStatus, ServiceAccount, ServiceAccountCreateResponse, ServiceActionResult,
-    SiteRemoveSpec, SiteStatusOptions, UpdateGroupMembersRequest, UpdateServiceAccountRequest,
-    User, UserStatus,
+    HealStatus, HealTaskRequest, KmsApi, KmsBackendKind, KmsCacheSummary,
+    KmsCancelKeyDeletionResult, KmsConfigSummary, KmsConfigureRequest, KmsCreateKeyRequest,
+    KmsCreateKeyResult, KmsDeleteKeyRequest, KmsDeleteKeyResult, KmsKey, KmsKeyPage, KmsKeyState,
+    KmsKeyUsage, KmsServiceState, KmsStatus, MAX_METRICS_LINE_BYTES, MAX_METRICS_RESPONSE_BYTES,
+    MAX_METRICS_SAMPLES, MAX_REPLICATION_DIFF_RESPONSE_BYTES,
+    MAX_SITE_REPLICATION_ERROR_RESPONSE_BYTES, MAX_SITE_REPLICATION_REQUEST_BYTES,
+    MAX_SITE_REPLICATION_SUCCESS_RESPONSE_BYTES, MetricsBatch, MetricsQuery, ObservabilityApi,
+    PeerSiteSpec, Policy, PolicyEntity, PolicyInfo, PoolStatus, PoolTarget, RealtimeMetrics,
+    RebalanceStartResult, RebalanceStatus, ReplicateEditStatus, ReplicationDiff,
+    ReplicationDiffApi, RuntimeCapabilitiesSnapshot, RuntimeCapabilityStatus, ScannerStatus,
+    ServiceAccount, ServiceAccountCreateResponse, ServiceActionResult, SiteRemoveSpec,
+    SiteReplicationInfo, SiteReplicationPeer, SiteReplicationResyncOperation,
+    SiteReplicationResyncStatus, SiteStatusOptions, StorageInfo, UpdateGroupMembersRequest,
+    UpdateServiceAccountRequest, User, UserStatus,
 };
 use rc_core::{Alias, Error, Result};
 use reqwest::header::{CONTENT_TYPE, HOST, HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Client, Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
+use zeroize::{Zeroize, Zeroizing};
+
+struct SensitiveRequestBody(Zeroizing<Vec<u8>>);
+
+impl AsRef<[u8]> for SensitiveRequestBody {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CapabilityCacheKey {
@@ -182,6 +202,14 @@ impl AdminClient {
         format!("{}/rustfs/admin/v4{}", self.endpoint, path)
     }
 
+    pub(crate) const fn http_client(&self) -> &Client {
+        &self.http_client
+    }
+
+    pub(crate) fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
     /// Calculate SHA256 hash of the body
     fn sha256_hash(body: &[u8]) -> String {
         let mut hasher = Sha256::new();
@@ -275,7 +303,7 @@ impl AdminClient {
     }
 
     /// Make a signed request to the admin API
-    async fn request<T: for<'de> Deserialize<'de>>(
+    pub(crate) async fn request<T: for<'de> Deserialize<'de>>(
         &self,
         method: Method,
         path: &str,
@@ -359,6 +387,210 @@ impl AdminClient {
         }
     }
 
+    async fn request_site_replication<T: for<'de> Deserialize<'de>>(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&[u8]>,
+        operation_label: &'static str,
+        mutation_outcome_label: Option<&'static str>,
+        uncertain_response_label: Option<&'static str>,
+    ) -> Result<T> {
+        let body_bytes = body.unwrap_or(&[]);
+        if body_bytes.len() > MAX_SITE_REPLICATION_REQUEST_BYTES {
+            return Err(Error::RequestRejected(format!(
+                "Site replication request size {} exceeds the {} byte limit",
+                body_bytes.len(),
+                MAX_SITE_REPLICATION_REQUEST_BYTES
+            )));
+        }
+
+        let url = self.admin_url(path);
+        let headers = self.request_headers(body_bytes)?;
+        let signed_headers = self
+            .sign_request(&method, &url, &headers, body_bytes)
+            .await?;
+        let mut request_builder = self.http_client.request(method, &url);
+        for (name, value) in &signed_headers {
+            request_builder = request_builder.header(name, value);
+        }
+        if !body_bytes.is_empty() {
+            request_builder = request_builder.body(body_bytes.to_vec());
+        }
+
+        let response = request_builder.send().await.map_err(|error| {
+            if let Some(mutation_outcome_label) = mutation_outcome_label {
+                Error::Network(format!(
+                    "{mutation_outcome_label} outcome is unknown; the request was not retried: {error}"
+                ))
+            } else {
+                Error::Network(format!("Request failed: {error}"))
+            }
+        })?;
+        let status = response.status();
+        let limit = if status.is_success() {
+            MAX_SITE_REPLICATION_SUCCESS_RESPONSE_BYTES
+        } else {
+            MAX_SITE_REPLICATION_ERROR_RESPONSE_BYTES
+        };
+        if response
+            .content_length()
+            .is_some_and(|content_length| content_length > limit as u64)
+        {
+            return Err(site_replication_response_rejected(
+                uncertain_response_label,
+                format!("response exceeds the {limit} byte limit"),
+            ));
+        }
+
+        let mut bytes = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| {
+                if let Some(mutation_outcome_label) = mutation_outcome_label {
+                    Error::Network(format!(
+                        "{mutation_outcome_label} outcome is unknown; the response could not be read and the request was not retried: {error}"
+                    ))
+                } else {
+                    Error::Network(format!("Failed to read site replication response: {error}"))
+                }
+            })?;
+            if bytes.len().saturating_add(chunk.len()) > limit {
+                return Err(site_replication_response_rejected(
+                    uncertain_response_label,
+                    format!("response exceeds the {limit} byte limit"),
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+
+        if !status.is_success() {
+            let error_body = String::from_utf8_lossy(&bytes);
+            let error = self.map_site_replication_error(status, &error_body, operation_label);
+            if !status.is_redirection()
+                && matches!(error, Error::Network(_))
+                && let Some(label) = uncertain_response_label
+            {
+                return Err(site_replication_response_unknown_network(
+                    label,
+                    status.as_u16(),
+                ));
+            }
+            return Err(error);
+        }
+        serde_json::from_slice(&bytes).map_err(|error| {
+            if uncertain_response_label.is_some() {
+                site_replication_response_rejected(
+                    uncertain_response_label,
+                    "server returned malformed JSON".to_string(),
+                )
+            } else {
+                Error::Json(error)
+            }
+        })
+    }
+
+    async fn request_bounded_json<T: for<'de> Deserialize<'de>>(
+        &self,
+        method: Method,
+        path: &str,
+        query: Option<&[(&str, &str)]>,
+        body: Option<&[u8]>,
+        max_response_bytes: usize,
+        response_name: &str,
+    ) -> Result<T> {
+        let mut url = self.admin_url(path);
+        if let Some(query) = query {
+            let query_string = query
+                .iter()
+                .map(|(key, value)| {
+                    format!(
+                        "{}={}",
+                        urlencoding::encode(key),
+                        urlencoding::encode(value)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("&");
+            if !query_string.is_empty() {
+                url.push('?');
+                url.push_str(&query_string);
+            }
+        }
+
+        let body_bytes = body.unwrap_or(&[]);
+        let headers = self.request_headers(body_bytes)?;
+        let signed_headers = self
+            .sign_request(&method, &url, &headers, body_bytes)
+            .await?;
+        let mut request_builder = self.http_client.request(method, &url);
+        for (name, value) in signed_headers.iter() {
+            request_builder = request_builder.header(name, value);
+        }
+        if !body_bytes.is_empty() {
+            request_builder = request_builder.body(body_bytes.to_vec());
+        }
+
+        let response = request_builder
+            .send()
+            .await
+            .map_err(|error| Error::Network(format!("Request failed: {error}")))?;
+        let status = response.status();
+        let response_body =
+            read_bounded_response_body(response, max_response_bytes, response_name).await?;
+        if !status.is_success() {
+            return Err(
+                self.map_replication_diff_error(status, &String::from_utf8_lossy(&response_body))
+            );
+        }
+
+        serde_json::from_slice(&response_body).map_err(Error::Json)
+    }
+
+    /// Send a KMS request while retaining ownership of its body in zeroizing storage.
+    async fn request_sensitive<T: for<'de> Deserialize<'de>>(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Zeroizing<Vec<u8>>>,
+    ) -> Result<T> {
+        let url = self.admin_url(path);
+        let body_bytes = body
+            .as_ref()
+            .map(|body| body.as_slice())
+            .unwrap_or_default();
+        let headers = self.request_headers(body_bytes)?;
+        let signed_headers = self
+            .sign_request(&method, &url, &headers, body_bytes)
+            .await?;
+        let mut request_builder = self.http_client.request(method, &url);
+        for (name, value) in signed_headers.iter() {
+            request_builder = request_builder.header(name, value);
+        }
+        if let Some(body) = body {
+            request_builder = request_builder.body(Bytes::from_owner(SensitiveRequestBody(body)));
+        }
+        let response = request_builder
+            .send()
+            .await
+            .map_err(|_| Error::Network("KMS administration request failed".to_string()))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(kms_lifecycle_status_error(status));
+        }
+        let text = Zeroizing::new(
+            response
+                .text()
+                .await
+                .map_err(|_| Error::Network("Failed to read KMS response".to_string()))?,
+        );
+        if text.is_empty() {
+            serde_json::from_str("null").map_err(Error::Json)
+        } else {
+            serde_json::from_str(&text).map_err(Error::Json)
+        }
+    }
+
     /// Make a signed request that returns no body
     async fn request_no_response(
         &self,
@@ -425,7 +657,7 @@ impl AdminClient {
     }
 
     /// Map HTTP status codes to appropriate errors
-    fn map_error(&self, status: StatusCode, body: &str) -> Error {
+    pub(crate) fn map_error(&self, status: StatusCode, body: &str) -> Error {
         if matches!(status, StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED) {
             return Error::Auth(body.to_string());
         }
@@ -463,6 +695,140 @@ impl AdminClient {
             _ => Error::Network(format!("HTTP {}: {}", status.as_u16(), body)),
         }
     }
+
+    fn map_site_replication_error(
+        &self,
+        status: StatusCode,
+        body: &str,
+        operation_label: &str,
+    ) -> Error {
+        if matches!(
+            status,
+            StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_IMPLEMENTED
+        ) {
+            return Error::UnsupportedFeature(format!(
+                "{operation_label} is not supported by this server"
+            ));
+        }
+        if status == StatusCode::BAD_REQUEST
+            && (site_replication_operation_conflicts(body)
+                || (operation_label.starts_with("Site replication resync")
+                    && site_replication_resync_conflicts(body)))
+        {
+            return Error::Conflict(
+                "Site replication request conflicts with current server state".to_string(),
+            );
+        }
+        if matches!(status, StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED) {
+            return Error::Auth("Authentication failed for site replication request".to_string());
+        }
+        if status == StatusCode::CONFLICT {
+            return Error::Conflict("Site replication request conflicts with server state".into());
+        }
+        if status == StatusCode::BAD_REQUEST {
+            return Error::General("Site replication request was rejected by the server".into());
+        }
+        Error::Network(format!(
+            "Site replication request failed with HTTP {}",
+            status.as_u16()
+        ))
+    }
+
+    fn sanitize_site_replication_status(&self, status: &mut ReplicateEditStatus) {
+        self.redact_admin_credentials(&mut status.status);
+        self.redact_admin_credentials(&mut status.error_detail);
+    }
+
+    fn sanitize_site_replication_resync_status(&self, status: &mut SiteReplicationResyncStatus) {
+        self.redact_admin_credentials(&mut status.operation);
+        self.redact_admin_credentials(&mut status.resync_id);
+        self.redact_admin_credentials(&mut status.status);
+        self.redact_admin_credentials(&mut status.error_detail);
+        for value in status.extensions.values_mut() {
+            self.redact_admin_credentials_in_value(value);
+        }
+        for bucket in &mut status.buckets {
+            self.redact_admin_credentials(&mut bucket.bucket);
+            self.redact_admin_credentials(&mut bucket.status);
+            self.redact_admin_credentials(&mut bucket.error_detail);
+            for value in bucket.extensions.values_mut() {
+                self.redact_admin_credentials_in_value(value);
+            }
+        }
+    }
+
+    fn redact_admin_credentials_in_value(&self, value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::String(value) => self.redact_admin_credentials(value),
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    self.redact_admin_credentials_in_value(value);
+                }
+            }
+            serde_json::Value::Object(values) => {
+                for value in values.values_mut() {
+                    self.redact_admin_credentials_in_value(value);
+                }
+            }
+            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            }
+        }
+    }
+
+    fn redact_admin_credentials(&self, value: &mut String) {
+        let mut credentials = [&self.access_key, &self.secret_key];
+        credentials.sort_by_key(|credential| std::cmp::Reverse(credential.len()));
+        for credential in credentials {
+            if !credential.is_empty() {
+                *value = value.replace(credential, "[REDACTED]");
+            }
+        }
+    }
+
+    fn map_replication_diff_error(&self, status: StatusCode, body: &str) -> Error {
+        if status != StatusCode::NOT_FOUND {
+            return self.map_error(status, body);
+        }
+
+        let structured_error = parse_admin_error(body);
+        if structured_error.as_ref().is_some_and(|error| {
+            matches!(
+                error.code.as_deref(),
+                Some(
+                    "NoSuchBucket"
+                        | "ReplicationConfigurationNotFoundError"
+                        | "ReplicationConfigurationNotFound"
+                )
+            )
+        }) {
+            return Error::NotFound(body.to_string());
+        }
+
+        let reason = structured_error
+            .and_then(|error| error.message)
+            .filter(|message| !message.trim().is_empty())
+            .unwrap_or_else(|| "the replication diff route was not found".to_string());
+        Error::UnsupportedFeature(reason)
+    }
+}
+
+fn site_replication_response_rejected(
+    mutation_outcome_label: Option<&str>,
+    reason: String,
+) -> Error {
+    if let Some(label) = mutation_outcome_label {
+        Error::General(format!(
+            "{label} outcome is unknown because the {reason}; do not retry blindly; inspect the persisted resync snapshot and storage state"
+        ))
+    } else {
+        Error::General(format!("Site replication {reason}"))
+    }
+}
+
+fn site_replication_response_unknown_network(label: &str, status: u16) -> Error {
+    Error::Network(format!(
+        "{label} outcome is unknown after the server returned HTTP {status}; do not retry blindly; inspect the persisted resync snapshot and storage state"
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -483,10 +849,153 @@ impl AdminErrorResponse {
     }
 }
 
+fn site_replication_operation_conflicts(body: &str) -> bool {
+    let Some(error) = parse_admin_error(body) else {
+        return false;
+    };
+    site_replication_server_invalid_state(
+        error.code.as_deref(),
+        error.message.as_deref().unwrap_or_default(),
+    )
+}
+
+fn site_replication_resync_conflicts(body: &str) -> bool {
+    let Some(error) = parse_admin_error(body) else {
+        return false;
+    };
+    if error.code.as_deref() != Some("InvalidRequest") {
+        return false;
+    }
+
+    matches!(
+        error
+            .message
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "no resync in progress"
+            | "invalid peer specified - cannot resync to self"
+            | "site replication peer not found"
+    )
+}
+
+fn validate_site_replication_resync_status(
+    requested_operation: &SiteReplicationResyncOperation,
+    status: &SiteReplicationResyncStatus,
+) -> Result<()> {
+    if status.operation.trim().is_empty() {
+        return Err(Error::General(
+            "Site replication resync response is missing the operation".to_string(),
+        ));
+    }
+    if status.status.trim().is_empty() {
+        return Err(Error::General(
+            "Site replication resync response is missing the status".to_string(),
+        ));
+    }
+    if requested_operation.is_mutation()
+        && !status
+            .operation
+            .trim()
+            .eq_ignore_ascii_case(requested_operation.as_str())
+    {
+        return Err(Error::General(
+            "Site replication resync response operation does not match the requested mutation"
+                .to_string(),
+        ));
+    }
+    let response_is_mutation = matches!(
+        status.operation.trim().to_ascii_lowercase().as_str(),
+        "start" | "cancel"
+    );
+    let is_no_snapshot = *requested_operation == SiteReplicationResyncOperation::Status
+        && status.operation.trim().eq_ignore_ascii_case("status")
+        && status.status.trim().eq_ignore_ascii_case("not-found");
+    if (requested_operation.is_mutation() || response_is_mutation)
+        && !is_no_snapshot
+        && status.resync_id.trim().is_empty()
+    {
+        return Err(Error::General(
+            "Site replication resync response is missing the operation ID".to_string(),
+        ));
+    }
+    if status
+        .buckets
+        .iter()
+        .any(|bucket| bucket.bucket.trim().is_empty() || bucket.status.trim().is_empty())
+    {
+        return Err(Error::General(
+            "Site replication resync response contains an incomplete bucket record".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn site_replication_server_invalid_state(code: Option<&str>, message: &str) -> bool {
+    if code.is_some_and(|code| {
+        matches!(
+            code,
+            "SiteReplicationIAMChangePending"
+                | "SiteReplicationOperationPending"
+                | "SiteReplicationPeerEditPending"
+        )
+    }) {
+        return true;
+    }
+
+    let message = message.trim().to_ascii_lowercase();
+    if matches!(
+        message.as_str(),
+        "site replication operation pending"
+            | "site replication peer edit pending"
+            | "site replication iam change pending"
+    ) {
+        return true;
+    }
+
+    let state_changed = matches!(
+        message.as_str(),
+        "site replication state changed" | "site replication refresh state changed"
+    );
+    state_changed && matches!(code, None | Some("InvalidRequest"))
+}
+
 fn parse_admin_error(body: &str) -> Option<AdminErrorResponse> {
     serde_json::from_str(body)
         .ok()
         .or_else(|| quick_xml::de::from_str(body).ok())
+}
+
+async fn read_bounded_response_body(
+    response: reqwest::Response,
+    max_response_bytes: usize,
+    response_name: &str,
+) -> Result<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_response_bytes as u64)
+    {
+        return Err(Error::General(format!(
+            "{response_name} exceeded the {max_response_bytes}-byte response limit"
+        )));
+    }
+
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.map_err(|error| Error::Network(format!("Failed to read response: {error}")))?;
+        if body.len().saturating_add(chunk.len()) > max_response_bytes {
+            return Err(Error::General(format!(
+                "{response_name} exceeded the {max_response_bytes}-byte response limit"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    Ok(body)
 }
 
 /// Response wrapper for user list
@@ -859,6 +1368,11 @@ struct ClusterSnapshotResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct StorageInfoResponse {
+    info: StorageInfo,
+}
+
+#[derive(Debug, Deserialize)]
 struct ClusterSnapshotPayload {
     summary: ClusterSnapshotSummary,
     runtime_capabilities_path: String,
@@ -1111,7 +1625,7 @@ fn stubbed_report(server_version: Option<String>, reason: String) -> CapabilityR
 }
 
 fn add_known_server_capabilities(version: Option<&str>, capabilities: &mut Vec<CapabilityEntry>) {
-    if !is_rustfs_beta10(version) {
+    if !version.is_some_and(is_rustfs_beta_10) {
         add_uniform_diagnostic_capabilities(
             capabilities,
             CapabilityAvailability::Unknown,
@@ -1119,6 +1633,17 @@ fn add_known_server_capabilities(version: Option<&str>, capabilities: &mut Vec<C
         );
         return;
     }
+
+    capabilities.push(CapabilityEntry {
+        name: "admin.data-usage".to_string(),
+        availability: CapabilityAvailability::Available,
+        reason: None,
+    });
+    capabilities.push(CapabilityEntry {
+        name: "listen_notification".to_string(),
+        availability: CapabilityAvailability::Available,
+        reason: None,
+    });
 
     for (name, reason) in [
         (
@@ -1150,15 +1675,6 @@ fn add_known_server_capabilities(version: Option<&str>, capabilities: &mut Vec<C
     }
 
     add_beta10_diagnostic_capabilities(capabilities);
-}
-
-fn is_rustfs_beta10(version: Option<&str>) -> bool {
-    version.is_some_and(|version| {
-        version == "1.0.0-beta.10"
-            || version
-                .strip_prefix("1.0.0-beta.10+")
-                .is_some_and(|metadata| !metadata.is_empty())
-    })
 }
 
 fn add_uniform_diagnostic_capabilities(
@@ -1261,6 +1777,655 @@ fn mirror_diagnostic_route(
     });
 }
 
+fn is_rustfs_beta_10(version: &str) -> bool {
+    version
+        .split(|character: char| character.is_ascii_whitespace() || character == '/')
+        .map(|component| component.trim_start_matches('v'))
+        .any(|component| component.split('+').next() == Some("1.0.0-beta.10"))
+}
+
+#[derive(Debug, Deserialize)]
+struct KmsServiceStatusResponse {
+    status: serde_json::Value,
+    #[serde(default)]
+    backend_type: Option<String>,
+    #[serde(default)]
+    healthy: Option<bool>,
+    #[serde(default)]
+    config_summary: Option<KmsConfigSummaryResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+struct KmsConfigSummaryResponse {
+    backend_type: String,
+    #[serde(default)]
+    default_key_id: Option<String>,
+    #[serde(default)]
+    timeout_seconds: Option<u64>,
+    #[serde(default)]
+    retry_attempts: Option<u32>,
+    #[serde(default)]
+    enable_cache: bool,
+    #[serde(default)]
+    max_cached_keys: Option<u64>,
+    #[serde(default)]
+    cache_ttl_seconds: Option<u64>,
+    #[serde(default)]
+    cache_summary: Option<KmsCacheSummaryResponse>,
+    #[serde(default)]
+    backend_summary: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct KmsCacheSummaryResponse {
+    #[serde(default)]
+    max_keys: Option<u64>,
+    #[serde(default)]
+    ttl_seconds: Option<u64>,
+    #[serde(default)]
+    enable_metrics: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct KmsListKeysResponse {
+    success: bool,
+    message: String,
+    #[serde(default)]
+    keys: Vec<KmsKeyResponse>,
+    #[serde(default)]
+    truncated: bool,
+    #[serde(default)]
+    next_marker: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct KmsDescribeKeyResponse {
+    success: bool,
+    message: String,
+    #[serde(default)]
+    key_metadata: Option<KmsKeyResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct KmsCreateKeyBody<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<&'a str>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    tags: BTreeMap<&'a str, &'a str>,
+}
+
+#[derive(Debug, Deserialize)]
+struct KmsCreateKeyResponse {
+    success: bool,
+    message: String,
+    #[serde(default)]
+    key_id: Option<String>,
+    #[serde(default)]
+    key_metadata: Option<KmsKeyResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct KmsDeleteKeyBody<'a> {
+    key_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pending_window_in_days: Option<u32>,
+    #[serde(skip_serializing_if = "is_false")]
+    force_immediate: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct KmsDeleteKeyResponse {
+    success: bool,
+    message: String,
+    #[serde(default)]
+    key_id: Option<String>,
+    #[serde(default)]
+    deletion_date: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct KmsCancelKeyDeletionBody<'a> {
+    key_id: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+struct KmsCancelKeyDeletionResponse {
+    success: bool,
+    message: String,
+    #[serde(default)]
+    key_id: Option<String>,
+    #[serde(default)]
+    key_metadata: Option<KmsKeyResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct KmsStartBody {
+    force: bool,
+}
+
+#[derive(Deserialize)]
+struct KmsLifecycleResponse {
+    success: bool,
+    message: String,
+    status: serde_json::Value,
+}
+
+impl Drop for KmsLifecycleResponse {
+    fn drop(&mut self) {
+        self.message.zeroize();
+        zeroize_json_value(&mut self.status);
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct KmsKeyResponse {
+    key_id: String,
+    #[serde(default, alias = "key_state", alias = "status")]
+    state: Option<String>,
+    #[serde(default, alias = "key_usage")]
+    usage: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    algorithm: Option<String>,
+    #[serde(default)]
+    version: Option<u32>,
+    #[serde(default, alias = "creation_date")]
+    created_at: Option<String>,
+    #[serde(default)]
+    deletion_date: Option<String>,
+    #[serde(default)]
+    rotated_at: Option<String>,
+    #[serde(default)]
+    origin: Option<String>,
+    #[serde(default, alias = "key_manager")]
+    manager: Option<String>,
+    #[serde(default)]
+    tags: BTreeMap<String, String>,
+    #[serde(default)]
+    metadata: BTreeMap<String, String>,
+}
+
+impl From<KmsConfigSummaryResponse> for KmsConfigSummary {
+    fn from(response: KmsConfigSummaryResponse) -> Self {
+        let backend_details = response.backend_summary.as_object();
+        let string_detail = |name: &str| {
+            backend_details
+                .and_then(|details| details.get(name))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        };
+        let bool_detail = |name: &str| {
+            backend_details
+                .and_then(|details| details.get(name))
+                .and_then(serde_json::Value::as_bool)
+        };
+        let cache = response.cache_summary;
+
+        Self {
+            backend: kms_backend_kind(&response.backend_type),
+            default_key_id: response.default_key_id,
+            timeout_seconds: response.timeout_seconds,
+            retry_attempts: response.retry_attempts,
+            cache: KmsCacheSummary {
+                enabled: response.enable_cache,
+                max_keys: cache
+                    .as_ref()
+                    .and_then(|summary| summary.max_keys)
+                    .or(response.max_cached_keys),
+                ttl_seconds: cache
+                    .as_ref()
+                    .and_then(|summary| summary.ttl_seconds)
+                    .or(response.cache_ttl_seconds),
+                metrics_enabled: cache.and_then(|summary| summary.enable_metrics),
+            },
+            endpoint: string_detail("address").and_then(|address| safe_backend_endpoint(&address)),
+            auth_method: string_detail("auth_method_type"),
+            credentials_configured: bool_detail("has_stored_credentials"),
+            tls_verification_disabled: bool_detail("skip_tls_verify"),
+        }
+    }
+}
+
+impl From<KmsKeyResponse> for KmsKey {
+    fn from(mut response: KmsKeyResponse) -> Self {
+        response.metadata.append(&mut response.tags);
+        Self {
+            key_id: response.key_id,
+            state: kms_key_state(response.state.as_deref()),
+            usage: kms_key_usage(response.usage.as_deref()),
+            description: response.description,
+            algorithm: response.algorithm,
+            version: response.version,
+            created_at: response.created_at,
+            deletion_date: response.deletion_date,
+            rotated_at: response.rotated_at,
+            origin: response.origin,
+            manager: response.manager,
+            tags: response.metadata,
+        }
+    }
+}
+
+fn kms_backend_kind(value: &str) -> KmsBackendKind {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "local" => KmsBackendKind::Local,
+        "vault" | "vaultkv2" | "vault-kv2" | "vault_kv2" => KmsBackendKind::VaultKv2,
+        "vaulttransit" | "vault-transit" | "vault_transit" => KmsBackendKind::VaultTransit,
+        _ => KmsBackendKind::Unknown,
+    }
+}
+
+fn zeroize_json_value(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(value) => value.zeroize(),
+        serde_json::Value::Array(values) => values.iter_mut().for_each(zeroize_json_value),
+        serde_json::Value::Object(values) => {
+            for (mut key, mut value) in std::mem::take(values) {
+                key.zeroize();
+                zeroize_json_value(&mut value);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+}
+
+fn safe_backend_endpoint(value: &str) -> Option<String> {
+    let mut endpoint = url::Url::parse(value).ok()?;
+    endpoint.set_username("").ok()?;
+    endpoint.set_password(None).ok()?;
+    endpoint.set_query(None);
+    endpoint.set_fragment(None);
+    Some(endpoint.into())
+}
+
+fn kms_service_state(value: &serde_json::Value) -> (KmsServiceState, Option<String>) {
+    match value {
+        serde_json::Value::String(state) => {
+            let state = state.trim();
+            let state = if ["notconfigured", "not-configured", "not_configured"]
+                .iter()
+                .any(|candidate| state.eq_ignore_ascii_case(candidate))
+            {
+                KmsServiceState::NotConfigured
+            } else if state.eq_ignore_ascii_case("configured") {
+                KmsServiceState::Configured
+            } else if state.eq_ignore_ascii_case("running") {
+                KmsServiceState::Running
+            } else if state.eq_ignore_ascii_case("error") {
+                KmsServiceState::Error
+            } else {
+                KmsServiceState::Unknown
+            };
+            (state, None)
+        }
+        serde_json::Value::Object(status) => status
+            .get("Error")
+            .or_else(|| status.get("error"))
+            .and_then(serde_json::Value::as_str)
+            .map_or((KmsServiceState::Unknown, None), |_| {
+                (
+                    KmsServiceState::Error,
+                    Some("KMS service reported an error".to_string()),
+                )
+            }),
+        _ => (KmsServiceState::Unknown, None),
+    }
+}
+
+fn kms_key_state(value: Option<&str>) -> KmsKeyState {
+    match value
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "enabled" => KmsKeyState::Enabled,
+        "active" => KmsKeyState::Active,
+        "disabled" => KmsKeyState::Disabled,
+        "pendingdeletion" | "pending-deletion" | "pending_deletion" => KmsKeyState::PendingDeletion,
+        "pendingimport" | "pending-import" | "pending_import" => KmsKeyState::PendingImport,
+        "unavailable" => KmsKeyState::Unavailable,
+        "deleted" => KmsKeyState::Deleted,
+        _ => KmsKeyState::Unknown,
+    }
+}
+
+fn kms_key_usage(value: Option<&str>) -> KmsKeyUsage {
+    match value
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "encryptdecrypt" | "encrypt-decrypt" | "encrypt_decrypt" => KmsKeyUsage::EncryptDecrypt,
+        "signverify" | "sign-verify" | "sign_verify" => KmsKeyUsage::SignVerify,
+        _ => KmsKeyUsage::Unknown,
+    }
+}
+
+fn kms_mutation_error(operation: &str, message: &str) -> Error {
+    let normalized = message.to_ascii_lowercase();
+    if normalized.contains("already exists") || normalized.contains("conflict") {
+        Error::Conflict(format!("KMS key {operation} conflicts with existing state"))
+    } else if normalized.contains("not found") || normalized.contains("does not exist") {
+        Error::NotFound(format!("KMS key {operation} target was not found"))
+    } else if normalized.contains("not initialized")
+        || normalized.contains("not running")
+        || normalized.contains("unavailable")
+    {
+        Error::Network("KMS service is unavailable".to_string())
+    } else {
+        Error::General(format!("KMS key {operation} request was rejected"))
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
+fn sanitize_kms_mutation_error(operation: &str, error: Error) -> Error {
+    match error {
+        Error::Auth(_) => Error::Auth("KMS mutation permission was denied".to_string()),
+        Error::NotFound(_) => Error::NotFound(format!("KMS key {operation} target was not found")),
+        Error::Conflict(_) => {
+            Error::Conflict(format!("KMS key {operation} conflicts with existing state"))
+        }
+        Error::Network(diagnostic) => {
+            let classified = kms_mutation_error(operation, &diagnostic);
+            match classified {
+                Error::Conflict(_) | Error::NotFound(_) => classified,
+                _ => Error::Network("KMS service is unavailable".to_string()),
+            }
+        }
+        Error::Json(error) => Error::Json(error),
+        Error::InvalidPath(_) | Error::Config(_) => error,
+        error => kms_mutation_error(operation, &error.to_string()),
+    }
+}
+
+fn kms_lifecycle_error(operation: &str, message: &str) -> Error {
+    if contains_ascii_case_insensitive(message, "not configured")
+        || contains_ascii_case_insensitive(message, "unconfigured")
+    {
+        Error::NotFound("KMS service is not configured".to_string())
+    } else if contains_ascii_case_insensitive(message, "already running")
+        || contains_ascii_case_insensitive(message, "already stopped")
+        || contains_ascii_case_insensitive(message, "conflict")
+    {
+        Error::Conflict(format!(
+            "KMS {operation} conflicts with current service state"
+        ))
+    } else if contains_ascii_case_insensitive(message, "not initialized")
+        || contains_ascii_case_insensitive(message, "unavailable")
+        || contains_ascii_case_insensitive(message, "storage layer not initialized")
+    {
+        Error::Network("KMS service is unavailable".to_string())
+    } else {
+        Error::General(format!("KMS {operation} request was rejected"))
+    }
+}
+
+fn contains_ascii_case_insensitive(value: &str, needle: &str) -> bool {
+    value
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+fn kms_lifecycle_status_error(status: StatusCode) -> Error {
+    match status {
+        StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED => {
+            Error::Auth("KMS administration permission was denied".to_string())
+        }
+        StatusCode::NOT_FOUND | StatusCode::NOT_IMPLEMENTED => Error::UnsupportedFeature(
+            "The RustFS KMS administration route is unavailable".to_string(),
+        ),
+        StatusCode::CONFLICT => {
+            Error::Conflict("KMS operation conflicts with current service state".to_string())
+        }
+        StatusCode::BAD_REQUEST => {
+            Error::General("KMS administration request was rejected".to_string())
+        }
+        _ => Error::Network("KMS service is unavailable".to_string()),
+    }
+}
+
+fn sanitize_kms_lifecycle_error(operation: &str, error: Error) -> Error {
+    match error {
+        Error::Auth(_) => Error::Auth("KMS administration permission was denied".to_string()),
+        Error::NotFound(_) => Error::NotFound("KMS service is not configured".to_string()),
+        Error::Conflict(_) => Error::Conflict(format!(
+            "KMS {operation} conflicts with current service state"
+        )),
+        Error::Network(mut diagnostic) => {
+            let classified = kms_lifecycle_error(operation, &diagnostic);
+            diagnostic.zeroize();
+            match classified {
+                Error::NotFound(_) | Error::Conflict(_) => classified,
+                _ => Error::Network("KMS service is unavailable".to_string()),
+            }
+        }
+        Error::Json(error) => Error::Json(error),
+        Error::UnsupportedFeature(_) => Error::UnsupportedFeature(
+            "The RustFS KMS administration route is unavailable".to_string(),
+        ),
+        Error::InvalidPath(_) | Error::Config(_) => error,
+        _ => Error::General(format!("KMS {operation} request failed")),
+    }
+}
+
+fn kms_lifecycle_state(operation: &str, response: KmsLifecycleResponse) -> Result<KmsServiceState> {
+    if !response.success {
+        return Err(kms_lifecycle_error(operation, &response.message));
+    }
+    Ok(kms_service_state(&response.status).0)
+}
+
+#[async_trait]
+impl KmsApi for AdminClient {
+    async fn kms_status(&self) -> Result<KmsStatus> {
+        let response: KmsServiceStatusResponse = self
+            .request(Method::GET, "/kms/service-status", None, None)
+            .await?;
+        let (state, error_message) = kms_service_state(&response.status);
+        let backend = response.backend_type.as_deref().map(kms_backend_kind);
+        Ok(KmsStatus {
+            state,
+            backend,
+            healthy: response.healthy,
+            error_message,
+            config: response.config_summary.map(Into::into),
+        })
+    }
+
+    async fn kms_list_keys(&self, limit: u32, marker: Option<&str>) -> Result<KmsKeyPage> {
+        let limit = limit.to_string();
+        let mut query = vec![("limit", limit.as_str())];
+        if let Some(marker) = marker {
+            query.push(("marker", marker));
+        }
+        let response: KmsListKeysResponse = self
+            .request(Method::GET, "/kms/keys", Some(&query), None)
+            .await?;
+        if !response.success {
+            return Err(Error::General(response.message));
+        }
+        Ok(KmsKeyPage {
+            keys: response.keys.into_iter().map(Into::into).collect(),
+            truncated: response.truncated,
+            next_marker: response.next_marker,
+        })
+    }
+
+    async fn kms_describe_key(&self, key_id: &str) -> Result<KmsKey> {
+        if key_id.trim().is_empty() {
+            return Err(Error::InvalidPath("KMS key id cannot be empty".to_string()));
+        }
+        let path = format!("/kms/keys/{}", urlencoding::encode(key_id));
+        let response: KmsDescribeKeyResponse = self.request(Method::GET, &path, None, None).await?;
+        if !response.success {
+            return Err(Error::General(response.message));
+        }
+        response
+            .key_metadata
+            .map(Into::into)
+            .ok_or_else(|| Error::Network("KMS describe response omitted key metadata".to_string()))
+    }
+
+    async fn kms_create_key(&self, request: &KmsCreateKeyRequest) -> Result<KmsCreateKeyResult> {
+        if request.tags.contains_key("name") {
+            return Err(Error::InvalidPath(
+                "The KMS tag key 'name' is reserved; use the name field".to_string(),
+            ));
+        }
+        let mut tags = request
+            .tags
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect::<BTreeMap<_, _>>();
+        if let Some(name) = request.name.as_deref() {
+            tags.insert("name", name);
+        }
+        let body = serde_json::to_vec(&KmsCreateKeyBody {
+            description: request.description.as_deref(),
+            tags,
+        })
+        .map_err(Error::Json)?;
+        let response: KmsCreateKeyResponse = self
+            .request(Method::POST, "/kms/keys", None, Some(&body))
+            .await
+            .map_err(|error| sanitize_kms_mutation_error("creation", error))?;
+        if !response.success {
+            return Err(kms_mutation_error("creation", &response.message));
+        }
+        let key = response.key_metadata.map(Into::into);
+        let key_id = response
+            .key_id
+            .or_else(|| key.as_ref().map(|key: &KmsKey| key.key_id.clone()))
+            .ok_or_else(|| {
+                Error::Network("KMS create response omitted the key identifier".to_string())
+            })?;
+        Ok(KmsCreateKeyResult { key_id, key })
+    }
+
+    async fn kms_delete_key(&self, request: &KmsDeleteKeyRequest) -> Result<KmsDeleteKeyResult> {
+        if request.key_id.trim().is_empty() {
+            return Err(Error::InvalidPath("KMS key id cannot be empty".to_string()));
+        }
+        if request.force_immediate && request.pending_window_in_days.is_some() {
+            return Err(Error::InvalidPath(
+                "Immediate KMS deletion cannot include a pending window".to_string(),
+            ));
+        }
+        if request
+            .pending_window_in_days
+            .is_some_and(|days| !(7..=30).contains(&days))
+        {
+            return Err(Error::InvalidPath(
+                "KMS deletion pending window must be between 7 and 30 days".to_string(),
+            ));
+        }
+        let body = serde_json::to_vec(&KmsDeleteKeyBody {
+            key_id: &request.key_id,
+            pending_window_in_days: request.pending_window_in_days,
+            force_immediate: request.force_immediate,
+        })
+        .map_err(Error::Json)?;
+        let response: KmsDeleteKeyResponse = self
+            .request(Method::DELETE, "/kms/keys/delete", None, Some(&body))
+            .await
+            .map_err(|error| sanitize_kms_mutation_error("deletion", error))?;
+        if !response.success {
+            return Err(kms_mutation_error("deletion", &response.message));
+        }
+        let key_id = response.key_id.ok_or_else(|| {
+            Error::Network("KMS delete response omitted the key identifier".to_string())
+        })?;
+        Ok(KmsDeleteKeyResult {
+            key_id,
+            deletion_date: response.deletion_date,
+            immediate: request.force_immediate,
+        })
+    }
+
+    async fn kms_cancel_key_deletion(&self, key_id: &str) -> Result<KmsCancelKeyDeletionResult> {
+        if key_id.trim().is_empty() {
+            return Err(Error::InvalidPath("KMS key id cannot be empty".to_string()));
+        }
+        let body = serde_json::to_vec(&KmsCancelKeyDeletionBody { key_id }).map_err(Error::Json)?;
+        let response: KmsCancelKeyDeletionResponse = self
+            .request(Method::POST, "/kms/keys/cancel-deletion", None, Some(&body))
+            .await
+            .map_err(|error| sanitize_kms_mutation_error("deletion cancellation", error))?;
+        if !response.success {
+            return Err(kms_mutation_error(
+                "deletion cancellation",
+                &response.message,
+            ));
+        }
+        let key = response.key_metadata.map(Into::into);
+        let key_id = response
+            .key_id
+            .or_else(|| key.as_ref().map(|key: &KmsKey| key.key_id.clone()))
+            .ok_or_else(|| {
+                Error::Network("KMS cancellation response omitted the key identifier".to_string())
+            })?;
+        Ok(KmsCancelKeyDeletionResult { key_id, key })
+    }
+
+    async fn kms_configure(&self, request: &KmsConfigureRequest) -> Result<KmsServiceState> {
+        request.validate(false)?;
+        self.kms_send_configuration("configure", "/kms/configure", request)
+            .await
+    }
+
+    async fn kms_reconfigure(&self, request: &KmsConfigureRequest) -> Result<KmsServiceState> {
+        request.validate(true)?;
+        self.kms_send_configuration("reconfiguration", "/kms/reconfigure", request)
+            .await
+    }
+
+    async fn kms_start(&self, force: bool) -> Result<KmsServiceState> {
+        let body = Zeroizing::new(serde_json::to_vec(&KmsStartBody { force }).map_err(|_| {
+            Error::General("Failed to encode KMS service control request".to_string())
+        })?);
+        let response: KmsLifecycleResponse = self
+            .request_sensitive(Method::POST, "/kms/start", Some(body))
+            .await
+            .map_err(|error| {
+                sanitize_kms_lifecycle_error(if force { "restart" } else { "start" }, error)
+            })?;
+        kms_lifecycle_state(if force { "restart" } else { "start" }, response)
+    }
+
+    async fn kms_stop(&self) -> Result<KmsServiceState> {
+        let response: KmsLifecycleResponse = self
+            .request_sensitive(Method::POST, "/kms/stop", None)
+            .await
+            .map_err(|error| sanitize_kms_lifecycle_error("stop", error))?;
+        kms_lifecycle_state("stop", response)
+    }
+}
+
+impl AdminClient {
+    async fn kms_send_configuration(
+        &self,
+        operation: &str,
+        path: &str,
+        request: &KmsConfigureRequest,
+    ) -> Result<KmsServiceState> {
+        let body = Zeroizing::new(serde_json::to_vec(request).map_err(|_| {
+            Error::General("Failed to encode KMS configuration request".to_string())
+        })?);
+        let response: KmsLifecycleResponse = self
+            .request_sensitive(Method::POST, path, Some(body))
+            .await
+            .map_err(|error| sanitize_kms_lifecycle_error(operation, error))?;
+        kms_lifecycle_state(operation, response)
+    }
+}
+
 #[async_trait]
 impl CapabilityApi for AdminClient {
     async fn discover_capabilities(&self, refresh: bool) -> Result<CapabilityReport> {
@@ -1272,6 +2437,174 @@ impl CapabilityApi for AdminClient {
         self.store_capabilities(&report)?;
         Ok(report)
     }
+}
+
+#[async_trait]
+impl ObservabilityApi for AdminClient {
+    async fn scanner_status(&self) -> Result<ScannerStatus> {
+        self.request(Method::GET, "/scanner/status", None, None)
+            .await
+            .map_err(|error| observability_route_error(error, "Scanner status"))
+    }
+
+    async fn storage_info(&self) -> Result<StorageInfo> {
+        let response: StorageInfoResponse = self
+            .request(Method::GET, "/storageinfo", None, None)
+            .await
+            .map_err(|error| observability_route_error(error, "Storage information"))?;
+        Ok(response.info)
+    }
+
+    async fn realtime_metrics(&self, query: &MetricsQuery) -> Result<MetricsBatch> {
+        if query.samples == 0 || query.samples > MAX_METRICS_SAMPLES {
+            return Err(Error::InvalidPath(format!(
+                "Metrics samples must be between 1 and {MAX_METRICS_SAMPLES}"
+            )));
+        }
+
+        let disks = query.disks.join(",");
+        let hosts = query.hosts.join(",");
+        let interval = query.interval.clone().unwrap_or_default();
+        let samples = query.samples.to_string();
+        let types = query.types_mask().to_string();
+        let mut params = Vec::new();
+        if !disks.is_empty() {
+            params.push(("disks", disks.as_str()));
+        }
+        if !hosts.is_empty() {
+            params.push(("hosts", hosts.as_str()));
+        }
+        if !interval.is_empty() {
+            params.push(("interval", interval.as_str()));
+        }
+        params.push(("n", samples.as_str()));
+        params.push(("types", types.as_str()));
+        if query.by_disk {
+            params.push(("by-disk", "true"));
+        }
+        if query.by_host {
+            params.push(("by-host", "true"));
+        }
+        if let Some(job_id) = query.job_id.as_deref() {
+            params.push(("by-jobID", job_id));
+        }
+        if let Some(deployment_id) = query.deployment_id.as_deref() {
+            params.push(("by-depID", deployment_id));
+        }
+
+        let mut url = self.admin_url("/metrics");
+        let query_string = params
+            .iter()
+            .map(|(key, value)| {
+                format!(
+                    "{}={}",
+                    urlencoding::encode(key),
+                    urlencoding::encode(value)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("&");
+        url.push('?');
+        url.push_str(&query_string);
+
+        let headers = self.request_headers(&[])?;
+        let signed_headers = self.sign_request(&Method::GET, &url, &headers, &[]).await?;
+        let mut request_builder = self.http_client.get(&url);
+        for (name, value) in &signed_headers {
+            request_builder = request_builder.header(name, value);
+        }
+        let response = request_builder
+            .send()
+            .await
+            .map_err(|error| Error::Network(format!("Request failed: {error}")))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(observability_route_error(
+                self.map_error(status, &body),
+                "Realtime metrics",
+            ));
+        }
+
+        let mut stream = response.bytes_stream();
+        let mut pending = Vec::new();
+        let mut snapshots = Vec::new();
+        let mut encoded_bytes = 0usize;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk
+                .map_err(|error| Error::Network(format!("Failed to read response: {error}")))?;
+            encoded_bytes = encoded_bytes.saturating_add(chunk.len());
+            if encoded_bytes > MAX_METRICS_RESPONSE_BYTES {
+                return Err(Error::General(format!(
+                    "Metrics response exceeded the {MAX_METRICS_RESPONSE_BYTES}-byte limit"
+                )));
+            }
+            pending.extend_from_slice(&chunk);
+            parse_metrics_records(&mut pending, &mut snapshots, false)?;
+            if snapshots.len() > usize::from(query.samples) {
+                return Err(Error::General(format!(
+                    "Metrics response exceeded the requested {} record limit",
+                    query.samples
+                )));
+            }
+        }
+        parse_metrics_records(&mut pending, &mut snapshots, true)?;
+        if snapshots.len() > usize::from(query.samples) {
+            return Err(Error::General(format!(
+                "Metrics response exceeded the requested {} record limit",
+                query.samples
+            )));
+        }
+
+        Ok(MetricsBatch {
+            snapshots,
+            encoded_bytes,
+        })
+    }
+}
+
+fn observability_route_error(error: Error, feature: &str) -> Error {
+    match error {
+        Error::NotFound(_) => {
+            Error::UnsupportedFeature(format!("{feature} is unavailable on this RustFS server"))
+        }
+        error => error,
+    }
+}
+
+fn parse_metrics_records(
+    pending: &mut Vec<u8>,
+    snapshots: &mut Vec<RealtimeMetrics>,
+    flush: bool,
+) -> Result<()> {
+    loop {
+        let record_end = pending.iter().position(|byte| *byte == b'\n');
+        let record = match record_end {
+            Some(index) => pending.drain(..=index).collect::<Vec<_>>(),
+            None if flush && !pending.is_empty() => std::mem::take(pending),
+            None => break,
+        };
+        let record = record.strip_suffix(b"\n").unwrap_or(record.as_slice());
+        let record = record.strip_suffix(b"\r").unwrap_or(record);
+        if record.is_empty() {
+            continue;
+        }
+        if record.len() > MAX_METRICS_LINE_BYTES {
+            return Err(Error::General(format!(
+                "Metrics record exceeded the {MAX_METRICS_LINE_BYTES}-byte record limit"
+            )));
+        }
+        snapshots.push(serde_json::from_slice(record).map_err(Error::Json)?);
+    }
+    if pending.len() > MAX_METRICS_LINE_BYTES {
+        return Err(Error::General(format!(
+            "Metrics record exceeded the {MAX_METRICS_LINE_BYTES}-byte record limit"
+        )));
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -1821,9 +3154,97 @@ impl AdminApi for AdminClient {
             .await
     }
 
-    async fn site_replication_info(&self) -> Result<serde_json::Value> {
-        self.request(Method::GET, "/site-replication/info", None, None)
-            .await
+    async fn site_replication_info(&self) -> Result<SiteReplicationInfo> {
+        self.request_site_replication(
+            Method::GET,
+            "/site-replication/info",
+            None,
+            "Site replication info",
+            None,
+            None,
+        )
+        .await
+    }
+
+    async fn site_replication_edit(
+        &self,
+        peer: &SiteReplicationPeer,
+    ) -> Result<ReplicateEditStatus> {
+        let body = serde_json::to_vec(peer).map_err(Error::Json)?;
+        let mut status: ReplicateEditStatus = self
+            .request_site_replication(
+                Method::PUT,
+                "/site-replication/edit",
+                Some(&body),
+                "Site replication edit",
+                Some("Site replication edit"),
+                None,
+            )
+            .await?;
+        self.sanitize_site_replication_status(&mut status);
+        if status.success {
+            return Ok(status);
+        }
+
+        let detail = if status.error_detail.trim().is_empty() {
+            status.status.clone()
+        } else {
+            status.error_detail.clone()
+        };
+        if site_replication_server_invalid_state(None, &detail) {
+            Err(Error::Conflict(
+                "Site replication edit conflicts with current server state".to_string(),
+            ))
+        } else {
+            Err(Error::General(
+                "Site replication edit was rejected by the server".to_string(),
+            ))
+        }
+    }
+
+    async fn site_replication_resync(
+        &self,
+        operation: SiteReplicationResyncOperation,
+        peer: &SiteReplicationPeer,
+    ) -> Result<SiteReplicationResyncStatus> {
+        let (operation_label, mutation_outcome_label) = match &operation {
+            SiteReplicationResyncOperation::Start => (
+                "Site replication resync start",
+                Some("Site replication resync start"),
+            ),
+            SiteReplicationResyncOperation::Status => ("Site replication resync status", None),
+            SiteReplicationResyncOperation::Cancel => (
+                "Site replication resync cancel",
+                Some("Site replication resync cancel"),
+            ),
+        };
+        let path = format!(
+            "/site-replication/resync/op?operation={}",
+            operation.as_str()
+        );
+        let body = serde_json::to_vec(peer).map_err(Error::Json)?;
+        let mut status = self
+            .request_site_replication(
+                Method::PUT,
+                &path,
+                Some(&body),
+                operation_label,
+                mutation_outcome_label,
+                mutation_outcome_label,
+            )
+            .await?;
+        if let Err(error) = validate_site_replication_resync_status(&operation, &status) {
+            if operation.is_mutation() {
+                return Err(site_replication_response_rejected(
+                    mutation_outcome_label,
+                    "server returned an invalid resync response".to_string(),
+                ));
+            }
+            return Err(error);
+        }
+        status.capture_semantics();
+        self.sanitize_site_replication_resync_status(&mut status);
+        Ok(status)
     }
 
     async fn site_replication_add(&self, sites: &[PeerSiteSpec]) -> Result<serde_json::Value> {
@@ -1858,6 +3279,30 @@ impl AdminApi for AdminClient {
         let body = serde_json::to_vec(spec).map_err(Error::Json)?;
         self.request(Method::PUT, "/site-replication/remove", None, Some(&body))
             .await
+    }
+}
+
+#[async_trait]
+impl ReplicationDiffApi for AdminClient {
+    async fn replication_diff(
+        &self,
+        bucket: &str,
+        prefix: Option<&str>,
+    ) -> Result<ReplicationDiff> {
+        let mut query = vec![("bucket", bucket)];
+        if let Some(prefix) = prefix {
+            query.push(("prefix", prefix));
+        }
+
+        self.request_bounded_json(
+            Method::POST,
+            "/replication/diff",
+            Some(&query),
+            None,
+            MAX_REPLICATION_DIFF_RESPONSE_BYTES,
+            "Replication diff response",
+        )
+        .await
     }
 }
 
@@ -1981,6 +3426,137 @@ mod tests {
         (endpoint, receiver, handle)
     }
 
+    fn start_admin_raw_response_server(response: Vec<u8>) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let _request = read_admin_request(&mut stream);
+            let _ = stream.write_all(&response);
+        });
+
+        (endpoint, handle)
+    }
+
+    fn start_admin_owned_test_server(
+        response_status: &str,
+        content_type: &str,
+        response_body: String,
+    ) -> (
+        String,
+        mpsc::Receiver<CapturedAdminRequest>,
+        thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        let (sender, receiver) = mpsc::channel();
+        let response_status = response_status.to_string();
+        let content_type = content_type.to_string();
+
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let request = read_admin_request(&mut stream);
+            sender.send(request).expect("send captured request");
+
+            let response = format!(
+                "HTTP/1.1 {response_status}\r\ncontent-length: {}\r\ncontent-type: {content_type}\r\nconnection: close\r\n\r\n{response_body}",
+                response_body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write HTTP response");
+        });
+
+        (endpoint, receiver, handle)
+    }
+
+    fn start_admin_disconnect_server() -> (
+        String,
+        mpsc::Receiver<CapturedAdminRequest>,
+        thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            sender
+                .send(read_admin_request(&mut stream))
+                .expect("send captured request");
+        });
+
+        (endpoint, receiver, handle)
+    }
+
+    fn start_admin_declared_length_server(
+        response_status: &'static str,
+        content_length: usize,
+    ) -> (
+        String,
+        mpsc::Receiver<CapturedAdminRequest>,
+        thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            sender
+                .send(read_admin_request(&mut stream))
+                .expect("send captured request");
+            let response = format!(
+                "HTTP/1.1 {response_status}\r\ncontent-length: {content_length}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n"
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write HTTP headers");
+        });
+
+        (endpoint, receiver, handle)
+    }
+
+    fn start_admin_chunked_overflow_server() -> (
+        String,
+        mpsc::Receiver<CapturedAdminRequest>,
+        mpsc::Receiver<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        let (sender, receiver) = mpsc::channel();
+        let (completion_sender, completion_receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            sender
+                .send(read_admin_request(&mut stream))
+                .expect("send captured request");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .expect("set response write timeout");
+
+            let header = b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n";
+            let chunk = vec![b'x'; 64 * 1024];
+            let mut remaining = MAX_REPLICATION_DIFF_RESPONSE_BYTES;
+            let mut write_failed = stream.write_all(header).is_err();
+            while remaining > 0 && !write_failed {
+                let chunk_len = remaining.min(chunk.len());
+                let chunk_header = format!("{chunk_len:x}\r\n");
+                write_failed = stream.write_all(chunk_header.as_bytes()).is_err()
+                    || stream.write_all(&chunk[..chunk_len]).is_err()
+                    || stream.write_all(b"\r\n").is_err();
+                remaining -= chunk_len;
+            }
+            if !write_failed {
+                // One additional byte is sufficient to exercise the streaming limit. Sending
+                // megabytes beyond the limit can block when the client intentionally stops
+                // reading, especially with Windows socket buffering behavior.
+                let _ = stream.write_all(b"1\r\nx\r\n");
+            }
+            let _ = completion_sender.send(());
+        });
+
+        (endpoint, receiver, completion_receiver)
+    }
+
     fn admin_client_for_endpoint(endpoint: &str) -> AdminClient {
         let alias = Alias::new("test", endpoint, "access", "secret");
         AdminClient::new(&alias).expect("admin client should build")
@@ -2063,6 +3639,15 @@ mod tests {
             capability.name == "runtime.memory-sampling"
                 && capability.availability == CapabilityAvailability::Unsupported
                 && capability.reason.as_deref() == Some("not available on this platform")
+        }));
+        assert!(report.capabilities.iter().any(|capability| {
+            capability.name == "admin.data-usage"
+                && capability.availability == CapabilityAvailability::Available
+        }));
+        assert!(report.capabilities.iter().any(|capability| {
+            capability.name == "listen_notification"
+                && capability.availability == CapabilityAvailability::Available
+                && capability.reason.is_none()
         }));
         for name in [
             "admin.batch",
@@ -2165,6 +3750,14 @@ mod tests {
             ]
         );
         handle.join().expect("server thread should finish");
+    }
+
+    #[test]
+    fn beta_10_capability_gate_does_not_match_beta_100() {
+        assert!(is_rustfs_beta_10("1.0.0-beta.10"));
+        assert!(is_rustfs_beta_10("rustfs/v1.0.0-beta.10+build.7"));
+        assert!(!is_rustfs_beta_10("1.0.0-beta.100"));
+        assert!(!is_rustfs_beta_10("1.0.0-beta.9"));
     }
 
     #[tokio::test]
@@ -3534,6 +5127,1409 @@ mod tests {
         handle.join().expect("server thread should finish");
     }
 
+    const SITE_REPLICATION_INFO_RESPONSE: &str = r#"{
+        "enabled":true,
+        "name":"primary",
+        "sites":[{
+            "endpoint":"https://secondary.example.test",
+            "name":"secondary",
+            "deploymentID":"deployment-2",
+            "sync":"enable",
+            "defaultbandwidth":{"bandwidthLimitPerBucket":1024,"set":true},
+            "replicate-ilm-expiry":true,
+            "objectNamingMode":"path",
+            "skipTlsVerify":false,
+            "caCertPem":"ORIGINAL-CA",
+            "apiVersion":"v1",
+            "futurePeer":{"mode":"preserved","accessToken":"OPAQUE-TOKEN-MUST-NOT-PRINT"}
+        }],
+        "serviceAccountAccessKey":"DISCARDED",
+        "apiVersion":"v1"
+    }"#;
+
+    #[tokio::test]
+    async fn site_replication_info_returns_typed_opaque_snapshot() {
+        let (endpoint, receiver, handle) =
+            start_admin_test_server("200 OK", SITE_REPLICATION_INFO_RESPONSE);
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let info = client
+            .site_replication_info()
+            .await
+            .expect("site replication info request");
+
+        assert_eq!(info.sites[0].deployment_id(), Some("deployment-2"));
+        assert_eq!(info.sites[0].ca_cert_pem(), Some("ORIGINAL-CA"));
+        let wire = serde_json::to_value(&info.sites[0]).expect("peer is serializable");
+        assert_eq!(
+            wire["futurePeer"]["accessToken"],
+            "OPAQUE-TOKEN-MUST-NOT-PRINT"
+        );
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.target, "/rustfs/admin/v3/site-replication/info");
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn site_replication_edit_puts_lossless_peer_snapshot() {
+        let (endpoint, receiver, handle) = start_admin_test_server(
+            "200 OK",
+            r#"{"success":true,"status":"updated","errorDetail":"","apiVersion":"v1"}"#,
+        );
+        let client = admin_client_for_endpoint(&endpoint);
+        let info: rc_core::admin::SiteReplicationInfo =
+            serde_json::from_str(SITE_REPLICATION_INFO_RESPONSE).expect("valid info fixture");
+
+        let status = client
+            .site_replication_edit(&info.sites[0])
+            .await
+            .expect("site replication edit request");
+
+        assert!(status.success);
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(request.method, "PUT");
+        assert_eq!(request.target, "/rustfs/admin/v3/site-replication/edit");
+        let body: serde_json::Value =
+            serde_json::from_slice(&request.body).expect("edit body should be JSON");
+        assert_eq!(body["caCertPem"], "ORIGINAL-CA");
+        assert_eq!(body["futurePeer"]["mode"], "preserved");
+        assert_eq!(
+            body["futurePeer"]["accessToken"],
+            "OPAQUE-TOKEN-MUST-NOT-PRINT"
+        );
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn site_replication_info_rejects_declared_success_overflow() {
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n",
+            rc_core::admin::MAX_SITE_REPLICATION_SUCCESS_RESPONSE_BYTES + 1
+        )
+        .into_bytes();
+        let (endpoint, handle) = start_admin_raw_response_server(response);
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let error = client
+            .site_replication_info()
+            .await
+            .expect_err("oversized declared response must fail");
+
+        assert!(matches!(error, Error::General(_)));
+        assert!(error.to_string().contains("exceeds"));
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn site_replication_info_rejects_chunked_success_overflow() {
+        let mut response = b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n".to_vec();
+        let chunk = vec![b'x'; 64 * 1024];
+        for _ in 0..=rc_core::admin::MAX_SITE_REPLICATION_SUCCESS_RESPONSE_BYTES / chunk.len() {
+            response.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+            response.extend_from_slice(&chunk);
+            response.extend_from_slice(b"\r\n");
+        }
+        response.extend_from_slice(b"0\r\n\r\n");
+        let (endpoint, handle) = start_admin_raw_response_server(response);
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let error = client
+            .site_replication_info()
+            .await
+            .expect_err("oversized chunked response must fail");
+
+        assert!(matches!(error, Error::General(_)));
+        assert!(error.to_string().contains("exceeds"));
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn site_replication_edit_rejects_chunked_error_overflow() {
+        let mut response = b"HTTP/1.1 500 Internal Server Error\r\ntransfer-encoding: chunked\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n".to_vec();
+        let body = vec![b'x'; rc_core::admin::MAX_SITE_REPLICATION_ERROR_RESPONSE_BYTES + 1];
+        response.extend_from_slice(format!("{:x}\r\n", body.len()).as_bytes());
+        response.extend_from_slice(&body);
+        response.extend_from_slice(b"\r\n0\r\n\r\n");
+        let (endpoint, handle) = start_admin_raw_response_server(response);
+        let client = admin_client_for_endpoint(&endpoint);
+        let peer = rc_core::admin::SiteReplicationPeer::default();
+
+        let error = client
+            .site_replication_edit(&peer)
+            .await
+            .expect_err("oversized chunked error must fail");
+
+        assert!(matches!(error, Error::General(_)));
+        assert!(error.to_string().contains("exceeds"));
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn site_replication_info_rejects_malformed_json() {
+        let (endpoint, _receiver, handle) = start_admin_test_server("200 OK", "{");
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let error = client
+            .site_replication_info()
+            .await
+            .expect_err("malformed JSON must fail");
+
+        assert!(matches!(error, Error::Json(_)));
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn site_replication_edit_rejects_oversized_request_before_network() {
+        let client = admin_client_for_endpoint("http://127.0.0.1:1");
+        let mut peer = rc_core::admin::SiteReplicationPeer::default();
+        peer.set_ca_cert_pem("x".repeat(rc_core::admin::MAX_SITE_REPLICATION_REQUEST_BYTES + 1));
+
+        let error = client
+            .site_replication_edit(&peer)
+            .await
+            .expect_err("oversized request must fail before connecting");
+
+        assert!(matches!(error, Error::RequestRejected(_)));
+        assert!(error.to_string().contains("exceeds"));
+    }
+
+    #[tokio::test]
+    async fn site_replication_edit_treats_success_false_as_failure() {
+        let (endpoint, _receiver, handle) = start_admin_test_server(
+            "200 OK",
+            r#"{"success":false,"status":"rejected","errorDetail":"peer is invalid","apiVersion":"v1"}"#,
+        );
+        let client = admin_client_for_endpoint(&endpoint);
+        let peer = rc_core::admin::SiteReplicationPeer::default();
+
+        let error = client
+            .site_replication_edit(&peer)
+            .await
+            .expect_err("success false must fail");
+
+        assert!(matches!(error, Error::General(_)));
+        assert!(!error.to_string().contains("peer is invalid"));
+        assert!(error.to_string().contains("rejected by the server"));
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn kms_create_key_posts_name_as_reserved_tag_and_ignores_key_material() {
+        let body = r#"{"success":true,"message":"created","key_id":"key-123","key_metadata":{"key_id":"key-123","key_state":"Enabled","key_usage":"EncryptDecrypt","tags":{"name":"archive"},"plaintext_key":"MUST_NOT_APPEAR"},"plaintext_key":"MUST_NOT_APPEAR"}"#;
+        let (endpoint, receiver, handle) = start_admin_test_server("200 OK", body);
+        let client = admin_client_for_endpoint(&endpoint);
+        let request = KmsCreateKeyRequest {
+            name: Some("archive".to_string()),
+            description: Some("Archive key".to_string()),
+            tags: BTreeMap::from([("environment".to_string(), "prod".to_string())]),
+        };
+
+        let result = client
+            .kms_create_key(&request)
+            .await
+            .expect("KMS key should be created");
+
+        assert_eq!(result.key_id, "key-123");
+        assert_eq!(
+            result
+                .key
+                .as_ref()
+                .and_then(|key| key.tags.get("name"))
+                .map(String::as_str),
+            Some("archive")
+        );
+        assert!(!format!("{result:?}").contains("MUST_NOT_APPEAR"));
+        let captured = receiver.recv().expect("captured request");
+        assert_eq!(captured.method, "POST");
+        assert_eq!(captured.target, "/rustfs/admin/v3/kms/keys");
+        let request_body: serde_json::Value =
+            serde_json::from_slice(&captured.body).expect("create request should be JSON");
+        assert_eq!(request_body["description"], "Archive key");
+        assert_eq!(request_body["tags"]["name"], "archive");
+        assert_eq!(request_body["tags"]["environment"], "prod");
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn kms_delete_and_cancel_use_native_lifecycle_routes() {
+        let responses = vec![
+            (
+                "200 OK",
+                r#"{"success":true,"message":"scheduled","key_id":"key-123","deletion_date":"2026-07-28T00:00:00Z"}"#,
+            ),
+            (
+                "200 OK",
+                r#"{"success":true,"message":"cancelled","key_id":"key-123","key_metadata":{"key_id":"key-123","key_state":"Enabled","key_usage":"EncryptDecrypt","tags":{}}}"#,
+            ),
+        ];
+        let (endpoint, receiver, handle) = start_admin_sequence_server(responses);
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let deleted = client
+            .kms_delete_key(&KmsDeleteKeyRequest {
+                key_id: "key-123".to_string(),
+                pending_window_in_days: Some(7),
+                force_immediate: false,
+            })
+            .await
+            .expect("KMS deletion should be scheduled");
+        assert_eq!(
+            deleted.deletion_date.as_deref(),
+            Some("2026-07-28T00:00:00Z")
+        );
+        assert!(!deleted.immediate);
+
+        let cancelled = client
+            .kms_cancel_key_deletion("key-123")
+            .await
+            .expect("KMS deletion should be cancelled");
+        assert_eq!(cancelled.key_id, "key-123");
+
+        let delete_request = receiver.recv().expect("captured delete request");
+        assert_eq!(delete_request.method, "DELETE");
+        assert_eq!(delete_request.target, "/rustfs/admin/v3/kms/keys/delete");
+        let delete_body: serde_json::Value =
+            serde_json::from_slice(&delete_request.body).expect("delete request should be JSON");
+        assert_eq!(delete_body["pending_window_in_days"], 7);
+        assert!(delete_body.get("force_immediate").is_none());
+
+        let cancel_request = receiver.recv().expect("captured cancel request");
+        assert_eq!(cancel_request.method, "POST");
+        assert_eq!(
+            cancel_request.target,
+            "/rustfs/admin/v3/kms/keys/cancel-deletion"
+        );
+        let cancel_body: serde_json::Value =
+            serde_json::from_slice(&cancel_request.body).expect("cancel request should be JSON");
+        assert_eq!(cancel_body["key_id"], "key-123");
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn kms_mutation_errors_are_typed_and_do_not_echo_server_details() {
+        for (status, body, expected) in [
+            (
+                "200 OK",
+                r#"{"success":false,"message":"key already exists: MUST_NOT_APPEAR"}"#,
+                "conflict",
+            ),
+            (
+                "500 Internal Server Error",
+                r#"{"success":false,"message":"key already exists: MUST_NOT_APPEAR"}"#,
+                "conflict",
+            ),
+            (
+                "200 OK",
+                r#"{"success":false,"message":"kms service is not running: MUST_NOT_APPEAR"}"#,
+                "network",
+            ),
+            (
+                "503 Service Unavailable",
+                r#"{"success":false,"message":"kms service is not running: MUST_NOT_APPEAR"}"#,
+                "network",
+            ),
+        ] {
+            let (endpoint, _receiver, handle) = start_admin_test_server(status, body);
+            let client = admin_client_for_endpoint(&endpoint);
+            let error = client
+                .kms_create_key(&KmsCreateKeyRequest {
+                    name: None,
+                    description: None,
+                    tags: BTreeMap::new(),
+                })
+                .await
+                .expect_err("mutation should fail");
+            match expected {
+                "conflict" => assert!(matches!(error, Error::Conflict(_))),
+                "network" => assert!(matches!(error, Error::Network(_))),
+                _ => panic!("unexpected expected error kind"),
+            }
+            assert!(!error.to_string().contains("MUST_NOT_APPEAR"));
+            handle.join().expect("server thread should finish");
+        }
+    }
+
+    #[tokio::test]
+    async fn kms_configure_posts_strict_sensitive_request_without_debug_exposure() {
+        let body = r#"{"success":true,"message":"configured","status":"Configured"}"#;
+        let (endpoint, receiver, handle) = start_admin_test_server("200 OK", body);
+        let client = admin_client_for_endpoint(&endpoint);
+        let request: KmsConfigureRequest = serde_json::from_str(
+            r#"{"backend_type":"VaultKV2","address":"https://vault.example","auth_method":{"Token":{"token":"VAULT_TOKEN_MUST_NOT_APPEAR"}},"mount_path":"transit","kv_mount":"secret","key_path_prefix":"rustfs/kms/keys"}"#,
+        )
+        .expect("configuration should deserialize");
+
+        let state = client
+            .kms_configure(&request)
+            .await
+            .expect("KMS should configure");
+
+        assert_eq!(state, KmsServiceState::Configured);
+        let captured = receiver.recv().expect("captured configure request");
+        assert_eq!(captured.method, "POST");
+        assert_eq!(captured.target, "/rustfs/admin/v3/kms/configure");
+        let request_body: serde_json::Value =
+            serde_json::from_slice(&captured.body).expect("configure request should be JSON");
+        assert_eq!(request_body["backend_type"], "VaultKV2");
+        assert_eq!(
+            request_body["auth_method"]["Token"]["token"],
+            "VAULT_TOKEN_MUST_NOT_APPEAR"
+        );
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn kms_reconfigure_start_restart_and_stop_use_native_routes() {
+        let responses = vec![
+            (
+                "200 OK",
+                r#"{"success":true,"message":"reconfigured","status":"Running"}"#,
+            ),
+            (
+                "200 OK",
+                r#"{"success":true,"message":"started","status":"Running"}"#,
+            ),
+            (
+                "200 OK",
+                r#"{"success":true,"message":"restarted","status":"Running"}"#,
+            ),
+            (
+                "200 OK",
+                r#"{"success":true,"message":"stopped","status":"Configured"}"#,
+            ),
+        ];
+        let (endpoint, receiver, handle) = start_admin_sequence_server(responses);
+        let client = admin_client_for_endpoint(&endpoint);
+        let request: KmsConfigureRequest = serde_json::from_str(
+            r#"{"backend_type":"VaultTransit","address":"https://vault.example","auth_method":{"Token":{"token":""}},"mount_path":"transit"}"#,
+        )
+        .expect("configuration should deserialize");
+
+        assert_eq!(
+            client
+                .kms_reconfigure(&request)
+                .await
+                .expect("KMS should reconfigure"),
+            KmsServiceState::Running
+        );
+        assert_eq!(
+            client.kms_start(false).await.expect("KMS should start"),
+            KmsServiceState::Running
+        );
+        assert_eq!(
+            client.kms_start(true).await.expect("KMS should restart"),
+            KmsServiceState::Running
+        );
+        assert_eq!(
+            client.kms_stop().await.expect("KMS should stop"),
+            KmsServiceState::Configured
+        );
+
+        let reconfigure = receiver.recv().expect("captured reconfigure request");
+        assert_eq!(reconfigure.target, "/rustfs/admin/v3/kms/reconfigure");
+        let start = receiver.recv().expect("captured start request");
+        assert_eq!(start.target, "/rustfs/admin/v3/kms/start");
+        let start_body: serde_json::Value =
+            serde_json::from_slice(&start.body).expect("start body should be JSON");
+        assert_eq!(start_body["force"], false);
+        let restart = receiver.recv().expect("captured restart request");
+        let restart_body: serde_json::Value =
+            serde_json::from_slice(&restart.body).expect("restart body should be JSON");
+        assert_eq!(restart_body["force"], true);
+        let stop = receiver.recv().expect("captured stop request");
+        assert_eq!(stop.target, "/rustfs/admin/v3/kms/stop");
+        assert!(stop.body.is_empty());
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn kms_lifecycle_errors_are_typed_and_redacted() {
+        for (status, body, expected) in [
+            (
+                "200 OK",
+                r#"{"success":false,"message":"KMS service is not configured: MUST_NOT_APPEAR","status":"NotConfigured"}"#,
+                "not_found",
+            ),
+            (
+                "403 Forbidden",
+                r#"{"message":"denied token MUST_NOT_APPEAR"}"#,
+                "auth",
+            ),
+            (
+                "503 Service Unavailable",
+                r#"{"message":"unavailable token MUST_NOT_APPEAR"}"#,
+                "network",
+            ),
+        ] {
+            let (endpoint, _receiver, handle) = start_admin_test_server(status, body);
+            let client = admin_client_for_endpoint(&endpoint);
+            let error = client
+                .kms_start(false)
+                .await
+                .expect_err("start should fail");
+            match expected {
+                "not_found" => assert!(matches!(error, Error::NotFound(_))),
+                "auth" => assert!(matches!(error, Error::Auth(_))),
+                "network" => assert!(matches!(error, Error::Network(_))),
+                _ => panic!("unexpected error kind"),
+            }
+            assert!(!error.to_string().contains("MUST_NOT_APPEAR"));
+            handle.join().expect("server thread should finish");
+        }
+    }
+
+    #[tokio::test]
+    async fn site_replication_edit_maps_typed_state_changes_to_conflict() {
+        for message in [
+            "site replication state changed",
+            "site replication refresh state changed",
+        ] {
+            let body = format!(
+                r#"{{"success":false,"status":"{message}","errorDetail":"","apiVersion":"v1"}}"#
+            );
+            let leaked: &'static str = Box::leak(body.into_boxed_str());
+            let (endpoint, _receiver, handle) = start_admin_test_server("200 OK", leaked);
+            let client = admin_client_for_endpoint(&endpoint);
+            let peer = rc_core::admin::SiteReplicationPeer::default();
+
+            let error = client
+                .site_replication_edit(&peer)
+                .await
+                .expect_err("typed state change must conflict");
+
+            assert!(matches!(error, Error::Conflict(_)));
+            assert_eq!(error.exit_code(), 6);
+            handle.join().expect("server thread should finish");
+        }
+    }
+
+    #[tokio::test]
+    async fn site_replication_edit_maps_typed_known_pending_phrases_to_conflict() {
+        for message in [
+            "site replication operation pending",
+            "site replication peer edit pending",
+            "site replication IAM change pending",
+        ] {
+            let body = format!(
+                r#"{{"success":false,"status":"{message}","errorDetail":"","apiVersion":"v1"}}"#
+            );
+            let leaked: &'static str = Box::leak(body.into_boxed_str());
+            let (endpoint, _receiver, handle) = start_admin_test_server("200 OK", leaked);
+            let client = admin_client_for_endpoint(&endpoint);
+            let peer = rc_core::admin::SiteReplicationPeer::default();
+
+            let error = client
+                .site_replication_edit(&peer)
+                .await
+                .expect_err("known typed pending state must conflict");
+
+            assert!(matches!(error, Error::Conflict(_)));
+            assert_eq!(error.exit_code(), 6);
+            handle.join().expect("server thread should finish");
+        }
+    }
+
+    #[tokio::test]
+    async fn site_replication_edit_does_not_overclassify_arbitrary_pending_text() {
+        let typed_body = r#"{"success":false,"status":"pending value is malformed","errorDetail":"","apiVersion":"v1"}"#;
+        let (endpoint, _receiver, handle) = start_admin_test_server("200 OK", typed_body);
+        let client = admin_client_for_endpoint(&endpoint);
+        let peer = rc_core::admin::SiteReplicationPeer::default();
+
+        let typed_error = client
+            .site_replication_edit(&peer)
+            .await
+            .expect_err("arbitrary typed pending text must fail");
+
+        assert!(matches!(typed_error, Error::General(_)));
+        assert_eq!(typed_error.exit_code(), 1);
+        handle.join().expect("server thread should finish");
+
+        let http_body = r#"{"code":"InvalidRequest","message":"pending value is malformed"}"#;
+        let (endpoint, _receiver, handle) = start_admin_test_server("400 Bad Request", http_body);
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let http_error = client
+            .site_replication_edit(&peer)
+            .await
+            .expect_err("arbitrary HTTP pending text must fail");
+
+        assert!(matches!(http_error, Error::General(_)));
+        assert_eq!(http_error.exit_code(), 1);
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn site_replication_edit_does_not_follow_temporary_redirect() {
+        let (endpoint, receiver, handle) = start_admin_test_server(
+            "307 Temporary Redirect",
+            r#"{"message":"do not redirect mutations"}"#,
+        );
+        let client = admin_client_for_endpoint(&endpoint);
+        let peer = rc_core::admin::SiteReplicationPeer::default();
+
+        let error = client
+            .site_replication_edit(&peer)
+            .await
+            .expect_err("redirect must not be followed");
+
+        assert!(matches!(error, Error::Network(_)));
+        let request = receiver.recv().expect("single captured request");
+        assert_eq!(request.method, "PUT");
+        assert_eq!(request.target, "/rustfs/admin/v3/site-replication/edit");
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn site_replication_edit_disconnect_reports_unknown_outcome_without_retry() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            sender
+                .send(read_admin_request(&mut stream))
+                .expect("send captured request");
+        });
+        let client = admin_client_for_endpoint(&endpoint);
+        let peer = rc_core::admin::SiteReplicationPeer::default();
+
+        let error = client
+            .site_replication_edit(&peer)
+            .await
+            .expect_err("disconnect after PUT must be an unknown outcome");
+
+        assert!(matches!(error, Error::Network(_)));
+        assert_eq!(error.exit_code(), 3);
+        assert!(error.to_string().contains("outcome is unknown"));
+        assert!(error.to_string().contains("not retried"));
+        let request = receiver.recv().expect("single captured request");
+        assert_eq!(request.method, "PUT");
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn site_replication_edit_maps_pending_bad_request_to_conflict() {
+        let (endpoint, _receiver, handle) = start_admin_test_server(
+            "400 Bad Request",
+            r#"{"code":"SiteReplicationOperationPending","message":"another site replication operation is pending"}"#,
+        );
+        let client = admin_client_for_endpoint(&endpoint);
+        let peer = rc_core::admin::SiteReplicationPeer::default();
+
+        let error = client
+            .site_replication_edit(&peer)
+            .await
+            .expect_err("pending operation must conflict");
+
+        assert!(matches!(error, Error::Conflict(_)));
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn site_replication_edit_maps_beta10_state_changes_to_conflict() {
+        for message in [
+            "site replication state changed",
+            "site replication refresh state changed",
+        ] {
+            let body = format!(r#"{{"code":"InvalidRequest","message":"{message}"}}"#);
+            let leaked: &'static str = Box::leak(body.into_boxed_str());
+            let (endpoint, _receiver, handle) = start_admin_test_server("400 Bad Request", leaked);
+            let client = admin_client_for_endpoint(&endpoint);
+            let peer = rc_core::admin::SiteReplicationPeer::default();
+
+            let error = client
+                .site_replication_edit(&peer)
+                .await
+                .expect_err("beta10 state change must conflict");
+
+            assert!(matches!(error, Error::Conflict(_)));
+            assert_eq!(error.exit_code(), 6);
+            handle.join().expect("server thread should finish");
+        }
+    }
+
+    #[tokio::test]
+    async fn site_replication_info_unsupported_message_names_info_operation() {
+        let (endpoint, _receiver, handle) = start_admin_test_server("404 Not Found", "");
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let error = client
+            .site_replication_info()
+            .await
+            .expect_err("missing info route must be unsupported");
+        let message = error.to_string();
+
+        assert!(matches!(error, Error::UnsupportedFeature(_)));
+        assert!(message.contains("Site replication info"));
+        assert!(!message.contains("edit"));
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn site_replication_edit_rejects_malformed_success_json() {
+        let (endpoint, _receiver, handle) = start_admin_test_server("200 OK", "{");
+        let client = admin_client_for_endpoint(&endpoint);
+        let peer = rc_core::admin::SiteReplicationPeer::default();
+
+        let error = client
+            .site_replication_edit(&peer)
+            .await
+            .expect_err("malformed JSON must fail");
+
+        assert!(matches!(error, Error::Json(_)));
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn site_replication_edit_maps_method_not_allowed_to_unsupported() {
+        let (endpoint, _receiver, handle) = start_admin_test_server("405 Method Not Allowed", "");
+        let client = admin_client_for_endpoint(&endpoint);
+        let peer = rc_core::admin::SiteReplicationPeer::default();
+
+        let error = client
+            .site_replication_edit(&peer)
+            .await
+            .expect_err("missing edit route must be unsupported");
+
+        assert!(matches!(error, Error::UnsupportedFeature(_)));
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn scanner_status_uses_beta10_route_and_typed_response() {
+        let body = r#"{
+            "enabled":true,
+            "disabled_reason":null,
+            "freshness":{"state":"fresh","last_cycle_end_unix_secs":10,"max_expected_age_seconds":120,"reason":null},
+            "metrics":{"collected_at":"2026-07-21T04:00:00Z","current_cycle":7,"last_cycle_end_unix_secs":10,"last_cycle_result":"success"},
+            "cycle_schedule":{"effective_interval_seconds":60,"clean_idle_backoff_enabled":false,"clean_idle_backoff_multiplier":1},
+            "runtime_config":{"speed":{"value":"fast","source":"default"}}
+        }"#;
+        let (endpoint, receiver, handle) = start_admin_test_server("200 OK", body);
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let status = client
+            .scanner_status()
+            .await
+            .expect("scanner status should succeed");
+
+        assert_eq!(status.health(), rc_core::admin::ScannerHealth::Healthy);
+        assert_eq!(status.metrics.current_cycle, 7);
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.target, "/rustfs/admin/v3/scanner/status");
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn site_replication_error_does_not_echo_sensitive_server_body() {
+        let (endpoint, _receiver, handle) = start_admin_test_server(
+            "409 Conflict",
+            r#"{"code":"Conflict","message":"accessKey=DO-NOT-ECHO secret=DO-NOT-ECHO"}"#,
+        );
+        let client = admin_client_for_endpoint(&endpoint);
+        let peer = rc_core::admin::SiteReplicationPeer::default();
+
+        let error = client
+            .site_replication_edit(&peer)
+            .await
+            .expect_err("conflict must fail");
+        let message = error.to_string();
+
+        assert!(matches!(error, Error::Conflict(_)));
+        assert!(!message.contains("DO-NOT-ECHO"));
+        assert!(!message.contains("accessKey"));
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn storage_info_unwraps_current_response_envelope() {
+        let body = r#"{
+            "info":{
+                "disks":[{"endpoint":"node1","path":"/data1","state":"online","totalspace":100,"usedspace":40,"availspace":60}],
+                "backend":{"BackendType":"Erasure","OnlineDisks":{"set-1":1},"OfflineDisks":{}}
+            },
+            "admin_discovery":{}
+        }"#;
+        let (endpoint, receiver, handle) = start_admin_test_server("200 OK", body);
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let info = client
+            .storage_info()
+            .await
+            .expect("storage info should succeed");
+
+        assert_eq!(info.disks.len(), 1);
+        assert_eq!(info.total_capacity(), 100);
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(request.target, "/rustfs/admin/v3/storageinfo");
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn site_replication_edit_redacts_alias_credentials_from_typed_status() {
+        let (endpoint, _receiver, handle) = start_admin_test_server(
+            "200 OK",
+            r#"{"success":true,"status":"updated by access using secret","errorDetail":"access secret","apiVersion":"v1"}"#,
+        );
+        let client = admin_client_for_endpoint(&endpoint);
+        let peer = rc_core::admin::SiteReplicationPeer::default();
+
+        let status = client
+            .site_replication_edit(&peer)
+            .await
+            .expect("edit status request");
+
+        assert!(!status.status.contains("access"));
+        assert!(!status.status.contains("secret"));
+        assert!(!status.error_detail.contains("access"));
+        assert!(!status.error_detail.contains("secret"));
+        assert!(status.status.contains("[REDACTED]"));
+        handle.join().expect("server thread should finish");
+    }
+
+    fn site_replication_resync_peer() -> SiteReplicationPeer {
+        serde_json::from_str(
+            r#"{
+                "endpoint":"https://secondary.example.test",
+                "name":"secondary",
+                "deploymentID":"deployment-2",
+                "sync":"enable",
+                "futurePeer":{"mode":"preserved"}
+            }"#,
+        )
+        .expect("valid resync peer")
+    }
+
+    const SITE_REPLICATION_RESYNC_RESPONSE: &str = r#"{
+        "op":"start",
+        "id":"resync-123",
+        "status":"success",
+        "buckets":[{"bucket":"photos","status":"started","errorDetail":""}],
+        "errorDetail":"",
+        "generation":7
+    }"#;
+
+    #[tokio::test]
+    async fn site_replication_resync_sends_exact_start_query_and_complete_peer() {
+        let (endpoint, receiver, handle) =
+            start_admin_test_server("200 OK", SITE_REPLICATION_RESYNC_RESPONSE);
+        let client = admin_client_for_endpoint(&endpoint);
+        let peer = site_replication_resync_peer();
+
+        let status = client
+            .site_replication_resync(SiteReplicationResyncOperation::Start, &peer)
+            .await
+            .expect("resync start request");
+
+        let returned = serde_json::to_value(status).expect("resync status serializes");
+        assert_eq!(returned["op"], "start");
+        assert_eq!(returned["id"], "resync-123");
+        assert_eq!(returned["buckets"][0]["bucket"], "photos");
+        assert_eq!(returned["generation"], 7);
+
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(request.method, "PUT");
+        assert_eq!(
+            request.target,
+            "/rustfs/admin/v3/site-replication/resync/op?operation=start"
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&request.body).expect("resync body should be JSON");
+        assert_eq!(body["endpoint"], "https://secondary.example.test");
+        assert_eq!(body["deploymentID"], "deployment-2");
+        assert_eq!(body["sync"], "enable");
+        assert_eq!(body["futurePeer"]["mode"], "preserved");
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn site_replication_resync_status_works_with_a_fresh_client() {
+        let (endpoint, receiver, handle) = start_admin_sequence_server(vec![
+            ("200 OK", SITE_REPLICATION_RESYNC_RESPONSE),
+            ("200 OK", SITE_REPLICATION_RESYNC_RESPONSE),
+        ]);
+        let peer = site_replication_resync_peer();
+        let first_client = admin_client_for_endpoint(&endpoint);
+        first_client
+            .site_replication_resync(SiteReplicationResyncOperation::Start, &peer)
+            .await
+            .expect("resync start request");
+        drop(first_client);
+
+        let fresh_client = admin_client_for_endpoint(&endpoint);
+        let status = fresh_client
+            .site_replication_resync(SiteReplicationResyncOperation::Status, &peer)
+            .await
+            .expect("fresh-client resync status request");
+
+        assert_eq!(
+            serde_json::to_value(status).expect("status serializes")["id"],
+            "resync-123"
+        );
+        let start = receiver.recv().expect("captured start request");
+        let status = receiver.recv().expect("captured status request");
+        assert_eq!(
+            start.target,
+            "/rustfs/admin/v3/site-replication/resync/op?operation=start"
+        );
+        assert_eq!(
+            status.target,
+            "/rustfs/admin/v3/site-replication/resync/op?operation=status"
+        );
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn site_replication_resync_redacts_known_and_nested_extension_values() {
+        let response = r#"{
+            "op":"start-access",
+            "id":"secret-id",
+            "status":"access secret",
+            "buckets":[{
+                "bucket":"access-bucket",
+                "status":"secret-status",
+                "errorDetail":"access secret",
+                "futureBucket":"access secret"
+            }],
+            "errorDetail":"access secret",
+            "futureTop":{
+                "updatedAt":"access secret",
+                "progress":["access",{"message":"secret"}]
+            }
+        }"#;
+        let (endpoint, _receiver, handle) = start_admin_test_server("200 OK", response);
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let status = client
+            .site_replication_resync(
+                SiteReplicationResyncOperation::Status,
+                &site_replication_resync_peer(),
+            )
+            .await
+            .expect("resync status request");
+        let value = serde_json::to_value(status).expect("resync status serializes");
+
+        for field in [
+            &value["op"],
+            &value["id"],
+            &value["status"],
+            &value["errorDetail"],
+            &value["buckets"][0]["bucket"],
+            &value["buckets"][0]["status"],
+            &value["buckets"][0]["errorDetail"],
+        ] {
+            let field = field.as_str().expect("known string field");
+            assert!(!field.contains("access"));
+            assert!(!field.contains("secret"));
+            assert!(field.contains("[REDACTED]"));
+        }
+        assert_eq!(value["futureTop"]["updatedAt"], "[REDACTED] [REDACTED]");
+        assert_eq!(value["futureTop"]["progress"][0], "[REDACTED]");
+        assert_eq!(value["futureTop"]["progress"][1]["message"], "[REDACTED]");
+        assert_eq!(value["buckets"][0]["futureBucket"], "[REDACTED] [REDACTED]");
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn realtime_metrics_encodes_exact_query_and_reads_ndjson_incrementally() {
+        let body = concat!(
+            "{\"errors\":[],\"hosts\":[],\"aggregated\":{\"scanner\":{\"collected\":\"2026-07-21T04:00:00Z\",\"current_cycle\":7}},\"by_host\":{},\"by_disk\":{},\"final\":false}\n",
+            "{\"errors\":[],\"hosts\":[],\"aggregated\":{\"scanner\":{\"collected\":\"2026-07-21T04:00:03Z\",\"current_cycle\":8}},\"by_host\":{},\"by_disk\":{},\"final\":true}\n"
+        );
+        let (endpoint, receiver, handle) =
+            start_admin_owned_test_server("200 OK", "application/x-ndjson", body.to_string());
+        let client = admin_client_for_endpoint(&endpoint);
+        let query = rc_core::admin::MetricsQuery {
+            scopes: vec![
+                rc_core::admin::MetricsScope::Scanner,
+                rc_core::admin::MetricsScope::Disk,
+            ],
+            hosts: vec!["node 1".to_string()],
+            disks: vec!["/data/one".to_string()],
+            interval: Some("3s".to_string()),
+            samples: 2,
+            by_host: true,
+            by_disk: true,
+            job_id: Some("job/1".to_string()),
+            deployment_id: Some("dep 1".to_string()),
+        };
+
+        let batch = client
+            .realtime_metrics(&query)
+            .await
+            .expect("metrics should succeed");
+
+        assert_eq!(batch.snapshots.len(), 2);
+        assert!(!batch.is_partial());
+        assert!(batch.encoded_bytes > 0);
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(request.method, "GET");
+        assert_eq!(
+            request.target,
+            "/rustfs/admin/v3/metrics?disks=%2Fdata%2Fone&hosts=node%201&interval=3s&n=2&types=3&by-disk=true&by-host=true&by-jobID=job%2F1&by-depID=dep%201"
+        );
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn site_replication_resync_preserves_semantics_when_credentials_match_status_values() {
+        let response = r#"{
+            "op":"start",
+            "id":"resync-1",
+            "status":"success",
+            "buckets":[{"bucket":"photos","status":"started"}]
+        }"#;
+        let (endpoint, _receiver, handle) = start_admin_test_server("200 OK", response);
+        let alias = Alias::new("test", &endpoint, "success", "success-extra");
+        let client = AdminClient::new(&alias).expect("admin client should build");
+
+        let status = client
+            .site_replication_resync(
+                SiteReplicationResyncOperation::Start,
+                &site_replication_resync_peer(),
+            )
+            .await
+            .expect("resync start request");
+
+        assert!(!status.has_failure());
+        assert_eq!(status.status, "[REDACTED]");
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn site_replication_resync_redacts_overlapping_credentials_longest_first() {
+        let response = r#"{
+            "op":"start",
+            "id":"resync-1",
+            "status":"success",
+            "updatedAt":"ABCDEF ABC"
+        }"#;
+        let (endpoint, _receiver, handle) = start_admin_test_server("200 OK", response);
+        let alias = Alias::new("test", &endpoint, "ABC", "ABCDEF");
+        let client = AdminClient::new(&alias).expect("admin client should build");
+
+        let status = client
+            .site_replication_resync(
+                SiteReplicationResyncOperation::Start,
+                &site_replication_resync_peer(),
+            )
+            .await
+            .expect("resync start request");
+        let value = serde_json::to_value(status).expect("resync status serializes");
+
+        assert_eq!(value["updatedAt"], "[REDACTED] [REDACTED]");
+        assert!(!value.to_string().contains("DEF"));
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn site_replication_resync_rejects_incomplete_success_payloads_without_echoing_them() {
+        for malformed in [
+            r#"{"status":"success","id":"resync-1","marker":"DO-NOT-ECHO"}"#,
+            r#"{"op":"start","id":"resync-1","marker":"DO-NOT-ECHO"}"#,
+            r#"{"op":"start","status":"success","marker":"DO-NOT-ECHO"}"#,
+            r#"{"op":"cancel","status":"success","marker":"DO-NOT-ECHO"}"#,
+            r#"{"op":"start","status":"not-found","marker":"DO-NOT-ECHO"}"#,
+            r#"{"op":"start","id":"resync-1","status":"success","buckets":[{"status":"started"}],"marker":"DO-NOT-ECHO"}"#,
+            r#"{"op":"start","id":"resync-1","status":"success","buckets":[{"bucket":"photos"}],"marker":"DO-NOT-ECHO"}"#,
+        ] {
+            let (endpoint, _receiver, handle) = start_admin_test_server("200 OK", malformed);
+            let client = admin_client_for_endpoint(&endpoint);
+            let error = client
+                .site_replication_resync(
+                    SiteReplicationResyncOperation::Status,
+                    &site_replication_resync_peer(),
+                )
+                .await
+                .expect_err("incomplete resync response must fail");
+
+            assert!(matches!(error, Error::General(_)));
+            assert_eq!(error.exit_code(), 1);
+            assert!(!error.to_string().contains("DO-NOT-ECHO"));
+            handle.join().expect("server thread should finish");
+        }
+
+        let (endpoint, _receiver, handle) = start_admin_test_server(
+            "200 OK",
+            r#"{"op":"status","status":"success","marker":"DO-NOT-ECHO"}"#,
+        );
+        let client = admin_client_for_endpoint(&endpoint);
+        let error = client
+            .site_replication_resync(
+                SiteReplicationResyncOperation::Start,
+                &site_replication_resync_peer(),
+            )
+            .await
+            .expect_err("requested mutation must require an operation ID");
+        assert!(matches!(error, Error::General(_)));
+        assert_eq!(error.exit_code(), 1);
+        assert!(!error.to_string().contains("DO-NOT-ECHO"));
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn site_replication_resync_accepts_not_found_without_id_and_future_wire_values() {
+        for response in [
+            r#"{"op":"status","status":"not-found"}"#,
+            r#"{"op":"future-operation","status":"future-status","future":true}"#,
+        ] {
+            let (endpoint, _receiver, handle) = start_admin_test_server("200 OK", response);
+            let client = admin_client_for_endpoint(&endpoint);
+            let status = client
+                .site_replication_resync(
+                    SiteReplicationResyncOperation::Status,
+                    &site_replication_resync_peer(),
+                )
+                .await
+                .expect("valid future-compatible resync response");
+
+            let value = serde_json::to_value(status).expect("resync status serializes");
+            let expected: serde_json::Value =
+                serde_json::from_str(response).expect("valid expected JSON");
+            assert_eq!(value["op"], expected["op"]);
+            assert_eq!(value["status"], expected["status"]);
+            if expected.get("future").is_some() {
+                assert_eq!(value["future"], true);
+            }
+            handle.join().expect("server thread should finish");
+        }
+    }
+
+    #[tokio::test]
+    async fn site_replication_resync_requires_mutations_to_echo_the_requested_operation() {
+        for (operation, response_operation) in [
+            (SiteReplicationResyncOperation::Start, "cancel"),
+            (SiteReplicationResyncOperation::Cancel, "start"),
+        ] {
+            let response =
+                format!(r#"{{"op":"{response_operation}","id":"resync-1","status":"success"}}"#);
+            let leaked: &'static str = Box::leak(response.into_boxed_str());
+            let (endpoint, _receiver, handle) = start_admin_test_server("200 OK", leaked);
+            let client = admin_client_for_endpoint(&endpoint);
+            let error = client
+                .site_replication_resync(operation, &site_replication_resync_peer())
+                .await
+                .expect_err("mismatched mutation operation must fail");
+
+            assert!(matches!(error, Error::General(_)));
+            assert!(error.to_string().contains("outcome is unknown"));
+            assert!(error.to_string().contains("do not retry blindly"));
+            handle.join().expect("server thread should finish");
+        }
+
+        let (endpoint, _receiver, handle) = start_admin_test_server(
+            "200 OK",
+            r#"{"op":"start","id":"resync-1","status":"success"}"#,
+        );
+        let client = admin_client_for_endpoint(&endpoint);
+        client
+            .site_replication_resync(
+                SiteReplicationResyncOperation::Status,
+                &site_replication_resync_peer(),
+            )
+            .await
+            .expect("status may return the persisted start snapshot");
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn site_replication_resync_rejects_oversized_request_before_network() {
+        let client = admin_client_for_endpoint("http://127.0.0.1:1");
+        let mut peer = site_replication_resync_peer();
+        peer.set_ca_cert_pem("x".repeat(MAX_SITE_REPLICATION_REQUEST_BYTES + 1));
+
+        let error = client
+            .site_replication_resync(SiteReplicationResyncOperation::Start, &peer)
+            .await
+            .expect_err("oversized resync request must fail before connecting");
+
+        assert!(matches!(error, Error::RequestRejected(_)));
+        assert!(error.to_string().contains("exceeds"));
+    }
+
+    #[tokio::test]
+    async fn site_replication_resync_enforces_success_and_error_response_bounds() {
+        let success_response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n",
+            MAX_SITE_REPLICATION_SUCCESS_RESPONSE_BYTES + 1
+        )
+        .into_bytes();
+        let (endpoint, handle) = start_admin_raw_response_server(success_response);
+        let client = admin_client_for_endpoint(&endpoint);
+        let peer = site_replication_resync_peer();
+        let error = client
+            .site_replication_resync(SiteReplicationResyncOperation::Status, &peer)
+            .await
+            .expect_err("declared oversized success must fail");
+        assert!(matches!(error, Error::General(_)));
+        assert!(error.to_string().contains("exceeds"));
+        assert!(!error.to_string().contains("outcome is unknown"));
+        handle.join().expect("server thread should finish");
+
+        let mut error_response = b"HTTP/1.1 500 Internal Server Error\r\ntransfer-encoding: chunked\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n".to_vec();
+        let body = vec![b'x'; MAX_SITE_REPLICATION_ERROR_RESPONSE_BYTES + 1];
+        error_response.extend_from_slice(format!("{:x}\r\n", body.len()).as_bytes());
+        error_response.extend_from_slice(&body);
+        error_response.extend_from_slice(b"\r\n0\r\n\r\n");
+        let (endpoint, handle) = start_admin_raw_response_server(error_response);
+        let client = admin_client_for_endpoint(&endpoint);
+        let error = client
+            .site_replication_resync(SiteReplicationResyncOperation::Start, &peer)
+            .await
+            .expect_err("chunked oversized error must fail");
+        assert!(matches!(error, Error::General(_)));
+        assert!(error.to_string().contains("exceeds"));
+        assert!(error.to_string().contains("outcome is unknown"));
+        assert!(error.to_string().contains("do not retry blindly"));
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn realtime_metrics_rejects_malformed_and_oversized_records() {
+        let (endpoint, _receiver, handle) = start_admin_owned_test_server(
+            "200 OK",
+            "application/x-ndjson",
+            "{not-json}\n".to_string(),
+        );
+        let client = admin_client_for_endpoint(&endpoint);
+        let error = client
+            .realtime_metrics(&rc_core::admin::MetricsQuery::default())
+            .await
+            .expect_err("malformed metrics should fail");
+        assert!(matches!(error, Error::Json(_)));
+        handle.join().expect("server thread should finish");
+
+        let oversized = format!(
+            "{{\"padding\":\"{}\"}}\n",
+            "x".repeat(rc_core::admin::MAX_METRICS_LINE_BYTES)
+        );
+        let (endpoint, _receiver, handle) =
+            start_admin_owned_test_server("200 OK", "application/x-ndjson", oversized);
+        let client = admin_client_for_endpoint(&endpoint);
+        let error = client
+            .realtime_metrics(&rc_core::admin::MetricsQuery::default())
+            .await
+            .expect_err("oversized metrics should fail");
+        assert!(matches!(error, Error::General(message) if message.contains("record limit")));
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn site_replication_resync_mutation_rejects_malformed_success_as_unknown() {
+        let (endpoint, _receiver, handle) = start_admin_test_server("200 OK", "{not-json");
+        let client = admin_client_for_endpoint(&endpoint);
+        let error = client
+            .site_replication_resync(
+                SiteReplicationResyncOperation::Start,
+                &site_replication_resync_peer(),
+            )
+            .await
+            .expect_err("malformed mutation response must fail");
+
+        assert!(matches!(error, Error::General(_)));
+        assert!(error.to_string().contains("outcome is unknown"));
+        assert!(error.to_string().contains("do not retry blindly"));
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn site_replication_resync_mutation_server_error_is_an_unknown_outcome() {
+        for operation in [
+            SiteReplicationResyncOperation::Start,
+            SiteReplicationResyncOperation::Cancel,
+        ] {
+            let (endpoint, _receiver, handle) = start_admin_test_server(
+                "500 Internal Server Error",
+                r#"{"message":"snapshot save failed"}"#,
+            );
+            let client = admin_client_for_endpoint(&endpoint);
+            let error = client
+                .site_replication_resync(operation, &site_replication_resync_peer())
+                .await
+                .expect_err("mutation server error must report an unknown outcome");
+
+            assert!(matches!(error, Error::Network(_)));
+            assert!(error.to_string().contains("outcome is unknown"));
+            assert!(error.to_string().contains("do not retry blindly"));
+            assert!(!error.to_string().contains("snapshot save failed"));
+            handle.join().expect("server thread should finish");
+        }
+    }
+
+    #[tokio::test]
+    async fn site_replication_resync_does_not_follow_redirects() {
+        for operation in [
+            SiteReplicationResyncOperation::Start,
+            SiteReplicationResyncOperation::Status,
+            SiteReplicationResyncOperation::Cancel,
+        ] {
+            let response = b"HTTP/1.1 307 Temporary Redirect\r\nlocation: http://127.0.0.1:1/replayed\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_vec();
+            let (endpoint, handle) = start_admin_raw_response_server(response);
+            let client = admin_client_for_endpoint(&endpoint);
+            let error = client
+                .site_replication_resync(operation, &site_replication_resync_peer())
+                .await
+                .expect_err("resync redirect must not be followed");
+
+            assert!(matches!(error, Error::Network(_)));
+            assert!(error.to_string().contains("HTTP 307"));
+            handle.join().expect("server thread should finish");
+        }
+    }
+
+    #[tokio::test]
+    async fn site_replication_resync_start_and_cancel_disconnects_have_specific_unknown_outcomes() {
+        for (operation, label) in [
+            (SiteReplicationResyncOperation::Start, "resync start"),
+            (SiteReplicationResyncOperation::Cancel, "resync cancel"),
+        ] {
+            let expected_target = format!(
+                "/rustfs/admin/v3/site-replication/resync/op?operation={}",
+                operation.as_str()
+            );
+            let (endpoint, receiver, handle) = start_admin_disconnect_server();
+            let client = admin_client_for_endpoint(&endpoint);
+            let error = client
+                .site_replication_resync(operation, &site_replication_resync_peer())
+                .await
+                .expect_err("mutation disconnect must report unknown outcome");
+
+            assert!(matches!(error, Error::Network(_)));
+            assert_eq!(error.exit_code(), 3);
+            assert!(error.to_string().contains(label));
+            assert!(error.to_string().contains("outcome is unknown"));
+            assert!(error.to_string().contains("not retried"));
+            let request = receiver.recv().expect("single captured request");
+            assert_eq!(request.method, "PUT");
+            assert_eq!(request.target, expected_target);
+            handle.join().expect("server thread should finish");
+        }
+    }
+
+    #[tokio::test]
+    async fn site_replication_resync_cancel_read_disconnect_has_specific_unknown_outcome() {
+        let response = b"HTTP/1.1 200 OK\r\ncontent-length: 128\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"op\":\"cancel\"".to_vec();
+        let (endpoint, handle) = start_admin_raw_response_server(response);
+        let client = admin_client_for_endpoint(&endpoint);
+        let error = client
+            .site_replication_resync(
+                SiteReplicationResyncOperation::Cancel,
+                &site_replication_resync_peer(),
+            )
+            .await
+            .expect_err("truncated cancel response must fail");
+
+        assert!(matches!(error, Error::Network(_)));
+        assert!(error.to_string().contains("resync cancel"));
+        assert!(error.to_string().contains("outcome is unknown"));
+        assert!(error.to_string().contains("response could not be read"));
+        assert!(error.to_string().contains("not retried"));
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn site_replication_resync_status_disconnect_is_retryable_network_semantics() {
+        let (endpoint, receiver, handle) = start_admin_disconnect_server();
+        let client = admin_client_for_endpoint(&endpoint);
+        let error = client
+            .site_replication_resync(
+                SiteReplicationResyncOperation::Status,
+                &site_replication_resync_peer(),
+            )
+            .await
+            .expect_err("status disconnect must fail");
+
+        assert!(matches!(error, Error::Network(_)));
+        assert_eq!(error.exit_code(), 3);
+        assert!(!error.to_string().contains("outcome is unknown"));
+        assert!(!error.to_string().contains("not retried"));
+        let request = receiver.recv().expect("single captured request");
+        assert_eq!(
+            request.target,
+            "/rustfs/admin/v3/site-replication/resync/op?operation=status"
+        );
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn site_replication_resync_maps_route_and_state_errors() {
+        for (status, expected_exit) in [
+            ("401 Unauthorized", 4),
+            ("403 Forbidden", 4),
+            ("404 Not Found", 7),
+            ("405 Method Not Allowed", 7),
+            ("501 Not Implemented", 7),
+            ("409 Conflict", 6),
+        ] {
+            let (endpoint, _receiver, handle) = start_admin_test_server(status, "{}");
+            let client = admin_client_for_endpoint(&endpoint);
+            let error = client
+                .site_replication_resync(
+                    SiteReplicationResyncOperation::Status,
+                    &site_replication_resync_peer(),
+                )
+                .await
+                .expect_err("mapped resync response must fail");
+
+            assert_eq!(error.exit_code(), expected_exit, "HTTP status {status}");
+            handle.join().expect("server thread should finish");
+        }
+
+        let (endpoint, _receiver, handle) = start_admin_test_server(
+            "400 Bad Request",
+            r#"{"code":"SiteReplicationOperationPending","message":"site replication operation pending"}"#,
+        );
+        let client = admin_client_for_endpoint(&endpoint);
+        let error = client
+            .site_replication_resync(
+                SiteReplicationResyncOperation::Start,
+                &site_replication_resync_peer(),
+            )
+            .await
+            .expect_err("pending resync must conflict");
+        assert_eq!(error.exit_code(), 6);
+        handle.join().expect("server thread should finish");
+
+        for message in [
+            "no resync in progress",
+            "invalid peer specified - cannot resync to self",
+            "site replication peer not found",
+        ] {
+            let body = format!(r#"{{"code":"InvalidRequest","message":"{message}"}}"#);
+            let leaked: &'static str = Box::leak(body.into_boxed_str());
+            let (endpoint, _receiver, handle) = start_admin_test_server("400 Bad Request", leaked);
+            let client = admin_client_for_endpoint(&endpoint);
+            let error = client
+                .site_replication_resync(
+                    SiteReplicationResyncOperation::Status,
+                    &site_replication_resync_peer(),
+                )
+                .await
+                .expect_err("known resync invalid state must conflict");
+
+            assert_eq!(error.exit_code(), 6, "message {message}");
+            handle.join().expect("server thread should finish");
+        }
+
+        let (endpoint, _receiver, handle) = start_admin_test_server(
+            "400 Bad Request",
+            r#"{"code":"InvalidRequest","message":"resync option is malformed"}"#,
+        );
+        let client = admin_client_for_endpoint(&endpoint);
+        let error = client
+            .site_replication_resync(
+                SiteReplicationResyncOperation::Status,
+                &site_replication_resync_peer(),
+            )
+            .await
+            .expect_err("arbitrary bad request must remain general");
+        assert_eq!(error.exit_code(), 1);
+        handle.join().expect("server thread should finish");
+    }
+
     #[tokio::test]
     async fn test_update_service_account_posts_access_key_and_partial_body() {
         let (endpoint, receiver, handle) = start_admin_test_server("204 No Content", "");
@@ -3607,6 +6603,320 @@ mod tests {
             }
             Ok(_) => panic!("Expected Error::Network for invalid PEM, got Ok(_)"),
             Err(e) => panic!("Expected Error::Network for invalid PEM, got Err({e})"),
+        }
+    }
+
+    #[tokio::test]
+    async fn replication_diff_posts_empty_signed_body_and_preserves_extensions() {
+        let (endpoint, receiver, handle) = start_admin_test_server(
+            "200 OK",
+            r#"{
+                "Entries":[{
+                    "Object":"reports/a.json",
+                    "VersionID":"v1",
+                    "Size":42,
+                    "IsDeleteMarker":false,
+                    "ReplicationStatus":"FAILED",
+                    "LastModified":"2026-07-21T04:00:00Z",
+                    "TargetDetail":{"attempts":2}
+                }],
+                "IsTruncated":false,
+                "ScannedVersions":24,
+                "ServerRevision":7
+            }"#,
+        );
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let diff = client
+            .replication_diff("source bucket", Some("reports/2026 Q3/"))
+            .await
+            .expect("replication diff");
+
+        assert_eq!(diff.entries[0].object, "reports/a.json");
+        assert_eq!(diff.entries[0].extra["TargetDetail"]["attempts"], 2);
+        assert_eq!(diff.extra["ServerRevision"], 7);
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(request.method, "POST");
+        assert_eq!(
+            request.target,
+            "/rustfs/admin/v3/replication/diff?bucket=source%20bucket&prefix=reports%2F2026%20Q3%2F"
+        );
+        assert!(request.body.is_empty());
+        assert!(request.headers.to_ascii_lowercase().contains(
+            "x-amz-content-sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        ));
+        handle.join().expect("server thread");
+    }
+
+    #[tokio::test]
+    async fn replication_diff_omits_prefix_query_when_not_requested() {
+        let (endpoint, receiver, handle) = start_admin_test_server(
+            "200 OK",
+            r#"{"Entries":[],"IsTruncated":false,"ScannedVersions":0}"#,
+        );
+        let client = anonymous_admin_client_for_endpoint(&endpoint);
+
+        let diff = client
+            .replication_diff("source", None)
+            .await
+            .expect("empty replication diff");
+
+        assert!(diff.entries.is_empty());
+        assert_eq!(
+            receiver.recv().expect("captured request").target,
+            "/rustfs/admin/v3/replication/diff?bucket=source"
+        );
+        handle.join().expect("server thread");
+    }
+
+    #[tokio::test]
+    async fn replication_diff_maps_auth_missing_and_unsupported_responses() {
+        let cases = [
+            (
+                "403 Forbidden",
+                r#"{"Code":"AccessDenied","Message":"denied"}"#,
+                "auth",
+            ),
+            (
+                "404 Not Found",
+                r#"{"Code":"NoSuchBucket","Message":"missing bucket"}"#,
+                "not_found",
+            ),
+            (
+                "404 Not Found",
+                r#"{"Code":"ReplicationConfigurationNotFoundError","Message":"replication is not configured"}"#,
+                "not_found",
+            ),
+            (
+                "404 Not Found",
+                r#"{"message":"route missing"}"#,
+                "unsupported",
+            ),
+            (
+                "501 Not Implemented",
+                r#"{"Code":"NotImplemented","Message":"not implemented"}"#,
+                "unsupported",
+            ),
+        ];
+
+        for (status, body, expected) in cases {
+            let (endpoint, _receiver, handle) = start_admin_test_server(status, body);
+            let error = anonymous_admin_client_for_endpoint(&endpoint)
+                .replication_diff("source", None)
+                .await
+                .expect_err("HTTP error response");
+            match expected {
+                "auth" => assert!(matches!(error, Error::Auth(_))),
+                "not_found" => assert!(matches!(error, Error::NotFound(_))),
+                "unsupported" => assert!(matches!(error, Error::UnsupportedFeature(_))),
+                _ => panic!("unexpected test expectation"),
+            }
+            handle.join().expect("server thread");
+        }
+    }
+
+    #[tokio::test]
+    async fn replication_diff_rejects_malformed_json_and_network_failure() {
+        let (endpoint, _receiver, handle) = start_admin_test_server("200 OK", "not-json");
+        let malformed = anonymous_admin_client_for_endpoint(&endpoint)
+            .replication_diff("source", None)
+            .await
+            .expect_err("malformed JSON response");
+        assert!(matches!(malformed, Error::Json(_)));
+        handle.join().expect("server thread");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("reserve unused port");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        drop(listener);
+        let network = anonymous_admin_client_for_endpoint(&endpoint)
+            .replication_diff("source", None)
+            .await
+            .expect_err("connection failure");
+        assert!(matches!(network, Error::Network(_)));
+    }
+
+    #[tokio::test]
+    async fn replication_diff_rejects_declared_and_chunked_overflow() {
+        let (endpoint, _receiver, handle) = start_admin_declared_length_server(
+            "403 Forbidden",
+            MAX_REPLICATION_DIFF_RESPONSE_BYTES + 1,
+        );
+        let declared = anonymous_admin_client_for_endpoint(&endpoint)
+            .replication_diff("source", None)
+            .await
+            .expect_err("declared overflow");
+        assert!(matches!(declared, Error::General(message) if message.contains("response limit")));
+        handle.join().expect("server thread");
+
+        let (endpoint, _receiver, completion) = start_admin_chunked_overflow_server();
+        let chunked = anonymous_admin_client_for_endpoint(&endpoint)
+            .replication_diff("source", None)
+            .await
+            .expect_err("chunked overflow");
+        assert!(matches!(chunked, Error::General(message) if message.contains("response limit")));
+        completion
+            .recv_timeout(Duration::from_secs(5))
+            .expect("chunked overflow server should complete within its socket timeout");
+    }
+
+    #[tokio::test]
+    async fn observability_routes_distinguish_permission_denial_from_unsupported() {
+        for (status, expected_auth) in [("403 Forbidden", true), ("404 Not Found", false)] {
+            let (endpoint, _receiver, handle) = start_admin_test_server(
+                status,
+                r#"{"code":"AccessDenied","message":"denied or absent"}"#,
+            );
+            let client = admin_client_for_endpoint(&endpoint);
+            let error = client
+                .scanner_status()
+                .await
+                .expect_err("request should fail");
+            if expected_auth {
+                assert!(matches!(error, Error::Auth(_)));
+            } else {
+                assert!(matches!(error, Error::UnsupportedFeature(_)));
+            }
+            handle.join().expect("server thread should finish");
+        }
+    }
+    #[tokio::test]
+    async fn kms_status_uses_service_status_and_normalizes_safe_summary() {
+        let body = r#"{"status":"Running","backend_type":"VaultKV2","healthy":true,"config_summary":{"backend_type":"VaultKV2","default_key_id":"archive-key","timeout_seconds":30,"retry_attempts":3,"enable_cache":true,"max_cached_keys":1000,"cache_ttl_seconds":3600,"cache_summary":{"max_keys":500,"ttl_seconds":900,"enable_metrics":true},"backend_summary":{"backend_type":"vault-kv2","address":"https://user:secret@vault.example/path?token=hidden#fragment","auth_method_type":"approle","has_stored_credentials":true,"skip_tls_verify":false}}}"#;
+        let (endpoint, receiver, handle) = start_admin_test_server("200 OK", body);
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let status = client.kms_status().await.expect("KMS status should parse");
+
+        assert_eq!(status.state, KmsServiceState::Running);
+        assert_eq!(status.backend, Some(KmsBackendKind::VaultKv2));
+        assert_eq!(status.healthy, Some(true));
+        let config = status.config.as_ref().expect("safe config summary");
+        assert_eq!(config.default_key_id.as_deref(), Some("archive-key"));
+        assert_eq!(
+            config.endpoint.as_deref(),
+            Some("https://vault.example/path")
+        );
+        assert_eq!(config.auth_method.as_deref(), Some("approle"));
+        assert_eq!(config.credentials_configured, Some(true));
+        assert_eq!(config.cache.max_keys, Some(500));
+
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.target, "/rustfs/admin/v3/kms/service-status");
+        assert!(!format!("{status:?}").contains("token"));
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn kms_status_treats_unconfigured_as_a_stable_result() {
+        let body = r#"{"status":"NotConfigured","backend_type":null,"healthy":null,"config_summary":null}"#;
+        let (endpoint, _receiver, handle) = start_admin_test_server("200 OK", body);
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let status = client
+            .kms_status()
+            .await
+            .expect("unconfigured KMS should not be an error");
+
+        assert_eq!(status.state, KmsServiceState::NotConfigured);
+        assert_eq!(status.backend, None);
+        assert_eq!(status.healthy, None);
+        assert_eq!(status.config, None);
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn kms_status_redacts_server_error_details() {
+        let body = r#"{"status":{"Error":"vault token MUST_NOT_APPEAR was rejected"},"backend_type":"VaultKV2","healthy":false,"config_summary":null}"#;
+        let (endpoint, _receiver, handle) = start_admin_test_server("200 OK", body);
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let status = client.kms_status().await.expect("error state should parse");
+
+        assert_eq!(status.state, KmsServiceState::Error);
+        assert_eq!(
+            status.error_message.as_deref(),
+            Some("KMS service reported an error")
+        );
+        assert!(!format!("{status:?}").contains("MUST_NOT_APPEAR"));
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn kms_list_keys_encodes_pagination_and_normalizes_key_info() {
+        let body = r#"{"success":true,"message":"keys listed successfully","keys":[{"key_id":"archive/key","description":"Archive key","algorithm":"AES_256","usage":"EncryptDecrypt","status":"Active","version":2,"metadata":{"owner":"storage"},"tags":{"environment":"prod"},"created_at":"2026-07-21T00:00:00Z","rotated_at":null,"created_by":"admin"}],"truncated":true,"next_marker":"next/key"}"#;
+        let (endpoint, receiver, handle) = start_admin_test_server("200 OK", body);
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let page = client
+            .kms_list_keys(25, Some("marker/with space"))
+            .await
+            .expect("KMS key page should parse");
+
+        assert!(page.truncated);
+        assert_eq!(page.next_marker.as_deref(), Some("next/key"));
+        assert_eq!(page.keys.len(), 1);
+        assert_eq!(page.keys[0].state, KmsKeyState::Active);
+        assert_eq!(page.keys[0].usage, KmsKeyUsage::EncryptDecrypt);
+        assert_eq!(
+            page.keys[0].tags.get("owner").map(String::as_str),
+            Some("storage")
+        );
+        assert_eq!(
+            page.keys[0].tags.get("environment").map(String::as_str),
+            Some("prod")
+        );
+
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(
+            request.target,
+            "/rustfs/admin/v3/kms/keys?limit=25&marker=marker%2Fwith%20space"
+        );
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn kms_describe_key_encodes_path_segment() {
+        let body = r#"{"success":true,"message":"Key described successfully","key_metadata":{"key_id":"archive/key one","key_state":"Enabled","key_usage":"EncryptDecrypt","description":null,"creation_date":"2026-07-21T00:00:00Z","deletion_date":null,"origin":"AWS_KMS","key_manager":"CUSTOMER","tags":{}}}"#;
+        let (endpoint, receiver, handle) = start_admin_test_server("200 OK", body);
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let key = client
+            .kms_describe_key("archive/key one")
+            .await
+            .expect("KMS key should parse");
+
+        assert_eq!(key.key_id, "archive/key one");
+        assert_eq!(key.state, KmsKeyState::Enabled);
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(
+            request.target,
+            "/rustfs/admin/v3/kms/keys/archive%2Fkey%20one"
+        );
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn kms_status_preserves_auth_unavailable_and_malformed_failures() {
+        for (status, body, expected) in [
+            ("403 Forbidden", r#"{"Code":"AccessDenied"}"#, "auth"),
+            (
+                "503 Service Unavailable",
+                r#"{"message":"kms service is not running"}"#,
+                "network",
+            ),
+            ("200 OK", r#"{"status":"Running"#, "json"),
+        ] {
+            let (endpoint, _receiver, handle) = start_admin_test_server(status, body);
+            let client = admin_client_for_endpoint(&endpoint);
+            let error = client.kms_status().await.expect_err("response should fail");
+            match expected {
+                "auth" => assert!(matches!(error, Error::Auth(_))),
+                "network" => assert!(matches!(error, Error::Network(_))),
+                "json" => assert!(matches!(error, Error::Json(_))),
+                _ => panic!("unexpected expected error kind"),
+            }
+            handle.join().expect("server thread should finish");
         }
     }
 }

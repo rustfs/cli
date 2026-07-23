@@ -29,6 +29,8 @@ rc object stat local/reports/summary.json --json
 
 Metadata output includes object identity and storage metadata such as size, modified time, ETag, content type, and user metadata when available.
 
+When `--version-id` is combined with JSON output, `stat` emits the output v3 `versioned_objects` envelope with `data.operation` set to `stat`. Metadata for the selected version is nested under `data.object`. JSON output without `--version-id` retains its legacy shape.
+
 Global options shown in command syntax use the same meaning everywhere:
 
 | Option | Description |

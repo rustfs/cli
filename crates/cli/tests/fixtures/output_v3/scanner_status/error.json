@@ -1,0 +1,1 @@
+{"schema_version":3,"type":"scanner_status","status":"error","error":{"type":"unsupported_feature","message":"Scanner status is unavailable","retryable":false,"capability":"admin.scanner-status","server":null,"suggestion":"Upgrade RustFS to beta.10 or later."}}

@@ -8,7 +8,7 @@ use clap::{Args, Subcommand};
 use crate::exit_code::ExitCode;
 use crate::output::OutputConfig;
 
-use super::{anonymous, cors, encryption, event, ilm, ls, mb, quota, rb, replicate, version};
+use super::{anonymous, cors, encryption, event, ilm, lock, ls, mb, quota, rb, replicate, version};
 
 const BUCKET_AFTER_HELP: &str = "\
 Examples:
@@ -18,6 +18,7 @@ Examples:
   rc bucket event list local/my-bucket
   rc bucket cors list local/my-bucket
   rc bucket encryption info local/my-bucket
+  rc bucket lock info local/my-bucket
   rc bucket replication status local/my-bucket";
 
 /// Manage bucket-oriented workflows
@@ -54,6 +55,9 @@ pub enum BucketCommands {
     /// Manage bucket versioning
     #[command(subcommand)]
     Version(version::VersionCommands),
+
+    /// Manage bucket Object Lock and default retention
+    Lock(lock::LockArgs),
 
     /// Manage bucket quota
     #[command(subcommand)]
@@ -103,6 +107,7 @@ pub async fn execute(args: BucketArgs, output_config: OutputConfig) -> ExitCode 
             ))
             .await
         }
+        BucketCommands::Lock(args) => Box::pin(lock::execute(args, output_config)).await,
         BucketCommands::Quota(cmd) => {
             Box::pin(quota::execute(
                 quota::QuotaArgs { command: cmd },
