@@ -253,6 +253,38 @@ fn run_rc(mock: &S3Mock, args: &[&str]) -> Output {
         .expect("run rc command")
 }
 
+fn run_rc_with_stdin(mock: &S3Mock, args: &[&str], input: &[u8]) -> Output {
+    let config_dir = tempfile::tempdir().expect("create config directory");
+    let authority = mock
+        .endpoint
+        .strip_prefix("http://")
+        .expect("mock endpoint has scheme");
+    let alias = format!("http://ACCESS_KEY:SECRET_KEY@{authority}");
+    let mut command = Command::new(rc_binary());
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("RC_HOST_") {
+            command.env_remove(key);
+        }
+    }
+    let mut child = command
+        .args(args)
+        .env("RC_CONFIG_DIR", config_dir.path())
+        .env("RC_HOST_test", alias)
+        .env("AWS_EC2_METADATA_DISABLED", "true")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn rc command");
+    child
+        .stdin
+        .take()
+        .expect("pipe command stdin")
+        .write_all(input)
+        .expect("write pipe input");
+    child.wait_with_output().expect("wait for rc command")
+}
+
 fn list_result(keys: &[String], truncated: bool, next_token: Option<&str>) -> Response {
     let contents = keys
         .iter()
@@ -303,6 +335,165 @@ fn is_list_request(request: &Request) -> bool {
 
 fn is_copy_request(request: &Request) -> bool {
     request.method == "PUT" && request.headers.contains_key("x-amz-copy-source")
+}
+
+#[test]
+fn single_copy_and_pipe_send_supported_storage_classes() {
+    let mock = S3Mock::start(|request| {
+        if request.method == "HEAD" && request.target == "/source/a.txt" {
+            return Response::head_with_etag(7, "source-etag");
+        }
+        if is_copy_request(request) {
+            return copy_result();
+        }
+        if request.method == "HEAD" && request.target == "/destination/b.txt" {
+            return Response {
+                status: "200 OK",
+                headers: vec![
+                    ("content-length", "7".to_string()),
+                    ("etag", "\"destination-etag\"".to_string()),
+                    ("x-amz-storage-class", "REDUCED_REDUNDANCY".to_string()),
+                ],
+                body: String::new(),
+            };
+        }
+        if request.method == "PUT" && request.target.starts_with("/destination/pipe.txt") {
+            return Response::empty();
+        }
+        if request.method == "PUT" && request.target.starts_with("/destination/upload.txt") {
+            return Response::empty();
+        }
+        Response {
+            status: "500 Internal Server Error",
+            headers: Vec::new(),
+            body: "<Error><Code>UnexpectedRequest</Code></Error>".to_string(),
+        }
+    });
+
+    let copy = run_rc(
+        &mock,
+        &[
+            "cp",
+            "test/source/a.txt",
+            "test/destination/b.txt",
+            "--storage-class",
+            "REDUCED_REDUNDANCY",
+        ],
+    );
+    assert!(
+        copy.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&copy.stdout),
+        String::from_utf8_lossy(&copy.stderr)
+    );
+
+    let pipe = run_rc_with_stdin(
+        &mock,
+        &[
+            "pipe",
+            "test/destination/pipe.txt",
+            "--storage-class",
+            "STANDARD",
+        ],
+        b"payload",
+    );
+    assert!(
+        pipe.status.success(),
+        "stdout: {}\nstderr: {}\nrequests: {:#?}",
+        String::from_utf8_lossy(&pipe.stdout),
+        String::from_utf8_lossy(&pipe.stderr),
+        mock.requests()
+    );
+
+    let source_dir = tempfile::tempdir().expect("create upload source directory");
+    let source = source_dir.path().join("upload.txt");
+    std::fs::write(&source, b"payload").expect("write upload source");
+    let upload = run_rc(
+        &mock,
+        &[
+            "cp",
+            source.to_str().expect("source path is valid UTF-8"),
+            "test/destination/upload.txt",
+            "--storage-class",
+            "STANDARD",
+        ],
+    );
+    assert!(
+        upload.status.success(),
+        "stdout: {}\nstderr: {}\nrequests: {:#?}",
+        String::from_utf8_lossy(&upload.stdout),
+        String::from_utf8_lossy(&upload.stderr),
+        mock.requests()
+    );
+
+    let requests = mock.requests();
+    let copy_request = requests
+        .iter()
+        .find(|request| is_copy_request(request))
+        .expect("copy request");
+    assert_eq!(
+        copy_request.headers.get("x-amz-storage-class"),
+        Some(&"REDUCED_REDUNDANCY".to_string())
+    );
+    let pipe_request = requests
+        .iter()
+        .find(|request| {
+            request.method == "PUT" && request.target.starts_with("/destination/pipe.txt")
+        })
+        .expect("pipe put request");
+    assert_eq!(
+        pipe_request.headers.get("x-amz-storage-class"),
+        Some(&"STANDARD".to_string())
+    );
+    let upload_request = requests
+        .iter()
+        .find(|request| {
+            request.method == "PUT" && request.target.starts_with("/destination/upload.txt")
+        })
+        .expect("local upload put request");
+    assert_eq!(
+        upload_request.headers.get("x-amz-storage-class"),
+        Some(&"STANDARD".to_string())
+    );
+}
+
+#[test]
+fn storage_class_dry_run_reports_policy_without_copy_mutation() {
+    let mock = S3Mock::start(|request| {
+        if request.method == "HEAD" && request.target == "/source/a.txt" {
+            return Response::head_with_etag(7, "source-etag");
+        }
+        Response {
+            status: "500 Internal Server Error",
+            headers: Vec::new(),
+            body: "<Error><Code>UnexpectedRequest</Code></Error>".to_string(),
+        }
+    });
+
+    let output = run_rc(
+        &mock,
+        &[
+            "cp",
+            "test/source/a.txt",
+            "test/destination/b.txt",
+            "--storage-class",
+            "STANDARD",
+            "--dry-run",
+        ],
+    );
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("[storage-class=STANDARD]"));
+    assert!(
+        mock.requests()
+            .iter()
+            .all(|request| !is_copy_request(request))
+    );
 }
 
 #[test]

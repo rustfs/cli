@@ -672,13 +672,27 @@ fn managed_object_encryption(
     }
 }
 
+fn rustfs_storage_class(value: Option<&str>) -> Result<Option<aws_sdk_s3::types::StorageClass>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    match value {
+        "STANDARD" => Ok(Some(aws_sdk_s3::types::StorageClass::Standard)),
+        "REDUCED_REDUNDANCY" => Ok(Some(aws_sdk_s3::types::StorageClass::ReducedRedundancy)),
+        value if aws_sdk_s3::types::StorageClass::try_parse(value).is_ok() => {
+            Err(Error::UnsupportedFeature(format!(
+                "RustFS beta.10 does not provide meaningful storage policy '{value}'; tracked by rustfs/backlog#1465"
+            )))
+        }
+        value => Err(Error::InvalidPath(format!(
+            "Unknown destination storage class '{value}'"
+        ))),
+    }
+}
+
 fn validate_attribute_tag_write_options(options: &ObjectWriteOptions) -> Result<()> {
     options.validate()?;
-    if options.storage_class.is_some() {
-        return Err(Error::UnsupportedFeature(
-            "Storage-class writes are tracked by rustfs/backlog#1457".to_string(),
-        ));
-    }
+    rustfs_storage_class(options.storage_class.as_deref())?;
     if options.checksum.is_some() {
         return Err(Error::UnsupportedFeature(
             "Checksum writes are tracked by rustfs/backlog#1458".to_string(),
@@ -1987,6 +2001,11 @@ impl S3Client {
                     .and_then(|value| std::str::from_utf8(value.as_bytes()).ok())
             });
             let status = raw.status().as_u16();
+            if matches!(code, Some("InvalidStorageClass")) {
+                return Error::UnsupportedFeature(
+                    "The S3 endpoint rejected the requested storage class".to_string(),
+                );
+            }
             if matches!(status, 409 | 412)
                 || matches!(
                     code,
@@ -3943,6 +3962,7 @@ impl ObjectStore for S3Client {
         let size = data.len() as i64;
         let body = aws_sdk_s3::primitives::ByteStream::from(data);
         let encryption = managed_object_encryption(options)?;
+        let storage_class = rustfs_storage_class(options.storage_class.as_deref())?;
         let request = apply_object_encryption_to_put_request(
             self.inner
                 .put_object()
@@ -3950,7 +3970,8 @@ impl ObjectStore for S3Client {
                 .key(&path.key)
                 .body(body),
             encryption,
-        );
+        )
+        .set_storage_class(storage_class);
         let mut request =
             apply_object_attributes_to_put_request(request, options.attributes.as_ref())?;
         if let Some(tags) = &options.tags {
@@ -3966,6 +3987,7 @@ impl ObjectStore for S3Client {
             info.metadata =
                 (!attributes.user_metadata.is_empty()).then(|| attributes.user_metadata.clone());
         }
+        info.storage_class = options.storage_class.clone();
         info.etag = response
             .e_tag()
             .map(|etag| etag.trim_matches('"').to_string());
@@ -4060,6 +4082,7 @@ impl ObjectStore for S3Client {
         validate_beta10_copy_options(options)?;
         let copy_source = encoded_copy_source(src, options.source.version_id.as_deref());
         let encryption = managed_object_encryption(&options.destination)?;
+        let storage_class = rustfs_storage_class(options.destination.storage_class.as_deref())?;
         let mut request = apply_object_encryption_to_copy_request(
             self.inner
                 .copy_object()
@@ -4067,7 +4090,8 @@ impl ObjectStore for S3Client {
                 .bucket(&dst.bucket)
                 .key(&dst.key),
             encryption,
-        );
+        )
+        .set_storage_class(storage_class);
         if matches!(options.metadata_directive, Some(MetadataDirective::Copy)) {
             request = request.metadata_directive(aws_sdk_s3::types::MetadataDirective::Copy);
         }
@@ -4167,6 +4191,12 @@ impl ObjectStore for S3Client {
             )));
         }
         validate_beta10_copy_options(transfer)?;
+        if transfer.destination.storage_class.is_some() {
+            return Err(Error::UnsupportedFeature(
+                "RustFS beta.10 does not persist storage class for multipart uploads; tracked by rustfs/backlog#1464"
+                    .to_string(),
+            ));
+        }
         if transfer.source.version_id.is_some()
             && transfer.source.version_id.as_deref() != multipart.source_version_id.as_deref()
         {
@@ -8076,13 +8106,15 @@ mod tests {
                 ("team name".to_string(), "storage/core".to_string()),
                 ("owner".to_string(), "alice smith".to_string()),
             ])),
+            storage_class: Some("REDUCED_REDUNDANCY".to_string()),
             ..ObjectWriteOptions::default()
         };
 
-        client
+        let info = client
             .put_object_with_options(&path, b"payload".to_vec(), &options)
             .await
             .expect("put object with attributes and tags");
+        assert_eq!(info.storage_class.as_deref(), Some("REDUCED_REDUNDANCY"));
 
         let request = request_receiver.expect_request();
         assert_eq!(request.headers().get("content-type"), Some("text/plain"));
@@ -8098,6 +8130,10 @@ mod tests {
         assert_eq!(
             request.headers().get("x-amz-tagging"),
             Some("owner=alice+smith&team+name=storage%2Fcore")
+        );
+        assert_eq!(
+            request.headers().get("x-amz-storage-class"),
+            Some("REDUCED_REDUNDANCY")
         );
     }
 
@@ -8147,6 +8183,62 @@ mod tests {
             .expect_err("access denied must remain typed");
         assert!(matches!(error, Error::Auth(_)));
         denied_requests.expect_request();
+    }
+
+    #[tokio::test]
+    async fn transfer_put_rejects_unsupported_and_maps_invalid_storage_classes() {
+        let path = RemotePath::new("test", "bucket", "file.txt");
+        let (unsupported_client, unsupported_requests) = test_s3_client(None);
+        let unsupported = unsupported_client
+            .put_object_with_options(
+                &path,
+                b"payload".to_vec(),
+                &ObjectWriteOptions {
+                    storage_class: Some("STANDARD_IA".to_string()),
+                    ..ObjectWriteOptions::default()
+                },
+            )
+            .await
+            .expect_err("label-only RustFS storage classes must fail locally");
+        assert!(matches!(unsupported, Error::UnsupportedFeature(_)));
+        unsupported_requests.expect_no_request();
+
+        let (unknown_client, unknown_requests) = test_s3_client(None);
+        let unknown = unknown_client
+            .put_object_with_options(
+                &path,
+                b"payload".to_vec(),
+                &ObjectWriteOptions {
+                    storage_class: Some("NOT_A_CLASS".to_string()),
+                    ..ObjectWriteOptions::default()
+                },
+            )
+            .await
+            .expect_err("unknown storage classes must fail locally");
+        assert!(matches!(unknown, Error::InvalidPath(_)));
+        unknown_requests.expect_no_request();
+
+        let invalid_response = http::Response::builder()
+            .status(400)
+            .header("x-amz-error-code", "InvalidStorageClass")
+            .body(SdkBody::from(
+                "<Error><Code>InvalidStorageClass</Code><Message>invalid</Message></Error>",
+            ))
+            .expect("build invalid storage class response");
+        let (invalid_client, invalid_requests) = test_s3_client(Some(invalid_response));
+        let invalid = invalid_client
+            .put_object_with_options(
+                &path,
+                b"payload".to_vec(),
+                &ObjectWriteOptions {
+                    storage_class: Some("STANDARD".to_string()),
+                    ..ObjectWriteOptions::default()
+                },
+            )
+            .await
+            .expect_err("service storage-class rejection must remain typed");
+        assert!(matches!(invalid, Error::UnsupportedFeature(_)));
+        invalid_requests.expect_request();
     }
 
     #[tokio::test]
@@ -8416,6 +8508,10 @@ mod tests {
                 &dst,
                 &TransferCopyOptions {
                     metadata_directive: Some(MetadataDirective::Copy),
+                    destination: ObjectWriteOptions {
+                        storage_class: Some("STANDARD".to_string()),
+                        ..ObjectWriteOptions::default()
+                    },
                     ..TransferCopyOptions::default()
                 },
             )
@@ -8425,6 +8521,10 @@ mod tests {
         assert_eq!(
             request.headers().get("x-amz-metadata-directive"),
             Some("COPY")
+        );
+        assert_eq!(
+            request.headers().get("x-amz-storage-class"),
+            Some("STANDARD")
         );
     }
 
@@ -8779,6 +8879,29 @@ mod tests {
             .expect_err("unsupported multipart tags must fail before preflight");
         assert!(matches!(error, Error::UnsupportedFeature(_)));
         assert!(replay.actual_requests().next().is_none());
+
+        let (storage_client, storage_replay) = test_s3_client_with_response_sequence(vec![]);
+        let storage_transfer = TransferCopyOptions {
+            metadata_directive: Some(MetadataDirective::Copy),
+            destination: ObjectWriteOptions {
+                storage_class: Some("STANDARD".to_string()),
+                ..ObjectWriteOptions::default()
+            },
+            ..TransferCopyOptions::default()
+        };
+        let storage_error = storage_client
+            .multipart_copy_with_transfer_options(
+                &src,
+                &dst,
+                &multipart,
+                &storage_transfer,
+                &MultipartCopyCancellation::new(),
+                &|_| {},
+            )
+            .await
+            .expect_err("multipart storage class must fail before metadata preflight");
+        assert!(matches!(storage_error, Error::UnsupportedFeature(_)));
+        assert!(storage_replay.actual_requests().next().is_none());
     }
 
     #[tokio::test]

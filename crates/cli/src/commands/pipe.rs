@@ -3,13 +3,18 @@
 //! Reads from stdin and uploads to S3. Useful for piping output from other commands.
 
 use clap::Args;
-use rc_core::{AliasManager, ObjectEncryptionRequest, ObjectStore as _, RemotePath};
+use rc_core::{
+    AliasManager, ObjectAttributes, ObjectEncryptionRequest, ObjectStore as _,
+    ObjectWriteEncryption, ObjectWriteOptions, RemotePath,
+};
 use rc_s3::S3Client;
 use serde::Serialize;
 use std::io::Read;
 
 use crate::exit_code::ExitCode;
 use crate::output::{Formatter, OutputConfig};
+
+use super::cp::{exit_code_for_core_error, validate_destination_storage_class};
 
 /// Stream stdin to an object
 #[derive(Args, Debug)]
@@ -47,11 +52,8 @@ struct PipeOutput {
 /// Execute the pipe command
 pub async fn execute(args: PipeArgs, output_config: OutputConfig) -> ExitCode {
     let formatter = Formatter::new(output_config);
-    if args.storage_class.is_some() {
-        return formatter.fail(
-            ExitCode::UnsupportedFeature,
-            "--storage-class is not implemented for pipe",
-        );
+    if let Err(error) = validate_destination_storage_class(args.storage_class.as_deref()) {
+        return formatter.fail(exit_code_for_core_error(&error), &error.to_string());
     }
     let encryption = match (args.enc_s3, args.enc_kms.as_deref()) {
         (true, None) => Some(ObjectEncryptionRequest::SseS3),
@@ -119,13 +121,17 @@ pub async fn execute(args: PipeArgs, output_config: OutputConfig) -> ExitCode {
     let target_display = format!("{alias_name}/{bucket}/{key}");
 
     // Upload
+    let options = ObjectWriteOptions {
+        attributes: Some(ObjectAttributes {
+            content_type: Some(args.content_type.clone()),
+            ..ObjectAttributes::default()
+        }),
+        storage_class: args.storage_class.clone(),
+        encryption: encryption.map(ObjectWriteEncryption::Managed),
+        ..ObjectWriteOptions::default()
+    };
     match client
-        .put_object(
-            &target,
-            buffer,
-            Some(&args.content_type),
-            encryption.as_ref(),
-        )
+        .put_object_with_options(&target, buffer, &options)
         .await
     {
         Ok(info) => {
@@ -148,7 +154,7 @@ pub async fn execute(args: PipeArgs, output_config: OutputConfig) -> ExitCode {
         }
         Err(e) => {
             formatter.error(&format!("Failed to upload: {e}"));
-            ExitCode::NetworkError
+            exit_code_for_core_error(&e)
         }
     }
 }
@@ -224,5 +230,23 @@ mod tests {
 
         let code = execute(args, OutputConfig::default()).await;
         assert_eq!(code, ExitCode::UsageError);
+    }
+
+    #[tokio::test]
+    async fn pipe_storage_class_errors_have_distinct_exit_codes_before_io() {
+        for (storage_class, expected) in [
+            ("NOT_A_CLASS", ExitCode::UsageError),
+            ("STANDARD_IA", ExitCode::UnsupportedFeature),
+        ] {
+            let args = PipeArgs {
+                target: "local/bucket/file.txt".to_string(),
+                content_type: "application/octet-stream".to_string(),
+                storage_class: Some(storage_class.to_string()),
+                enc_s3: false,
+                enc_kms: None,
+            };
+
+            assert_eq!(execute(args, OutputConfig::default()).await, expected);
+        }
     }
 }

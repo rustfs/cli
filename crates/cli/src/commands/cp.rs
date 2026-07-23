@@ -7,9 +7,10 @@ use jiff::Timestamp;
 use rc_core::alias::RetryConfig;
 use rc_core::{
     AliasManager, CopyObjectOptions, Error, MultipartCopyCancellation, MultipartCopyOptions,
-    ObjectEncryptionRequest, ObjectInfo, ObjectStore as _, ParsedPath, RemotePath,
-    TransferCancellation, TransferCandidate, TransferControls, TransferExecutor,
-    TransferOutcomeState, TransferPlan, TransferSelection, parse_path,
+    ObjectAttributes, ObjectEncryptionRequest, ObjectInfo, ObjectStore as _, ObjectWriteEncryption,
+    ObjectWriteOptions, ParsedPath, RemotePath, TransferCancellation, TransferCandidate,
+    TransferControls, TransferCopyOptions, TransferExecutor, TransferOutcomeState, TransferPlan,
+    TransferReadOptions, TransferSelection, parse_path,
 };
 use rc_s3::S3Client;
 use serde::Serialize;
@@ -209,11 +210,8 @@ pub async fn execute(args: CpArgs, output_config: OutputConfig) -> ExitCode {
             "--preserve is not implemented; refusing to continue with a silently ignored option",
         );
     }
-    if args.storage_class.is_some() {
-        return formatter.fail(
-            ExitCode::UnsupportedFeature,
-            "--storage-class is not implemented; refusing to continue with a silently ignored option",
-        );
+    if let Err(error) = validate_destination_storage_class(args.storage_class.as_deref()) {
+        return formatter.fail(exit_code_for_core_error(&error), &error.to_string());
     }
 
     if formatter.is_json() && uses_transfer_planner(&args) {
@@ -259,6 +257,12 @@ pub async fn execute(args: CpArgs, output_config: OutputConfig) -> ExitCode {
             );
         }
     };
+    if args.storage_class.is_some() && matches!(target, ParsedPath::Local(_)) {
+        return formatter.fail(
+            ExitCode::UsageError,
+            "--storage-class requires a remote destination",
+        );
+    }
 
     let target_is_container = is_container_target(&args.target, &target);
     if args.sources.len() > 1 && !target_is_container {
@@ -333,6 +337,47 @@ fn uses_transfer_planner(args: &CpArgs) -> bool {
         || args.retry_max_backoff_ms.is_some()
         || args.fail_empty
         || args.summary
+}
+
+pub(super) fn validate_destination_storage_class(value: Option<&str>) -> rc_core::Result<()> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    match value {
+        "STANDARD" | "REDUCED_REDUNDANCY" => Ok(()),
+        "DEEP_ARCHIVE"
+        | "EXPRESS_ONEZONE"
+        | "FSX_ONTAP"
+        | "FSX_OPENZFS"
+        | "GLACIER"
+        | "GLACIER_IR"
+        | "INTELLIGENT_TIERING"
+        | "ONEZONE_IA"
+        | "OUTPOSTS"
+        | "SNOW"
+        | "STANDARD_IA" => Err(Error::UnsupportedFeature(format!(
+            "RustFS beta.10 does not provide meaningful storage policy '{value}'"
+        ))),
+        value => Err(Error::InvalidPath(format!(
+            "Unknown destination storage class '{value}'"
+        ))),
+    }
+}
+
+fn object_write_options(
+    content_type: Option<&str>,
+    encryption: Option<&ObjectEncryptionRequest>,
+    storage_class: Option<String>,
+) -> ObjectWriteOptions {
+    ObjectWriteOptions {
+        attributes: content_type.map(|content_type| ObjectAttributes {
+            content_type: Some(content_type.to_string()),
+            ..ObjectAttributes::default()
+        }),
+        storage_class,
+        encryption: encryption.cloned().map(ObjectWriteEncryption::Managed),
+        ..ObjectWriteOptions::default()
+    }
 }
 
 async fn execute_single_copy(
@@ -466,6 +511,9 @@ async fn execute_transfer_plan(
     };
 
     let mut plan = TransferPlan::build(candidates, &selection);
+    if let Err(error) = validate_storage_class_plan(&plan, args.storage_class.as_deref()) {
+        return formatter.fail(exit_code_for_core_error(&error), &error.to_string());
+    }
     if let Err(error) = validate_plan_targets(&plan) {
         return formatter.fail(ExitCode::UsageError, &error.to_string());
     }
@@ -508,9 +556,10 @@ async fn execute_transfer_plan(
     if args.dry_run {
         for item in &plan.items {
             formatter.println(&format!(
-                "Would copy: {} -> {}",
+                "Would copy: {} -> {}{}",
                 formatter.style_file(&item.source),
-                formatter.style_file(&item.target)
+                formatter.style_file(&item.target),
+                storage_class_suffix(args.storage_class.as_deref())
             ));
         }
         for item in &skipped_existing {
@@ -642,6 +691,41 @@ async fn execute_transfer_plan(
     }
 }
 
+fn storage_class_suffix(storage_class: Option<&str>) -> String {
+    storage_class
+        .map(|value| format!(" [storage-class={value}]"))
+        .unwrap_or_default()
+}
+
+fn validate_storage_class_plan(
+    plan: &TransferPlan<CpOperation>,
+    storage_class: Option<&str>,
+) -> rc_core::Result<()> {
+    if storage_class.is_none() {
+        return Ok(());
+    }
+    for item in &plan.items {
+        let size = item.size_bytes.ok_or_else(|| {
+            Error::UnsupportedFeature(format!(
+                "Cannot guarantee storage class for a transfer with unknown size: {}",
+                item.source
+            ))
+        })?;
+        let multipart = match &item.payload {
+            CpOperation::LocalToRemote { .. } => size > MULTIPART_THRESHOLD,
+            CpOperation::RemoteToRemote { .. } => rc_core::requires_multipart_copy(size),
+            CpOperation::RemoteToLocal { .. } => false,
+        };
+        if multipart {
+            return Err(Error::UnsupportedFeature(format!(
+                "RustFS beta.10 does not persist storage class for multipart transfer: {}",
+                item.source
+            )));
+        }
+    }
+    Ok(())
+}
+
 async fn execute_planned_operation(
     item: TransferCandidate<CpOperation>,
     args: &CpArgs,
@@ -674,6 +758,7 @@ async fn execute_planned_operation(
                 target,
                 source_info,
                 encryption.as_ref(),
+                args.storage_class.as_deref(),
                 multipart_cancellation,
                 &|bytes| copy_progress.set(&progress_key, bytes),
             )
@@ -709,9 +794,23 @@ async fn perform_planned_upload(
         guessed_type.as_deref(),
         file_size,
     );
-    let info = client
-        .put_object_from_path(target, source, content_type, encryption, |_| {})
-        .await?;
+    let info = if let Some(storage_class) = args.storage_class.as_deref() {
+        if file_size > MULTIPART_THRESHOLD {
+            return Err(Error::UnsupportedFeature(
+                "RustFS beta.10 does not persist storage class for multipart uploads".to_string(),
+            ));
+        }
+        let data = tokio::fs::read(source).await?;
+        let options =
+            object_write_options(content_type, encryption, Some(storage_class.to_string()));
+        client
+            .put_object_with_options(target, data, &options)
+            .await?
+    } else {
+        client
+            .put_object_from_path(target, source, content_type, encryption, |_| {})
+            .await?
+    };
     Ok(info
         .size_bytes
         .and_then(|size| u64::try_from(size).ok())
@@ -746,12 +845,14 @@ struct PlannedRemoteCopyResult {
     object: ObjectInfo,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn perform_planned_remote_copy(
     client: &S3Client,
     source: &RemotePath,
     target: &RemotePath,
     source_info: &ObjectInfo,
     encryption: Option<&ObjectEncryptionRequest>,
+    storage_class: Option<&str>,
     cancellation: &MultipartCopyCancellation,
     on_progress: &(dyn Fn(u64) + Send + Sync),
 ) -> rc_core::Result<PlannedRemoteCopyResult> {
@@ -765,6 +866,11 @@ async fn perform_planned_remote_copy(
         .and_then(|size| u64::try_from(size).ok())
         .ok_or_else(|| Error::InvalidPath(format!("Source size is unavailable: {source}")))?;
     if rc_core::requires_multipart_copy(planned_size) {
+        if storage_class.is_some() {
+            return Err(Error::UnsupportedFeature(
+                "RustFS beta.10 does not persist storage class for multipart copies".to_string(),
+            ));
+        }
         let current = client.head_object(source).await?;
         if current.size_bytes != source_info.size_bytes
             || source_info
@@ -796,10 +902,31 @@ async fn perform_planned_remote_copy(
             object: copied.object,
         });
     }
-    let options = CopyObjectOptions::for_source_version(source_info.version_id.clone())?;
-    let copied = client
-        .copy_object_with_options(source, target, &options, encryption)
-        .await?;
+    let copied = if let Some(storage_class) = storage_class {
+        client
+            .copy_object_with_transfer_options(
+                source,
+                target,
+                &TransferCopyOptions {
+                    source: TransferReadOptions {
+                        version_id: source_info.version_id.clone(),
+                        ..TransferReadOptions::default()
+                    },
+                    destination: object_write_options(
+                        None,
+                        encryption,
+                        Some(storage_class.to_string()),
+                    ),
+                    ..TransferCopyOptions::default()
+                },
+            )
+            .await?
+    } else {
+        let options = CopyObjectOptions::for_source_version(source_info.version_id.clone())?;
+        client
+            .copy_object_with_options(source, target, &options, encryption)
+            .await?
+    };
     let bytes_copied = copied
         .size_bytes
         .and_then(|size| u64::try_from(size).ok())
@@ -970,7 +1097,7 @@ fn print_transfer_summary(formatter: &Formatter, summary: &rc_core::TransferSumm
     ));
 }
 
-fn exit_code_for_core_error(error: &Error) -> ExitCode {
+pub(super) fn exit_code_for_core_error(error: &Error) -> ExitCode {
     ExitCode::from_i32(error.exit_code()).unwrap_or(ExitCode::GeneralError)
 }
 
@@ -1753,13 +1880,6 @@ async fn upload_file(
     let src_display = src.display().to_string();
     let dst_display = format!("{}/{}/{}", dst.alias, dst.bucket, dst_key);
 
-    if args.dry_run {
-        let styled_src = formatter.style_file(&src_display);
-        let styled_dst = formatter.style_file(&dst_display);
-        formatter.println(&format!("Would copy: {styled_src} -> {styled_dst}"));
-        return ExitCode::Success;
-    }
-
     // Get file size for progress bar decision
     let file_size = match std::fs::metadata(src) {
         Ok(m) => m.len(),
@@ -1770,6 +1890,21 @@ async fn upload_file(
             );
         }
     };
+    if args.storage_class.is_some() && file_size > MULTIPART_THRESHOLD {
+        return formatter.fail(
+            ExitCode::UnsupportedFeature,
+            "RustFS beta.10 does not persist storage class for multipart uploads",
+        );
+    }
+    if args.dry_run {
+        let styled_src = formatter.style_file(&src_display);
+        let styled_dst = formatter.style_file(&dst_display);
+        formatter.println(&format!(
+            "Would copy: {styled_src} -> {styled_dst}{}",
+            storage_class_suffix(args.storage_class.as_deref())
+        ));
+        return ExitCode::Success;
+    }
 
     // Determine content type
     let guessed_type: Option<String> = mime_guess::from_path(src)
@@ -1795,14 +1930,27 @@ async fn upload_file(
     };
 
     // Upload
-    match client
-        .put_object_from_path(&target, src, content_type, encryption, |bytes_sent| {
-            if let Some(ref pb) = progress {
-                pb.set_position(bytes_sent);
+    let upload_result = if let Some(storage_class) = args.storage_class.as_deref() {
+        match tokio::fs::read(src).await {
+            Ok(data) => {
+                let options =
+                    object_write_options(content_type, encryption, Some(storage_class.to_string()));
+                client
+                    .put_object_with_options(&target, data, &options)
+                    .await
             }
-        })
-        .await
-    {
+            Err(error) => Err(Error::Io(error)),
+        }
+    } else {
+        client
+            .put_object_from_path(&target, src, content_type, encryption, |bytes_sent| {
+                if let Some(ref pb) = progress {
+                    pb.set_position(bytes_sent);
+                }
+            })
+            .await
+    };
+    match upload_result {
         Ok(info) => {
             if let Some(ref pb) = progress {
                 pb.finish_and_clear();
@@ -1815,7 +1963,7 @@ async fn upload_file(
                 pb.finish_and_clear();
             }
             formatter.fail(
-                ExitCode::NetworkError,
+                exit_code_for_core_error(&e),
                 &format!("Failed to upload {src_display}: {e}"),
             )
         }
@@ -2289,7 +2437,7 @@ async fn copy_s3_to_s3_prepared(
     let src_display = format!("{}/{}/{}", src.alias, src.bucket, src.key);
     let dst_display = format!("{}/{}/{}", dst.alias, dst.bucket, dst.key);
 
-    if args.dry_run {
+    if args.dry_run && args.storage_class.is_none() {
         let styled_src = formatter.style_file(&src_display);
         let styled_dst = formatter.style_file(&dst_display);
         formatter.println(&format!("Would copy: {styled_src} -> {styled_dst}"));
@@ -2312,6 +2460,24 @@ async fn copy_s3_to_s3_prepared(
             );
         }
     };
+    let source_size = source_info
+        .size_bytes
+        .and_then(|size| u64::try_from(size).ok());
+    if args.storage_class.is_some() && source_size.is_none_or(rc_core::requires_multipart_copy) {
+        return formatter.fail(
+            ExitCode::UnsupportedFeature,
+            "RustFS beta.10 does not persist storage class for multipart or unknown-size copies",
+        );
+    }
+    if args.dry_run {
+        let styled_src = formatter.style_file(&src_display);
+        let styled_dst = formatter.style_file(&dst_display);
+        formatter.println(&format!(
+            "Would copy: {styled_src} -> {styled_dst}{}",
+            storage_class_suffix(args.storage_class.as_deref())
+        ));
+        return ExitCode::Success;
+    }
 
     let cancellation = MultipartCopyCancellation::new();
     let transfer_cancellation = TransferCancellation::new();
@@ -2332,6 +2498,7 @@ async fn copy_s3_to_s3_prepared(
         dst,
         &source_info,
         encryption,
+        args.storage_class.as_deref(),
         &cancellation,
         &ignore_progress,
     );
@@ -3135,5 +3302,46 @@ mod tests {
         assert_eq!(json["data"]["operation"], "copy");
         assert_eq!(json["data"]["source_version_id"], "source-v1");
         assert_eq!(json["data"]["version_id"], "destination-v2");
+    }
+
+    #[tokio::test]
+    async fn storage_class_validation_has_usage_and_unsupported_exit_codes() {
+        for (storage_class, expected) in [
+            ("not-a-class", ExitCode::UsageError),
+            ("STANDARD_IA", ExitCode::UnsupportedFeature),
+        ] {
+            let mut args = CpArgs::single("source.txt", "local/bucket/target.txt");
+            args.storage_class = Some(storage_class.to_string());
+
+            assert_eq!(execute(args, OutputConfig::default()).await, expected);
+        }
+    }
+
+    #[test]
+    fn storage_class_plan_rejects_multipart_without_mutation() {
+        let plan = TransferPlan::build(
+            vec![TransferCandidate {
+                payload: CpOperation::RemoteToRemote {
+                    source: RemotePath::new("local", "source", "large.bin"),
+                    target: RemotePath::new("local", "target", "large.bin"),
+                    source_info: Box::new(ObjectInfo::file(
+                        "large.bin",
+                        (MAX_SINGLE_COPY_SIZE + 1) as i64,
+                    )),
+                    encryption: None,
+                },
+                source: "local/source/large.bin".to_string(),
+                target: "local/target/large.bin".to_string(),
+                relative_path: "large.bin".to_string(),
+                modified: None,
+                size_bytes: Some(MAX_SINGLE_COPY_SIZE + 1),
+            }],
+            &TransferSelection::default(),
+        );
+
+        assert!(matches!(
+            validate_storage_class_plan(&plan, Some("STANDARD")),
+            Err(Error::UnsupportedFeature(_))
+        ));
     }
 }
