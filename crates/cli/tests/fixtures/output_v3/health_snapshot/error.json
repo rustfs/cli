@@ -1,0 +1,1 @@
+{"schema_version":3,"type":"health_snapshot","status":"error","error":{"type":"auth_error","message":"Authentication failed","retryable":false,"suggestion":"Verify credentials and the required RustFS admin permission."}}

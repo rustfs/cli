@@ -162,6 +162,7 @@ fn top_level_command_help_contract() {
             args: &["admin"],
             usage: "Usage: rc admin [OPTIONS] <COMMAND>",
             expected_tokens: &[
+                "diagnostics",
                 "info",
                 "scanner",
                 "metrics",
@@ -549,6 +550,26 @@ fn nested_subcommand_help_contract() {
         HelpCase {
             args: &["admin", "info", "cluster"],
             usage: "Usage: rc admin info cluster [OPTIONS] <ALIAS>",
+            expected_tokens: &[],
+        },
+        HelpCase {
+            args: &["admin", "diagnostics"],
+            usage: "Usage: rc admin diagnostics [OPTIONS] <COMMAND>",
+            expected_tokens: &["health", "cluster", "extensions"],
+        },
+        HelpCase {
+            args: &["admin", "diagnostics", "health"],
+            usage: "Usage: rc admin diagnostics health [OPTIONS] <ALIAS>",
+            expected_tokens: &[],
+        },
+        HelpCase {
+            args: &["admin", "diagnostics", "cluster"],
+            usage: "Usage: rc admin diagnostics cluster [OPTIONS] <ALIAS>",
+            expected_tokens: &[],
+        },
+        HelpCase {
+            args: &["admin", "diagnostics", "extensions"],
+            usage: "Usage: rc admin diagnostics extensions [OPTIONS] <ALIAS>",
             expected_tokens: &[],
         },
         HelpCase {

@@ -38,7 +38,10 @@
         "bucket_operations",
         "scanner_status",
         "storage_info",
-        "kms"
+        "kms",
+        "health_snapshot",
+        "cluster_snapshot",
+        "extension_catalog"
       ]
     },
     "pagination": {
@@ -92,6 +95,44 @@
           "type": "array",
           "items": { "$ref": "#/definitions/capability" }
         }
+      }
+    },
+    "healthSnapshotData": {
+      "type": "object",
+      "required": ["version", "cpu", "memory", "os", "process", "drives", "unsupported_probes"],
+      "properties": {
+        "version": { "type": "string" },
+        "deployment_id": { "$ref": "#/definitions/nullableString" },
+        "region": { "$ref": "#/definitions/nullableString" },
+        "timestamp": { "$ref": "#/definitions/nullableTimestamp" },
+        "cpu": { "type": "object" },
+        "memory": { "type": "object" },
+        "os": { "type": "object" },
+        "process": { "type": "object" },
+        "drives": { "type": "array", "items": { "type": "object" } },
+        "unsupported_probes": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "clusterSnapshotData": {
+      "type": "object",
+      "required": ["available", "state", "snapshot"],
+      "properties": {
+        "available": { "type": "boolean" },
+        "state": {
+          "type": "string",
+          "enum": ["available", "initializing_or_unavailable"]
+        },
+        "snapshot": { "type": ["object", "null"] }
+      }
+    },
+    "extensionCatalogData": {
+      "type": "object",
+      "required": ["extensions", "runtime_capabilities", "cluster_snapshot", "external_plugin_flow"],
+      "properties": {
+        "extensions": { "type": "array", "items": { "type": "object" } },
+        "runtime_capabilities": { "type": "object" },
+        "cluster_snapshot": { "type": "object" },
+        "external_plugin_flow": { "type": "object" }
       }
     },
     "objectVersion": {
@@ -1055,6 +1096,39 @@
           "properties": {
             "type": { "const": "capabilities" },
             "data": { "$ref": "#/definitions/capabilitiesData" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/definitions/successEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "health_snapshot" },
+            "data": { "$ref": "#/definitions/healthSnapshotData" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/definitions/successEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "cluster_snapshot" },
+            "data": { "$ref": "#/definitions/clusterSnapshotData" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/definitions/successEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "extension_catalog" },
+            "data": { "$ref": "#/definitions/extensionCatalogData" }
           }
         }
       ]

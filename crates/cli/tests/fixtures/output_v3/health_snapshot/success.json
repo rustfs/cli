@@ -1,0 +1,1 @@
+{"schema_version":3,"type":"health_snapshot","status":"success","data":{"version":"1.0.0-beta.10","deployment_id":"deployment-1","region":"us-east-1","timestamp":"2026-07-22T00:00:00Z","cpu":{"logical_cores":8},"memory":{"total_bytes":1024},"os":{"hostname":"node-1"},"process":{"pid":42},"drives":[],"unsupported_probes":["perf-net"]}}

@@ -10,6 +10,7 @@ The `rc admin` operation manages the RustFS Admin API, including scanner and sto
 
 ```bash
 rc [GLOBAL OPTIONS] admin <COMMAND>
+rc admin diagnostics <health|cluster|extensions> <ALIAS>
 rc admin info <cluster|server|disk|storage> <ALIAS> [OPTIONS]
 rc admin scanner status <ALIAS>
 rc admin metrics <ALIAS> [OPTIONS]
@@ -49,6 +50,7 @@ rc admin replicate remove <ALIAS> <--all|--site <NAME>>
 
 | Command | Description |
 | --- | --- |
+| `diagnostics` | Read bounded authenticated health, cluster, and extension snapshots. |
 | `info` | Display cluster, server, or disk information. |
 | `scanner` | Inspect scanner health, freshness, and cycle state. |
 | `metrics` | Query bounded realtime metrics as normalized JSON Lines or raw server records. |
@@ -71,6 +73,19 @@ Show cluster information:
 
 ```bash
 rc admin info cluster local
+```
+
+Read detailed authenticated health observations:
+
+```bash
+rc admin diagnostics health local
+```
+
+Read the cluster snapshot and extension catalog:
+
+```bash
+rc admin diagnostics cluster local
+rc admin diagnostics extensions local
 ```
 
 Inspect scanner health and storage topology:
@@ -193,6 +208,10 @@ rc admin service restart local
 ## Behavior
 
 Admin operations use the configured alias to create a RustFS admin client. The credentials behind the alias must have permissions for the requested administrative API. The command accepts aliases with or without a trailing slash.
+
+`rc admin diagnostics` performs bounded read-only requests. Each JSON response is limited to 8 MiB. The health command reads the authenticated RustFS health snapshot and is separate from public liveness or readiness probes. Its drive throughput and latency fields are live observations, not active benchmarks, and the command preserves the server's `unsupported_probes` list instead of claiming `mc support diag` parity. Cluster output represents `snapshot: null` as `initializing_or_unavailable`. Extension diagnostics read schemas and runtime capability summaries only; they never request extension instance configuration.
+
+The diagnostic commands require capability discovery to classify the corresponding route as available. Authentication failures, unsupported routes, malformed JSON, and transport failures retain distinct exit codes.
 
 ## Observability Workflow
 

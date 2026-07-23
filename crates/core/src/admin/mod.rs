@@ -5,6 +5,7 @@
 
 mod capabilities;
 mod cluster;
+mod diagnostics;
 mod kms;
 mod kms_diagnostic;
 mod observability;
@@ -26,6 +27,13 @@ pub use cluster::{
     PoolDecommissionInfo, PoolErasureSetInfo, PoolStatus, PoolTarget, RebalanceCleanupWarnings,
     RebalancePoolProgress, RebalancePoolStatus, RebalanceStartResult, RebalanceStatus, ServerInfo,
     UsageInfo,
+};
+pub use diagnostics::{
+    ClusterComponentSnapshot, ClusterComponentSnapshots, ClusterListingSnapshot,
+    ClusterSnapshotDocument, ClusterUsageSnapshot, DetailedHealthSnapshot,
+    DiagnosticClusterSnapshot, DiagnosticClusterSummary, DiagnosticReadApi, HealthCpuSnapshot,
+    HealthDriveSnapshot, HealthMemorySnapshot, HealthOsSnapshot, HealthProcessSnapshot,
+    MAX_DIAGNOSTIC_RESPONSE_BYTES,
 };
 pub use kms::{
     KmsApi, KmsBackendKind, KmsCacheSummary, KmsCancelKeyDeletionResult, KmsConfigSummary,

@@ -1,6 +1,7 @@
 //! Runtime capability discovery contracts for the RustFS Admin API.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fmt;
 
 /// Effective availability of an Admin API capability.
@@ -38,6 +39,7 @@ pub enum RuntimeCapabilityState {
     Supported,
     Unsupported,
     Disabled,
+    #[serde(other)]
     Unknown,
 }
 
@@ -47,6 +49,8 @@ pub struct RuntimeCapabilityStatus {
     pub state: RuntimeCapabilityState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(flatten, default)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 impl RuntimeCapabilityStatus {
@@ -57,6 +61,16 @@ impl RuntimeCapabilityStatus {
             RuntimeCapabilityState::Unsupported => CapabilityAvailability::Unsupported,
             RuntimeCapabilityState::Disabled => CapabilityAvailability::Disabled,
             RuntimeCapabilityState::Unknown => CapabilityAvailability::Unknown,
+        }
+    }
+
+    /// Stable display label for the server-reported state.
+    pub const fn state_label(&self) -> &'static str {
+        match self.state {
+            RuntimeCapabilityState::Supported => "supported",
+            RuntimeCapabilityState::Unsupported => "unsupported",
+            RuntimeCapabilityState::Disabled => "disabled",
+            RuntimeCapabilityState::Unknown => "unknown",
         }
     }
 }
@@ -96,19 +110,24 @@ pub struct ExtensionMetadata {
     pub provider: String,
     pub version: String,
     pub kind: String,
+    #[serde(default)]
+    pub runtime: serde_json::Value,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
     pub disabled_by_default: bool,
+    #[serde(flatten, default)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 /// Typed subset of `/v4/extensions/catalog`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExtensionsCatalog {
     pub extensions: Vec<ExtensionMetadata>,
-    #[serde(default)]
-    pub runtime_capabilities: serde_json::Value,
-    #[serde(default)]
-    pub cluster_snapshot: serde_json::Value,
-    #[serde(default)]
-    pub external_plugin_flow: serde_json::Value,
+    pub runtime_capabilities: BTreeMap<String, serde_json::Value>,
+    pub cluster_snapshot: BTreeMap<String, serde_json::Value>,
+    pub external_plugin_flow: BTreeMap<String, serde_json::Value>,
+    #[serde(flatten, default)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 /// Typed summary returned inside a cluster snapshot.
@@ -298,6 +317,7 @@ mod tests {
         let status = |state| RuntimeCapabilityStatus {
             state,
             reason: None,
+            extra: BTreeMap::new(),
         };
 
         assert_eq!(

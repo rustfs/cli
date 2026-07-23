@@ -6,6 +6,7 @@
 mod access_key;
 mod capabilities;
 mod decommission;
+mod diagnostics;
 mod expand;
 mod group;
 mod heal;
@@ -35,6 +36,10 @@ use rc_s3::AdminClient;
 pub enum AdminCommands {
     /// Discover effective RustFS runtime capabilities
     Capabilities(capabilities::CapabilitiesArgs),
+
+    /// Read bounded RustFS diagnostic snapshots
+    #[command(subcommand)]
+    Diagnostics(diagnostics::DiagnosticsCommands),
 
     /// Query bounded RustFS realtime metrics
     Metrics(metrics::MetricsArgs),
@@ -106,6 +111,7 @@ pub async fn execute(cmd: AdminCommands, output_config: OutputConfig) -> ExitCod
 
     match cmd {
         AdminCommands::Capabilities(args) => capabilities::execute(args, &formatter).await,
+        AdminCommands::Diagnostics(command) => diagnostics::execute(command, &formatter).await,
         AdminCommands::Metrics(args) => metrics::execute(args, &formatter).await,
         AdminCommands::Kms(kms_cmd) => kms::execute(kms_cmd, &formatter).await,
         AdminCommands::Scanner(scanner_cmd) => scanner::execute(scanner_cmd, &formatter).await,
@@ -435,6 +441,24 @@ mod tests {
                 assert!(args.yes);
             }
             _ => panic!("Unexpected KMS restart command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_admin_diagnostics_commands() {
+        for (name, expected) in [
+            ("health", "health"),
+            ("cluster", "cluster"),
+            ("extensions", "extensions"),
+        ] {
+            let cli = TestCli::parse_from(["rc", "diagnostics", name, "local"]);
+            match cli.command {
+                AdminCommands::Diagnostics(command) => {
+                    assert_eq!(command.name(), expected);
+                    assert_eq!(command.alias(), "local");
+                }
+                _ => panic!("Unexpected command parsing result"),
+            }
         }
     }
 

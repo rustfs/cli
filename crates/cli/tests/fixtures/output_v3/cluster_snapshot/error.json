@@ -1,0 +1,1 @@
+{"schema_version":3,"type":"cluster_snapshot","status":"error","error":{"type":"unsupported_feature","message":"Cluster snapshot is unavailable","retryable":false,"capability":"admin.diagnostics.cluster-snapshot","server":"rustfs","suggestion":"Verify the server diagnostic capability and version."}}

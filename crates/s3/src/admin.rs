@@ -13,14 +13,15 @@ use bytes::Bytes;
 use futures::StreamExt;
 use rc_core::admin::{
     AccessKeyInfo, AdminApi, BucketQuota, CapabilityApi, CapabilityAvailability, CapabilityEntry,
-    CapabilityReport, ClusterInfo, ClusterSnapshotMetadata, ClusterSnapshotSummary,
-    CreateServiceAccountRequest, DecommissionPoolStatus, DecommissionStatus, DiagnosticCapability,
+    CapabilityReport, ClusterInfo, ClusterSnapshotDocument, ClusterSnapshotMetadata,
+    ClusterSnapshotSummary, CreateServiceAccountRequest, DecommissionPoolStatus,
+    DecommissionStatus, DetailedHealthSnapshot, DiagnosticCapability, DiagnosticReadApi,
     ExtensionsCatalog, Group, GroupStatus, HealRuntimeState, HealScanMode, HealStartRequest,
     HealStatus, HealTaskRequest, KmsApi, KmsBackendKind, KmsCacheSummary,
     KmsCancelKeyDeletionResult, KmsConfigSummary, KmsConfigureRequest, KmsCreateKeyRequest,
     KmsCreateKeyResult, KmsDeleteKeyRequest, KmsDeleteKeyResult, KmsKey, KmsKeyPage, KmsKeyState,
-    KmsKeyUsage, KmsServiceState, KmsStatus, MAX_METRICS_LINE_BYTES, MAX_METRICS_RESPONSE_BYTES,
-    MAX_METRICS_SAMPLES, MAX_REPLICATION_DIFF_RESPONSE_BYTES,
+    KmsKeyUsage, KmsServiceState, KmsStatus, MAX_DIAGNOSTIC_RESPONSE_BYTES, MAX_METRICS_LINE_BYTES,
+    MAX_METRICS_RESPONSE_BYTES, MAX_METRICS_SAMPLES, MAX_REPLICATION_DIFF_RESPONSE_BYTES,
     MAX_SITE_REPLICATION_ERROR_RESPONSE_BYTES, MAX_SITE_REPLICATION_REQUEST_BYTES,
     MAX_SITE_REPLICATION_SUCCESS_RESPONSE_BYTES, MetricsBatch, MetricsQuery, ObservabilityApi,
     PeerSiteSpec, Policy, PolicyEntity, PolicyInfo, PoolStatus, PoolTarget, RealtimeMetrics,
@@ -319,8 +320,32 @@ impl AdminClient {
         method: Method,
         path: &str,
     ) -> Result<T> {
-        self.request_url(method, self.admin_v4_url(path), None, None)
+        self.request_bounded_json_url(method, self.admin_v4_url(path))
             .await
+    }
+
+    async fn request_bounded_json_url<T: for<'de> Deserialize<'de>>(
+        &self,
+        method: Method,
+        url: String,
+    ) -> Result<T> {
+        let headers = self.request_headers(&[])?;
+        let signed_headers = self.sign_request(&method, &url, &headers, &[]).await?;
+        let mut request_builder = self.http_client.request(method, &url);
+        for (name, value) in signed_headers.iter() {
+            request_builder = request_builder.header(name, value);
+        }
+
+        let response = request_builder
+            .send()
+            .await
+            .map_err(|error| Error::Network(format!("Request failed: {error}")))?;
+        let status = response.status();
+        let body = read_bounded_diagnostic_body(response).await?;
+        if !status.is_success() {
+            return Err(self.map_error(status, &String::from_utf8_lossy(&body)));
+        }
+        serde_json::from_slice(&body).map_err(Error::Json)
     }
 
     async fn request_url<T: for<'de> Deserialize<'de>>(
@@ -968,6 +993,31 @@ fn parse_admin_error(body: &str) -> Option<AdminErrorResponse> {
         .or_else(|| quick_xml::de::from_str(body).ok())
 }
 
+async fn read_bounded_diagnostic_body(response: reqwest::Response) -> Result<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_DIAGNOSTIC_RESPONSE_BYTES as u64)
+    {
+        return Err(Error::General(
+            "Diagnostic response exceeded the 8 MiB limit".to_string(),
+        ));
+    }
+
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.map_err(|error| Error::Network(format!("Failed to read response: {error}")))?;
+        if body.len().saturating_add(chunk.len()) > MAX_DIAGNOSTIC_RESPONSE_BYTES {
+            return Err(Error::General(
+                "Diagnostic response exceeded the 8 MiB limit".to_string(),
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 async fn read_bounded_response_body(
     response: reqwest::Response,
     max_response_bytes: usize,
@@ -1415,7 +1465,10 @@ impl AdminClient {
     }
 
     async fn discover_capabilities_uncached(&self) -> Result<CapabilityReport> {
-        let cluster_info = self.cluster_info().await?;
+        let cluster_info = self
+            .request_bounded_json_url::<ServerInfoResponse>(Method::GET, self.admin_url("/info"))
+            .await?
+            .info;
         let server_version = cluster_info.servers.as_ref().and_then(|servers| {
             servers
                 .iter()
@@ -1631,6 +1684,7 @@ fn add_known_server_capabilities(version: Option<&str>, capabilities: &mut Vec<C
             CapabilityAvailability::Unknown,
             "No pinned diagnostic capability contract is available for this server version",
         );
+        mirror_read_only_diagnostic_routes(capabilities);
         return;
     }
 
@@ -1743,6 +1797,10 @@ fn add_beta10_diagnostic_capabilities(capabilities: &mut Vec<CapabilityEntry>) {
         });
     }
 
+    mirror_read_only_diagnostic_routes(capabilities);
+}
+
+fn mirror_read_only_diagnostic_routes(capabilities: &mut Vec<CapabilityEntry>) {
     mirror_diagnostic_route(
         capabilities,
         DiagnosticCapability::ClusterSnapshot,
@@ -1770,11 +1828,21 @@ fn mirror_diagnostic_route(
             Some("The diagnostic route was not classified during discovery".to_string()),
         )
     });
+    capabilities.retain(|entry| entry.name != diagnostic.name());
     capabilities.push(CapabilityEntry {
         name: diagnostic.name().to_string(),
         availability,
         reason,
     });
+}
+
+fn diagnostic_route_error(error: Error, feature: &str) -> Error {
+    match error {
+        Error::NotFound(_) => {
+            Error::UnsupportedFeature(format!("{feature} is unavailable on this RustFS server"))
+        }
+        error => error,
+    }
 }
 
 fn is_rustfs_beta_10(version: &str) -> bool {
@@ -2436,6 +2504,27 @@ impl CapabilityApi for AdminClient {
         let report = self.discover_capabilities_uncached().await?;
         self.store_capabilities(&report)?;
         Ok(report)
+    }
+}
+
+#[async_trait]
+impl DiagnosticReadApi for AdminClient {
+    async fn health_snapshot(&self) -> Result<DetailedHealthSnapshot> {
+        self.request_bounded_json_url(Method::GET, self.admin_url("/healthinfo"))
+            .await
+            .map_err(|error| diagnostic_route_error(error, "Detailed health snapshot"))
+    }
+
+    async fn cluster_snapshot(&self) -> Result<ClusterSnapshotDocument> {
+        self.request_bounded_json_url(Method::GET, self.admin_v4_url("/cluster/snapshot"))
+            .await
+            .map_err(|error| diagnostic_route_error(error, "Cluster snapshot"))
+    }
+
+    async fn extensions_catalog(&self) -> Result<ExtensionsCatalog> {
+        self.request_bounded_json_url(Method::GET, self.admin_v4_url("/extensions/catalog"))
+            .await
+            .map_err(|error| diagnostic_route_error(error, "Extension catalog"))
     }
 }
 
@@ -3557,6 +3646,34 @@ mod tests {
         (endpoint, receiver, completion_receiver)
     }
 
+    fn start_admin_content_length_test_server(
+        response_status: &str,
+        content_length: usize,
+    ) -> (
+        String,
+        mpsc::Receiver<CapturedAdminRequest>,
+        thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        let (sender, receiver) = mpsc::channel();
+        let response_status = response_status.to_string();
+
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let request = read_admin_request(&mut stream);
+            sender.send(request).expect("send captured request");
+            let response = format!(
+                "HTTP/1.1 {response_status}\r\ncontent-length: {content_length}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n"
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write HTTP response");
+        });
+
+        (endpoint, receiver, handle)
+    }
+
     fn admin_client_for_endpoint(endpoint: &str) -> AdminClient {
         let alias = Alias::new("test", endpoint, "access", "secret");
         AdminClient::new(&alias).expect("admin client should build")
@@ -3721,8 +3838,6 @@ mod tests {
 
         for name in [
             "admin.diagnostics.health-snapshot",
-            "admin.diagnostics.cluster-snapshot",
-            "admin.diagnostics.extensions-catalog",
             "admin.diagnostics.drive-observations",
             "admin.diagnostics.client-devnull",
             "admin.diagnostics.inspect-archive",
@@ -3734,6 +3849,15 @@ mod tests {
             assert!(report.capabilities.iter().any(|capability| {
                 capability.name == name
                     && capability.availability == CapabilityAvailability::Unknown
+            }));
+        }
+        for name in [
+            "admin.diagnostics.cluster-snapshot",
+            "admin.diagnostics.extensions-catalog",
+        ] {
+            assert!(report.capabilities.iter().any(|capability| {
+                capability.name == name
+                    && capability.availability == CapabilityAvailability::Available
             }));
         }
 
@@ -3888,6 +4012,43 @@ mod tests {
             receiver.recv().expect("runtime request").target,
             "/rustfs/admin/v4/runtime/capabilities"
         );
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn capability_discovery_rejects_oversized_v4_json() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept info request");
+            let _request = read_admin_request(&mut stream);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{}",
+                CAPABILITY_INFO_RESPONSE.len(),
+                CAPABILITY_INFO_RESPONSE
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write info response");
+
+            let (mut stream, _) = listener.accept().expect("accept runtime request");
+            let _request = read_admin_request(&mut stream);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n",
+                rc_core::admin::MAX_DIAGNOSTIC_RESPONSE_BYTES + 1
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write oversized response headers");
+        });
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let error = client
+            .discover_capabilities(false)
+            .await
+            .expect_err("oversized runtime discovery should fail");
+
+        assert!(matches!(error, Error::General(message) if message.contains("8 MiB")));
         handle.join().expect("server thread should finish");
     }
 
@@ -6560,6 +6721,130 @@ mod tests {
         assert_eq!(body["newDescription"], "Updated description");
         assert_eq!(body.as_object().expect("request object").len(), 2);
         handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn diagnostic_read_routes_use_typed_bounded_snapshots() {
+        let health = r#"{"version":"1.0.0-beta.10","cpu":{"logical_cores":8,"brand":"test-cpu","frequency_mhz":2400,"usage_percent":12.5},"memory":{"total_bytes":1024,"used_bytes":512,"available_bytes":512,"total_swap_bytes":0,"used_swap_bytes":0},"os":{"os":"linux","kernel_version":"6.8","os_version":"test","hostname":"node-1","arch":"x86_64","uptime_secs":60},"process":{"pid":42,"cpu_usage_percent":1.25,"memory_bytes":128},"drives":[],"unsupported_probes":["perf-net"]}"#;
+        let (endpoint, receiver, handle) = start_admin_test_server("200 OK", health);
+        let client = admin_client_for_endpoint(&endpoint);
+        let snapshot = client
+            .health_snapshot()
+            .await
+            .expect("health snapshot should succeed");
+        assert_eq!(snapshot.unsupported_probes, ["perf-net"]);
+        assert_eq!(
+            receiver.recv().expect("health request").target,
+            "/rustfs/admin/v3/healthinfo"
+        );
+        handle.join().expect("health server should finish");
+
+        let (endpoint, receiver, handle) =
+            start_admin_test_server("200 OK", r#"{"snapshot":null}"#);
+        let client = admin_client_for_endpoint(&endpoint);
+        let snapshot = client
+            .cluster_snapshot()
+            .await
+            .expect("null cluster snapshot should succeed");
+        assert!(snapshot.snapshot.is_none());
+        assert_eq!(
+            receiver.recv().expect("cluster request").target,
+            "/rustfs/admin/v4/cluster/snapshot"
+        );
+        handle.join().expect("cluster server should finish");
+
+        let (endpoint, receiver, handle) = start_admin_test_server("200 OK", EXTENSIONS_RESPONSE);
+        let client = admin_client_for_endpoint(&endpoint);
+        let catalog = client
+            .extensions_catalog()
+            .await
+            .expect("extension catalog should succeed");
+        assert_eq!(catalog.extensions.len(), 1);
+        assert_eq!(
+            receiver.recv().expect("extensions request").target,
+            "/rustfs/admin/v4/extensions/catalog"
+        );
+        handle.join().expect("extensions server should finish");
+    }
+
+    #[tokio::test]
+    async fn diagnostic_reads_reject_malformed_and_oversized_json() {
+        let (endpoint, _receiver, handle) = start_admin_test_server("200 OK", "{not-json}");
+        let error = admin_client_for_endpoint(&endpoint)
+            .health_snapshot()
+            .await
+            .expect_err("malformed health JSON should fail");
+        assert!(matches!(error, Error::Json(_)));
+        handle.join().expect("malformed server should finish");
+
+        let (endpoint, _receiver, handle) = start_admin_content_length_test_server(
+            "200 OK",
+            rc_core::admin::MAX_DIAGNOSTIC_RESPONSE_BYTES + 1,
+        );
+        let error = admin_client_for_endpoint(&endpoint)
+            .extensions_catalog()
+            .await
+            .expect_err("oversized catalog should fail");
+        assert!(matches!(error, Error::General(message) if message.contains("8 MiB")));
+        handle.join().expect("oversized server should finish");
+    }
+
+    #[tokio::test]
+    async fn diagnostic_reads_reject_semantically_incomplete_json() {
+        for (body, read) in [
+            ("{}", DiagnosticCapability::HealthSnapshot),
+            (
+                r#"{"version":"1.0.0-beta.10","cpu":{},"memory":{"total_bytes":1024,"used_bytes":512,"available_bytes":512,"total_swap_bytes":0,"used_swap_bytes":0},"os":{"os":"linux","arch":"x86_64","uptime_secs":60},"process":{"pid":42,"cpu_usage_percent":1.25,"memory_bytes":128},"drives":[],"unsupported_probes":[]}"#,
+                DiagnosticCapability::HealthSnapshot,
+            ),
+            ("{}", DiagnosticCapability::ClusterSnapshot),
+            (
+                r#"{"extensions":[]}"#,
+                DiagnosticCapability::ExtensionsCatalog,
+            ),
+        ] {
+            let (endpoint, _receiver, handle) = start_admin_test_server("200 OK", body);
+            let client = admin_client_for_endpoint(&endpoint);
+            let error = match read {
+                DiagnosticCapability::HealthSnapshot => client
+                    .health_snapshot()
+                    .await
+                    .expect_err("incomplete health snapshot should fail"),
+                DiagnosticCapability::ClusterSnapshot => client
+                    .cluster_snapshot()
+                    .await
+                    .expect_err("missing cluster snapshot field should fail"),
+                DiagnosticCapability::ExtensionsCatalog => client
+                    .extensions_catalog()
+                    .await
+                    .expect_err("incomplete extension catalog should fail"),
+                _ => unreachable!("fixture only covers diagnostic reads"),
+            };
+            assert!(matches!(error, Error::Json(_)));
+            handle
+                .join()
+                .expect("incomplete response server should finish");
+        }
+    }
+
+    #[tokio::test]
+    async fn diagnostic_route_errors_distinguish_permission_and_unsupported() {
+        for (status, expected_auth) in [("403 Forbidden", true), ("404 Not Found", false)] {
+            let (endpoint, _receiver, handle) = start_admin_test_server(
+                status,
+                r#"{"code":"AccessDenied","message":"denied or absent"}"#,
+            );
+            let error = admin_client_for_endpoint(&endpoint)
+                .health_snapshot()
+                .await
+                .expect_err("diagnostic route should fail");
+            if expected_auth {
+                assert!(matches!(error, Error::Auth(_)));
+            } else {
+                assert!(matches!(error, Error::UnsupportedFeature(_)));
+            }
+            handle.join().expect("error server should finish");
+        }
     }
 
     #[test]

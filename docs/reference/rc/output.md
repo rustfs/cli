@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | [`output_v1.json`](../../../schemas/output_v1.json) | Original S3 and alias command output | Preserved unchanged |
 | [`output_v2.json`](../../../schemas/output_v2.json) | Existing cluster and administrative output | Preserved unchanged |
-| [`output_v3.json`](../../../schemas/output_v3.json) | New capability, version, lock, multipart, watch, health, usage, metrics, scanner-status, storage-info, KMS, admin-operation, replication, and bucket-operation families | Contract for new implementations |
+| [`output_v3.json`](../../../schemas/output_v3.json) | New capability, version, lock, multipart, watch, health, usage, metrics, diagnostic snapshot, scanner-status, storage-info, KMS, admin-operation, replication, and bucket-operation families | Contract for new implementations |
 
 Adding v3 does not silently change the JSON emitted by existing commands. Each command implementation must document when it adopts v3. Consumers should choose a parser from the command's documented output version instead of inferring a version from the installed `rc` release.
 
@@ -88,3 +88,11 @@ Object retention timestamps are normalized to UTC. A bucket default uses `defaul
 This is an additive v3 extension. Output v1 and v2 require no migration, and the pre-existing v3 lock fields remain valid. Consumers adopting the new commands should dispatch on `schema_version: 3`, then on `type: locks`, and finally on `data.operation`.
 
 The golden fixtures under `crates/cli/tests/fixtures/output_v3/` provide success, empty, and error examples for every v3 family.
+
+Authenticated RustFS diagnostics use distinct families so they cannot be confused with lightweight public probes:
+
+| Family | Command | Meaning |
+| --- | --- | --- |
+| `health_snapshot` | `rc admin diagnostics health` | Detailed authenticated host, process, memory, CPU, drive, and unsupported-probe observations. |
+| `cluster_snapshot` | `rc admin diagnostics cluster` | Read-only cluster state; `available: false` and `snapshot: null` mean the runtime is unavailable or initializing. |
+| `extension_catalog` | `rc admin diagnostics extensions` | Extension schemas and runtime capability summaries without instance configuration. |
