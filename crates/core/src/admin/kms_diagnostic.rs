@@ -219,6 +219,11 @@ fn classify_and_discard_error(mut error: Error) -> KmsRoundTripErrorClass {
             message.zeroize();
             KmsRoundTripErrorClass::NotFound
         }
+        Error::VersionNotFound { path, version_id } | Error::DeleteMarker { path, version_id } => {
+            path.zeroize();
+            version_id.zeroize();
+            KmsRoundTripErrorClass::NotFound
+        }
         Error::Network(message) => {
             message.zeroize();
             KmsRoundTripErrorClass::Network
@@ -227,10 +232,16 @@ fn classify_and_discard_error(mut error: Error) -> KmsRoundTripErrorClass {
             message.zeroize();
             KmsRoundTripErrorClass::Conflict
         }
+        Error::GovernanceDenied { path, version_id } => {
+            path.zeroize();
+            version_id.zeroize();
+            KmsRoundTripErrorClass::Conflict
+        }
         Error::Config(message)
         | Error::InvalidPath(message)
         | Error::UnsupportedFeature(message)
-        | Error::General(message) => {
+        | Error::General(message)
+        | Error::RequestRejected(message) => {
             message.zeroize();
             KmsRoundTripErrorClass::General
         }

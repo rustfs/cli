@@ -6,6 +6,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct CapturedAdminRequest {
     #[allow(dead_code)]
     pub method: String,
@@ -41,22 +42,18 @@ fn read_admin_request(stream: &mut TcpStream) -> CapturedAdminRequest {
 
     let mut request = Vec::new();
     let mut buffer = [0_u8; 8192];
-    loop {
+    let header_end = loop {
         let bytes_read = stream.read(&mut buffer).expect("read admin request");
-        if bytes_read == 0 {
-            break;
-        }
+        assert!(
+            bytes_read > 0,
+            "client closed before request headers completed"
+        );
         request.extend_from_slice(&buffer[..bytes_read]);
-        if request.windows(4).any(|window| window == b"\r\n\r\n") {
-            break;
+        if let Some(position) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+            break position + 4;
         }
-    }
+    };
 
-    let header_end = request
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .map(|position| position + 4)
-        .expect("admin request should contain headers");
     let headers = String::from_utf8(request[..header_end].to_vec())
         .expect("admin request headers should be UTF-8");
     let content_length = headers
@@ -71,7 +68,7 @@ fn read_admin_request(stream: &mut TcpStream) -> CapturedAdminRequest {
         let bytes_read = stream.read(&mut buffer).expect("read admin request body");
         assert!(
             bytes_read > 0,
-            "client closed connection before request body"
+            "client closed before request body completed"
         );
         request.extend_from_slice(&buffer[..bytes_read]);
     }
@@ -101,6 +98,48 @@ pub fn start_admin_test_server(
         .set_nonblocking(true)
         .expect("set admin test server nonblocking");
     let endpoint = format!("http://{}", listener.local_addr().expect("server address"));
+    let (sender, receiver) = mpsc::channel();
+
+    let handle = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(accepted) => break accepted,
+                Err(e) if e.kind() == ErrorKind::WouldBlock && Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("accept admin request: {e}"),
+            }
+        };
+        stream
+            .set_nonblocking(false)
+            .expect("set admin request stream blocking");
+        let request = read_admin_request(&mut stream);
+        sender.send(request).expect("send captured request");
+
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            response_body.len(),
+            response_body
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write admin response");
+    });
+
+    (endpoint, receiver, handle)
+}
+
+#[allow(dead_code)]
+pub fn start_admin_test_server_with_endpoint_response(
+    response_template: &'static str,
+) -> (String, Receiver<CapturedAdminRequest>, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind admin test server");
+    listener
+        .set_nonblocking(true)
+        .expect("set admin test server nonblocking");
+    let endpoint = format!("http://{}", listener.local_addr().expect("server address"));
+    let response_body = response_template.replace("SELF_ENDPOINT", &endpoint);
     let (sender, receiver) = mpsc::channel();
 
     let handle = thread::spawn(move || {

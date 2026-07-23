@@ -1,1 +1,1 @@
-{"schema_version":3,"type":"locks","status":"success","data":{"items":[{"bucket":"records","key":"invoice.pdf","version_id":"v2","object_lock_enabled":true,"retention":{"mode":"governance","retain_until":"2027-07-21T04:00:00Z"},"legal_hold":false}]}}
+{"schema_version":3,"type":"locks","status":"success","data":{"operation":"retention_info","changed":false,"items":[{"bucket":"records","key":"invoice.pdf","version_id":"v2","object_lock_enabled":true,"retention":{"mode":"governance","retain_until":"2027-07-21T04:00:00Z"},"legal_hold":null,"default_retention":null}]}}
