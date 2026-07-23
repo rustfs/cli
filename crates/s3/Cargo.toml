@@ -38,6 +38,7 @@ tracing.workspace = true
 jiff.workspace = true
 humantime.workspace = true
 bytes.workspace = true
+base64.workspace = true
 url.workspace = true
 zeroize.workspace = true
 

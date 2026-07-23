@@ -21,6 +21,8 @@ use aws_smithy_runtime_api::client::runtime_components::RuntimeComponents;
 use aws_smithy_runtime_api::http::{Response, StatusCode};
 use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::config_bag::ConfigBag;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use bytes::Bytes;
 use futures::TryStreamExt as _;
 use http_body::Frame;
@@ -31,14 +33,15 @@ pub use rc_core::DeleteRequestOptions;
 use rc_core::admin::KmsDiagnosticStore;
 use rc_core::{
     Alias, BucketEncryption, BucketNotification, BucketObjectLockConfiguration, Capabilities,
-    CopyObjectOptions, CorsRule, CreateBucketOptions, DefaultRetention, DeleteObjectFailure,
-    DeleteObjectsResult, DeletedObject, Error, LegalHoldStatus, LifecycleRule,
-    ListObjectVersionsOptions, ListOptions, ListResult, MetadataDirective, MultipartAbortStatus,
-    MultipartCopyCancellation, MultipartCopyOptions, MultipartCopyPlan, MultipartCopyProgress,
-    MultipartCopyResult, NotificationTarget, ObjectAttributes, ObjectEncryptionRequest, ObjectInfo,
-    ObjectLockOptions, ObjectReadOptions, ObjectRetention, ObjectStore, ObjectTransferMetadata,
-    ObjectVersion, ObjectVersionIdentifier, ObjectVersionListResult, ObjectWriteEncryption,
-    ObjectWriteOptions, RemotePath, ReplicationConfiguration, ReplicationResyncStartOptions,
+    ChecksumAlgorithm, ChecksumRequest, CopyObjectOptions, CorsRule, CreateBucketOptions,
+    DefaultRetention, DeleteObjectFailure, DeleteObjectsResult, DeletedObject, Error,
+    LegalHoldStatus, LifecycleRule, ListObjectVersionsOptions, ListOptions, ListResult,
+    MetadataDirective, MultipartAbortStatus, MultipartCopyCancellation, MultipartCopyOptions,
+    MultipartCopyPlan, MultipartCopyProgress, MultipartCopyResult, NotificationTarget,
+    ObjectAttributes, ObjectChecksum, ObjectEncryptionRequest, ObjectInfo, ObjectLockOptions,
+    ObjectReadOptions, ObjectRetention, ObjectStore, ObjectTransferMetadata, ObjectVersion,
+    ObjectVersionIdentifier, ObjectVersionListResult, ObjectWriteEncryption, ObjectWriteOptions,
+    RemotePath, ReplicationConfiguration, ReplicationResyncStartOptions,
     ReplicationResyncStartResult, ReplicationResyncState, ReplicationResyncStatus,
     ReplicationResyncTargetStatus, RequestHeader, Result, RetentionDuration, RetentionDurationUnit,
     RetentionMode, SelectOptions, TransferCopyOptions, TransferReadOptions, global_request_headers,
@@ -72,8 +75,7 @@ enum ObjectWritePrecondition<'a> {
 
 #[derive(Debug, Clone, Copy)]
 struct PathUploadOptions<'a> {
-    content_type: Option<&'a str>,
-    encryption: Option<&'a ObjectEncryptionRequest>,
+    write: &'a ObjectWriteOptions,
     precondition: ObjectWritePrecondition<'a>,
 }
 
@@ -690,14 +692,86 @@ fn rustfs_storage_class(value: Option<&str>) -> Result<Option<aws_sdk_s3::types:
     }
 }
 
+fn sha256_checksum(data: &[u8]) -> String {
+    BASE64_STANDARD.encode(Sha256::digest(data))
+}
+
+fn composite_sha256_checksum(part_digests: &[[u8; 32]]) -> String {
+    let mut aggregate = Sha256::new();
+    for digest in part_digests {
+        aggregate.update(digest);
+    }
+    format!(
+        "{}-{}",
+        BASE64_STANDARD.encode(aggregate.finalize()),
+        part_digests.len()
+    )
+}
+
+fn requested_sha256_checksum(
+    data: &[u8],
+    request: Option<&ChecksumRequest>,
+) -> Result<Option<String>> {
+    match request {
+        None => Ok(None),
+        Some(ChecksumRequest::Calculate(ChecksumAlgorithm::Sha256)) => {
+            Ok(Some(sha256_checksum(data)))
+        }
+        Some(ChecksumRequest::Precomputed(checksum))
+            if checksum.algorithm == ChecksumAlgorithm::Sha256 =>
+        {
+            Ok(Some(checksum.value.clone()))
+        }
+        Some(_) => Err(Error::UnsupportedFeature(
+            "RustFS beta.10 checksum writes currently support SHA-256 only".to_string(),
+        )),
+    }
+}
+
+fn validate_sha256_checksum_request(request: Option<&ChecksumRequest>) -> Result<()> {
+    match request {
+        None
+        | Some(ChecksumRequest::Calculate(ChecksumAlgorithm::Sha256))
+        | Some(ChecksumRequest::Precomputed(ObjectChecksum {
+            algorithm: ChecksumAlgorithm::Sha256,
+            ..
+        })) => Ok(()),
+        Some(_) => Err(Error::UnsupportedFeature(
+            "RustFS beta.10 checksum writes currently support SHA-256 only".to_string(),
+        )),
+    }
+}
+
+fn persisted_sha256_checksum(
+    value: &str,
+    checksum_type: Option<&aws_sdk_s3::types::ChecksumType>,
+) -> Result<ObjectChecksum> {
+    let invalid =
+        || Error::General("S3 returned an invalid persisted SHA-256 checksum".to_string());
+    match checksum_type {
+        Some(aws_sdk_s3::types::ChecksumType::FullObject) => {
+            ObjectChecksum::new(ChecksumAlgorithm::Sha256, value).map_err(|_| invalid())
+        }
+        Some(aws_sdk_s3::types::ChecksumType::Composite) => {
+            if ObjectChecksum::new(ChecksumAlgorithm::Sha256, value).is_ok() {
+                return Err(invalid());
+            }
+            ObjectChecksum::new_persisted(ChecksumAlgorithm::Sha256, value).map_err(|_| invalid())
+        }
+        Some(value) => Err(Error::UnsupportedFeature(format!(
+            "Unsupported S3 checksum type '{}'",
+            value.as_str()
+        ))),
+        None => {
+            ObjectChecksum::new_persisted(ChecksumAlgorithm::Sha256, value).map_err(|_| invalid())
+        }
+    }
+}
+
 fn validate_attribute_tag_write_options(options: &ObjectWriteOptions) -> Result<()> {
     options.validate()?;
     rustfs_storage_class(options.storage_class.as_deref())?;
-    if options.checksum.is_some() {
-        return Err(Error::UnsupportedFeature(
-            "Checksum writes are tracked by rustfs/backlog#1458".to_string(),
-        ));
-    }
+    validate_sha256_checksum_request(options.checksum.as_ref())?;
     if options.retention.is_some() || options.legal_hold.is_some() {
         return Err(Error::UnsupportedFeature(
             "Object-lock writes are tracked by rustfs/backlog#1460".to_string(),
@@ -720,6 +794,12 @@ fn validate_beta10_copy_options(options: &TransferCopyOptions) -> Result<()> {
         ));
     }
     validate_attribute_tag_write_options(&options.destination)?;
+    if options.destination.checksum.is_some() {
+        return Err(Error::UnsupportedFeature(
+            "RustFS beta.10 does not preserve CopyObject checksum selection; tracked by rustfs/backlog#1466"
+                .to_string(),
+        ));
+    }
     if matches!(options.metadata_directive, Some(MetadataDirective::Replace)) {
         return Err(Error::UnsupportedFeature(
             "RustFS beta.10 does not preserve complete metadata REPLACE semantics; tracked by rustfs/backlog#1463"
@@ -2006,6 +2086,11 @@ impl S3Client {
                     "The S3 endpoint rejected the requested storage class".to_string(),
                 );
             }
+            if matches!(code, Some("BadDigest") | Some("InvalidDigest")) {
+                return Error::Conflict(
+                    "The S3 endpoint rejected the supplied object checksum".to_string(),
+                );
+            }
             if matches!(status, 409 | 412)
                 || matches!(
                     code,
@@ -2862,6 +2947,39 @@ impl S3Client {
         Ok(total_read)
     }
 
+    async fn verify_persisted_sha256(
+        &self,
+        path: &RemotePath,
+        version_id: Option<String>,
+        expected: &str,
+    ) -> Result<()> {
+        let persisted = self
+            .head_object_transfer_metadata(
+                path,
+                &TransferReadOptions {
+                    version_id,
+                    checksum_mode: true,
+                    ..TransferReadOptions::default()
+                },
+            )
+            .await?
+            .checksums
+            .into_iter()
+            .find(|checksum| checksum.algorithm == ChecksumAlgorithm::Sha256)
+            .ok_or_else(|| {
+                Error::UnsupportedFeature(
+                    "RustFS did not report a persisted SHA-256 checksum; post-write verification is unavailable"
+                        .to_string(),
+                )
+            })?;
+        if persisted.value != expected {
+            return Err(Error::Conflict(
+                "Persisted object SHA-256 checksum does not match the uploaded payload".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     async fn put_object_single_part_from_path(
         &self,
         path: &RemotePath,
@@ -2872,19 +2990,31 @@ impl S3Client {
         let data = tokio::fs::read(file_path)
             .await
             .map_err(|e| Error::General(format!("read file '{}': {e}", file_path.display())))?;
+        let requested_checksum = requested_sha256_checksum(&data, options.write.checksum.as_ref())?;
         let body = aws_sdk_s3::primitives::ByteStream::from(data);
+        let encryption = managed_object_encryption(options.write)?;
+        let storage_class = rustfs_storage_class(options.write.storage_class.as_deref())?;
 
-        let mut request = apply_object_encryption_to_put_request(
-            self.inner
-                .put_object()
-                .bucket(&path.bucket)
-                .key(&path.key)
-                .body(body),
-            options.encryption,
-        );
+        let mut request = apply_object_attributes_to_put_request(
+            apply_object_encryption_to_put_request(
+                self.inner
+                    .put_object()
+                    .bucket(&path.bucket)
+                    .key(&path.key)
+                    .body(body),
+                encryption,
+            ),
+            options.write.attributes.as_ref(),
+        )?
+        .set_storage_class(storage_class);
 
-        if let Some(ct) = options.content_type {
-            request = request.content_type(ct);
+        if let Some(tags) = &options.write.tags {
+            request = request.tagging(encode_object_tags(tags));
+        }
+        if let Some(checksum) = &requested_checksum {
+            request = request
+                .checksum_algorithm(aws_sdk_s3::types::ChecksumAlgorithm::Sha256)
+                .checksum_sha256(checksum);
         }
         request = match options.precondition {
             ObjectWritePrecondition::None => request,
@@ -2899,7 +3029,7 @@ impl S3Client {
             {
                 Error::Conflict(format!("Object changed before upload: {path}"))
             } else {
-                Error::Network(Self::format_sdk_error(&error))
+                Self::map_object_request_error(&error, path, None)
             }
         })?;
 
@@ -2909,7 +3039,12 @@ impl S3Client {
         }
         info.version_id = response.version_id().map(ToString::to_string);
         info.last_modified = Some(jiff::Timestamp::now());
+        info.storage_class = options.write.storage_class.clone();
 
+        if let Some(checksum) = requested_checksum {
+            self.verify_persisted_sha256(path, info.version_id.clone(), &checksum)
+                .await?;
+        }
         Ok(info)
     }
 
@@ -2932,7 +3067,7 @@ impl S3Client {
         }
     }
 
-    async fn abort_multipart_copy_with_error(
+    async fn abort_multipart_upload_with_error(
         &self,
         path: &RemotePath,
         upload_id: &str,
@@ -2954,6 +3089,12 @@ impl S3Client {
     ) -> Result<ObjectInfo> {
         use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 
+        if options.write.storage_class.is_some() {
+            return Err(Error::UnsupportedFeature(
+                "RustFS beta.10 does not persist storage class for multipart uploads; tracked by rustfs/backlog#1464"
+                    .to_string(),
+            ));
+        }
         let config = crate::multipart::MultipartConfig::default();
         let part_size = config.calculate_part_size(file_size);
         let part_buffer_size = usize::try_from(part_size)
@@ -2962,32 +3103,44 @@ impl S3Client {
             .await
             .map_err(|e| Error::General(format!("open file '{}': {e}", file_path.display())))?;
         let mut chunk = vec![0u8; part_buffer_size];
+        let checksum_requested = options.write.checksum.is_some();
+        if checksum_requested
+            && matches!(
+                options.write.checksum,
+                Some(ChecksumRequest::Precomputed(_))
+            )
+        {
+            return Err(Error::UnsupportedFeature(
+                "Precomputed SHA-256 checksums are not supported for multipart uploads".to_string(),
+            ));
+        }
+        let encryption = managed_object_encryption(options.write)?;
 
         tracing::debug!(file_size, part_size, "Starting multipart upload");
 
-        let mut create_request = self
-            .inner
-            .create_multipart_upload()
-            .bucket(&path.bucket)
-            .key(&path.key);
-
-        create_request = match options.encryption {
-            Some(ObjectEncryptionRequest::SseS3) => create_request
-                .server_side_encryption(aws_sdk_s3::types::ServerSideEncryption::Aes256),
-            Some(ObjectEncryptionRequest::SseKms { key_id }) => create_request
-                .server_side_encryption(aws_sdk_s3::types::ServerSideEncryption::AwsKms)
-                .ssekms_key_id(key_id),
-            None => create_request,
-        };
-
-        if let Some(ct) = options.content_type {
-            create_request = create_request.content_type(ct);
+        let mut create_request = apply_object_encryption_to_multipart_create_request(
+            self.inner
+                .create_multipart_upload()
+                .bucket(&path.bucket)
+                .key(&path.key),
+            encryption,
+        );
+        if let Some(attributes) = &options.write.attributes {
+            create_request =
+                apply_object_attributes_to_multipart_create_request(create_request, attributes)?;
+        }
+        if let Some(tags) = &options.write.tags {
+            create_request = create_request.tagging(encode_object_tags(tags));
+        }
+        if checksum_requested {
+            create_request =
+                create_request.checksum_algorithm(aws_sdk_s3::types::ChecksumAlgorithm::Sha256);
         }
 
         let create_response = create_request
             .send()
             .await
-            .map_err(|e| Error::Network(format!("create multipart upload: {e}")))?;
+            .map_err(|error| Self::map_object_request_error(&error, path, None))?;
 
         let upload_id = create_response
             .upload_id()
@@ -2999,14 +3152,15 @@ impl S3Client {
         let mut completed_parts = Vec::new();
         let mut part_number: i32 = 1;
         let mut bytes_uploaded: u64 = 0;
+        let mut part_digests = Vec::new();
 
         loop {
             let bytes_read = match Self::read_next_part(&mut file, file_path, &mut chunk).await {
                 Ok(bytes_read) => bytes_read,
                 Err(error) => {
-                    self.abort_multipart_upload_best_effort(path, &upload_id)
-                        .await;
-                    return Err(error);
+                    return Err(self
+                        .abort_multipart_upload_with_error(path, &upload_id, error)
+                        .await);
                 }
             };
             // A conditional zero-byte write still needs a multipart completion
@@ -3018,17 +3172,26 @@ impl S3Client {
 
             tracing::debug!(part_number, bytes_read, "Uploading part");
 
+            let part_checksum = checksum_requested.then(|| {
+                let digest: [u8; 32] = Sha256::digest(&chunk[..bytes_read]).into();
+                part_digests.push(digest);
+                BASE64_STANDARD.encode(digest)
+            });
             let body = aws_sdk_s3::primitives::ByteStream::from(chunk[..bytes_read].to_vec());
-            let upload_part_result = self
+            let mut upload_part_request = self
                 .inner
                 .upload_part()
                 .bucket(&path.bucket)
                 .key(&path.key)
                 .upload_id(&upload_id)
                 .part_number(part_number)
-                .body(body)
-                .send()
-                .await;
+                .body(body);
+            if let Some(checksum) = &part_checksum {
+                upload_part_request = upload_part_request
+                    .checksum_algorithm(aws_sdk_s3::types::ChecksumAlgorithm::Sha256)
+                    .checksum_sha256(checksum);
+            }
+            let upload_part_result = upload_part_request.send().await;
 
             let upload_part_response = match upload_part_result {
                 Ok(response) => response,
@@ -3038,31 +3201,54 @@ impl S3Client {
                         part_number,
                         "Aborting multipart upload due to error"
                     );
-                    self.abort_multipart_upload_best_effort(path, &upload_id)
-                        .await;
-                    return Err(Error::Network(format!(
-                        "upload multipart part {part_number}: {e}"
-                    )));
+                    let primary = Self::map_object_request_error(&e, path, None);
+                    return Err(self
+                        .abort_multipart_upload_with_error(path, &upload_id, primary)
+                        .await);
                 }
             };
+            if let Some(expected) = &part_checksum {
+                match upload_part_response.checksum_sha256() {
+                    Some(actual) if actual == expected => {}
+                    Some(_) => {
+                        let primary = Error::Conflict(format!(
+                            "Persisted multipart part {part_number} SHA-256 checksum does not match the uploaded payload"
+                        ));
+                        return Err(self
+                            .abort_multipart_upload_with_error(path, &upload_id, primary)
+                            .await);
+                    }
+                    None => {
+                        let primary = Error::UnsupportedFeature(format!(
+                            "RustFS did not report a SHA-256 checksum for multipart part {part_number}"
+                        ));
+                        return Err(self
+                            .abort_multipart_upload_with_error(path, &upload_id, primary)
+                            .await);
+                    }
+                }
+            }
 
             let etag = match upload_part_response.e_tag() {
                 Some(value) => value.trim_matches('"').to_string(),
                 None => {
-                    self.abort_multipart_upload_best_effort(path, &upload_id)
-                        .await;
-                    return Err(Error::General(format!(
-                        "missing ETag for multipart part {part_number}"
-                    )));
+                    let primary =
+                        Error::General(format!("missing ETag for multipart part {part_number}"));
+                    return Err(self
+                        .abort_multipart_upload_with_error(path, &upload_id, primary)
+                        .await);
                 }
             };
 
-            completed_parts.push(
-                CompletedPart::builder()
+            completed_parts.push({
+                let mut part = CompletedPart::builder()
                     .part_number(part_number)
-                    .e_tag(etag)
-                    .build(),
-            );
+                    .e_tag(etag);
+                if let Some(checksum) = part_checksum {
+                    part = part.checksum_sha256(checksum);
+                }
+                part.build()
+            });
 
             bytes_uploaded += bytes_read as u64;
             on_progress(bytes_uploaded);
@@ -3092,20 +3278,17 @@ impl S3Client {
             Ok(response) => response,
             Err(error) => {
                 tracing::debug!(upload_id = %upload_id, "Attempting to abort multipart upload after completion failure");
-                self.abort_multipart_upload_best_effort(path, &upload_id)
-                    .await;
-                if !matches!(options.precondition, ObjectWritePrecondition::None)
+                let primary = if !matches!(options.precondition, ObjectWritePrecondition::None)
                     && let aws_sdk_s3::error::SdkError::ServiceError(service_error) = &error
                     && matches!(service_error.raw().status().as_u16(), 409 | 412)
                 {
-                    return Err(Error::Conflict(format!(
-                        "Object changed before upload: {path}"
-                    )));
-                }
-                return Err(Error::Network(format!(
-                    "complete multipart upload: {}",
-                    Self::format_sdk_error(&error)
-                )));
+                    Error::Conflict(format!("Object changed before upload: {path}"))
+                } else {
+                    Self::map_object_request_error(&error, path, None)
+                };
+                return Err(self
+                    .abort_multipart_upload_with_error(path, &upload_id, primary)
+                    .await);
             }
         };
 
@@ -3118,6 +3301,11 @@ impl S3Client {
         info.version_id = complete_response.version_id().map(ToString::to_string);
         info.last_modified = Some(jiff::Timestamp::now());
 
+        if checksum_requested {
+            let expected_checksum = composite_sha256_checksum(&part_digests);
+            self.verify_persisted_sha256(path, info.version_id.clone(), &expected_checksum)
+                .await?;
+        }
         Ok(info)
     }
 
@@ -3133,11 +3321,38 @@ impl S3Client {
         encryption: Option<&ObjectEncryptionRequest>,
         on_progress: impl Fn(u64) + Send,
     ) -> Result<ObjectInfo> {
+        let options = ObjectWriteOptions {
+            attributes: Some(ObjectAttributes {
+                content_type: content_type.map(ToString::to_string),
+                ..ObjectAttributes::default()
+            }),
+            encryption: encryption.cloned().map(ObjectWriteEncryption::Managed),
+            ..ObjectWriteOptions::default()
+        };
         self.put_object_from_path_with_condition(
             path,
             file_path,
-            content_type,
-            encryption,
+            &options,
+            ObjectWritePrecondition::None,
+            on_progress,
+        )
+        .await
+    }
+
+    /// Upload a local file path with advanced transfer-fidelity options.
+    ///
+    /// Checksum calculation remains streaming for multipart uploads.
+    pub async fn put_object_from_path_with_options(
+        &self,
+        path: &RemotePath,
+        file_path: &std::path::Path,
+        options: &ObjectWriteOptions,
+        on_progress: impl Fn(u64) + Send,
+    ) -> Result<ObjectInfo> {
+        self.put_object_from_path_with_condition(
+            path,
+            file_path,
+            options,
             ObjectWritePrecondition::None,
             on_progress,
         )
@@ -3157,11 +3372,18 @@ impl S3Client {
         encryption: Option<&ObjectEncryptionRequest>,
         on_progress: impl Fn(u64) + Send,
     ) -> Result<ObjectInfo> {
+        let options = ObjectWriteOptions {
+            attributes: Some(ObjectAttributes {
+                content_type: content_type.map(ToString::to_string),
+                ..ObjectAttributes::default()
+            }),
+            encryption: encryption.cloned().map(ObjectWriteEncryption::Managed),
+            ..ObjectWriteOptions::default()
+        };
         self.put_object_from_path_with_condition(
             path,
             file_path,
-            content_type,
-            encryption,
+            &options,
             ObjectWritePrecondition::IfAbsent,
             on_progress,
         )
@@ -3178,11 +3400,18 @@ impl S3Client {
         etag: &str,
         on_progress: impl Fn(u64) + Send,
     ) -> Result<ObjectInfo> {
+        let options = ObjectWriteOptions {
+            attributes: Some(ObjectAttributes {
+                content_type: content_type.map(ToString::to_string),
+                ..ObjectAttributes::default()
+            }),
+            encryption: encryption.cloned().map(ObjectWriteEncryption::Managed),
+            ..ObjectWriteOptions::default()
+        };
         self.put_object_from_path_with_condition(
             path,
             file_path,
-            content_type,
-            encryption,
+            &options,
             ObjectWritePrecondition::IfMatch(etag),
             on_progress,
         )
@@ -3193,11 +3422,11 @@ impl S3Client {
         &self,
         path: &RemotePath,
         file_path: &std::path::Path,
-        content_type: Option<&str>,
-        encryption: Option<&ObjectEncryptionRequest>,
+        write: &ObjectWriteOptions,
         precondition: ObjectWritePrecondition<'_>,
         on_progress: impl Fn(u64) + Send,
     ) -> Result<ObjectInfo> {
+        validate_attribute_tag_write_options(write)?;
         let metadata = tokio::fs::metadata(file_path).await.map_err(|e| {
             Error::General(format!("read metadata for '{}': {e}", file_path.display()))
         })?;
@@ -3210,8 +3439,7 @@ impl S3Client {
 
         let file_size = metadata.len();
         let options = PathUploadOptions {
-            content_type,
-            encryption,
+            write,
             precondition,
         };
         // RustFS evaluates write preconditions for multipart completion. Keep
@@ -3265,7 +3493,7 @@ impl S3Client {
                 biased;
                 _ = cancellation.cancelled() => {
                     return Err(self
-                        .abort_multipart_copy_with_error(
+                        .abort_multipart_upload_with_error(
                             dst,
                             &upload_id,
                             Error::Interrupted("Multipart copy was cancelled".to_string()),
@@ -3284,7 +3512,7 @@ impl S3Client {
                         options.source_version_id.as_deref(),
                     );
                     return Err(self
-                        .abort_multipart_copy_with_error(dst, &upload_id, primary)
+                        .abort_multipart_upload_with_error(dst, &upload_id, primary)
                         .await);
                 }
             };
@@ -3301,7 +3529,7 @@ impl S3Client {
                 Some(etag) => etag.trim_matches('"').to_string(),
                 None => {
                     return Err(self
-                        .abort_multipart_copy_with_error(
+                        .abort_multipart_upload_with_error(
                             dst,
                             &upload_id,
                             Error::General(format!(
@@ -3342,7 +3570,7 @@ impl S3Client {
             response = complete_request => response,
             _ = cancellation.cancelled() => {
                 return Err(self
-                    .abort_multipart_copy_with_error(
+                    .abort_multipart_upload_with_error(
                         dst,
                         &upload_id,
                         Error::Interrupted("Multipart copy was cancelled".to_string()),
@@ -3355,7 +3583,7 @@ impl S3Client {
             Err(error) => {
                 let primary = Self::map_object_request_error(&error, dst, None);
                 return Err(self
-                    .abort_multipart_copy_with_error(dst, &upload_id, primary)
+                    .abort_multipart_upload_with_error(dst, &upload_id, primary)
                     .await);
             }
         };
@@ -3701,11 +3929,6 @@ impl ObjectStore for S3Client {
         options: &TransferReadOptions,
     ) -> Result<ObjectTransferMetadata> {
         options.validate()?;
-        if options.checksum_mode {
-            return Err(Error::UnsupportedFeature(
-                "Checksum-mode metadata reads are tracked by rustfs/backlog#1458".to_string(),
-            ));
-        }
         if options.customer_key.is_some() {
             return Err(Error::UnsupportedFeature(
                 "SSE-C metadata reads are tracked by rustfs/backlog#1459".to_string(),
@@ -3715,6 +3938,9 @@ impl ObjectStore for S3Client {
         let mut request = self.inner.head_object().bucket(&path.bucket).key(&path.key);
         if let Some(version_id) = &options.version_id {
             request = request.version_id(version_id);
+        }
+        if options.checksum_mode {
+            request = request.checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled);
         }
         let response = request.send().await.map_err(|error| {
             Self::map_object_request_error(&error, path, options.version_id.as_deref())
@@ -3731,6 +3957,16 @@ impl ObjectStore for S3Client {
         }
 
         let expires = response.expires_string().map(core_http_date).transpose()?;
+        let checksums = if options.checksum_mode {
+            response
+                .checksum_sha256()
+                .map(|value| persisted_sha256_checksum(value, response.checksum_type()))
+                .transpose()?
+                .into_iter()
+                .collect()
+        } else {
+            Vec::new()
+        };
         Ok(ObjectTransferMetadata {
             attributes: ObjectAttributes {
                 content_type: response.content_type().map(ToString::to_string),
@@ -3744,7 +3980,7 @@ impl ObjectStore for S3Client {
             storage_class: response
                 .storage_class()
                 .map(|storage_class| storage_class.as_str().to_string()),
-            checksums: Vec::new(),
+            checksums,
         })
     }
 
@@ -3960,6 +4196,7 @@ impl ObjectStore for S3Client {
     ) -> Result<ObjectInfo> {
         validate_attribute_tag_write_options(options)?;
         let size = data.len() as i64;
+        let requested_checksum = requested_sha256_checksum(&data, options.checksum.as_ref())?;
         let body = aws_sdk_s3::primitives::ByteStream::from(data);
         let encryption = managed_object_encryption(options)?;
         let storage_class = rustfs_storage_class(options.storage_class.as_deref())?;
@@ -3977,6 +4214,11 @@ impl ObjectStore for S3Client {
         if let Some(tags) = &options.tags {
             request = request.tagging(encode_object_tags(tags));
         }
+        if let Some(checksum) = &requested_checksum {
+            request = request
+                .checksum_algorithm(aws_sdk_s3::types::ChecksumAlgorithm::Sha256)
+                .checksum_sha256(checksum);
+        }
         let response = request.send().await.map_err(|error| {
             self.redact_sensitive_error(Self::map_object_request_error(&error, path, None))
         })?;
@@ -3993,6 +4235,10 @@ impl ObjectStore for S3Client {
             .map(|etag| etag.trim_matches('"').to_string());
         info.version_id = response.version_id().map(ToString::to_string);
         info.last_modified = Some(jiff::Timestamp::now());
+        if let Some(requested_checksum) = requested_checksum {
+            self.verify_persisted_sha256(path, info.version_id.clone(), &requested_checksum)
+                .await?;
+        }
         Ok(info)
     }
 
@@ -7093,6 +7339,237 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multipart_path_upload_streams_and_verifies_composite_sha256() {
+        let part_raw = Sha256::digest(b"data");
+        let part_checksum = BASE64_STANDARD.encode(part_raw);
+        let aggregate = format!("{}-1", BASE64_STANDARD.encode(Sha256::digest(part_raw)));
+        let part_response = http::Response::builder()
+            .status(200)
+            .header("etag", "\"part-etag\"")
+            .header("x-amz-checksum-sha256", &part_checksum)
+            .body(SdkBody::empty())
+            .expect("build checksum part response");
+        let complete_response = http::Response::builder()
+            .status(200)
+            .header("content-type", "application/xml")
+            .header("x-amz-version-id", "multipart-v1")
+            .body(SdkBody::from(
+                r#"<CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>bucket</Bucket><Key>key.txt</Key><ETag>"final-etag"</ETag></CompleteMultipartUploadResult>"#,
+            ))
+            .expect("build checksum complete response");
+        let head_response = http::Response::builder()
+            .status(200)
+            .header("content-length", "4")
+            .header("x-amz-checksum-sha256", &aggregate)
+            .header("x-amz-checksum-type", "COMPOSITE")
+            .body(SdkBody::empty())
+            .expect("build composite head response");
+        let (client, replay) = test_s3_client_with_response_sequence(vec![
+            multipart_create_response(),
+            part_response,
+            complete_response,
+            head_response,
+        ]);
+        let path = RemotePath::new("test", "bucket", "key.txt");
+        let mut source = tempfile::NamedTempFile::new().expect("create multipart source");
+        source.write_all(b"data").expect("write multipart source");
+        let write = ObjectWriteOptions {
+            checksum: Some(ChecksumRequest::Calculate(ChecksumAlgorithm::Sha256)),
+            ..ObjectWriteOptions::default()
+        };
+
+        client
+            .put_object_multipart_from_path(
+                &path,
+                source.path(),
+                4,
+                PathUploadOptions {
+                    write: &write,
+                    precondition: ObjectWritePrecondition::None,
+                },
+                |_| {},
+            )
+            .await
+            .expect("upload and verify multipart checksum");
+
+        let requests = replay.actual_requests().collect::<Vec<_>>();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(
+            requests[0].headers().get("x-amz-checksum-algorithm"),
+            Some("SHA256")
+        );
+        assert_eq!(
+            requests[1].headers().get("x-amz-checksum-sha256"),
+            Some(part_checksum.as_str())
+        );
+        let completion_body = requests[2].body().bytes().expect("completion request body");
+        let completion_body =
+            std::str::from_utf8(completion_body).expect("completion body is utf8");
+        assert!(completion_body.contains("<ChecksumSHA256>"));
+        assert!(completion_body.contains(&part_checksum));
+        assert_eq!(
+            requests[3].headers().get("x-amz-checksum-mode"),
+            Some("ENABLED")
+        );
+        assert!(requests[3].uri().contains("versionId=multipart-v1"));
+    }
+
+    #[tokio::test]
+    async fn multipart_path_upload_rejects_precomputed_checksum_before_mutation() {
+        let (client, replay) = test_s3_client_with_response_sequence(Vec::new());
+        let path = RemotePath::new("test", "bucket", "key.txt");
+        let mut source = tempfile::NamedTempFile::new().expect("create multipart source");
+        source.write_all(b"data").expect("write multipart source");
+        let write = ObjectWriteOptions {
+            checksum: Some(ChecksumRequest::Precomputed(
+                ObjectChecksum::new(ChecksumAlgorithm::Sha256, sha256_checksum(b"data"))
+                    .expect("valid checksum"),
+            )),
+            ..ObjectWriteOptions::default()
+        };
+
+        let error = client
+            .put_object_multipart_from_path(
+                &path,
+                source.path(),
+                4,
+                PathUploadOptions {
+                    write: &write,
+                    precondition: ObjectWritePrecondition::None,
+                },
+                |_| {},
+            )
+            .await
+            .expect_err("precomputed multipart checksums must fail before create");
+
+        assert!(matches!(error, Error::UnsupportedFeature(_)));
+        assert_eq!(replay.actual_requests().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn multipart_path_upload_rejects_storage_class_before_mutation() {
+        let (client, replay) = test_s3_client_with_response_sequence(Vec::new());
+        let path = RemotePath::new("test", "bucket", "key.txt");
+        let mut source = tempfile::NamedTempFile::new().expect("create multipart source");
+        source.write_all(b"data").expect("write multipart source");
+        let write = ObjectWriteOptions {
+            storage_class: Some("STANDARD".to_string()),
+            ..ObjectWriteOptions::default()
+        };
+
+        let error = client
+            .put_object_multipart_from_path(
+                &path,
+                source.path(),
+                4,
+                PathUploadOptions {
+                    write: &write,
+                    precondition: ObjectWritePrecondition::None,
+                },
+                |_| {},
+            )
+            .await
+            .expect_err("beta.10 multipart storage class must fail before create");
+
+        assert!(matches!(error, Error::UnsupportedFeature(_)));
+        assert_eq!(replay.actual_requests().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn multipart_part_checksum_rejection_maps_to_conflict_and_aborts() {
+        let part_response = http::Response::builder()
+            .status(400)
+            .header("x-amz-error-code", "BadDigest")
+            .body(SdkBody::from(
+                "<Error><Code>BadDigest</Code><Message>checksum rejected</Message></Error>",
+            ))
+            .expect("build checksum part rejection");
+        let abort_response = http::Response::builder()
+            .status(204)
+            .body(SdkBody::empty())
+            .expect("build multipart abort response");
+        let (client, replay) = test_s3_client_with_response_sequence(vec![
+            multipart_create_response(),
+            part_response,
+            abort_response,
+        ]);
+        let path = RemotePath::new("test", "bucket", "key.txt");
+        let mut source = tempfile::NamedTempFile::new().expect("create multipart source");
+        source.write_all(b"data").expect("write multipart source");
+        let write = ObjectWriteOptions {
+            checksum: Some(ChecksumRequest::Calculate(ChecksumAlgorithm::Sha256)),
+            ..ObjectWriteOptions::default()
+        };
+
+        let error = client
+            .put_object_multipart_from_path(
+                &path,
+                source.path(),
+                4,
+                PathUploadOptions {
+                    write: &write,
+                    precondition: ObjectWritePrecondition::None,
+                },
+                |_| {},
+            )
+            .await
+            .expect_err("part checksum rejection must abort");
+
+        assert!(matches!(error, Error::Conflict(_)));
+        let requests = replay.actual_requests().collect::<Vec<_>>();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[2].method(), "DELETE");
+    }
+
+    #[tokio::test]
+    async fn multipart_checksum_error_reports_failed_abort() {
+        let part_response = http::Response::builder()
+            .status(400)
+            .header("x-amz-error-code", "BadDigest")
+            .body(SdkBody::from(
+                "<Error><Code>BadDigest</Code><Message>checksum rejected</Message></Error>",
+            ))
+            .expect("build checksum part rejection");
+        let abort_response = http::Response::builder()
+            .status(500)
+            .header("x-amz-error-code", "InternalError")
+            .body(SdkBody::from(
+                "<Error><Code>InternalError</Code><Message>abort failed</Message></Error>",
+            ))
+            .expect("build multipart abort failure");
+        let (client, replay) = test_s3_client_with_response_sequence(vec![
+            multipart_create_response(),
+            part_response,
+            abort_response,
+        ]);
+        let path = RemotePath::new("test", "bucket", "key.txt");
+        let mut source = tempfile::NamedTempFile::new().expect("create multipart source");
+        source.write_all(b"data").expect("write multipart source");
+        let write = ObjectWriteOptions {
+            checksum: Some(ChecksumRequest::Calculate(ChecksumAlgorithm::Sha256)),
+            ..ObjectWriteOptions::default()
+        };
+
+        let error = client
+            .put_object_multipart_from_path(
+                &path,
+                source.path(),
+                4,
+                PathUploadOptions {
+                    write: &write,
+                    precondition: ObjectWritePrecondition::None,
+                },
+                |_| {},
+            )
+            .await
+            .expect_err("failed checksum cleanup must be reported");
+
+        assert!(matches!(error, Error::Conflict(_)));
+        assert!(error.to_string().contains("abort: failed"));
+        assert_eq!(replay.actual_requests().count(), 3);
+    }
+
+    #[tokio::test]
     async fn conditional_multipart_completion_sets_if_none_match() {
         let complete_response = http::Response::builder()
             .status(200)
@@ -7109,6 +7586,13 @@ mod tests {
         let path = RemotePath::new("test", "bucket", "key.txt");
         let mut source = tempfile::NamedTempFile::new().expect("create multipart source");
         source.write_all(b"data").expect("write multipart source");
+        let write = ObjectWriteOptions {
+            attributes: Some(ObjectAttributes {
+                content_type: Some("text/plain".to_string()),
+                ..ObjectAttributes::default()
+            }),
+            ..ObjectWriteOptions::default()
+        };
 
         client
             .put_object_multipart_from_path(
@@ -7116,8 +7600,7 @@ mod tests {
                 source.path(),
                 4,
                 PathUploadOptions {
-                    content_type: Some("text/plain"),
-                    encryption: None,
+                    write: &write,
                     precondition: ObjectWritePrecondition::IfAbsent,
                 },
                 |_| {},
@@ -7158,6 +7641,7 @@ mod tests {
             let path = RemotePath::new("test", "bucket", "key.txt");
             let mut source = tempfile::NamedTempFile::new().expect("create multipart source");
             source.write_all(b"data").expect("write multipart source");
+            let write = ObjectWriteOptions::default();
 
             let result = client
                 .put_object_multipart_from_path(
@@ -7165,8 +7649,7 @@ mod tests {
                     source.path(),
                     4,
                     PathUploadOptions {
-                        content_type: None,
-                        encryption: None,
+                        write: &write,
                         precondition: ObjectWritePrecondition::IfMatch("expected-etag"),
                     },
                     |_| {},
@@ -7211,6 +7694,7 @@ mod tests {
         let path = RemotePath::new("test", "bucket", "key.txt");
         let mut source = tempfile::NamedTempFile::new().expect("create multipart source");
         source.write_all(b"data").expect("write multipart source");
+        let write = ObjectWriteOptions::default();
 
         let result = client
             .put_object_multipart_from_path(
@@ -7218,8 +7702,7 @@ mod tests {
                 source.path(),
                 4,
                 PathUploadOptions {
-                    content_type: None,
-                    encryption: None,
+                    write: &write,
                     precondition: ObjectWritePrecondition::IfAbsent,
                 },
                 |_| {},
@@ -8241,13 +8724,44 @@ mod tests {
         invalid_requests.expect_request();
     }
 
+    #[test]
+    fn sha256_checksum_matches_known_vector() {
+        assert_eq!(
+            sha256_checksum(b"abc"),
+            "ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0="
+        );
+        let first: [u8; 32] = Sha256::digest(b"first").into();
+        let second: [u8; 32] = Sha256::digest(b"second").into();
+        assert_eq!(
+            composite_sha256_checksum(&[first, second]),
+            "LzQWAyxTThs81Y8OBSjFqPV96lhreIsEDE+rDTcFXSg=-2"
+        );
+        assert_ne!(
+            composite_sha256_checksum(&[second, first]),
+            "LzQWAyxTThs81Y8OBSjFqPV96lhreIsEDE+rDTcFXSg=-2"
+        );
+    }
+
     #[tokio::test]
-    async fn advanced_transfer_defaults_reject_before_backend_requests() {
+    async fn transfer_put_sends_and_verifies_sha256_for_exact_version() {
+        let expected = sha256_checksum(b"payload");
+        let put_response = http::Response::builder()
+            .status(200)
+            .header("x-amz-version-id", "v1")
+            .body(SdkBody::empty())
+            .expect("build checksum put response");
+        let head_response = http::Response::builder()
+            .status(200)
+            .header("content-length", "7")
+            .header("x-amz-checksum-sha256", &expected)
+            .header("x-amz-checksum-type", "FULL_OBJECT")
+            .body(SdkBody::empty())
+            .expect("build checksum head response");
+        let (client, replay) =
+            test_s3_client_with_response_sequence(vec![put_response, head_response]);
         let path = RemotePath::new("test", "bucket", "file.txt");
 
-        let (put_client, put_requests) = test_s3_client(None);
-        let put_store: &dyn ObjectStore = &put_client;
-        let put_error = put_store
+        client
             .put_object_with_options(
                 &path,
                 b"payload".to_vec(),
@@ -8257,9 +8771,237 @@ mod tests {
                 },
             )
             .await
-            .expect_err("advanced put must not silently degrade");
+            .expect("put and verify checksum");
+
+        let requests = replay.actual_requests().collect::<Vec<_>>();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].headers().get("x-amz-checksum-sha256"),
+            Some(expected.as_str())
+        );
+        assert_eq!(
+            requests[0].headers().get("x-amz-sdk-checksum-algorithm"),
+            Some("SHA256")
+        );
+        assert_eq!(
+            requests[1].headers().get("x-amz-checksum-mode"),
+            Some("ENABLED")
+        );
+        assert!(requests[1].uri().contains("versionId=v1"));
+    }
+
+    #[tokio::test]
+    async fn transfer_put_never_succeeds_without_matching_persisted_checksum() {
+        for (reported, expected_error) in [
+            (None, "unsupported"),
+            (Some(sha256_checksum(b"different")), "conflict"),
+        ] {
+            let put_response = http::Response::builder()
+                .status(200)
+                .body(SdkBody::empty())
+                .expect("build checksum put response");
+            let mut head = http::Response::builder()
+                .status(200)
+                .header("content-length", "7");
+            if let Some(value) = reported {
+                head = head
+                    .header("x-amz-checksum-sha256", value)
+                    .header("x-amz-checksum-type", "FULL_OBJECT");
+            }
+            let head_response = head
+                .body(SdkBody::empty())
+                .expect("build checksum head response");
+            let (client, replay) =
+                test_s3_client_with_response_sequence(vec![put_response, head_response]);
+            let path = RemotePath::new("test", "bucket", "file.txt");
+
+            let error = client
+                .put_object_with_options(
+                    &path,
+                    b"payload".to_vec(),
+                    &ObjectWriteOptions {
+                        checksum: Some(ChecksumRequest::Calculate(ChecksumAlgorithm::Sha256)),
+                        ..ObjectWriteOptions::default()
+                    },
+                )
+                .await
+                .expect_err("unverified checksum must not report success");
+            match expected_error {
+                "unsupported" => assert!(matches!(error, Error::UnsupportedFeature(_))),
+                "conflict" => assert!(matches!(error, Error::Conflict(_))),
+                _ => unreachable!("fixed test case"),
+            }
+            assert_eq!(replay.actual_requests().count(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn checksum_service_rejections_map_to_conflict() {
+        for code in ["BadDigest", "InvalidDigest"] {
+            let response = http::Response::builder()
+                .status(400)
+                .header("x-amz-error-code", code)
+                .body(SdkBody::from(format!(
+                    "<Error><Code>{code}</Code><Message>checksum rejected</Message></Error>"
+                )))
+                .expect("build checksum rejection");
+            let (client, replay) = test_s3_client_with_response_sequence(vec![response]);
+            let path = RemotePath::new("test", "bucket", "file.txt");
+            let checksum =
+                ObjectChecksum::new(ChecksumAlgorithm::Sha256, sha256_checksum(b"payload"))
+                    .expect("valid checksum");
+
+            let error = client
+                .put_object_with_options(
+                    &path,
+                    b"different".to_vec(),
+                    &ObjectWriteOptions {
+                        checksum: Some(ChecksumRequest::Precomputed(checksum)),
+                        ..ObjectWriteOptions::default()
+                    },
+                )
+                .await
+                .expect_err("service checksum rejection must remain typed");
+            assert!(matches!(error, Error::Conflict(_)), "code {code}");
+            assert_eq!(replay.actual_requests().count(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn path_checksum_service_rejection_maps_to_conflict() {
+        let response = http::Response::builder()
+            .status(400)
+            .header("x-amz-error-code", "BadDigest")
+            .body(SdkBody::from(
+                "<Error><Code>BadDigest</Code><Message>checksum rejected</Message></Error>",
+            ))
+            .expect("build checksum rejection");
+        let (client, replay) = test_s3_client_with_response_sequence(vec![response]);
+        let path = RemotePath::new("test", "bucket", "file.txt");
+        let mut source = tempfile::NamedTempFile::new().expect("create checksum source");
+        source.write_all(b"payload").expect("write checksum source");
+        let checksum =
+            ObjectChecksum::new(ChecksumAlgorithm::Sha256, sha256_checksum(b"different"))
+                .expect("valid checksum");
+
+        let error = client
+            .put_object_from_path_with_options(
+                &path,
+                source.path(),
+                &ObjectWriteOptions {
+                    checksum: Some(ChecksumRequest::Precomputed(checksum)),
+                    ..ObjectWriteOptions::default()
+                },
+                |_| {},
+            )
+            .await
+            .expect_err("path checksum rejection must remain typed");
+
+        assert!(matches!(error, Error::Conflict(_)));
+        assert_eq!(replay.actual_requests().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn transfer_head_accepts_valid_composite_sha256() {
+        let composite = format!("{}-2", sha256_checksum(b"part digests"));
+        let response = http::Response::builder()
+            .status(200)
+            .header("content-length", "12")
+            .header("x-amz-checksum-sha256", &composite)
+            .header("x-amz-checksum-type", "COMPOSITE")
+            .body(SdkBody::empty())
+            .expect("build composite checksum response");
+        let (client, requests) = test_s3_client(Some(response));
+        let path = RemotePath::new("test", "bucket", "file.txt");
+
+        let metadata = client
+            .head_object_transfer_metadata(
+                &path,
+                &TransferReadOptions {
+                    checksum_mode: true,
+                    ..TransferReadOptions::default()
+                },
+            )
+            .await
+            .expect("read composite checksum");
+        assert_eq!(metadata.checksums[0].value, composite);
+        let request = requests.expect_request();
+        assert_eq!(
+            request.headers().get("x-amz-checksum-mode"),
+            Some("ENABLED")
+        );
+    }
+
+    #[tokio::test]
+    async fn transfer_head_rejects_checksum_type_encoding_mismatches() {
+        let plain = sha256_checksum(b"payload");
+        let composite = format!("{plain}-2");
+        for (checksum_type, value) in [
+            ("COMPOSITE", plain.as_str()),
+            ("FULL_OBJECT", composite.as_str()),
+        ] {
+            let response = http::Response::builder()
+                .status(200)
+                .header("content-length", "7")
+                .header("x-amz-checksum-sha256", value)
+                .header("x-amz-checksum-type", checksum_type)
+                .body(SdkBody::empty())
+                .expect("build mismatched checksum response");
+            let (client, requests) = test_s3_client(Some(response));
+            let path = RemotePath::new("test", "bucket", "file.txt");
+
+            let error = client
+                .head_object_transfer_metadata(
+                    &path,
+                    &TransferReadOptions {
+                        checksum_mode: true,
+                        ..TransferReadOptions::default()
+                    },
+                )
+                .await
+                .expect_err("checksum type mismatch must not be accepted");
+            assert!(matches!(error, Error::General(_)));
+            requests.expect_request();
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_advanced_transfers_reject_before_backend_requests() {
+        let path = RemotePath::new("test", "bucket", "file.txt");
+
+        let (put_client, put_requests) = test_s3_client(None);
+        let put_store: &dyn ObjectStore = &put_client;
+        let put_error = put_store
+            .put_object_with_options(
+                &path,
+                b"payload".to_vec(),
+                &ObjectWriteOptions {
+                    checksum: Some(ChecksumRequest::Calculate(ChecksumAlgorithm::Sha1)),
+                    ..ObjectWriteOptions::default()
+                },
+            )
+            .await
+            .expect_err("unsupported checksum must fail before mutation");
         assert!(matches!(put_error, Error::UnsupportedFeature(_)));
         put_requests.expect_no_request();
+
+        let (checksum_copy_client, checksum_copy_requests) = test_s3_client(None);
+        let checksum_copy_error = checksum_copy_client
+            .copy_object_with_transfer_options(
+                &path,
+                &RemotePath::new("test", "bucket", "checksum-copy.txt"),
+                &TransferCopyOptions {
+                    destination: ObjectWriteOptions {
+                        checksum: Some(ChecksumRequest::Calculate(ChecksumAlgorithm::Sha256)),
+                        ..ObjectWriteOptions::default()
+                    },
+                    ..TransferCopyOptions::default()
+                },
+            )
+            .await
+            .expect_err("beta.10 copy checksum must fail before mutation");
+        assert!(matches!(checksum_copy_error, Error::UnsupportedFeature(_)));
+        checksum_copy_requests.expect_no_request();
 
         let (read_client, read_requests) = test_s3_client(None);
         let read_store: &dyn ObjectStore = &read_client;

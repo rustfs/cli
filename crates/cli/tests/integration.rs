@@ -218,6 +218,84 @@ fn cleanup_bucket(config_dir: &std::path::Path, bucket: &str) {
     let _ = run_rc(&["rb", &format!("test/{}", bucket)], config_dir);
 }
 
+mod checksum_operations {
+    use super::*;
+    use rc_core::{
+        Alias, ChecksumAlgorithm, ChecksumRequest, Error, ObjectChecksum, ObjectStore,
+        ObjectWriteOptions, RemotePath,
+    };
+    use rc_s3::S3Client;
+
+    fn checksum_alias() -> Alias {
+        let (endpoint, access_key, secret_key) =
+            get_test_config().expect("S3 integration test setup failed");
+        let mut alias = Alias::new("test", endpoint, access_key, secret_key);
+        alias.bucket_lookup = "path".to_string();
+        alias
+    }
+
+    #[tokio::test]
+    async fn test_beta10_checksum_put_multipart_and_rejection() {
+        let (config_dir, bucket_name) =
+            setup_with_alias("checksum").expect("S3 integration test setup failed");
+        let client = S3Client::new(checksum_alias())
+            .await
+            .expect("create checksum test client");
+        let write = ObjectWriteOptions {
+            checksum: Some(ChecksumRequest::Calculate(ChecksumAlgorithm::Sha256)),
+            ..ObjectWriteOptions::default()
+        };
+
+        let put_path = RemotePath::new("test", &bucket_name, "checksum-put.bin");
+        client
+            .put_object_with_options(&put_path, b"rustfs-checksum".to_vec(), &write)
+            .await
+            .expect("beta.10 PutObject checksum should persist and verify");
+
+        let multipart_path = RemotePath::new("test", &bucket_name, "checksum-multipart.bin");
+        let multipart_source =
+            tempfile::NamedTempFile::new().expect("create multipart checksum source");
+        multipart_source
+            .as_file()
+            .set_len(5 * 1024 * 1024 + 1)
+            .expect("size multipart checksum source");
+        client
+            .put_object_from_path_with_options(
+                &multipart_path,
+                multipart_source.path(),
+                &write,
+                |_| {},
+            )
+            .await
+            .expect("beta.10 multipart checksum should persist and verify");
+
+        let rejected_path = RemotePath::new("test", &bucket_name, "checksum-rejected.bin");
+        let invalid_checksum = ObjectChecksum::new(
+            ChecksumAlgorithm::Sha256,
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        )
+        .expect("valid precomputed checksum encoding");
+        let rejection = client
+            .put_object_with_options(
+                &rejected_path,
+                b"not-thirty-two-zero-bytes".to_vec(),
+                &ObjectWriteOptions {
+                    checksum: Some(ChecksumRequest::Precomputed(invalid_checksum)),
+                    ..ObjectWriteOptions::default()
+                },
+            )
+            .await
+            .expect_err("beta.10 must reject a mismatched checksum");
+        assert!(matches!(rejection, Error::Conflict(_)));
+        assert!(matches!(
+            client.head_object(&rejected_path).await,
+            Err(Error::NotFound(_))
+        ));
+
+        cleanup_bucket(config_dir.path(), &bucket_name);
+    }
+}
+
 mod bucket_operations {
     use super::*;
 

@@ -14,6 +14,8 @@ use crate::object_lock::{LegalHoldStatus, ObjectRetention};
 use crate::traits::{CopyObjectOptions, ObjectReadOptions};
 use crate::{Error, Result};
 
+const S3_MULTIPART_CHECKSUM_MAX_PARTS: u32 = 10_000;
+
 /// Standard HTTP object attributes and user-defined metadata.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ObjectAttributes {
@@ -162,6 +164,54 @@ impl ObjectChecksum {
             value: value.into(),
         };
         checksum.validate()?;
+        Ok(checksum)
+    }
+
+    /// Build a checksum reported by a metadata read.
+    ///
+    /// Multipart SHA and CRC checksums use the S3 composite form
+    /// `<base64-digest>-<part-count>`, which is not valid as a precomputed
+    /// full-object write checksum.
+    pub fn new_persisted(algorithm: ChecksumAlgorithm, value: impl Into<String>) -> Result<Self> {
+        let checksum = Self {
+            algorithm,
+            value: value.into(),
+        };
+        if checksum.validate().is_ok() {
+            return Ok(checksum);
+        }
+
+        let (digest, part_count) = checksum.value.rsplit_once('-').ok_or_else(|| {
+            Error::InvalidPath("Persisted object checksum is not valid Base64".to_string())
+        })?;
+        let part_count = part_count.parse::<u32>().map_err(|_| {
+            Error::InvalidPath(
+                "Composite checksum part count must be a positive integer".to_string(),
+            )
+        })?;
+        if part_count == 0
+            || part_count > S3_MULTIPART_CHECKSUM_MAX_PARTS
+            || checksum.algorithm == ChecksumAlgorithm::Crc64Nvme
+        {
+            return Err(Error::InvalidPath(
+                "Persisted composite checksum is not valid for this algorithm".to_string(),
+            ));
+        }
+        let decoded = BASE64_STANDARD.decode(digest).map_err(|_| {
+            Error::InvalidPath("Composite checksum digest must be valid Base64".to_string())
+        })?;
+        let expected_length = match checksum.algorithm {
+            ChecksumAlgorithm::Crc32 | ChecksumAlgorithm::Crc32c => 4,
+            ChecksumAlgorithm::Sha1 => 20,
+            ChecksumAlgorithm::Sha256 => 32,
+            ChecksumAlgorithm::Crc64Nvme => 8,
+        };
+        if decoded.len() != expected_length {
+            return Err(Error::InvalidPath(format!(
+                "Composite checksum for {:?} must decode to {expected_length} bytes",
+                checksum.algorithm
+            )));
+        }
         Ok(checksum)
     }
 
@@ -492,6 +542,33 @@ impl TransferCopyOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persisted_checksums_accept_valid_composite_values_only() {
+        let digest = BASE64_STANDARD.encode([7_u8; 32]);
+        let checksum =
+            ObjectChecksum::new_persisted(ChecksumAlgorithm::Sha256, format!("{digest}-3"))
+                .expect("valid composite checksum");
+        assert_eq!(checksum.value, format!("{digest}-3"));
+
+        for value in [
+            format!("{digest}-0"),
+            format!("{digest}-10001"),
+            format!("{digest}-not-a-number"),
+        ] {
+            assert!(matches!(
+                ObjectChecksum::new_persisted(ChecksumAlgorithm::Sha256, value),
+                Err(Error::InvalidPath(_))
+            ));
+        }
+        assert!(matches!(
+            ObjectChecksum::new_persisted(
+                ChecksumAlgorithm::Crc64Nvme,
+                format!("{}-2", BASE64_STANDARD.encode([3_u8; 8]))
+            ),
+            Err(Error::InvalidPath(_))
+        ));
+    }
 
     #[test]
     fn advanced_reads_cannot_fall_through_to_legacy_backends() {
