@@ -321,8 +321,8 @@ mod atomic_object_lock_operations {
     use super::*;
     use rc_core::{
         Alias, CreateBucketOptions, DeleteRequestOptions, LegalHoldStatus, ObjectLockOptions,
-        ObjectRetention, ObjectStore, ObjectWriteOptions, RemotePath, RetentionMode,
-        TransferCopyOptions,
+        ObjectRetention, ObjectStore, ObjectVersionIdentifier, ObjectWriteOptions, RemotePath,
+        RetentionMode, TransferCopyOptions,
     };
     use rc_s3::S3Client;
 
@@ -349,28 +349,22 @@ mod atomic_object_lock_operations {
         }
     }
 
-    async fn clear_and_delete_locked_version(
+    async fn clear_locked_version(
         client: &S3Client,
         path: &RemotePath,
         version_id: String,
-    ) {
+    ) -> ObjectVersionIdentifier {
         let lock_options =
             ObjectLockOptions::new(Some(version_id.clone()), true).expect("valid lock selection");
         client
             .put_object_legal_hold(path, LegalHoldStatus::Off, &lock_options)
             .await
             .expect("clear legal hold");
-        client
-            .delete_object_with_options(
-                path,
-                DeleteRequestOptions {
-                    version_id: Some(version_id),
-                    bypass_governance: true,
-                    force_delete: true,
-                },
-            )
-            .await
-            .expect("delete unlocked object version");
+        ObjectVersionIdentifier {
+            key: path.key.clone(),
+            version_id: Some(version_id),
+            is_delete_marker: false,
+        }
     }
 
     #[tokio::test]
@@ -490,9 +484,29 @@ mod atomic_object_lock_operations {
         );
 
         tokio::time::sleep(Duration::from_secs(6)).await;
-        clear_and_delete_locked_version(&client, &put_path, put_version).await;
-        clear_and_delete_locked_version(&client, &copy_path, copy_version).await;
-        clear_and_delete_locked_version(&client, &multipart_path, multipart_version).await;
+        let locked_versions = vec![
+            clear_locked_version(&client, &put_path, put_version).await,
+            clear_locked_version(&client, &copy_path, copy_version).await,
+            clear_locked_version(&client, &multipart_path, multipart_version).await,
+        ];
+        let cleanup = client
+            .delete_object_versions_with_options(
+                &bucket_name,
+                locked_versions,
+                DeleteRequestOptions {
+                    version_id: None,
+                    bypass_governance: true,
+                    force_delete: true,
+                },
+            )
+            .await
+            .expect("delete unlocked object versions");
+        assert!(
+            cleanup.failures.is_empty(),
+            "all unlocked object versions must be deleted: {:?}",
+            cleanup.failures
+        );
+        assert_eq!(cleanup.deleted.len(), 3);
         client
             .delete_bucket(&bucket_name)
             .await
