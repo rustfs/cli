@@ -66,9 +66,9 @@ jobs:
               -out "$PWD/tls/rustfs_cert.pem" \
               -subj "/CN=localhost" \
               -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
-            sudo chown 10001:10001 "$PWD/tls/rustfs_key.pem"
             chmod 0600 "$PWD/tls/rustfs_key.pem"
             chmod 0644 "$PWD/tls/rustfs_cert.pem"
+            sudo chown 10001:10001 "$PWD/tls/rustfs_key.pem"
             tls_args+=(
               -v "$PWD/tls:/opt/tls:ro"
               -e RUSTFS_TLS_PATH=/opt/tls
@@ -196,9 +196,9 @@ jobs:
             -out "$PWD/tls/rustfs_cert.pem" \
             -subj "/CN=localhost" \
             -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
-          sudo chown 10001:10001 "$PWD/tls/rustfs_key.pem"
           chmod 0600 "$PWD/tls/rustfs_key.pem"
           chmod 0644 "$PWD/tls/rustfs_cert.pem"
+          sudo chown 10001:10001 "$PWD/tls/rustfs_key.pem"
           {
             echo "TEST_S3_ENDPOINT=https://localhost:9000"
             echo "TEST_S3_CA_BUNDLE=$PWD/tls/rustfs_cert.pem"
