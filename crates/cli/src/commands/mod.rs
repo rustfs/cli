@@ -49,6 +49,7 @@ mod sql;
 mod stat;
 mod tag;
 mod tree;
+mod undo;
 mod version;
 mod watch;
 
@@ -253,6 +254,9 @@ pub enum Commands {
     /// Deprecated: use `rc object remove`
     Rm(rm::RmArgs),
 
+    /// Restore a versioned PUT or DELETE operation without removing data history
+    Undo(undo::UndoArgs),
+
     /// Stream stdin to an object
     Pipe(pipe::PipeArgs),
 
@@ -416,6 +420,13 @@ pub async fn execute(cli: Cli) -> ExitCode {
         }
         Commands::Rm(args) => {
             rm::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
+        Commands::Undo(args) => {
+            undo::execute(
+                args,
+                output_options.resolve(OutputBehavior::StructuredDefault),
+            )
+            .await
         }
         Commands::Pipe(args) => {
             pipe::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await

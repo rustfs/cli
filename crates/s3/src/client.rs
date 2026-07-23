@@ -31,14 +31,15 @@ pub use rc_core::DeleteRequestOptions;
 use rc_core::admin::KmsDiagnosticStore;
 use rc_core::{
     Alias, BucketEncryption, BucketNotification, BucketObjectLockConfiguration, Capabilities,
-    CorsRule, CreateBucketOptions, DefaultRetention, DeleteObjectFailure, DeleteObjectsResult,
-    DeletedObject, Error, LegalHoldStatus, LifecycleRule, ListObjectVersionsOptions, ListOptions,
-    ListResult, NotificationTarget, ObjectEncryptionRequest, ObjectInfo, ObjectLockOptions,
-    ObjectReadOptions, ObjectRetention, ObjectStore, ObjectVersion, ObjectVersionIdentifier,
-    ObjectVersionListResult, RemotePath, ReplicationConfiguration, ReplicationResyncStartOptions,
-    ReplicationResyncStartResult, ReplicationResyncState, ReplicationResyncStatus,
-    ReplicationResyncTargetStatus, RequestHeader, Result, RetentionDuration, RetentionDurationUnit,
-    RetentionMode, SelectOptions, global_request_headers,
+    CopyObjectOptions, CorsRule, CreateBucketOptions, DefaultRetention, DeleteObjectFailure,
+    DeleteObjectsResult, DeletedObject, Error, LegalHoldStatus, LifecycleRule,
+    ListObjectVersionsOptions, ListOptions, ListResult, NotificationTarget,
+    ObjectEncryptionRequest, ObjectInfo, ObjectLockOptions, ObjectReadOptions, ObjectRetention,
+    ObjectStore, ObjectVersion, ObjectVersionIdentifier, ObjectVersionListResult, RemotePath,
+    ReplicationConfiguration, ReplicationResyncStartOptions, ReplicationResyncStartResult,
+    ReplicationResyncState, ReplicationResyncStatus, ReplicationResyncTargetStatus, RequestHeader,
+    Result, RetentionDuration, RetentionDurationUnit, RetentionMode, SelectOptions,
+    global_request_headers,
 };
 use reqwest::Method;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
@@ -595,6 +596,23 @@ fn apply_object_encryption_to_copy_request(
             .ssekms_key_id(key_id),
         None => request,
     }
+}
+
+fn encoded_copy_source(src: &RemotePath, source_version_id: Option<&str>) -> String {
+    let encoded_key = src
+        .key
+        .split('/')
+        .map(|segment| urlencoding::encode(segment).into_owned())
+        .collect::<Vec<_>>()
+        .join("/");
+    let mut copy_source = format!("{}/{encoded_key}", urlencoding::encode(&src.bucket));
+
+    if let Some(version_id) = source_version_id {
+        copy_source.push_str("?versionId=");
+        copy_source.push_str(&urlencoding::encode(version_id));
+    }
+
+    copy_source
 }
 
 fn sdk_retention_mode(mode: RetentionMode) -> aws_sdk_s3::types::ObjectLockRetentionMode {
@@ -1291,7 +1309,7 @@ impl S3Client {
                 is_delete_marker: false,
                 last_modified: v
                     .last_modified()
-                    .and_then(|dt| Timestamp::from_second(dt.secs()).ok()),
+                    .and_then(|timestamp| core_timestamp(timestamp).ok()),
                 size_bytes: v.size(),
                 etag: v.e_tag().map(|s| s.trim_matches('"').to_string()),
             });
@@ -1305,7 +1323,7 @@ impl S3Client {
                 is_delete_marker: true,
                 last_modified: m
                     .last_modified()
-                    .and_then(|dt| Timestamp::from_second(dt.secs()).ok()),
+                    .and_then(|timestamp| core_timestamp(timestamp).ok()),
                 size_bytes: None,
                 etag: None,
             });
@@ -3576,9 +3594,18 @@ impl ObjectStore for S3Client {
         dst: &RemotePath,
         encryption: Option<&ObjectEncryptionRequest>,
     ) -> Result<ObjectInfo> {
-        // Build copy source: bucket/key
-        let copy_source = format!("{}/{}", src.bucket, src.key);
+        self.copy_object_with_options(src, dst, &CopyObjectOptions::default(), encryption)
+            .await
+    }
 
+    async fn copy_object_with_options(
+        &self,
+        src: &RemotePath,
+        dst: &RemotePath,
+        options: &CopyObjectOptions,
+        encryption: Option<&ObjectEncryptionRequest>,
+    ) -> Result<ObjectInfo> {
+        let copy_source = encoded_copy_source(src, options.source_version_id.as_deref());
         let response = apply_object_encryption_to_copy_request(
             self.inner
                 .copy_object()
@@ -3589,13 +3616,8 @@ impl ObjectStore for S3Client {
         )
         .send()
         .await
-        .map_err(|e| {
-            let err_str = e.to_string();
-            if err_str.contains("NotFound") || err_str.contains("NoSuchKey") {
-                Error::NotFound(src.to_string())
-            } else {
-                Error::Network(err_str)
-            }
+        .map_err(|error| {
+            Self::map_object_request_error(&error, src, options.source_version_id.as_deref())
         })?;
 
         // Get size from head_object since copy doesn't return it
@@ -7308,6 +7330,131 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn copy_object_url_encodes_source_path() {
+        let response = http::Response::builder()
+            .status(500)
+            .header("x-amz-error-code", "InternalError")
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error>
+  <Code>InternalError</Code>
+  <Message>Something went wrong.</Message>
+</Error>"#,
+            ))
+            .expect("build copy object response");
+        let (client, request_receiver) = test_s3_client(Some(response));
+        let src = RemotePath::new("test", "source-bucket", "dir one/a+b?#.txt");
+        let dst = RemotePath::new("test", "destination-bucket", "dst.txt");
+
+        let _ = client.copy_object(&src, &dst, None).await;
+
+        let request = request_receiver.expect_request();
+        assert_eq!(
+            request.headers().get("x-amz-copy-source"),
+            Some("source-bucket/dir%20one/a%2Bb%3F%23.txt")
+        );
+    }
+
+    #[tokio::test]
+    async fn copy_object_with_options_selects_url_encoded_source_version() {
+        let response = http::Response::builder()
+            .status(500)
+            .header("x-amz-error-code", "InternalError")
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error>
+  <Code>InternalError</Code>
+  <Message>Something went wrong.</Message>
+</Error>"#,
+            ))
+            .expect("build copy object response");
+        let (client, request_receiver) = test_s3_client(Some(response));
+        let src = RemotePath::new("test", "source-bucket", "dir one/a+b?#.txt");
+        let dst = RemotePath::new("test", "destination-bucket", "dst.txt");
+        let options = CopyObjectOptions::for_source_version(Some("v 1+/=?#%".to_string()))
+            .expect("valid source version ID");
+
+        let _ = client
+            .copy_object_with_options(&src, &dst, &options, None)
+            .await;
+
+        let request = request_receiver.expect_request();
+        assert_eq!(
+            request.headers().get("x-amz-copy-source"),
+            Some("source-bucket/dir%20one/a%2Bb%3F%23.txt?versionId=v%201%2B%2F%3D%3F%23%25")
+        );
+    }
+
+    #[tokio::test]
+    async fn copy_object_with_options_preserves_source_and_destination_versions() {
+        let copy_response = http::Response::builder()
+            .status(200)
+            .header("content-type", "application/xml")
+            .header("x-amz-version-id", "destination-v3")
+            .header("x-amz-copy-source-version-id", "source-v1")
+            .body(SdkBody::from(
+                r#"<CopyObjectResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><ETag>"copied-etag"</ETag><LastModified>2026-07-23T00:00:00Z</LastModified></CopyObjectResult>"#,
+            ))
+            .expect("build copy object response");
+        let head_response = http::Response::builder()
+            .status(200)
+            .header("content-length", "7")
+            .header("etag", "\"copied-etag\"")
+            .header("x-amz-version-id", "destination-v3")
+            .body(SdkBody::empty())
+            .expect("build head object response");
+        let (client, replay) =
+            test_s3_client_with_response_sequence(vec![copy_response, head_response]);
+        let src = RemotePath::new("test", "source-bucket", "src.txt");
+        let dst = RemotePath::new("test", "destination-bucket", "dst.txt");
+        let options = CopyObjectOptions::for_source_version(Some("source-v1".to_string()))
+            .expect("valid source version ID");
+
+        let result = client
+            .copy_object_with_options(&src, &dst, &options, None)
+            .await
+            .expect("copy exact source version");
+
+        assert_eq!(result.version_id.as_deref(), Some("destination-v3"));
+        assert_eq!(result.source_version_id.as_deref(), Some("source-v1"));
+        assert_eq!(result.etag.as_deref(), Some("copied-etag"));
+        let requests = replay.actual_requests().collect::<Vec<_>>();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].headers().get("x-amz-copy-source"),
+            Some("source-bucket/src.txt?versionId=source-v1")
+        );
+    }
+
+    #[tokio::test]
+    async fn copy_object_with_options_maps_missing_source_version() {
+        let response = http::Response::builder()
+            .status(404)
+            .header("x-amz-error-code", "NoSuchVersion")
+            .body(SdkBody::from(
+                "<Error><Code>NoSuchVersion</Code><Message>missing</Message></Error>",
+            ))
+            .expect("build missing source version response");
+        let (client, _) = test_s3_client(Some(response));
+        let src = RemotePath::new("test", "source-bucket", "src.txt");
+        let dst = RemotePath::new("test", "destination-bucket", "dst.txt");
+        let options = CopyObjectOptions::for_source_version(Some("missing-v1".to_string()))
+            .expect("valid source version ID");
+
+        let result = client
+            .copy_object_with_options(&src, &dst, &options, None)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(Error::VersionNotFound {
+                version_id,
+                ..
+            }) if version_id == "missing-v1"
+        ));
+    }
+
+    #[tokio::test]
     async fn delete_object_wrapper_uses_default_options_without_rustfs_header() {
         let (client, request_receiver) = test_s3_client(None);
         let path = RemotePath::new("test", "bucket", "key.txt");
@@ -7453,6 +7600,57 @@ mod tests {
         assert!(delete_marker.is_delete_marker);
         assert_eq!(delete_marker.size_bytes, None);
         assert_eq!(delete_marker.etag, None);
+    }
+
+    #[tokio::test]
+    async fn list_object_versions_orders_same_second_entries_by_nanoseconds() {
+        let response = http::Response::builder()
+            .status(200)
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListVersionsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>bucket</Name>
+  <Prefix>logs/a.txt</Prefix>
+  <MaxKeys>25</MaxKeys>
+  <IsTruncated>false</IsTruncated>
+  <Version>
+    <Key>logs/a.txt</Key>
+    <VersionId>data-v1</VersionId>
+    <IsLatest>false</IsLatest>
+    <LastModified>2026-07-23T03:00:00.100Z</LastModified>
+    <ETag>"etag-a"</ETag>
+    <Size>12</Size>
+    <StorageClass>STANDARD</StorageClass>
+  </Version>
+  <DeleteMarker>
+    <Key>logs/a.txt</Key>
+    <VersionId>marker-v2</VersionId>
+    <IsLatest>true</IsLatest>
+    <LastModified>2026-07-23T03:00:00.900Z</LastModified>
+  </DeleteMarker>
+</ListVersionsResult>"#,
+            ))
+            .expect("build list object versions response");
+        let (client, _) = test_s3_client(Some(response));
+        let path = RemotePath::new("test", "bucket", "logs/a.txt");
+
+        let result = client
+            .list_object_versions_page(&path, Some(25))
+            .await
+            .expect("list object versions page");
+
+        assert_eq!(
+            result
+                .items
+                .iter()
+                .map(|version| version.version_id.as_str())
+                .collect::<Vec<_>>(),
+            ["marker-v2", "data-v1"]
+        );
+        assert!(
+            result.items[0].last_modified > result.items[1].last_modified,
+            "nanosecond precision must be preserved for safe undo ordering"
+        );
     }
 
     #[tokio::test]

@@ -24,6 +24,7 @@ pub mod retry;
 pub mod select;
 pub mod traits;
 pub mod transfer;
+pub mod undo;
 pub mod watch;
 
 pub use alias::{
@@ -60,7 +61,7 @@ pub use select::{
     SelectSseCustomerOptions,
 };
 pub use traits::{
-    BucketNotification, Capabilities, CreateBucketOptions, DeleteObjectFailure,
+    BucketNotification, Capabilities, CopyObjectOptions, CreateBucketOptions, DeleteObjectFailure,
     DeleteObjectsResult, DeleteRequestOptions, DeletedObject, ListObjectVersionsOptions,
     ListOptions, ListResult, NotificationTarget, ObjectInfo, ObjectReadOptions, ObjectStore,
     ObjectVersion, ObjectVersionIdentifier, ObjectVersionListResult,
@@ -68,5 +69,8 @@ pub use traits::{
 pub use transfer::{
     TransferCandidate, TransferControls, TransferExecutor, TransferOutcome, TransferOutcomeState,
     TransferPlan, TransferReport, TransferSelection, TransferSummary,
+};
+pub use undo::{
+    UndoAction, UndoObjectResult, UndoOutcome, UndoPlan, UndoPlanItem, plan_object_undo,
 };
 pub use watch::{WatchApi, WatchEvent, WatchFrame, WatchRequest, WatchSource, WatchStream};

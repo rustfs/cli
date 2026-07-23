@@ -124,6 +124,25 @@ pub struct ObjectReadOptions {
     pub version_id: Option<String>,
 }
 
+/// Request options for a server-side object copy.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CopyObjectOptions {
+    /// Exact historical source version to copy. `None` selects the current source.
+    pub source_version_id: Option<String>,
+}
+
+impl CopyObjectOptions {
+    /// Build copy options while rejecting an ambiguous empty source version identifier.
+    pub fn for_source_version(source_version_id: Option<String>) -> Result<Self> {
+        if source_version_id.as_deref().is_some_and(str::is_empty) {
+            return Err(Error::InvalidPath(
+                "Source version ID cannot be empty".to_string(),
+            ));
+        }
+        Ok(Self { source_version_id })
+    }
+}
+
 impl ObjectReadOptions {
     /// Build read options while rejecting ambiguous empty version identifiers.
     pub fn for_version(version_id: Option<String>) -> Result<Self> {
@@ -566,6 +585,23 @@ pub trait ObjectStore: Send + Sync {
         dst: &RemotePath,
         encryption: Option<&ObjectEncryptionRequest>,
     ) -> Result<ObjectInfo>;
+
+    /// Copy the current object or one exact historical source version.
+    async fn copy_object_with_options(
+        &self,
+        src: &RemotePath,
+        dst: &RemotePath,
+        options: &CopyObjectOptions,
+        encryption: Option<&ObjectEncryptionRequest>,
+    ) -> Result<ObjectInfo> {
+        if options.source_version_id.is_some() {
+            return Err(Error::UnsupportedFeature(
+                "Exact-version server-side copy is not implemented by this object store"
+                    .to_string(),
+            ));
+        }
+        self.copy_object(src, dst, encryption).await
+    }
 
     /// Generate a presigned URL for an object
     async fn presign_get(&self, path: &RemotePath, expires_secs: u64) -> Result<String>;
