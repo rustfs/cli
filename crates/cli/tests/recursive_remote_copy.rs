@@ -458,6 +458,346 @@ fn single_copy_and_pipe_send_supported_storage_classes() {
 }
 
 #[test]
+fn transfer_fidelity_options_reach_copy_upload_and_pipe_requests() {
+    let mock = S3Mock::start(|request| {
+        if request.method == "HEAD" && request.target == "/source/a.txt" {
+            return Response::head_with_etag(7, "source-etag");
+        }
+        if is_copy_request(request) {
+            return copy_result();
+        }
+        if request.method == "HEAD" && request.target == "/destination/preserved.txt" {
+            return Response::head_with_etag(7, "destination-etag");
+        }
+        if request.method == "HEAD" && request.target == "/destination/upload.txt" {
+            return Response {
+                status: "200 OK",
+                headers: vec![
+                    ("content-length", "7".to_string()),
+                    ("etag", "\"destination-etag\"".to_string()),
+                    (
+                        "x-amz-checksum-sha256",
+                        "I59Z7VXnN8dxR89VrQwbAwttfudIp0JpUvm4UtWpNeU=".to_string(),
+                    ),
+                ],
+                body: String::new(),
+            };
+        }
+        if request.method == "PUT"
+            && (request.target.starts_with("/destination/upload.txt")
+                || request.target.starts_with("/destination/pipe.txt"))
+        {
+            return Response::empty();
+        }
+        Response {
+            status: "500 Internal Server Error",
+            headers: Vec::new(),
+            body: "<Error><Code>UnexpectedRequest</Code></Error>".to_string(),
+        }
+    });
+
+    let copy = run_rc(
+        &mock,
+        &[
+            "cp",
+            "test/source/a.txt",
+            "test/destination/preserved.txt",
+            "--preserve",
+            "--retention-mode",
+            "GOVERNANCE",
+            "--retain-until",
+            "2099-01-02T03:04:05Z",
+            "--legal-hold",
+            "ON",
+        ],
+    );
+    assert!(
+        copy.status.success(),
+        "stdout: {}\nstderr: {}\nrequests: {:#?}",
+        String::from_utf8_lossy(&copy.stdout),
+        String::from_utf8_lossy(&copy.stderr),
+        mock.requests()
+    );
+
+    let source_dir = tempfile::tempdir().expect("create upload source directory");
+    let source = source_dir.path().join("upload.txt");
+    std::fs::write(&source, b"payload").expect("write upload source");
+    let upload = run_rc(
+        &mock,
+        &[
+            "cp",
+            source.to_str().expect("source path is valid UTF-8"),
+            "test/destination/upload.txt",
+            "--cache-control",
+            "max-age=3600",
+            "--content-language",
+            "en-US",
+            "--expires",
+            "2099-01-02T03:04:05Z",
+            "--metadata",
+            "owner=analytics",
+            "--tags",
+            "env=prod",
+            "--checksum",
+            "sha256",
+            "--retention-mode",
+            "GOVERNANCE",
+            "--retain-until",
+            "2099-01-02T03:04:05Z",
+            "--legal-hold",
+            "ON",
+        ],
+    );
+    assert!(
+        upload.status.success(),
+        "stdout: {}\nstderr: {}\nrequests: {:#?}",
+        String::from_utf8_lossy(&upload.stdout),
+        String::from_utf8_lossy(&upload.stderr),
+        mock.requests()
+    );
+
+    let pipe = run_rc_with_stdin(
+        &mock,
+        &[
+            "pipe",
+            "test/destination/pipe.txt",
+            "--cache-control",
+            "no-cache",
+            "--metadata",
+            "source=stdin",
+            "--tags",
+            "stream=true",
+        ],
+        b"payload",
+    );
+    assert!(
+        pipe.status.success(),
+        "stdout: {}\nstderr: {}\nrequests: {:#?}",
+        String::from_utf8_lossy(&pipe.stdout),
+        String::from_utf8_lossy(&pipe.stderr),
+        mock.requests()
+    );
+
+    let requests = mock.requests();
+    let copy_request = requests
+        .iter()
+        .find(|request| is_copy_request(request))
+        .expect("copy request");
+    assert_eq!(
+        copy_request.headers.get("x-amz-metadata-directive"),
+        Some(&"COPY".to_string())
+    );
+    assert_eq!(
+        copy_request.headers.get("x-amz-object-lock-mode"),
+        Some(&"GOVERNANCE".to_string())
+    );
+    assert_eq!(
+        copy_request.headers.get("x-amz-object-lock-legal-hold"),
+        Some(&"ON".to_string())
+    );
+
+    let upload_request = requests
+        .iter()
+        .find(|request| {
+            request.method == "PUT" && request.target.starts_with("/destination/upload.txt")
+        })
+        .expect("upload request");
+    assert_eq!(
+        upload_request.headers.get("cache-control"),
+        Some(&"max-age=3600".to_string())
+    );
+    assert_eq!(
+        upload_request.headers.get("content-language"),
+        Some(&"en-US".to_string())
+    );
+    assert_eq!(
+        upload_request.headers.get("x-amz-meta-owner"),
+        Some(&"analytics".to_string())
+    );
+    assert_eq!(
+        upload_request.headers.get("x-amz-tagging"),
+        Some(&"env=prod".to_string())
+    );
+    assert_eq!(
+        upload_request.headers.get("x-amz-sdk-checksum-algorithm"),
+        Some(&"SHA256".to_string())
+    );
+    assert_eq!(
+        upload_request.headers.get("x-amz-object-lock-mode"),
+        Some(&"GOVERNANCE".to_string())
+    );
+    assert_eq!(
+        upload_request.headers.get("x-amz-object-lock-legal-hold"),
+        Some(&"ON".to_string())
+    );
+
+    let pipe_request = requests
+        .iter()
+        .find(|request| {
+            request.method == "PUT" && request.target.starts_with("/destination/pipe.txt")
+        })
+        .expect("pipe request");
+    assert_eq!(
+        pipe_request.headers.get("cache-control"),
+        Some(&"no-cache".to_string())
+    );
+    assert_eq!(
+        pipe_request.headers.get("x-amz-meta-source"),
+        Some(&"stdin".to_string())
+    );
+    assert_eq!(
+        pipe_request.headers.get("x-amz-tagging"),
+        Some(&"stream=true".to_string())
+    );
+}
+
+#[test]
+fn fidelity_preflight_returns_stable_exit_codes_and_redacts_dry_run_secrets() {
+    let mock = S3Mock::start(|_| Response {
+        status: "500 Internal Server Error",
+        headers: Vec::new(),
+        body: "<Error><Code>UnexpectedRequest</Code></Error>".to_string(),
+    });
+
+    for args in [
+        vec![
+            "cp",
+            "test/source/a.txt",
+            "test/destination/b.txt",
+            "--metadata-directive",
+            "replace",
+        ],
+        vec![
+            "cp",
+            "test/source/a.txt",
+            "test/destination/b.txt",
+            "--checksum",
+            "sha256",
+        ],
+        vec![
+            "cp",
+            "test/source/a.txt",
+            "test/destination/b.txt",
+            "--tagging-directive",
+            "copy",
+        ],
+    ] {
+        let output = run_rc(&mock, &args);
+        assert_eq!(
+            output.status.code(),
+            Some(7),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let source_dir = tempfile::tempdir().expect("create local source directory");
+    let source = source_dir.path().join("source.txt");
+    std::fs::write(&source, b"payload").expect("write local source");
+    let invalid_direction = run_rc(
+        &mock,
+        &[
+            "cp",
+            source.to_str().expect("source path is valid UTF-8"),
+            "test/destination/b.txt",
+            "--preserve",
+        ],
+    );
+    assert_eq!(invalid_direction.status.code(), Some(2));
+
+    let secret_path = "/definitely/missing/secret-transfer-key";
+    let dry_run = run_rc(
+        &mock,
+        &[
+            "cp",
+            "test/source/a.txt",
+            "test/destination/b.txt",
+            "--preserve",
+            "--enc-c-source-key-file",
+            secret_path,
+            "--enc-c-destination-key-file",
+            secret_path,
+            "--dry-run",
+        ],
+    );
+    assert!(
+        dry_run.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&dry_run.stdout),
+        String::from_utf8_lossy(&dry_run.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&dry_run.stdout),
+        String::from_utf8_lossy(&dry_run.stderr)
+    );
+    assert!(combined.contains("metadata=copy"));
+    assert!(combined.contains("encryption=sse-c"));
+    assert!(!combined.contains(secret_path));
+    assert!(
+        mock.requests().is_empty(),
+        "preflight and dry-run paths must not contact S3"
+    );
+}
+
+#[test]
+fn checksum_verification_mismatch_returns_conflict_exit_code() {
+    let mock = S3Mock::start(|request| {
+        if request.method == "PUT" && request.target.starts_with("/destination/checksum.txt") {
+            return Response::empty();
+        }
+        if request.method == "HEAD" && request.target == "/destination/checksum.txt" {
+            return Response {
+                status: "200 OK",
+                headers: vec![
+                    ("content-length", "7".to_string()),
+                    ("etag", "\"destination-etag\"".to_string()),
+                    (
+                        "x-amz-checksum-sha256",
+                        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
+                    ),
+                ],
+                body: String::new(),
+            };
+        }
+        Response {
+            status: "500 Internal Server Error",
+            headers: Vec::new(),
+            body: "<Error><Code>UnexpectedRequest</Code></Error>".to_string(),
+        }
+    });
+    let source_dir = tempfile::tempdir().expect("create checksum source directory");
+    let source = source_dir.path().join("checksum.txt");
+    std::fs::write(&source, b"payload").expect("write checksum source");
+
+    let output = run_rc(
+        &mock,
+        &[
+            "cp",
+            source.to_str().expect("source path is valid UTF-8"),
+            "test/destination/checksum.txt",
+            "--checksum",
+            "sha256",
+        ],
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(6),
+        "stdout: {}\nstderr: {}\nrequests: {:#?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        mock.requests()
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .to_ascii_lowercase()
+            .contains("checksum")
+    );
+}
+
+#[test]
 fn storage_class_dry_run_reports_policy_without_copy_mutation() {
     let mock = S3Mock::start(|request| {
         if request.method == "HEAD" && request.target == "/source/a.txt" {
@@ -488,7 +828,7 @@ fn storage_class_dry_run_reports_policy_without_copy_mutation() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(String::from_utf8_lossy(&output.stdout).contains("[storage-class=STANDARD]"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("[policy:storage-class=STANDARD]"));
     assert!(
         mock.requests()
             .iter()
@@ -967,7 +1307,15 @@ fn recursive_large_copy_uses_multipart_and_reports_abort_cleanup() {
             return large_object_list(LARGE_SIZE);
         }
         if request.method == "HEAD" && request.target == "/source/src/large.bin" {
-            return Response::head_with_etag(LARGE_SIZE as usize, "source-etag");
+            return Response {
+                status: "200 OK",
+                headers: vec![
+                    ("content-length", LARGE_SIZE.to_string()),
+                    ("etag", "\"source-etag\"".to_string()),
+                    ("x-amz-meta-owner", "analytics".to_string()),
+                ],
+                body: String::new(),
+            };
         }
         if request.method == "POST"
             && request.target.starts_with("/destination/dst/large.bin?")
@@ -1002,6 +1350,7 @@ fn recursive_large_copy_uses_multipart_and_reports_abort_cleanup() {
         &[
             "cp",
             "--recursive",
+            "--preserve",
             "--retry-attempts",
             "1",
             "test/source/src/",
@@ -1027,6 +1376,14 @@ fn recursive_large_copy_uses_multipart_and_reports_abort_cleanup() {
             .filter(|request| request.method == "POST")
             .count(),
         1
+    );
+    let create_request = requests
+        .iter()
+        .find(|request| request.method == "POST")
+        .expect("multipart create request");
+    assert_eq!(
+        create_request.headers.get("x-amz-meta-owner"),
+        Some(&"analytics".to_string())
     );
     assert_eq!(
         requests

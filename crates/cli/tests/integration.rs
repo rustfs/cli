@@ -268,10 +268,40 @@ mod checksum_operations {
         };
 
         let put_path = RemotePath::new("test", &bucket_name, "checksum-put.bin");
-        client
-            .put_object_with_options(&put_path, b"rustfs-checksum".to_vec(), &write)
+        let put_source = tempfile::NamedTempFile::new().expect("create checksum source");
+        std::fs::write(put_source.path(), b"rustfs-checksum").expect("write checksum source");
+        let put_target = format!("test/{bucket_name}/checksum-put.bin");
+        let put = run_rc(
+            &[
+                "cp",
+                put_source.path().to_str().expect("checksum path is UTF-8"),
+                &put_target,
+                "--checksum",
+                "sha256",
+                "--metadata",
+                "owner=cli",
+                "--tags",
+                "suite=beta10",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            put.status.success(),
+            "beta.10 CLI checksum upload failed: {}",
+            String::from_utf8_lossy(&put.stderr)
+        );
+        let put_info = client
+            .head_object(&put_path)
             .await
-            .expect("beta.10 PutObject checksum should persist and verify");
+            .expect("head CLI checksum upload");
+        assert_eq!(
+            put_info
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("owner"))
+                .map(String::as_str),
+            Some("cli")
+        );
 
         let multipart_path = RemotePath::new("test", &bucket_name, "checksum-multipart.bin");
         let multipart_source =
@@ -322,7 +352,7 @@ mod atomic_object_lock_operations {
     use rc_core::{
         Alias, CreateBucketOptions, DeleteRequestOptions, LegalHoldStatus, ObjectLockOptions,
         ObjectRetention, ObjectStore, ObjectVersionIdentifier, ObjectWriteOptions, RemotePath,
-        RetentionMode, TransferCopyOptions,
+        RetentionMode,
     };
     use rc_s3::S3Client;
 
@@ -385,14 +415,33 @@ mod atomic_object_lock_operations {
             .expect("short test retention remains representable");
 
         let put_path = RemotePath::new("test", &bucket_name, "locked-put.bin");
+        let put_source = tempfile::NamedTempFile::new().expect("create locked CLI source");
+        std::fs::write(put_source.path(), b"atomic-object-lock").expect("write locked CLI source");
+        let put_target = format!("test/{bucket_name}/locked-put.bin");
+        let retain_until_arg = retain_until.to_string();
+        let put = run_rc(
+            &[
+                "cp",
+                put_source.path().to_str().expect("locked path is UTF-8"),
+                &put_target,
+                "--retention-mode",
+                "GOVERNANCE",
+                "--retain-until",
+                &retain_until_arg,
+                "--legal-hold",
+                "ON",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            put.status.success(),
+            "beta.10 CLI object-lock upload failed: {}",
+            String::from_utf8_lossy(&put.stderr)
+        );
         let put = client
-            .put_object_with_options(
-                &put_path,
-                b"atomic-object-lock".to_vec(),
-                &locked_write(LegalHoldStatus::On, retain_until),
-            )
+            .head_object(&put_path)
             .await
-            .expect("atomically lock PutObject");
+            .expect("head atomically locked CLI upload");
         let put_version = put.version_id.expect("locked put returns a version");
         let put_selection = ObjectLockOptions::new(Some(put_version.clone()), false)
             .expect("valid put version selection");
@@ -414,17 +463,32 @@ mod atomic_object_lock_operations {
         );
 
         let copy_path = RemotePath::new("test", &bucket_name, "locked-copy.bin");
+        let copy_source = format!("test/{bucket_name}/locked-put.bin");
+        let copy_target = format!("test/{bucket_name}/locked-copy.bin");
+        let copy = run_rc(
+            &[
+                "cp",
+                &copy_source,
+                &copy_target,
+                "--preserve",
+                "--retention-mode",
+                "GOVERNANCE",
+                "--retain-until",
+                &retain_until_arg,
+                "--legal-hold",
+                "OFF",
+            ],
+            config_dir.path(),
+        );
+        assert!(
+            copy.status.success(),
+            "beta.10 CLI preserve copy failed: {}",
+            String::from_utf8_lossy(&copy.stderr)
+        );
         let copy = client
-            .copy_object_with_transfer_options(
-                &put_path,
-                &copy_path,
-                &TransferCopyOptions {
-                    destination: locked_write(LegalHoldStatus::Off, retain_until),
-                    ..TransferCopyOptions::default()
-                },
-            )
+            .head_object(&copy_path)
             .await
-            .expect("atomically lock CopyObject");
+            .expect("head atomically locked CLI copy");
         let copy_version = copy.version_id.expect("locked copy returns a version");
         let copy_selection = ObjectLockOptions::new(Some(copy_version.clone()), false)
             .expect("valid copy version selection");

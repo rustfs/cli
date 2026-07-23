@@ -3,10 +3,7 @@
 //! Reads from stdin and uploads to S3. Useful for piping output from other commands.
 
 use clap::Args;
-use rc_core::{
-    AliasManager, ObjectAttributes, ObjectEncryptionRequest, ObjectStore as _,
-    ObjectWriteEncryption, ObjectWriteOptions, RemotePath,
-};
+use rc_core::{AliasManager, ObjectEncryptionRequest, ObjectStore as _, RemotePath};
 use rc_s3::S3Client;
 use serde::Serialize;
 use std::fmt;
@@ -18,6 +15,7 @@ use crate::output::{Formatter, OutputConfig};
 use crate::secret_input::resolve_secret_locator;
 
 use super::cp::{exit_code_for_core_error, validate_destination_storage_class};
+use super::transfer_fidelity::TransferFidelityArgs;
 
 /// Stream stdin to an object
 #[derive(Args)]
@@ -32,6 +30,9 @@ pub struct PipeArgs {
     /// Storage class for the object
     #[arg(long)]
     pub storage_class: Option<String>,
+
+    #[command(flatten)]
+    pub(crate) fidelity: TransferFidelityArgs,
 
     /// Apply SSE-S3 to the upload target
     #[arg(long = "enc-s3", default_value = "false")]
@@ -72,6 +73,14 @@ pub async fn execute(args: PipeArgs, output_config: OutputConfig) -> ExitCode {
     if let Err(error) = validate_destination_storage_class(args.storage_class.as_deref()) {
         return formatter.fail(exit_code_for_core_error(&error), &error.to_string());
     }
+    if let Err(error) = args.fidelity.build_write_options(
+        Some(&args.content_type),
+        None,
+        None,
+        args.storage_class.clone(),
+    ) {
+        return formatter.fail(exit_code_for_core_error(&error), &error.to_string());
+    }
     let customer_key_locator =
         match resolve_secret_locator(args.enc_c_key_file.clone(), args.enc_c_key_env.clone()) {
             Ok(locator) => locator,
@@ -100,17 +109,12 @@ pub async fn execute(args: PipeArgs, output_config: OutputConfig) -> ExitCode {
             return formatter.fail(exit_code_for_core_error(&error), &error.to_string());
         }
     };
-    let encryption = match (args.enc_s3, args.enc_kms.as_deref(), customer_key) {
-        (true, None, None) => Some(ObjectWriteEncryption::Managed(
-            ObjectEncryptionRequest::SseS3,
-        )),
-        (false, Some(key_id), None) => Some(ObjectWriteEncryption::Managed(
-            ObjectEncryptionRequest::SseKms {
-                key_id: key_id.to_string(),
-            },
-        )),
-        (false, None, Some(key)) => Some(ObjectWriteEncryption::SseCustomer { key }),
-        (false, None, None) => None,
+    let managed_encryption = match (args.enc_s3, args.enc_kms.as_deref()) {
+        (true, None) => Some(ObjectEncryptionRequest::SseS3),
+        (false, Some(key_id)) => Some(ObjectEncryptionRequest::SseKms {
+            key_id: key_id.to_string(),
+        }),
+        (false, None) => None,
         _ => unreachable!("encryption combinations are validated before loading the key"),
     };
 
@@ -166,14 +170,16 @@ pub async fn execute(args: PipeArgs, output_config: OutputConfig) -> ExitCode {
     let target_display = format!("{alias_name}/{bucket}/{key}");
 
     // Upload
-    let options = ObjectWriteOptions {
-        attributes: Some(ObjectAttributes {
-            content_type: Some(args.content_type.clone()),
-            ..ObjectAttributes::default()
-        }),
-        storage_class: args.storage_class.clone(),
-        encryption,
-        ..ObjectWriteOptions::default()
+    let options = match args.fidelity.build_write_options(
+        Some(&args.content_type),
+        managed_encryption.as_ref(),
+        customer_key.as_ref(),
+        args.storage_class.clone(),
+    ) {
+        Ok(options) => options,
+        Err(error) => {
+            return formatter.fail(exit_code_for_core_error(&error), &error.to_string());
+        }
     };
     match client
         .put_object_with_options(&target, buffer, &options)
@@ -269,6 +275,7 @@ mod tests {
             target: "local/bucket/file.txt".to_string(),
             content_type: "application/octet-stream".to_string(),
             storage_class: None,
+            fidelity: TransferFidelityArgs::default(),
             enc_s3: true,
             enc_kms: Some("kms-key".to_string()),
             enc_c_key_file: None,
@@ -289,6 +296,7 @@ mod tests {
                 target: "local/bucket/file.txt".to_string(),
                 content_type: "application/octet-stream".to_string(),
                 storage_class: Some(storage_class.to_string()),
+                fidelity: TransferFidelityArgs::default(),
                 enc_s3: false,
                 enc_kms: None,
                 enc_c_key_file: None,

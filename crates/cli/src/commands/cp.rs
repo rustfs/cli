@@ -6,11 +6,11 @@ use clap::Args;
 use jiff::Timestamp;
 use rc_core::alias::RetryConfig;
 use rc_core::{
-    AliasManager, CopyObjectOptions, Error, MultipartCopyCancellation, MultipartCopyOptions,
-    ObjectAttributes, ObjectEncryptionRequest, ObjectInfo, ObjectStore as _, ObjectWriteEncryption,
-    ObjectWriteOptions, ParsedPath, RemotePath, SseCustomerKey, TransferCancellation,
-    TransferCandidate, TransferControls, TransferCopyOptions, TransferExecutor,
-    TransferOutcomeState, TransferPlan, TransferReadOptions, TransferSelection, parse_path,
+    AliasManager, Error, MetadataDirective, MultipartCopyCancellation, MultipartCopyOptions,
+    ObjectEncryptionRequest, ObjectInfo, ObjectStore as _, ObjectWriteOptions, ParsedPath,
+    RemotePath, SseCustomerKey, TransferCancellation, TransferCandidate, TransferControls,
+    TransferCopyOptions, TransferExecutor, TransferOutcomeState, TransferPlan, TransferReadOptions,
+    TransferSelection, parse_path,
 };
 use rc_s3::S3Client;
 use serde::Serialize;
@@ -23,6 +23,8 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::exit_code::ExitCode;
 use crate::output::{Formatter, OutputConfig, ProgressBar, V3SuccessEnvelope};
 use crate::secret_input::{SecretLocator, resolve_secret_locator};
+
+use super::transfer_fidelity::{MetadataDirectiveArg, TaggingDirectiveArg, TransferFidelityArgs};
 
 const CP_AFTER_HELP: &str = "\
 Examples:
@@ -55,8 +57,16 @@ pub struct CpArgs {
     pub recursive: bool,
 
     /// Preserve file attributes
-    #[arg(short, long)]
+    #[arg(short, long, conflicts_with = "metadata_directive")]
     pub preserve: bool,
+
+    /// Source metadata handling for remote copies
+    #[arg(long, value_enum)]
+    pub(crate) metadata_directive: Option<MetadataDirectiveArg>,
+
+    /// Source tag handling for remote copies
+    #[arg(long, value_enum)]
+    pub(crate) tagging_directive: Option<TaggingDirectiveArg>,
 
     /// Continue on errors
     #[arg(long)]
@@ -87,6 +97,9 @@ pub struct CpArgs {
     /// Content type for uploaded files
     #[arg(long)]
     pub content_type: Option<String>,
+
+    #[command(flatten)]
+    pub(crate) fidelity: TransferFidelityArgs,
 
     /// Apply SSE-S3 to the remote destination path
     #[arg(long = "enc-s3")]
@@ -180,12 +193,15 @@ impl CpArgs {
             target: target.into(),
             recursive: false,
             preserve: false,
+            metadata_directive: None,
+            tagging_directive: None,
             continue_on_error: false,
             overwrite: true,
             skip_existing: false,
             dry_run: false,
             storage_class: None,
             content_type: None,
+            fidelity: TransferFidelityArgs::default(),
             enc_s3: Vec::new(),
             enc_kms: Vec::new(),
             enc_c_source_key_file: None,
@@ -240,13 +256,16 @@ struct VersionCopyData {
 pub async fn execute(mut args: CpArgs, output_config: OutputConfig) -> ExitCode {
     let formatter = Formatter::new(output_config);
 
-    if args.preserve {
-        return formatter.fail(
-            ExitCode::UnsupportedFeature,
-            "--preserve is not implemented; refusing to continue with a silently ignored option",
-        );
-    }
     if let Err(error) = validate_destination_storage_class(args.storage_class.as_deref()) {
+        return formatter.fail(exit_code_for_core_error(&error), &error.to_string());
+    }
+    if let Err(error) = object_write_options(
+        &args.fidelity,
+        args.content_type.as_deref(),
+        None,
+        None,
+        args.storage_class.clone(),
+    ) {
         return formatter.fail(exit_code_for_core_error(&error), &error.to_string());
     }
 
@@ -293,6 +312,9 @@ pub async fn execute(mut args: CpArgs, output_config: OutputConfig) -> ExitCode 
             );
         }
     };
+    if let Err(error) = validate_fidelity_directions(&args, &sources, &target) {
+        return formatter.fail(exit_code_for_core_error(&error), &error.to_string());
+    }
     let source_key_locator = match resolve_secret_locator(
         args.enc_c_source_key_file.clone(),
         args.enc_c_source_key_env.clone(),
@@ -467,23 +489,119 @@ pub(super) fn validate_destination_storage_class(value: Option<&str>) -> rc_core
 }
 
 fn object_write_options(
+    fidelity: &TransferFidelityArgs,
     content_type: Option<&str>,
     encryption: Option<&ObjectEncryptionRequest>,
     customer_key: Option<&SseCustomerKey>,
     storage_class: Option<String>,
-) -> ObjectWriteOptions {
-    ObjectWriteOptions {
-        attributes: content_type.map(|content_type| ObjectAttributes {
-            content_type: Some(content_type.to_string()),
-            ..ObjectAttributes::default()
-        }),
-        storage_class,
-        encryption: customer_key
-            .cloned()
-            .map(|key| ObjectWriteEncryption::SseCustomer { key })
-            .or_else(|| encryption.cloned().map(ObjectWriteEncryption::Managed)),
-        ..ObjectWriteOptions::default()
+) -> rc_core::Result<ObjectWriteOptions> {
+    fidelity.build_write_options(content_type, encryption, customer_key, storage_class)
+}
+
+fn requested_metadata_directive(args: &CpArgs) -> Option<MetadataDirective> {
+    if args.preserve {
+        Some(MetadataDirective::Copy)
+    } else {
+        args.metadata_directive.map(Into::into)
     }
+}
+
+fn transfer_copy_options(
+    args: &CpArgs,
+    source_version_id: Option<String>,
+    encryption: Option<&ObjectEncryptionRequest>,
+) -> rc_core::Result<TransferCopyOptions> {
+    let metadata_directive = requested_metadata_directive(args);
+    let tagging_directive = args.tagging_directive.map(Into::into);
+    let mut destination = object_write_options(
+        &args.fidelity,
+        args.content_type.as_deref(),
+        encryption,
+        args.destination_customer_key.as_ref(),
+        args.storage_class.clone(),
+    )?;
+    if matches!(metadata_directive, Some(MetadataDirective::Replace))
+        && destination.attributes.is_none()
+    {
+        destination.attributes = Some(Default::default());
+    }
+    if matches!(tagging_directive, Some(rc_core::TaggingDirective::Replace))
+        && destination.tags.is_none()
+    {
+        destination.tags = Some(Default::default());
+    }
+    let options = TransferCopyOptions {
+        source: TransferReadOptions {
+            version_id: source_version_id,
+            customer_key: args.source_customer_key.clone(),
+            ..TransferReadOptions::default()
+        },
+        metadata_directive,
+        tagging_directive,
+        destination,
+    };
+    options.validate()?;
+    Ok(options)
+}
+
+fn validate_fidelity_directions(
+    args: &CpArgs,
+    sources: &[ParsedPath],
+    target: &ParsedPath,
+) -> rc_core::Result<()> {
+    let all_remote = sources
+        .iter()
+        .all(|source| matches!(source, ParsedPath::Remote(_)));
+    let any_remote = sources
+        .iter()
+        .any(|source| matches!(source, ParsedPath::Remote(_)));
+    let target_remote = matches!(target, ParsedPath::Remote(_));
+    let has_copy_directive =
+        args.preserve || args.metadata_directive.is_some() || args.tagging_directive.is_some();
+    if has_copy_directive && !(all_remote && target_remote) {
+        return Err(Error::InvalidPath(
+            "Metadata and tagging copy directives require remote sources and a remote destination"
+                .to_string(),
+        ));
+    }
+    if !target_remote
+        && (args.storage_class.is_some()
+            || args.content_type.is_some()
+            || args.fidelity.has_write_policy()
+            || !args.enc_s3.is_empty()
+            || !args.enc_kms.is_empty()
+            || args.enc_c_destination_key_file.is_some()
+            || args.enc_c_destination_key_env.is_some())
+    {
+        return Err(Error::InvalidPath(
+            "Destination transfer policies require a remote destination".to_string(),
+        ));
+    }
+    if any_remote && target_remote {
+        let copy_options = transfer_copy_options(args, None, None)?;
+        if matches!(
+            copy_options.metadata_directive,
+            Some(MetadataDirective::Replace)
+        ) {
+            return Err(Error::UnsupportedFeature(
+                "RustFS beta.10 does not preserve complete metadata REPLACE semantics; tracked by rustfs/backlog#1463"
+                    .to_string(),
+            ));
+        }
+        if copy_options.tagging_directive.is_some() || copy_options.destination.tags.is_some() {
+            return Err(Error::UnsupportedFeature(
+                "RustFS beta.10 does not preserve CopyObject tagging directives; tracked by rustfs/backlog#1462"
+                    .to_string(),
+            ));
+        }
+        if copy_options.destination.checksum.is_some() {
+            return Err(Error::UnsupportedFeature(
+                "RustFS beta.10 does not preserve CopyObject checksum selection; tracked by rustfs/backlog#1466"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn load_customer_key(locator: Option<&SecretLocator>) -> rc_core::Result<Option<SseCustomerKey>> {
@@ -676,7 +794,7 @@ async fn execute_transfer_plan(
                 "Would copy: {} -> {}{}",
                 formatter.style_file(&item.source),
                 formatter.style_file(&item.target),
-                storage_class_suffix(args.storage_class.as_deref())
+                transfer_policy_suffix(args)
             ));
         }
         for item in &skipped_existing {
@@ -808,10 +926,55 @@ async fn execute_transfer_plan(
     }
 }
 
-fn storage_class_suffix(storage_class: Option<&str>) -> String {
-    storage_class
-        .map(|value| format!(" [storage-class={value}]"))
-        .unwrap_or_default()
+fn transfer_policy_suffix(args: &CpArgs) -> String {
+    let mut policies = Vec::new();
+    if let Some(value) = args.storage_class.as_deref() {
+        policies.push(format!("storage-class={value}"));
+    }
+    if let Some(directive) = requested_metadata_directive(args) {
+        policies.push(format!(
+            "metadata={}",
+            match directive {
+                MetadataDirective::Copy => "copy",
+                MetadataDirective::Replace => "replace",
+            }
+        ));
+    } else if args.fidelity.has_attribute_policy() || args.content_type.is_some() {
+        policies.push(format!("metadata=write({})", args.fidelity.metadata.len()));
+    }
+    if let Some(directive) = args.tagging_directive {
+        policies.push(format!(
+            "tags={}({})",
+            match directive {
+                TaggingDirectiveArg::Copy => "copy",
+                TaggingDirectiveArg::Replace => "replace",
+            },
+            args.fidelity.tags.len()
+        ));
+    } else if args.fidelity.has_tag_policy() {
+        policies.push(format!("tags=write({})", args.fidelity.tags.len()));
+    }
+    if args.fidelity.checksum.is_some() {
+        policies.push("checksum=sha256".to_string());
+    }
+    if let Some(mode) = args.fidelity.retention_mode.as_deref() {
+        policies.push(format!("retention={}", mode.to_ascii_lowercase()));
+    }
+    if let Some(state) = args.fidelity.legal_hold.as_deref() {
+        policies.push(format!("legal-hold={}", state.to_ascii_lowercase()));
+    }
+    if args.enc_c_destination_key_file.is_some() || args.enc_c_destination_key_env.is_some() {
+        policies.push("encryption=sse-c".to_string());
+    } else if !args.enc_kms.is_empty() {
+        policies.push("encryption=sse-kms".to_string());
+    } else if !args.enc_s3.is_empty() {
+        policies.push("encryption=sse-s3".to_string());
+    }
+    if policies.is_empty() {
+        String::new()
+    } else {
+        format!(" [policy:{}]", policies.join(","))
+    }
 }
 
 fn validate_storage_class_plan(
@@ -875,7 +1038,6 @@ async fn execute_planned_operation(
                 target,
                 source_info,
                 encryption.as_ref(),
-                args.storage_class.as_deref(),
                 multipart_cancellation,
                 &|bytes| copy_progress.set(&progress_key, bytes),
                 args,
@@ -912,33 +1074,16 @@ async fn perform_planned_upload(
         guessed_type.as_deref(),
         file_size,
     );
-    let info = if let Some(storage_class) = args.storage_class.as_deref() {
-        if file_size > MULTIPART_THRESHOLD {
-            return Err(Error::UnsupportedFeature(
-                "RustFS beta.10 does not persist storage class for multipart uploads".to_string(),
-            ));
-        }
-        let data = tokio::fs::read(source).await?;
-        let options = object_write_options(
-            content_type,
-            encryption,
-            args.destination_customer_key.as_ref(),
-            Some(storage_class.to_string()),
-        );
-        client
-            .put_object_with_options(target, data, &options)
-            .await?
-    } else {
-        let options = object_write_options(
-            content_type,
-            encryption,
-            args.destination_customer_key.as_ref(),
-            None,
-        );
-        client
-            .put_object_from_path_with_options(target, source, &options, |_| {})
-            .await?
-    };
+    let options = object_write_options(
+        &args.fidelity,
+        content_type,
+        encryption,
+        args.destination_customer_key.as_ref(),
+        args.storage_class.clone(),
+    )?;
+    let info = client
+        .put_object_from_path_with_options(target, source, &options, |_| {})
+        .await?;
     Ok(info
         .size_bytes
         .and_then(|size| u64::try_from(size).ok())
@@ -988,7 +1133,6 @@ async fn perform_planned_remote_copy(
     target: &RemotePath,
     source_info: &ObjectInfo,
     encryption: Option<&ObjectEncryptionRequest>,
-    storage_class: Option<&str>,
     cancellation: &MultipartCopyCancellation,
     on_progress: &(dyn Fn(u64) + Send + Sync),
     args: &CpArgs,
@@ -1009,7 +1153,7 @@ async fn perform_planned_remote_copy(
         .and_then(|size| u64::try_from(size).ok())
         .ok_or_else(|| Error::InvalidPath(format!("Source size is unavailable: {source}")))?;
     if rc_core::requires_multipart_copy(planned_size) {
-        if storage_class.is_some() {
+        if args.storage_class.is_some() {
             return Err(Error::UnsupportedFeature(
                 "RustFS beta.10 does not persist storage class for multipart copies".to_string(),
             ));
@@ -1027,13 +1171,14 @@ async fn perform_planned_remote_copy(
             )));
         }
         let options = multipart_options_from_source(&current)?;
+        let transfer = transfer_copy_options(args, current.version_id.clone(), encryption)?;
         let copied = client
-            .multipart_copy(
+            .multipart_copy_with_transfer_options(
                 source,
                 target,
                 &options,
+                &transfer,
                 cancellation,
-                encryption,
                 on_progress,
             )
             .await?;
@@ -1045,32 +1190,10 @@ async fn perform_planned_remote_copy(
             object: copied.object,
         });
     }
-    let copied = if let Some(storage_class) = storage_class {
-        client
-            .copy_object_with_transfer_options(
-                source,
-                target,
-                &TransferCopyOptions {
-                    source: TransferReadOptions {
-                        version_id: source_info.version_id.clone(),
-                        ..TransferReadOptions::default()
-                    },
-                    destination: object_write_options(
-                        None,
-                        encryption,
-                        args.destination_customer_key.as_ref(),
-                        Some(storage_class.to_string()),
-                    ),
-                    ..TransferCopyOptions::default()
-                },
-            )
-            .await?
-    } else {
-        let options = CopyObjectOptions::for_source_version(source_info.version_id.clone())?;
-        client
-            .copy_object_with_options(source, target, &options, encryption)
-            .await?
-    };
+    let options = transfer_copy_options(args, source_info.version_id.clone(), encryption)?;
+    let copied = client
+        .copy_object_with_transfer_options(source, target, &options)
+        .await?;
     let bytes_copied = copied
         .size_bytes
         .and_then(|size| u64::try_from(size).ok())
@@ -2066,7 +2189,7 @@ async fn upload_file(
         let styled_dst = formatter.style_file(&dst_display);
         formatter.println(&format!(
             "Would copy: {styled_src} -> {styled_dst}{}",
-            storage_class_suffix(args.storage_class.as_deref())
+            transfer_policy_suffix(args)
         ));
         return ExitCode::Success;
     }
@@ -2095,35 +2218,23 @@ async fn upload_file(
     };
 
     // Upload
-    let upload_result = if let Some(storage_class) = args.storage_class.as_deref() {
-        match tokio::fs::read(src).await {
-            Ok(data) => {
-                let options = object_write_options(
-                    content_type,
-                    encryption,
-                    args.destination_customer_key.as_ref(),
-                    Some(storage_class.to_string()),
-                );
-                client
-                    .put_object_with_options(&target, data, &options)
-                    .await
-            }
-            Err(error) => Err(Error::Io(error)),
+    let upload_result = match object_write_options(
+        &args.fidelity,
+        content_type,
+        encryption,
+        args.destination_customer_key.as_ref(),
+        args.storage_class.clone(),
+    ) {
+        Ok(options) => {
+            client
+                .put_object_from_path_with_options(&target, src, &options, |bytes_sent| {
+                    if let Some(ref pb) = progress {
+                        pb.set_position(bytes_sent);
+                    }
+                })
+                .await
         }
-    } else {
-        let options = object_write_options(
-            content_type,
-            encryption,
-            args.destination_customer_key.as_ref(),
-            None,
-        );
-        client
-            .put_object_from_path_with_options(&target, src, &options, |bytes_sent| {
-                if let Some(ref pb) = progress {
-                    pb.set_position(bytes_sent);
-                }
-            })
-            .await
+        Err(error) => Err(error),
     };
     match upload_result {
         Ok(info) => {
@@ -2635,7 +2746,10 @@ async fn copy_s3_to_s3_prepared(
     if args.dry_run && args.storage_class.is_none() {
         let styled_src = formatter.style_file(&src_display);
         let styled_dst = formatter.style_file(&dst_display);
-        formatter.println(&format!("Would copy: {styled_src} -> {styled_dst}"));
+        formatter.println(&format!(
+            "Would copy: {styled_src} -> {styled_dst}{}",
+            transfer_policy_suffix(args)
+        ));
         return ExitCode::Success;
     }
 
@@ -2669,7 +2783,7 @@ async fn copy_s3_to_s3_prepared(
         let styled_dst = formatter.style_file(&dst_display);
         formatter.println(&format!(
             "Would copy: {styled_src} -> {styled_dst}{}",
-            storage_class_suffix(args.storage_class.as_deref())
+            transfer_policy_suffix(args)
         ));
         return ExitCode::Success;
     }
@@ -2693,7 +2807,6 @@ async fn copy_s3_to_s3_prepared(
         dst,
         &source_info,
         encryption,
-        args.storage_class.as_deref(),
         &cancellation,
         &ignore_progress,
         args,
@@ -3512,6 +3625,62 @@ mod tests {
 
             assert_eq!(execute(args, OutputConfig::default()).await, expected);
         }
+    }
+
+    #[test]
+    fn fidelity_direction_preflight_rejects_silent_or_beta10_unsupported_paths() {
+        let local = ParsedPath::Local(PathBuf::from("report.json"));
+        let source = ParsedPath::Remote(RemotePath::new("test", "source", "report.json"));
+        let target = ParsedPath::Remote(RemotePath::new("test", "target", "report.json"));
+
+        let mut preserve_upload = CpArgs::single("report.json", "test/target/report.json");
+        preserve_upload.preserve = true;
+        assert!(matches!(
+            validate_fidelity_directions(&preserve_upload, std::slice::from_ref(&local), &target),
+            Err(Error::InvalidPath(_))
+        ));
+
+        let mut replace = CpArgs::single("test/source/report.json", "test/target/report.json");
+        replace.metadata_directive = Some(MetadataDirectiveArg::Replace);
+        assert!(matches!(
+            validate_fidelity_directions(&replace, std::slice::from_ref(&source), &target),
+            Err(Error::UnsupportedFeature(_))
+        ));
+
+        let mut tags = CpArgs::single("test/source/report.json", "test/target/report.json");
+        tags.tagging_directive = Some(TaggingDirectiveArg::Replace);
+        tags.fidelity.tags = vec!["env=prod".to_string()];
+        assert!(matches!(
+            validate_fidelity_directions(&tags, std::slice::from_ref(&source), &target),
+            Err(Error::UnsupportedFeature(_))
+        ));
+
+        let mut checksum = CpArgs::single("test/source/report.json", "test/target/report.json");
+        checksum.fidelity.checksum = Some("sha256".to_string());
+        assert!(matches!(
+            validate_fidelity_directions(&checksum, std::slice::from_ref(&source), &target),
+            Err(Error::UnsupportedFeature(_))
+        ));
+    }
+
+    #[test]
+    fn preserve_builds_explicit_metadata_copy_without_replacement_payload() {
+        let mut args = CpArgs::single("test/source/report.json", "test/target/report.json");
+        args.preserve = true;
+        args.fidelity.retention_mode = Some("GOVERNANCE".to_string());
+        args.fidelity.retain_until = Some("2099-01-02T03:04:05Z".to_string());
+        args.fidelity.legal_hold = Some("ON".to_string());
+
+        let options =
+            transfer_copy_options(&args, Some("source-v1".to_string()), None).expect("copy policy");
+        assert_eq!(options.metadata_directive, Some(MetadataDirective::Copy));
+        assert!(options.destination.attributes.is_none());
+        assert_eq!(options.source.version_id.as_deref(), Some("source-v1"));
+        assert!(options.destination.retention.is_some());
+        assert_eq!(
+            options.destination.legal_hold,
+            Some(rc_core::LegalHoldStatus::On)
+        );
     }
 
     #[test]

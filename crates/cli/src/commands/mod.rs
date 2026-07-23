@@ -48,6 +48,7 @@ mod share;
 mod sql;
 mod stat;
 mod tag;
+mod transfer_fidelity;
 mod tree;
 mod undo;
 mod version;
@@ -246,7 +247,7 @@ pub enum Commands {
 
     // Phase 3: Transfer commands
     /// Deprecated: use `rc object copy`
-    Cp(cp::CpArgs),
+    Cp(Box<cp::CpArgs>),
 
     /// Deprecated: use `rc object move`
     Mv(mv::MvArgs),
@@ -413,7 +414,7 @@ pub async fn execute(cli: Cli) -> ExitCode {
             stat::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
         }
         Commands::Cp(args) => {
-            cp::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
+            cp::execute(*args, output_options.resolve(OutputBehavior::HumanDefault)).await
         }
         Commands::Mv(args) => {
             mv::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
@@ -1327,7 +1328,25 @@ mod tests {
             "--content-type",
             "application/json",
             "--storage-class",
-            "STANDARD_IA",
+            "STANDARD",
+            "--metadata-directive",
+            "replace",
+            "--tagging-directive",
+            "replace",
+            "--cache-control",
+            "max-age=3600",
+            "--metadata",
+            "owner=analytics",
+            "--tags",
+            "env=prod",
+            "--checksum",
+            "sha256",
+            "--retention-mode",
+            "governance",
+            "--retain-until",
+            "2031-01-02T03:04:05Z",
+            "--legal-hold",
+            "on",
             "--dry-run",
         ])
         .expect("parse object copy with transfer options");
@@ -1338,7 +1357,21 @@ mod tests {
                     assert_eq!(arg.sources, ["./report.json"]);
                     assert_eq!(arg.target, "local/my-bucket/reports/");
                     assert_eq!(arg.content_type.as_deref(), Some("application/json"));
-                    assert_eq!(arg.storage_class.as_deref(), Some("STANDARD_IA"));
+                    assert_eq!(arg.storage_class.as_deref(), Some("STANDARD"));
+                    assert_eq!(
+                        arg.metadata_directive,
+                        Some(transfer_fidelity::MetadataDirectiveArg::Replace)
+                    );
+                    assert_eq!(
+                        arg.tagging_directive,
+                        Some(transfer_fidelity::TaggingDirectiveArg::Replace)
+                    );
+                    assert_eq!(arg.fidelity.cache_control.as_deref(), Some("max-age=3600"));
+                    assert_eq!(arg.fidelity.metadata, ["owner=analytics"]);
+                    assert_eq!(arg.fidelity.tags, ["env=prod"]);
+                    assert_eq!(arg.fidelity.checksum.as_deref(), Some("sha256"));
+                    assert_eq!(arg.fidelity.retention_mode.as_deref(), Some("governance"));
+                    assert_eq!(arg.fidelity.legal_hold.as_deref(), Some("on"));
                     assert!(arg.dry_run);
                 }
                 other => panic!("expected object copy command, got {:?}", other),
