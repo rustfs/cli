@@ -1,0 +1,31 @@
+{
+  "schema_version": 3,
+  "type": "admin_operations",
+  "status": "success",
+  "data": {
+    "operations": [
+      {
+        "operation": "site_replication_resync_start",
+        "resource": "deployment-2",
+        "state": "succeeded",
+        "operation_id": "resync-123",
+        "changed": true,
+        "result": {
+          "snapshot_kind": "mutation_response",
+          "lifecycle_state": "unknown",
+          "server_operation": "start",
+          "server_status": "success",
+          "buckets": [
+            {
+              "bucket": "photos",
+              "status": "started"
+            }
+          ],
+          "future": {
+            "generation": 7
+          }
+        }
+      }
+    ]
+  }
+}

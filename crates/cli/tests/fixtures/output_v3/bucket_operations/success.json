@@ -1,0 +1,25 @@
+{
+  "schema_version": 3,
+  "type": "bucket_operations",
+  "status": "success",
+  "data": {
+    "operation": "create",
+    "bucket": "archive",
+    "outcome": "created",
+    "created": true,
+    "requested": {
+      "region": "us-east-1",
+      "versioning_enabled": true,
+      "object_lock_enabled": false
+    },
+    "effective_region": "us-east-1",
+    "region_semantics": "service_reported",
+    "effective_versioning": true,
+    "completed_stages": [
+      "bucket_created",
+      "region_verified",
+      "versioning_enabled",
+      "versioning_verified"
+    ]
+  }
+}

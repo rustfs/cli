@@ -1,13 +1,14 @@
 # Docker Compose configuration for rc CLI E2E tests
 #
 # Usage:
-#   docker compose up -d      # Start services
+#   docker compose up -d      # Start the pinned target release
+#   RUSTFS_IMAGE=rustfs/rustfs:1.0.0-beta.9 docker compose up -d
 #   docker compose down -v    # Stop and cleanup
 
 services:
   # RustFS - S3-compatible object storage (Tier 1)
   rustfs:
-    image: rustfs/rustfs:latest
+    image: ${RUSTFS_IMAGE:-rustfs/rustfs:1.0.0-beta.10}
     container_name: rc-test-rustfs
     ports:
       - "9000:9000"   # S3 API

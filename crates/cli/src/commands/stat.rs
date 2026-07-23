@@ -3,13 +3,14 @@
 //! Displays detailed metadata information about an object.
 
 use clap::Args;
-use rc_core::{AliasManager, ObjectInfo, ObjectStore as _, RemotePath};
+use rc_core::{AliasManager, ObjectInfo, ObjectReadOptions, ObjectStore, RemotePath};
 use rc_s3::S3Client;
 use serde::Serialize;
 use std::collections::BTreeMap;
 
+use crate::commands::{exit_code_for_core_error, validate_version_selector};
 use crate::exit_code::ExitCode;
-use crate::output::{Formatter, OutputConfig};
+use crate::output::{Formatter, OutputConfig, V3ErrorEnvelope, V3SuccessEnvelope};
 
 /// Show object metadata
 #[derive(Args, Debug)]
@@ -17,7 +18,7 @@ pub struct StatArgs {
     /// Object path (alias/bucket/key)
     pub path: String,
 
-    /// Show version ID information
+    /// Exact object version ID to inspect
     #[arg(long)]
     pub version_id: Option<String>,
 
@@ -44,6 +45,28 @@ struct StatOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     version_id: Option<String>,
     #[serde(skip_serializing_if = "metadata_is_none_or_empty")]
+    metadata: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Serialize)]
+struct VersionStatData {
+    operation: &'static str,
+    object: VersionStatObject,
+}
+
+#[derive(Debug, Serialize)]
+struct VersionStatObject {
+    path: String,
+    bucket: String,
+    key: String,
+    version_id: Option<String>,
+    delete_marker: bool,
+    last_modified: Option<String>,
+    size_bytes: Option<i64>,
+    size_human: Option<String>,
+    etag: Option<String>,
+    content_type: Option<String>,
+    storage_class: Option<String>,
     metadata: Option<BTreeMap<String, String>>,
 }
 
@@ -80,20 +103,38 @@ fn build_display_metadata(info: &ObjectInfo) -> BTreeMap<String, String> {
 /// Execute the stat command
 pub async fn execute(args: StatArgs, output_config: OutputConfig) -> ExitCode {
     let formatter = Formatter::new(output_config);
+    let version_output = args.version_id.is_some();
 
-    if args.version_id.is_some() || args.rewind.is_some() {
-        return formatter.fail(
+    if let Err(error) =
+        validate_version_selector(args.version_id.as_deref(), args.rewind.as_deref())
+    {
+        return fail_stat(&formatter, version_output, ExitCode::UsageError, &error);
+    }
+    if args.rewind.is_some() {
+        return fail_stat(
+            &formatter,
+            version_output,
             ExitCode::UnsupportedFeature,
-            "--version-id and --rewind are not implemented for stat",
+            "--rewind is not implemented for stat",
         );
     }
+    let read_options = match ObjectReadOptions::for_version(args.version_id.clone()) {
+        Ok(options) => options,
+        Err(error) => {
+            return fail_stat(
+                &formatter,
+                version_output,
+                ExitCode::UsageError,
+                &error.to_string(),
+            );
+        }
+    };
 
     // Parse the path
     let (alias_name, bucket, key) = match parse_stat_path(&args.path) {
         Ok(parsed) => parsed,
         Err(e) => {
-            formatter.error(&e);
-            return ExitCode::UsageError;
+            return fail_stat(&formatter, version_output, ExitCode::UsageError, &e);
         }
     };
 
@@ -101,16 +142,24 @@ pub async fn execute(args: StatArgs, output_config: OutputConfig) -> ExitCode {
     let alias_manager = match AliasManager::new() {
         Ok(am) => am,
         Err(e) => {
-            formatter.error(&format!("Failed to load aliases: {e}"));
-            return ExitCode::GeneralError;
+            return fail_stat(
+                &formatter,
+                version_output,
+                ExitCode::GeneralError,
+                &format!("Failed to load aliases: {e}"),
+            );
         }
     };
 
     let alias = match alias_manager.get(&alias_name) {
         Ok(a) => a,
         Err(_) => {
-            formatter.error(&format!("Alias '{alias_name}' not found"));
-            return ExitCode::NotFound;
+            return fail_stat(
+                &formatter,
+                version_output,
+                ExitCode::NotFound,
+                &format!("Alias '{alias_name}' not found"),
+            );
         }
     };
 
@@ -118,37 +167,62 @@ pub async fn execute(args: StatArgs, output_config: OutputConfig) -> ExitCode {
     let client = match S3Client::new(alias).await {
         Ok(c) => c,
         Err(e) => {
-            formatter.error(&format!("Failed to create S3 client: {e}"));
-            return ExitCode::NetworkError;
+            return fail_stat(
+                &formatter,
+                version_output,
+                ExitCode::NetworkError,
+                &format!("Failed to create S3 client: {e}"),
+            );
         }
     };
 
     let path = RemotePath::new(&alias_name, &bucket, &key);
 
     // Get object metadata
-    match client.head_object(&path).await {
+    match ObjectStore::head_object_with_options(&client, &path, &read_options).await {
         Ok(info) => {
             if formatter.is_json() {
-                let output = StatOutput {
-                    name: info.key.clone(),
-                    last_modified: info.last_modified.map(|d| d.to_string()),
-                    size_bytes: info.size_bytes,
-                    size_human: info.size_human.clone(),
-                    etag: info.etag.clone(),
-                    content_type: info.content_type.clone(),
-                    storage_class: info.storage_class.clone(),
-                    version_id: None,
-                    metadata: info
-                        .metadata
-                        .as_ref()
-                        .map(|m| {
-                            m.iter()
-                                .map(|(k, v)| (k.clone(), v.clone()))
-                                .collect::<BTreeMap<_, _>>()
-                        })
-                        .filter(|m| !m.is_empty()),
-                };
-                formatter.json(&output);
+                let metadata = info
+                    .metadata
+                    .as_ref()
+                    .map(|m| {
+                        m.iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect::<BTreeMap<_, _>>()
+                    })
+                    .filter(|m| !m.is_empty());
+                if version_output {
+                    formatter.json(&V3SuccessEnvelope::versioned_objects(VersionStatData {
+                        operation: "stat",
+                        object: VersionStatObject {
+                            path: args.path.clone(),
+                            bucket: bucket.clone(),
+                            key: info.key.clone(),
+                            version_id: info.version_id.clone().or_else(|| args.version_id.clone()),
+                            delete_marker: info.is_delete_marker.unwrap_or(false),
+                            last_modified: info.last_modified.map(|d| d.to_string()),
+                            size_bytes: info.size_bytes,
+                            size_human: info.size_human.clone(),
+                            etag: info.etag.clone(),
+                            content_type: info.content_type.clone(),
+                            storage_class: info.storage_class.clone(),
+                            metadata,
+                        },
+                    }));
+                } else {
+                    let output = StatOutput {
+                        name: info.key.clone(),
+                        last_modified: info.last_modified.map(|d| d.to_string()),
+                        size_bytes: info.size_bytes,
+                        size_human: info.size_human.clone(),
+                        etag: info.etag.clone(),
+                        content_type: info.content_type.clone(),
+                        storage_class: info.storage_class.clone(),
+                        version_id: info.version_id.clone(),
+                        metadata,
+                    };
+                    formatter.json(&output);
+                }
             } else {
                 // Helper to format key-value pairs with styling
                 let format_kv = |key: &str, value: &str| {
@@ -180,6 +254,9 @@ pub async fn execute(args: StatArgs, output_config: OutputConfig) -> ExitCode {
                 if let Some(sc) = &info.storage_class {
                     formatter.println(&format_kv("Class", sc));
                 }
+                if let Some(version_id) = &info.version_id {
+                    formatter.println(&format_kv("Version", version_id));
+                }
                 let display_metadata = build_display_metadata(&info);
                 if !display_metadata.is_empty() {
                     formatter.println(&format_kv("Metadata", ""));
@@ -191,18 +268,32 @@ pub async fn execute(args: StatArgs, output_config: OutputConfig) -> ExitCode {
             ExitCode::Success
         }
         Err(e) => {
-            let err_str = e.to_string();
-            if err_str.contains("NotFound") || err_str.contains("NoSuchKey") {
-                formatter.error(&format!("Object not found: {}", args.path));
-                ExitCode::NotFound
-            } else if err_str.contains("AccessDenied") {
-                formatter.error(&format!("Access denied: {}", args.path));
-                ExitCode::AuthError
-            } else {
-                formatter.error(&format!("Failed to get object metadata: {e}"));
-                ExitCode::NetworkError
-            }
+            let exit_code = exit_code_for_core_error(&e);
+            fail_stat(
+                &formatter,
+                version_output,
+                exit_code,
+                &format!("Failed to inspect {}: {e}", args.path),
+            )
         }
+    }
+}
+
+fn fail_stat(
+    formatter: &Formatter,
+    version_output: bool,
+    code: ExitCode,
+    message: &str,
+) -> ExitCode {
+    if formatter.is_json() && version_output {
+        formatter.json_error(&V3ErrorEnvelope::versioned_objects(
+            code,
+            message,
+            Some("head_object_version"),
+        ));
+        code
+    } else {
+        formatter.fail(code, message)
     }
 }
 
@@ -367,6 +458,9 @@ mod tests {
             storage_class: None,
             content_type: Some("text/plain".to_string()),
             metadata: Some(user_meta),
+            version_id: None,
+            source_version_id: None,
+            is_delete_marker: None,
             is_dir: false,
         };
 

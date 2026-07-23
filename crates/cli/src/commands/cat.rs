@@ -3,9 +3,10 @@
 //! Outputs the entire content of an object to stdout.
 
 use clap::Args;
-use rc_core::{AliasManager, RemotePath};
+use rc_core::{AliasManager, ObjectReadOptions, ObjectStore, RemotePath};
 use rc_s3::S3Client;
 
+use crate::commands::{exit_code_for_core_error, validate_version_selector};
 use crate::exit_code::ExitCode;
 use crate::output::{Formatter, OutputConfig};
 
@@ -32,12 +33,27 @@ pub struct CatArgs {
 pub async fn execute(args: CatArgs, output_config: OutputConfig) -> ExitCode {
     let formatter = Formatter::new(output_config);
 
-    if args.enc_key.is_some() || args.rewind.is_some() || args.version_id.is_some() {
+    if let Err(error) =
+        validate_version_selector(args.version_id.as_deref(), args.rewind.as_deref())
+    {
+        return formatter.fail(ExitCode::UsageError, &error);
+    }
+    if args.enc_key.is_some() {
         return formatter.fail(
             ExitCode::UnsupportedFeature,
-            "--enc-key, --rewind, and --version-id are not implemented for cat",
+            "--enc-key is not implemented for cat",
         );
     }
+    if args.rewind.is_some() {
+        return formatter.fail(
+            ExitCode::UnsupportedFeature,
+            "--rewind is not implemented for cat",
+        );
+    }
+    let read_options = match ObjectReadOptions::for_version(args.version_id.clone()) {
+        Ok(options) => options,
+        Err(error) => return formatter.fail(ExitCode::UsageError, &error.to_string()),
+    };
 
     // Parse the path
     let (alias_name, bucket, key) = match parse_cat_path(&args.path) {
@@ -78,20 +94,20 @@ pub async fn execute(args: CatArgs, output_config: OutputConfig) -> ExitCode {
 
     // Get object content
     let mut stdout = tokio::io::stdout();
-    match client.write_object_to(&path, &mut stdout, None).await {
+    match ObjectStore::write_object_to_with_options(
+        &client,
+        &path,
+        &read_options,
+        &mut stdout,
+        None,
+    )
+    .await
+    {
         Ok(_) => ExitCode::Success,
         Err(e) => {
-            let err_str = e.to_string();
-            if err_str.contains("NotFound") || err_str.contains("NoSuchKey") {
-                formatter.error(&format!("Object not found: {}", args.path));
-                ExitCode::NotFound
-            } else if err_str.contains("AccessDenied") {
-                formatter.error(&format!("Access denied: {}", args.path));
-                ExitCode::AuthError
-            } else {
-                formatter.error(&format!("Failed to get object: {e}"));
-                ExitCode::NetworkError
-            }
+            let exit_code = exit_code_for_core_error(&e);
+            formatter.error_with_code(exit_code, &format!("Failed to read {}: {e}", args.path));
+            exit_code
         }
     }
 }

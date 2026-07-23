@@ -186,7 +186,9 @@ fn success_output(report: &CapabilityReport) -> CapabilitiesSuccessOutput {
 }
 
 fn capability_scope(name: &str) -> &'static str {
-    if name.starts_with("runtime.") {
+    if name == "listen_notification" {
+        "bucket"
+    } else if name.starts_with("runtime.") {
         "runtime"
     } else if name.starts_with("admin.") {
         "admin"
@@ -285,6 +287,11 @@ mod tests {
 
     use super::*;
     use crate::output::OutputConfig;
+
+    #[test]
+    fn listen_notification_capability_uses_bucket_scope() {
+        assert_eq!(capability_scope("listen_notification"), "bucket");
+    }
 
     const SUCCESS_GOLDEN: &str =
         include_str!("../../../tests/fixtures/output_v3/capabilities/runtime_success.json");
