@@ -1,0 +1,31 @@
+{
+  "schema_version": 3,
+  "type": "replication",
+  "status": "success",
+  "data": {
+    "operation": "diff",
+    "bucket": "source",
+    "prefix": "reports/",
+    "entries": [
+      {
+        "object": "reports/a.json",
+        "version_id": "v1",
+        "delete_marker": false,
+        "size_bytes": 42,
+        "replication_status": "FAILED",
+        "last_modified": "2026-07-21T04:00:00Z",
+        "extensions": {
+          "TargetDetail": { "attempts": 2 }
+        }
+      }
+    ],
+    "scan": {
+      "scanned_versions": 24,
+      "truncated": false,
+      "resumable": false
+    },
+    "extensions": {
+      "ServerRevision": 7
+    }
+  }
+}

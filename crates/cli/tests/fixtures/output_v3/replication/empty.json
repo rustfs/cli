@@ -1,0 +1,17 @@
+{
+  "schema_version": 3,
+  "type": "replication",
+  "status": "success",
+  "data": {
+    "operation": "diff",
+    "bucket": "source",
+    "prefix": null,
+    "entries": [],
+    "scan": {
+      "scanned_versions": 0,
+      "truncated": false,
+      "resumable": false
+    },
+    "extensions": {}
+  }
+}

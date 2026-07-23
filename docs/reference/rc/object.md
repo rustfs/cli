@@ -2,7 +2,7 @@
 
 ## Purpose
 
-The `rc object` operation is the preferred noun-first entry point for object workflows. It groups listing, copy, move, remove, metadata, preview, search, tree, and presigned URL operations.
+The `rc object` operation is the preferred noun-first entry point for object workflows. It groups listing, copy, move, remove, metadata, preview, search, tree, presigned URL, retention, and legal-hold operations.
 
 ## Syntax
 
@@ -18,6 +18,8 @@ rc object head [OPTIONS] <ALIAS/BUCKET/KEY>
 rc object find [OPTIONS] <ALIAS/BUCKET[/PREFIX]>
 rc object tree [OPTIONS] <ALIAS/BUCKET[/PREFIX]>
 rc object share [OPTIONS] <ALIAS/BUCKET/KEY>
+rc object retention <info|set|clear> ...
+rc object legalhold <info|set|clear> ...
 ```
 
 ## Commands
@@ -34,6 +36,8 @@ rc object share [OPTIONS] <ALIAS/BUCKET/KEY>
 | `find` | Search object keys with filters. |
 | `tree` | Display object keys as a tree. |
 | `share` | Generate a presigned object URL. |
+| `retention` | Inspect, set, or clear retention for an object version. |
+| `legalhold` | Inspect legal-hold status or set it to ON/OFF for an object version. |
 
 ## Common Parameters
 
@@ -74,9 +78,18 @@ Generate a one-day download URL:
 rc object share local/reports/report.json --expire 1d
 ```
 
+Inspect retention and legal hold on one exact version:
+
+```bash
+rc object retention info local/records/invoice.pdf --version-id v2
+rc object legalhold info local/records/invoice.pdf --version-id v2
+```
+
 ## Behavior
 
 Prefer `rc object ...` for new scripts. Legacy commands such as `rc cp`, `rc mv`, `rc rm`, `rc cat`, `rc head`, `rc stat`, `rc find`, `rc tree`, and `rc share` remain available for compatibility.
+
+The top-level [`rc retention`](retention.md) and [`rc legalhold`](legalhold.md) names provide `mc`-compatible entry points to the same implementations.
 
 Global options shown in command syntax use the same meaning everywhere:
 

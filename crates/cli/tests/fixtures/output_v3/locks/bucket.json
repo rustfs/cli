@@ -1,0 +1,1 @@
+{"schema_version":3,"type":"locks","status":"success","data":{"operation":"bucket_lock_info","changed":false,"items":[{"bucket":"records","key":"","version_id":null,"object_lock_enabled":true,"retention":null,"legal_hold":null,"default_retention":{"mode":"governance","duration":{"unit":"days","value":30}}}]}}

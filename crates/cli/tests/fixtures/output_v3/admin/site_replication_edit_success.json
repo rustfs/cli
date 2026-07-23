@@ -1,0 +1,22 @@
+{
+  "schema_version": 3,
+  "type": "admin_operations",
+  "status": "success",
+  "data": {
+    "operations": [
+      {
+        "operation": "site_replication_edit",
+        "resource": "deployment-2",
+        "state": "succeeded",
+        "operation_id": null,
+        "changed": true,
+        "result": {
+          "site": "secondary",
+          "endpoint": "https://secondary.example.test",
+          "verify_tls": true,
+          "has_custom_ca": true
+        }
+      }
+    ]
+  }
+}

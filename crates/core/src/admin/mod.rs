@@ -7,6 +7,7 @@ mod capabilities;
 mod cluster;
 mod kms;
 mod observability;
+mod replication;
 mod site;
 pub mod tier;
 mod types;
@@ -35,7 +36,16 @@ pub use observability::{
     ScannerRuntimeConfigValue, ScannerStatus, StorageBackend, StorageBackendKind, StorageDisk,
     StorageDiskMetrics, StorageInfo,
 };
-pub use site::{PeerSiteSpec, ServiceActionResult, SiteRemoveSpec, SiteStatusOptions};
+pub use replication::{
+    MAX_REPLICATION_DIFF_RESPONSE_BYTES, ReplicationDiff, ReplicationDiffApi, ReplicationDiffEntry,
+};
+pub use site::{
+    MAX_SITE_REPLICATION_CA_CERT_BYTES, MAX_SITE_REPLICATION_ERROR_RESPONSE_BYTES,
+    MAX_SITE_REPLICATION_REQUEST_BYTES, MAX_SITE_REPLICATION_SUCCESS_RESPONSE_BYTES, PeerSiteSpec,
+    ReplicateEditStatus, ServiceActionResult, SiteRemoveSpec, SiteReplicationInfo,
+    SiteReplicationPeer, SiteReplicationResyncBucketStatus, SiteReplicationResyncOperation,
+    SiteReplicationResyncStatus, SiteStatusOptions, validate_site_replication_ca_bundle,
+};
 pub use tier::{
     TierAliyun, TierAzure, TierConfig, TierCreds, TierGCS, TierHuaweicloud, TierMinIO, TierR2,
     TierRustFS, TierS3, TierTencent, TierType,
@@ -260,7 +270,20 @@ pub trait AdminApi: Send + Sync {
     // ==================== Site Replication Operations ====================
 
     /// Get current site replication configuration
-    async fn site_replication_info(&self) -> Result<serde_json::Value>;
+    async fn site_replication_info(&self) -> Result<SiteReplicationInfo>;
+
+    /// Edit a peer using a complete read-modify-write snapshot
+    async fn site_replication_edit(
+        &self,
+        peer: &SiteReplicationPeer,
+    ) -> Result<ReplicateEditStatus>;
+
+    /// Start, inspect, or cancel a resync toward one complete peer snapshot
+    async fn site_replication_resync(
+        &self,
+        operation: SiteReplicationResyncOperation,
+        peer: &SiteReplicationPeer,
+    ) -> Result<SiteReplicationResyncStatus>;
 
     /// Add peer sites to the site replication cluster
     async fn site_replication_add(&self, sites: &[PeerSiteSpec]) -> Result<serde_json::Value>;
