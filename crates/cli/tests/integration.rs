@@ -333,6 +333,11 @@ mod sse_customer_operations {
 
     #[tokio::test]
     async fn test_beta10_sse_customer_put_head_get_wrong_key_and_multipart() {
+        if std::env::var_os("TEST_S3_CA_BUNDLE").is_none() {
+            eprintln!("SSE-C integration requires a trusted TLS test endpoint");
+            return;
+        }
+
         let (config_dir, bucket_name) =
             setup_with_alias("sse-c").expect("S3 integration test setup failed");
         let client = S3Client::new(test_alias())
