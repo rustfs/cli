@@ -34,15 +34,16 @@ use rc_core::admin::{
     MAX_IAM_POLICY_DETACH_REQUEST_BYTES, MAX_IAM_POLICY_DETACH_RESPONSE_BYTES,
     MAX_IAM_POLICY_ENTITIES_RESPONSE_BYTES, MAX_METRICS_LINE_BYTES, MAX_METRICS_RESPONSE_BYTES,
     MAX_METRICS_SAMPLES, MAX_OIDC_RESPONSE_BYTES, MAX_REPLICATION_DIFF_RESPONSE_BYTES,
-    MAX_SITE_REPLICATION_ERROR_RESPONSE_BYTES, MAX_SITE_REPLICATION_REQUEST_BYTES,
-    MAX_SITE_REPLICATION_SUCCESS_RESPONSE_BYTES, ManualTransitionRunRequest,
-    ManualTransitionRunResponse, MetricsBatch, MetricsQuery, ModuleSwitches, ObservabilityApi,
-    OidcMutationApi, OidcMutationRequest, OidcMutationResult, OidcProvider, OidcProviderList,
-    OidcReadApi, OidcValidationRequest, OidcValidationResult, PeerSiteSpec, Policy,
-    PolicyDetachEntity, PolicyDetachRequest, PolicyDetachResult, PolicyEntitiesQuery,
-    PolicyEntitiesResult, PolicyEntity, PolicyInfo, PoolStatus, PoolTarget, RealtimeMetrics,
-    RebalanceStartResult, RebalanceStatus, ReplicateEditStatus, ReplicationDiff,
-    ReplicationDiffApi, RuntimeCapabilitiesSnapshot, RuntimeCapabilityStatus, ScannerStatus,
+    MAX_REPLICATION_INSPECTION_RESPONSE_BYTES, MAX_SITE_REPLICATION_ERROR_RESPONSE_BYTES,
+    MAX_SITE_REPLICATION_REQUEST_BYTES, MAX_SITE_REPLICATION_SUCCESS_RESPONSE_BYTES,
+    ManualTransitionRunRequest, ManualTransitionRunResponse, MetricsBatch, MetricsQuery,
+    ModuleSwitches, ObservabilityApi, OidcMutationApi, OidcMutationRequest, OidcMutationResult,
+    OidcProvider, OidcProviderList, OidcReadApi, OidcValidationRequest, OidcValidationResult,
+    PeerSiteSpec, Policy, PolicyDetachEntity, PolicyDetachRequest, PolicyDetachResult,
+    PolicyEntitiesQuery, PolicyEntitiesResult, PolicyEntity, PolicyInfo, PoolStatus, PoolTarget,
+    RealtimeMetrics, RebalanceStartResult, RebalanceStatus, ReplicateEditStatus, ReplicationDiff,
+    ReplicationDiffApi, ReplicationInspectionApi, ReplicationMetricScope, ReplicationMetrics,
+    ReplicationMrf, RuntimeCapabilitiesSnapshot, RuntimeCapabilityStatus, ScannerStatus,
     ServiceAccount, ServiceAccountCreateResponse, ServiceActionResult, SiteRemoveSpec,
     SiteReplicationInfo, SiteReplicationPeer, SiteReplicationResyncOperation,
     SiteReplicationResyncStatus, SiteStatusOptions, StorageInfo, UpdateGroupMembersRequest,
@@ -1177,6 +1178,89 @@ impl AdminClient {
             .filter(|message| !message.trim().is_empty())
             .unwrap_or_else(|| "the replication diff route was not found".to_string());
         Error::UnsupportedFeature(reason)
+    }
+
+    fn map_replication_inspection_error(&self, status: StatusCode, body: &str) -> Error {
+        if matches!(status, StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED) {
+            return Error::Auth("Authentication failed for replication inspection".into());
+        }
+        if matches!(
+            status,
+            StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_IMPLEMENTED
+        ) {
+            return Error::UnsupportedFeature(
+                "Replication inspection is not supported by this server".into(),
+            );
+        }
+        if status != StatusCode::NOT_FOUND {
+            let mut redacted = body.to_string();
+            self.redact_admin_credentials(&mut redacted);
+            return self.map_error(status, &redacted);
+        }
+        let structured = parse_admin_error(body);
+        let mut safe_message = structured
+            .as_ref()
+            .and_then(|error| error.message.clone())
+            .filter(|message| !message.trim().is_empty());
+        if let Some(message) = &mut safe_message {
+            self.redact_admin_credentials(message);
+        }
+        if structured.as_ref().is_some_and(|error| {
+            matches!(
+                error.code.as_deref(),
+                Some(
+                    "NoSuchBucket"
+                        | "ReplicationConfigurationNotFoundError"
+                        | "ReplicationConfigurationNotFound"
+                )
+            )
+        }) {
+            return Error::NotFound(safe_message.unwrap_or_else(|| {
+                "Bucket or replication configuration was not found".to_string()
+            }));
+        }
+        Error::UnsupportedFeature(
+            safe_message.unwrap_or_else(|| "Replication inspection route was not found".into()),
+        )
+    }
+
+    fn sanitize_replication_scope(&self, scope: &mut Option<ReplicationMetricScope>) {
+        if let Some(ReplicationMetricScope::Unknown(value)) = scope {
+            self.redact_admin_credentials(value);
+        }
+    }
+
+    fn sanitize_replication_metrics(&self, metrics: &mut ReplicationMetrics) {
+        self.sanitize_replication_scope(&mut metrics.queue_scope);
+        for value in metrics.extra.values_mut() {
+            self.redact_admin_credentials_in_value(value);
+        }
+        for (arn, mut target) in std::mem::take(&mut metrics.stats) {
+            let mut redacted_arn = arn;
+            self.redact_admin_credentials(&mut redacted_arn);
+            self.sanitize_replication_scope(&mut target.latency_scope);
+            self.sanitize_replication_scope(&mut target.bandwidth_scope);
+            for value in target.extra.values_mut() {
+                self.redact_admin_credentials_in_value(value);
+            }
+            metrics.stats.insert(redacted_arn, target);
+        }
+    }
+
+    fn sanitize_replication_mrf(&self, mrf: &mut ReplicationMrf) {
+        self.redact_admin_credentials(&mut mrf.bucket);
+        for target in &mut mrf.targets {
+            self.redact_admin_credentials(&mut target.arn);
+            if let ReplicationMetricScope::Unknown(value) = &mut target.observation_scope {
+                self.redact_admin_credentials(value);
+            }
+            for value in target.extra.values_mut() {
+                self.redact_admin_credentials_in_value(value);
+            }
+        }
+        for value in mrf.extra.values_mut() {
+            self.redact_admin_credentials_in_value(value);
+        }
     }
 
     fn map_iam_policy_entities_error(&self, status: StatusCode, _body: &str) -> Error {
@@ -4521,12 +4605,6 @@ impl AdminApi for AdminClient {
             .await
     }
 
-    async fn replication_metrics(&self, bucket: &str) -> Result<serde_json::Value> {
-        let query: &[(&str, &str)] = &[("bucket", bucket)];
-        self.request(Method::GET, "/replicationmetrics", Some(query), None)
-            .await
-    }
-
     async fn service_action(&self, action: &str) -> Result<ServiceActionResult> {
         let query: &[(&str, &str)] = &[("action", action)];
         self.request(Method::POST, "/service", Some(query), None)
@@ -4685,6 +4763,96 @@ impl ReplicationDiffApi for AdminClient {
             },
         )
         .await
+    }
+}
+
+#[async_trait]
+impl ReplicationInspectionApi for AdminClient {
+    async fn replication_metrics(&self, bucket: &str) -> Result<ReplicationMetrics> {
+        let query = [("bucket", bucket)];
+        let mut metrics: ReplicationMetrics = self
+            .request_bounded_json(
+                Method::GET,
+                "/replicationmetrics",
+                Some(&query),
+                None,
+                BoundedJsonResponse {
+                    max_bytes: MAX_REPLICATION_INSPECTION_RESPONSE_BYTES,
+                    name: "Replication metrics response",
+                    error_mapper: Self::map_replication_inspection_error,
+                },
+            )
+            .await?;
+        for target in metrics.stats.values() {
+            if target
+                .fail_stats
+                .as_ref()
+                .is_some_and(|authoritative| authoritative != &target.failed)
+            {
+                return Err(Error::General(
+                    "Replication metrics response contains inconsistent failed totals".into(),
+                ));
+            }
+            if [
+                target.latency.avg,
+                target.latency.curr,
+                target.latency.max,
+                target.xfer_rate_lrg.avg,
+                target.xfer_rate_lrg.curr,
+                target.xfer_rate_lrg.peak,
+                target.xfer_rate_sml.avg,
+                target.xfer_rate_sml.curr,
+                target.xfer_rate_sml.peak,
+                target.current_bandwidth_bytes_per_sec,
+            ]
+            .into_iter()
+            .any(|value| !value.is_finite() || value < 0.0)
+            {
+                return Err(Error::General(
+                    "Replication metrics response contains invalid negative observations".into(),
+                ));
+            }
+        }
+        self.sanitize_replication_metrics(&mut metrics);
+        Ok(metrics)
+    }
+
+    async fn replication_mrf(&self, bucket: &str) -> Result<ReplicationMrf> {
+        let query = [("bucket", bucket)];
+        let mut mrf: ReplicationMrf = self
+            .request_bounded_json(
+                Method::GET,
+                "/replication/mrf",
+                Some(&query),
+                None,
+                BoundedJsonResponse {
+                    max_bytes: MAX_REPLICATION_INSPECTION_RESPONSE_BYTES,
+                    name: "Replication MRF response",
+                    error_mapper: Self::map_replication_inspection_error,
+                },
+            )
+            .await?;
+        if mrf.bucket != bucket {
+            return Err(Error::General(
+                "Replication MRF response bucket does not match the request".into(),
+            ));
+        }
+        let target_count = mrf.targets.iter().try_fold(0_u64, |total, target| {
+            total.checked_add(target.failed_count)
+        });
+        let target_size = mrf
+            .targets
+            .iter()
+            .try_fold(0_u64, |total, target| total.checked_add(target.failed_size));
+        if target_count != Some(mrf.total_failed_count)
+            || target_size != Some(mrf.total_failed_size)
+        {
+            return Err(Error::General(
+                "Replication MRF response contains inconsistent target totals".into(),
+            ));
+        }
+        self.sanitize_replication_mrf(&mut mrf);
+        Ok(mrf)
     }
 }
 
@@ -9164,6 +9332,162 @@ mod tests {
         completion
             .recv_timeout(Duration::from_secs(5))
             .expect("chunked overflow server should complete within its socket timeout");
+    }
+
+    #[tokio::test]
+    async fn replication_metrics_reads_typed_truth_and_redacts_credentials() {
+        let body = r#"{
+            "stats":{"arn:secret":{"replicated_size":30,"replicated_count":3,
+                "failed":{"count":2,"size":20},"fail_stats":{"count":2,"size":20},
+                "latency":{"avg":1.0,"curr":2.0,"max":3.0},
+                "xfer_rate_lrg":{"avg":4.0,"curr":5.0,"peak":6.0},
+                "xfer_rate_sml":{"avg":7.0,"curr":8.0,"peak":9.0},
+                "bandwidth_limit_bytes_per_sec":100,
+                "current_bandwidth_bytes_per_sec":50.0,
+                "latency_scope":"partial_cluster","bandwidth_scope":"node_local",
+                "Future":"access"}},
+            "replica_size":40,"replica_count":4,"replicated_size":30,"replicated_count":3,
+            "q_stat":{"curr":{"count":1,"bytes":10},"avg":{"count":1,"bytes":10},
+                "max":{"count":2,"bytes":20},"last_minute":{"count":1,"bytes":10}},
+            "provider_available":true,"cluster_complete":false,
+            "observed_node_count":1,"expected_node_count":2,"queue_scope":"partial_cluster"
+        }"#;
+        let (endpoint, receiver, handle) = start_admin_test_server("200 OK", body);
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let metrics = client
+            .replication_metrics("source bucket")
+            .await
+            .expect("typed metrics");
+
+        assert_eq!(metrics.provider_available, Some(true));
+        assert_eq!(metrics.q_stat.curr.size, 10);
+        assert!(metrics.stats.contains_key("arn:[REDACTED]"));
+        assert_eq!(
+            metrics.stats["arn:[REDACTED]"].extra["Future"],
+            "[REDACTED]"
+        );
+        assert_eq!(
+            receiver.recv().expect("request").target,
+            "/rustfs/admin/v3/replicationmetrics?bucket=source%20bucket"
+        );
+        handle.join().expect("server thread");
+    }
+
+    #[tokio::test]
+    async fn replication_mrf_preserves_partial_and_explicit_availability() {
+        let body = r#"{"Bucket":"source","Targets":[
+            {"ARN":"arn:a","FailedCount":2,"FailedSize":20,"ObservationScope":"partial_cluster"}
+        ],"TotalFailedCount":2,"TotalFailedSize":20,"QueuedCount":1,"QueuedSize":10,
+        "PerObjectEntriesAvailable":false,"RuntimeStatsAvailable":true,
+        "ClusterComplete":false,"ObservedNodeCount":1,"ExpectedNodeCount":2,
+        "DurableBacklogAvailable":true,"DurableCount":3,"DurableSize":30,
+        "PerTargetDurableEntriesAvailable":false}"#;
+        let (endpoint, receiver, handle) = start_admin_test_server("200 OK", body);
+
+        let mrf = anonymous_admin_client_for_endpoint(&endpoint)
+            .replication_mrf("source")
+            .await
+            .expect("typed MRF");
+
+        assert!(!mrf.cluster_complete);
+        assert!(!mrf.per_object_entries_available);
+        assert_eq!(mrf.queued_count, 1);
+        assert_eq!(
+            receiver.recv().expect("request").target,
+            "/rustfs/admin/v3/replication/mrf?bucket=source"
+        );
+        handle.join().expect("server thread");
+    }
+
+    #[tokio::test]
+    async fn replication_inspection_distinguishes_errors_and_rejects_bad_truth() {
+        for (status, body, expected) in [
+            (
+                "403 Forbidden",
+                r#"{"Code":"AccessDenied","Message":"denied"}"#,
+                "auth",
+            ),
+            (
+                "404 Not Found",
+                r#"{"Code":"ReplicationConfigurationNotFoundError","Message":"absent"}"#,
+                "not_found",
+            ),
+            (
+                "404 Not Found",
+                r#"{"message":"route absent"}"#,
+                "unsupported",
+            ),
+        ] {
+            let (endpoint, _receiver, handle) = start_admin_test_server(status, body);
+            let error = anonymous_admin_client_for_endpoint(&endpoint)
+                .replication_metrics("source")
+                .await
+                .expect_err("inspection error");
+            match expected {
+                "auth" => assert!(matches!(error, Error::Auth(_))),
+                "not_found" => assert!(matches!(error, Error::NotFound(_))),
+                "unsupported" => assert!(matches!(error, Error::UnsupportedFeature(_))),
+                _ => unreachable!(),
+            }
+            handle.join().expect("server thread");
+        }
+
+        let (endpoint, _receiver, handle) =
+            start_admin_test_server("404 Not Found", r#"{"message":"route access absent"}"#);
+        let redacted = admin_client_for_endpoint(&endpoint)
+            .replication_metrics("source")
+            .await
+            .expect_err("unsupported response");
+        assert!(!redacted.to_string().contains("access"));
+        assert!(redacted.to_string().contains("[REDACTED]"));
+        handle.join().expect("server thread");
+
+        let (endpoint, _receiver, handle) = start_admin_test_server("200 OK", "not-json");
+        assert!(matches!(
+            anonymous_admin_client_for_endpoint(&endpoint)
+                .replication_metrics("source")
+                .await
+                .expect_err("malformed response"),
+            Error::Json(_)
+        ));
+        handle.join().expect("server thread");
+
+        let inconsistent = r#"{"Bucket":"source","Targets":[{"ARN":"a","FailedCount":1,"FailedSize":1,"ObservationScope":"node_local"}],"TotalFailedCount":2,"TotalFailedSize":1,"QueuedCount":0,"QueuedSize":0,"PerObjectEntriesAvailable":false,"RuntimeStatsAvailable":true,"ClusterComplete":true,"ObservedNodeCount":1,"ExpectedNodeCount":1,"DurableBacklogAvailable":false,"DurableCount":0,"DurableSize":0,"PerTargetDurableEntriesAvailable":false}"#;
+        let (endpoint, _receiver, handle) = start_admin_test_server("200 OK", inconsistent);
+        assert!(matches!(
+            anonymous_admin_client_for_endpoint(&endpoint)
+                .replication_mrf("source")
+                .await
+                .expect_err("inconsistent totals"),
+            Error::General(message) if message.contains("inconsistent")
+        ));
+        handle.join().expect("server thread");
+    }
+
+    #[tokio::test]
+    async fn replication_inspection_bounds_error_and_success_bodies() {
+        let (endpoint, _receiver, handle) = start_admin_declared_length_server(
+            "200 OK",
+            MAX_REPLICATION_INSPECTION_RESPONSE_BYTES + 1,
+        );
+        let error = anonymous_admin_client_for_endpoint(&endpoint)
+            .replication_metrics("source")
+            .await
+            .expect_err("oversized success");
+        assert!(matches!(error, Error::General(message) if message.contains("response limit")));
+        handle.join().expect("server thread");
+
+        let (endpoint, _receiver, handle) = start_admin_declared_length_server(
+            "403 Forbidden",
+            MAX_REPLICATION_INSPECTION_RESPONSE_BYTES + 1,
+        );
+        let error = anonymous_admin_client_for_endpoint(&endpoint)
+            .replication_mrf("source")
+            .await
+            .expect_err("oversized error");
+        assert!(matches!(error, Error::General(message) if message.contains("response limit")));
+        handle.join().expect("server thread");
     }
 
     #[tokio::test]

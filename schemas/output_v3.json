@@ -1255,19 +1255,140 @@
       }
     },
     "replicationData": {
+      "oneOf": [
+        { "$ref": "#/definitions/replicationDiffData" },
+        { "$ref": "#/definitions/replicationStatusData" },
+        { "$ref": "#/definitions/replicationMrfData" }
+      ]
+    },
+    "replicationDiffData": {
       "type": "object",
-      "required": [
-        "operation", "bucket", "prefix", "entries", "scan", "extensions"
-      ],
+      "required": ["operation", "bucket", "prefix", "entries", "scan", "extensions"],
       "properties": {
         "operation": { "const": "diff" },
         "bucket": { "type": "string", "minLength": 1 },
         "prefix": { "$ref": "#/definitions/nullableString" },
-        "entries": {
-          "type": "array",
-          "items": { "$ref": "#/definitions/replicationDiffEntry" }
-        },
+        "entries": { "type": "array", "items": { "$ref": "#/definitions/replicationDiffEntry" } },
         "scan": { "$ref": "#/definitions/replicationDiffScan" },
+        "extensions": { "type": "object" }
+      }
+    },
+    "replicationCluster": {
+      "type": "object",
+      "required": ["state", "observed_nodes", "expected_nodes"],
+      "properties": {
+        "state": { "enum": ["complete", "partial", "unavailable", "legacy_unknown"] },
+        "observed_nodes": { "type": ["integer", "null"], "minimum": 0 },
+        "expected_nodes": { "type": ["integer", "null"], "minimum": 0 }
+      }
+    },
+    "replicationBacklog": {
+      "type": "object",
+      "required": ["count", "size_bytes"],
+      "properties": {
+        "count": { "type": "integer", "minimum": 0 },
+        "size_bytes": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "replicationStatusData": {
+      "type": "object",
+      "required": ["operation", "bucket", "availability", "cluster", "queue", "totals", "targets", "extensions"],
+      "properties": {
+        "operation": { "const": "status" },
+        "bucket": { "type": "string", "minLength": 1 },
+        "availability": { "enum": ["available", "unavailable", "legacy_unknown"] },
+        "cluster": { "$ref": "#/definitions/replicationCluster" },
+        "queue": {
+          "type": "object",
+          "required": ["count", "size_bytes", "scope"],
+          "properties": {
+            "count": { "type": "integer", "minimum": 0 },
+            "size_bytes": { "type": "integer", "minimum": 0 },
+            "scope": { "type": "string", "minLength": 1 }
+          }
+        },
+        "totals": {
+          "type": "object",
+          "required": ["replica_count", "replica_size_bytes", "replicated_count", "replicated_size_bytes"],
+          "properties": {
+            "replica_count": { "type": "integer", "minimum": 0 },
+            "replica_size_bytes": { "type": "integer", "minimum": 0 },
+            "replicated_count": { "type": "integer", "minimum": 0 },
+            "replicated_size_bytes": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "targets": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["target_arn", "replicated_count", "replicated_size_bytes", "failed_count", "failed_size_bytes", "latency", "bandwidth", "extensions"],
+            "properties": {
+              "target_arn": { "type": "string" },
+              "replicated_count": { "type": "integer", "minimum": 0 },
+              "replicated_size_bytes": { "type": "integer", "minimum": 0 },
+              "failed_count": { "type": "integer", "minimum": 0 },
+              "failed_size_bytes": { "type": "integer", "minimum": 0 },
+              "latency": {
+                "type": "object",
+                "required": ["average_ms", "current_ms", "maximum_ms", "scope"],
+                "properties": {
+                  "average_ms": { "type": "number", "minimum": 0 },
+                  "current_ms": { "type": "number", "minimum": 0 },
+                  "maximum_ms": { "type": "number", "minimum": 0 },
+                  "scope": { "type": "string", "minLength": 1 }
+                }
+              },
+              "bandwidth": {
+                "type": "object",
+                "required": ["limit_bytes_per_sec", "current_bytes_per_sec", "scope"],
+                "properties": {
+                  "limit_bytes_per_sec": { "type": "integer", "minimum": 0 },
+                  "current_bytes_per_sec": { "type": "number", "minimum": 0 },
+                  "scope": { "type": "string", "minLength": 1 }
+                }
+              },
+              "extensions": { "type": "object" }
+            }
+          }
+        },
+        "extensions": { "type": "object" }
+      }
+    },
+    "replicationMrfData": {
+      "type": "object",
+      "required": ["operation", "bucket", "runtime_stats_available", "cluster", "failed", "queue", "durable_backlog", "per_object_entries_available", "per_target_durable_entries_available", "targets", "extensions"],
+      "properties": {
+        "operation": { "const": "mrf" },
+        "bucket": { "type": "string", "minLength": 1 },
+        "runtime_stats_available": { "type": "boolean" },
+        "cluster": { "$ref": "#/definitions/replicationCluster" },
+        "failed": { "$ref": "#/definitions/replicationBacklog" },
+        "queue": { "$ref": "#/definitions/replicationBacklog" },
+        "durable_backlog": {
+          "type": "object",
+          "required": ["available", "count", "size_bytes"],
+          "properties": {
+            "available": { "type": "boolean" },
+            "count": { "type": "integer", "minimum": 0 },
+            "size_bytes": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "per_object_entries_available": { "type": "boolean" },
+        "per_target_durable_entries_available": { "type": "boolean" },
+        "targets": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["target_arn", "failed_count", "failed_size_bytes", "observation_scope", "extensions"],
+            "properties": {
+              "target_arn": { "type": "string" },
+              "failed_count": { "type": "integer", "minimum": 0 },
+              "failed_size_bytes": { "type": "integer", "minimum": 0 },
+              "observation_scope": { "type": "string", "minLength": 1 },
+              "extensions": { "type": "object" }
+            }
+          }
+        },
         "extensions": { "type": "object" }
       }
     },

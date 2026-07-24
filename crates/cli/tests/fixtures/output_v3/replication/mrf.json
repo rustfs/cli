@@ -1,0 +1,28 @@
+{
+  "schema_version": 3,
+  "type": "replication",
+  "status": "success",
+  "data": {
+    "operation": "mrf",
+    "bucket": "source",
+    "runtime_stats_available": true,
+    "cluster": {
+      "state": "partial",
+      "observed_nodes": 1,
+      "expected_nodes": 2
+    },
+    "failed": {"count": 2, "size_bytes": 20},
+    "queue": {"count": 1, "size_bytes": 10},
+    "durable_backlog": {"available": true, "count": 3, "size_bytes": 30},
+    "per_object_entries_available": false,
+    "per_target_durable_entries_available": false,
+    "targets": [{
+      "target_arn": "arn:rustfs:replication::target",
+      "failed_count": 2,
+      "failed_size_bytes": 20,
+      "observation_scope": "partial_cluster",
+      "extensions": {}
+    }],
+    "extensions": {}
+  }
+}

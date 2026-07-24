@@ -148,6 +148,16 @@ fn every_v3_family_has_valid_contract_fixtures() {
 }
 
 #[test]
+fn replication_status_and_mrf_fixtures_are_valid() {
+    let validator = load_validator(3);
+    for case in ["status", "mrf"] {
+        let path = fixture_path("replication", case);
+        let value = load_json(&path);
+        assert_valid(&validator, &value, &path.display().to_string());
+    }
+}
+
+#[test]
 fn multipart_partial_fixture_preserves_successes_and_per_upload_errors() {
     let validator = load_validator(3);
     let fixture = load_json(&fixture_path("multipart_uploads", "partial"));

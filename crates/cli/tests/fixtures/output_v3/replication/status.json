@@ -1,0 +1,46 @@
+{
+  "schema_version": 3,
+  "type": "replication",
+  "status": "success",
+  "data": {
+    "operation": "status",
+    "bucket": "source",
+    "availability": "available",
+    "cluster": {
+      "state": "partial",
+      "observed_nodes": 1,
+      "expected_nodes": 2
+    },
+    "queue": {
+      "count": 1,
+      "size_bytes": 10,
+      "scope": "partial_cluster"
+    },
+    "totals": {
+      "replica_count": 4,
+      "replica_size_bytes": 40,
+      "replicated_count": 3,
+      "replicated_size_bytes": 30
+    },
+    "targets": [{
+      "target_arn": "arn:rustfs:replication::target",
+      "replicated_count": 3,
+      "replicated_size_bytes": 30,
+      "failed_count": 1,
+      "failed_size_bytes": 10,
+      "latency": {
+        "average_ms": 1.0,
+        "current_ms": 2.0,
+        "maximum_ms": 3.0,
+        "scope": "partial_cluster"
+      },
+      "bandwidth": {
+        "limit_bytes_per_sec": 100,
+        "current_bytes_per_sec": 50.0,
+        "scope": "node_local"
+      },
+      "extensions": {}
+    }],
+    "extensions": {}
+  }
+}

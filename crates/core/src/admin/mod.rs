@@ -95,7 +95,11 @@ pub use oidc::{
     OidcValidationResult,
 };
 pub use replication::{
-    MAX_REPLICATION_DIFF_RESPONSE_BYTES, ReplicationDiff, ReplicationDiffApi, ReplicationDiffEntry,
+    MAX_REPLICATION_DIFF_RESPONSE_BYTES, MAX_REPLICATION_INSPECTION_RESPONSE_BYTES,
+    ReplicationCountSize, ReplicationDiff, ReplicationDiffApi, ReplicationDiffEntry,
+    ReplicationInspectionApi, ReplicationLatencyMetric, ReplicationMetricScope, ReplicationMetrics,
+    ReplicationMrf, ReplicationMrfTarget, ReplicationQueueMetric, ReplicationTargetMetric,
+    ReplicationTransferRate,
 };
 pub use site::{
     MAX_SITE_REPLICATION_CA_CERT_BYTES, MAX_SITE_REPLICATION_ERROR_RESPONSE_BYTES,
@@ -323,9 +327,6 @@ pub trait AdminApi: Send + Sync {
 
     /// Remove a remote replication target
     async fn remove_remote_target(&self, bucket: &str, arn: &str) -> Result<()>;
-
-    /// Get replication metrics for a bucket
-    async fn replication_metrics(&self, bucket: &str) -> Result<serde_json::Value>;
 
     // ==================== Service Control Operations ====================
 

@@ -5,7 +5,10 @@
 
 use clap::{Args, Subcommand};
 use comfy_table::{Cell, Table};
-use rc_core::admin::{AdminApi, ReplicationDiff, ReplicationDiffApi, ReplicationDiffEntry};
+use rc_core::admin::{
+    AdminApi, ReplicationDiff, ReplicationDiffApi, ReplicationDiffEntry, ReplicationInspectionApi,
+    ReplicationMetricScope, ReplicationMetrics, ReplicationMrf,
+};
 use rc_core::replication::{
     BucketTarget, BucketTargetCredentials, ReplicationConfiguration, ReplicationDestination,
     ReplicationResyncStartOptions, ReplicationResyncStartResult, ReplicationResyncStatus,
@@ -60,6 +63,9 @@ pub enum ReplicateCommands {
 
     /// Show replication status/metrics for a bucket
     Status(BucketArg),
+
+    /// Show aggregate replication MRF backlog for a bucket
+    Mrf(BucketArg),
 
     /// Scan for object versions that have not replicated
     Diff(DiffArgs),
@@ -423,6 +429,113 @@ struct ReplicationDiffScanOutput {
 }
 
 #[derive(Debug, Serialize)]
+struct ReplicationInspectionOutput<T> {
+    schema_version: u8,
+    #[serde(rename = "type")]
+    output_type: &'static str,
+    status: &'static str,
+    data: T,
+}
+
+#[derive(Debug, Serialize)]
+struct ReplicationClusterOutput {
+    state: &'static str,
+    observed_nodes: Option<u32>,
+    expected_nodes: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReplicationStatusData {
+    operation: &'static str,
+    bucket: String,
+    availability: &'static str,
+    cluster: ReplicationClusterOutput,
+    queue: ReplicationQueueOutput,
+    totals: ReplicationTotalsOutput,
+    targets: Vec<ReplicationStatusTargetOutput>,
+    extensions: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReplicationQueueOutput {
+    count: u64,
+    size_bytes: u64,
+    scope: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ReplicationTotalsOutput {
+    replica_count: u64,
+    replica_size_bytes: u64,
+    replicated_count: u64,
+    replicated_size_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct ReplicationStatusTargetOutput {
+    target_arn: String,
+    replicated_count: u64,
+    replicated_size_bytes: u64,
+    failed_count: u64,
+    failed_size_bytes: u64,
+    latency: ReplicationLatencyOutput,
+    bandwidth: ReplicationBandwidthOutput,
+    extensions: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReplicationLatencyOutput {
+    average_ms: f64,
+    current_ms: f64,
+    maximum_ms: f64,
+    scope: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ReplicationBandwidthOutput {
+    limit_bytes_per_sec: u64,
+    current_bytes_per_sec: f64,
+    scope: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ReplicationMrfData {
+    operation: &'static str,
+    bucket: String,
+    runtime_stats_available: bool,
+    cluster: ReplicationClusterOutput,
+    failed: ReplicationBacklogOutput,
+    queue: ReplicationBacklogOutput,
+    durable_backlog: ReplicationDurableBacklogOutput,
+    per_object_entries_available: bool,
+    per_target_durable_entries_available: bool,
+    targets: Vec<ReplicationMrfTargetOutput>,
+    extensions: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReplicationBacklogOutput {
+    count: u64,
+    size_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct ReplicationDurableBacklogOutput {
+    available: bool,
+    count: u64,
+    size_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct ReplicationMrfTargetOutput {
+    target_arn: String,
+    failed_count: u64,
+    failed_size_bytes: u64,
+    observation_scope: String,
+    extensions: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
 struct ReplicationDiffErrorOutput {
     schema_version: u8,
     #[serde(rename = "type")]
@@ -467,6 +580,7 @@ pub async fn execute(args: ReplicateArgs, output_config: OutputConfig) -> ExitCo
         ReplicateCommands::Update(args) => execute_update(args, output_config).await,
         ReplicateCommands::List(args) => execute_list(args, output_config).await,
         ReplicateCommands::Status(args) => execute_status(args, output_config).await,
+        ReplicateCommands::Mrf(args) => execute_mrf(args, output_config).await,
         ReplicateCommands::Diff(args) => execute_diff(args, output_config).await,
         ReplicateCommands::Remove(args) => execute_remove(args, output_config).await,
         ReplicateCommands::Export(args) => execute_export(args, output_config).await,
@@ -1150,27 +1264,344 @@ async fn execute_status(args: BucketArg, output_config: OutputConfig) -> ExitCod
         Err(code) => return code,
     };
 
-    match admin_client.replication_metrics(&bucket).await {
+    execute_status_with_api(&bucket, &admin_client, &formatter).await
+}
+
+async fn execute_status_with_api(
+    bucket: &str,
+    api: &dyn ReplicationInspectionApi,
+    formatter: &Formatter,
+) -> ExitCode {
+    match api.replication_metrics(bucket).await {
         Ok(metrics) => {
             if formatter.is_json() {
-                formatter.json(&metrics);
+                formatter.json(&replication_status_output(bucket, metrics));
             } else {
-                formatter.println(&format!("Replication metrics for '{alias_name}/{bucket}':"));
-                match serde_json::to_string_pretty(&metrics) {
-                    Ok(pretty) => formatter.println(&pretty),
-                    Err(error) => {
-                        formatter.error(&format!("Failed to format metrics: {error}"));
-                        return ExitCode::GeneralError;
-                    }
+                for line in replication_status_lines(bucket, &metrics, formatter) {
+                    formatter.println(&line);
                 }
             }
             ExitCode::Success
         }
+        Err(error) => emit_replication_inspection_error(
+            &error,
+            formatter,
+            "read replication status",
+            "replication_status",
+        ),
+    }
+}
+
+async fn execute_mrf(args: BucketArg, output_config: OutputConfig) -> ExitCode {
+    let formatter = Formatter::new(output_config);
+    let (alias_name, bucket) = match parse_bucket_path(&args.path) {
+        Ok(parts) => parts,
         Err(error) => {
-            formatter.error(&format!("Failed to get replication metrics: {error}"));
-            ExitCode::GeneralError
+            return formatter.fail_with_suggestion(
+                ExitCode::UsageError,
+                &error,
+                "Use a bucket path in the form alias/bucket.",
+            );
+        }
+    };
+    let admin_client = match setup_admin_client(&alias_name, &formatter) {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
+    match admin_client.replication_mrf(&bucket).await {
+        Ok(mrf) => {
+            if formatter.is_json() {
+                formatter.json(&replication_mrf_output(mrf));
+            } else {
+                for line in replication_mrf_lines(&mrf, &formatter) {
+                    formatter.println(&line);
+                }
+            }
+            ExitCode::Success
+        }
+        Err(error) => emit_replication_inspection_error(
+            &error,
+            &formatter,
+            "read replication MRF",
+            "replication_mrf",
+        ),
+    }
+}
+
+fn scope_output(scope: Option<&ReplicationMetricScope>) -> String {
+    scope
+        .map(|scope| scope.as_str().to_string())
+        .unwrap_or_else(|| "legacy_unknown".to_string())
+}
+
+fn cluster_output(
+    available: Option<bool>,
+    complete: Option<bool>,
+    observed: Option<u32>,
+    expected: Option<u32>,
+) -> ReplicationClusterOutput {
+    ReplicationClusterOutput {
+        state: match (available, complete) {
+            (Some(false), _) => "unavailable",
+            (_, Some(true)) => "complete",
+            (_, Some(false)) => "partial",
+            (_, None) => "legacy_unknown",
+        },
+        observed_nodes: observed,
+        expected_nodes: expected,
+    }
+}
+
+fn replication_status_output(
+    bucket: &str,
+    metrics: ReplicationMetrics,
+) -> ReplicationInspectionOutput<ReplicationStatusData> {
+    let targets = metrics
+        .stats
+        .into_iter()
+        .map(|(target_arn, target)| {
+            let failed = target.fail_stats.unwrap_or(target.failed);
+            ReplicationStatusTargetOutput {
+                target_arn,
+                replicated_count: target.replicated_count,
+                replicated_size_bytes: target.replicated_size,
+                failed_count: failed.count,
+                failed_size_bytes: failed.size,
+                latency: ReplicationLatencyOutput {
+                    average_ms: target.latency.avg,
+                    current_ms: target.latency.curr,
+                    maximum_ms: target.latency.max,
+                    scope: scope_output(target.latency_scope.as_ref()),
+                },
+                bandwidth: ReplicationBandwidthOutput {
+                    limit_bytes_per_sec: target.bandwidth_limit_bytes_per_sec,
+                    current_bytes_per_sec: target.current_bandwidth_bytes_per_sec,
+                    scope: scope_output(target.bandwidth_scope.as_ref()),
+                },
+                extensions: target.extra,
+            }
+        })
+        .collect();
+    ReplicationInspectionOutput {
+        schema_version: 3,
+        output_type: "replication",
+        status: "success",
+        data: ReplicationStatusData {
+            operation: "status",
+            bucket: bucket.to_string(),
+            availability: match metrics.provider_available {
+                Some(true) => "available",
+                Some(false) => "unavailable",
+                None => "legacy_unknown",
+            },
+            cluster: cluster_output(
+                metrics.provider_available,
+                metrics.cluster_complete,
+                metrics.observed_node_count,
+                metrics.expected_node_count,
+            ),
+            queue: ReplicationQueueOutput {
+                count: metrics.q_stat.curr.count,
+                size_bytes: metrics.q_stat.curr.size,
+                scope: scope_output(metrics.queue_scope.as_ref()),
+            },
+            totals: ReplicationTotalsOutput {
+                replica_count: metrics.replica_count,
+                replica_size_bytes: metrics.replica_size,
+                replicated_count: metrics.replicated_count,
+                replicated_size_bytes: metrics.replicated_size,
+            },
+            targets,
+            extensions: metrics.extra,
+        },
+    }
+}
+
+fn replication_status_lines(
+    bucket: &str,
+    metrics: &ReplicationMetrics,
+    formatter: &Formatter,
+) -> Vec<String> {
+    let availability = match metrics.provider_available {
+        Some(true) => "available",
+        Some(false) => "unavailable",
+        None => "legacy/unknown",
+    };
+    let cluster = cluster_output(
+        metrics.provider_available,
+        metrics.cluster_complete,
+        metrics.observed_node_count,
+        metrics.expected_node_count,
+    );
+    let cluster_detail = match (cluster.observed_nodes, cluster.expected_nodes) {
+        (Some(observed), Some(expected)) => {
+            format!("{} ({observed}/{expected} nodes)", cluster.state)
+        }
+        _ => cluster.state.to_string(),
+    };
+    let mut lines = vec![
+        format!(
+            "Replication status for '{}': provider={availability}, cluster={}",
+            formatter.sanitize_text(bucket),
+            cluster_detail
+        ),
+        format!(
+            "Bucket queue: {} objects, {} bytes (scope: {})",
+            metrics.q_stat.curr.count,
+            metrics.q_stat.curr.size,
+            formatter.sanitize_text(&scope_output(metrics.queue_scope.as_ref()))
+        ),
+        format!(
+            "Totals: replicated {} / {} objects, {} / {} bytes",
+            metrics.replicated_count,
+            metrics.replica_count,
+            metrics.replicated_size,
+            metrics.replica_size
+        ),
+    ];
+    if metrics.stats.is_empty() {
+        lines.push("No target observations were supplied by the server.".into());
+    } else {
+        lines.push("TARGET  REPLICATED  FAILED  LATENCY SCOPE  BANDWIDTH SCOPE".into());
+        for (arn, target) in &metrics.stats {
+            let failed = target.fail_stats.as_ref().unwrap_or(&target.failed);
+            lines.push(format!(
+                "{}  {} / {} bytes  {} / {} bytes  {}  {}",
+                formatter.sanitize_text(arn),
+                target.replicated_count,
+                target.replicated_size,
+                failed.count,
+                failed.size,
+                formatter.sanitize_text(&scope_output(target.latency_scope.as_ref())),
+                formatter.sanitize_text(&scope_output(target.bandwidth_scope.as_ref())),
+            ));
         }
     }
+    lines
+}
+
+fn replication_mrf_output(
+    mut mrf: ReplicationMrf,
+) -> ReplicationInspectionOutput<ReplicationMrfData> {
+    mrf.targets.sort_by(|left, right| left.arn.cmp(&right.arn));
+    ReplicationInspectionOutput {
+        schema_version: 3,
+        output_type: "replication",
+        status: "success",
+        data: ReplicationMrfData {
+            operation: "mrf",
+            bucket: mrf.bucket,
+            runtime_stats_available: mrf.runtime_stats_available,
+            cluster: cluster_output(
+                Some(mrf.runtime_stats_available),
+                Some(mrf.cluster_complete),
+                Some(mrf.observed_node_count),
+                Some(mrf.expected_node_count),
+            ),
+            failed: ReplicationBacklogOutput {
+                count: mrf.total_failed_count,
+                size_bytes: mrf.total_failed_size,
+            },
+            queue: ReplicationBacklogOutput {
+                count: mrf.queued_count,
+                size_bytes: mrf.queued_size,
+            },
+            durable_backlog: ReplicationDurableBacklogOutput {
+                available: mrf.durable_backlog_available,
+                count: mrf.durable_count,
+                size_bytes: mrf.durable_size,
+            },
+            per_object_entries_available: mrf.per_object_entries_available,
+            per_target_durable_entries_available: mrf.per_target_durable_entries_available,
+            targets: mrf
+                .targets
+                .into_iter()
+                .map(|target| ReplicationMrfTargetOutput {
+                    target_arn: target.arn,
+                    failed_count: target.failed_count,
+                    failed_size_bytes: target.failed_size,
+                    observation_scope: target.observation_scope.as_str().to_string(),
+                    extensions: target.extra,
+                })
+                .collect(),
+            extensions: mrf.extra,
+        },
+    }
+}
+
+fn replication_mrf_lines(mrf: &ReplicationMrf, formatter: &Formatter) -> Vec<String> {
+    let cluster_state = if !mrf.runtime_stats_available {
+        "unavailable"
+    } else if mrf.cluster_complete {
+        "complete"
+    } else {
+        "partial"
+    };
+    let mut lines = vec![
+        format!(
+            "Replication MRF for '{}': cluster={} ({}/{} nodes)",
+            formatter.sanitize_text(&mrf.bucket),
+            cluster_state,
+            mrf.observed_node_count,
+            mrf.expected_node_count
+        ),
+        format!(
+            "Failed: {} objects, {} bytes; queued: {} objects, {} bytes",
+            mrf.total_failed_count, mrf.total_failed_size, mrf.queued_count, mrf.queued_size
+        ),
+        format!(
+            "Durable backlog: {} objects, {} bytes (available: {}); per-object entries available: {}",
+            mrf.durable_count,
+            mrf.durable_size,
+            mrf.durable_backlog_available,
+            mrf.per_object_entries_available
+        ),
+    ];
+    let mut targets = mrf.targets.iter().collect::<Vec<_>>();
+    targets.sort_by(|left, right| left.arn.cmp(&right.arn));
+    for target in targets {
+        lines.push(format!(
+            "{}  failed: {} / {} bytes  scope: {}",
+            formatter.sanitize_text(&target.arn),
+            target.failed_count,
+            target.failed_size,
+            formatter.sanitize_text(target.observation_scope.as_str())
+        ));
+    }
+    lines
+}
+
+fn emit_replication_inspection_error(
+    error: &Error,
+    formatter: &Formatter,
+    operation: &str,
+    capability: &'static str,
+) -> ExitCode {
+    let code = ExitCode::from_i32(error.exit_code()).unwrap_or(ExitCode::GeneralError);
+    let message = format!("Failed to {operation}: {error}");
+    if formatter.is_json() {
+        let output = if matches!(error, Error::UnsupportedFeature(_)) {
+            ReplicationDiffErrorOutput {
+                schema_version: 3,
+                output_type: "replication",
+                status: "error",
+                error: ReplicationDiffError::Unsupported(ReplicationDiffUnsupportedError {
+                    error_type: "unsupported_feature",
+                    message,
+                    retryable: false,
+                    capability,
+                    server: None,
+                    suggestion: Some("Upgrade RustFS or verify that the route is enabled."),
+                }),
+            }
+        } else {
+            replication_diff_error_output(error, code, message)
+        };
+        formatter.json_error(&output);
+    } else {
+        formatter.error_with_code(code, &message);
+    }
+    code
 }
 
 // ==================== Remove ====================
@@ -3042,5 +3473,127 @@ mod tests {
         let code = execute(args, OutputConfig::default()).await;
 
         assert_eq!(code, ExitCode::UsageError);
+    }
+
+    #[test]
+    fn status_output_preserves_partial_truth_without_inventing_target_queue_or_uptime() {
+        let metrics: ReplicationMetrics = serde_json::from_str(
+            r#"{"stats":{"arn:b":{"replicated_size":3,"replicated_count":2,
+            "failed":{"count":1,"size":4},"fail_stats":{"count":1,"size":4},
+            "latency":{"avg":1,"curr":2,"max":3},
+            "xfer_rate_lrg":{"avg":0,"curr":0,"peak":0},
+            "xfer_rate_sml":{"avg":0,"curr":0,"peak":0},
+            "bandwidth_limit_bytes_per_sec":10,"current_bandwidth_bytes_per_sec":5,
+            "latency_scope":"partial_cluster","bandwidth_scope":"node_local"}},
+            "replica_size":4,"replica_count":3,"replicated_size":3,"replicated_count":2,
+            "q_stat":{"curr":{"count":1,"bytes":4},"avg":{"count":1,"bytes":4},
+            "max":{"count":1,"bytes":4},"last_minute":{"count":1,"bytes":4}},
+            "provider_available":true,"cluster_complete":false,
+            "observed_node_count":1,"expected_node_count":2,"queue_scope":"partial_cluster"}"#,
+        )
+        .expect("metrics");
+
+        let value = serde_json::to_value(replication_status_output("source", metrics))
+            .expect("status JSON");
+
+        assert_eq!(value["data"]["availability"], "available");
+        assert_eq!(value["data"]["cluster"]["state"], "partial");
+        assert_eq!(value["data"]["queue"]["count"], 1);
+        assert_eq!(value["data"]["targets"][0]["failed_count"], 1);
+        assert!(value["data"]["targets"][0].get("queue").is_none());
+        assert!(value["data"]["targets"][0].get("uptime").is_none());
+        assert!(value["data"].get("healthy").is_none());
+    }
+
+    #[test]
+    fn status_output_marks_legacy_availability_unknown() {
+        let metrics: ReplicationMetrics = serde_json::from_str(
+            r#"{"stats":{},"replica_size":0,"replica_count":0,
+            "replicated_size":0,"replicated_count":0,
+            "q_stat":{"curr":{"count":0,"bytes":0},"avg":{"count":0,"bytes":0},
+            "max":{"count":0,"bytes":0},"last_minute":{"count":0,"bytes":0}}}"#,
+        )
+        .expect("legacy metrics");
+        let value = serde_json::to_value(replication_status_output("source", metrics))
+            .expect("status JSON");
+        assert_eq!(value["data"]["availability"], "legacy_unknown");
+        assert_eq!(value["data"]["cluster"]["state"], "legacy_unknown");
+        assert_eq!(value["data"]["queue"]["scope"], "legacy_unknown");
+    }
+
+    #[test]
+    fn status_output_keeps_unavailable_provider_distinct_from_valid_empty() {
+        let unavailable: ReplicationMetrics = serde_json::from_str(
+            r#"{"stats":{},"replica_size":0,"replica_count":0,
+            "replicated_size":0,"replicated_count":0,
+            "q_stat":{"curr":{"count":0,"bytes":0},"avg":{"count":0,"bytes":0},
+            "max":{"count":0,"bytes":0},"last_minute":{"count":0,"bytes":0}},
+            "provider_available":false,"cluster_complete":false,
+            "observed_node_count":0,"expected_node_count":2,"queue_scope":"unavailable"}"#,
+        )
+        .expect("unavailable metrics");
+        let unavailable =
+            serde_json::to_value(replication_status_output("source", unavailable)).expect("JSON");
+        assert_eq!(unavailable["data"]["availability"], "unavailable");
+        assert_eq!(unavailable["data"]["cluster"]["state"], "unavailable");
+
+        let available: ReplicationMetrics = serde_json::from_str(
+            r#"{"stats":{},"replica_size":0,"replica_count":0,
+            "replicated_size":0,"replicated_count":0,
+            "q_stat":{"curr":{"count":0,"bytes":0},"avg":{"count":0,"bytes":0},
+            "max":{"count":0,"bytes":0},"last_minute":{"count":0,"bytes":0}},
+            "provider_available":true,"cluster_complete":true,
+            "observed_node_count":2,"expected_node_count":2,"queue_scope":"cluster_aggregated"}"#,
+        )
+        .expect("valid empty metrics");
+        let available =
+            serde_json::to_value(replication_status_output("source", available)).expect("JSON");
+        assert_eq!(available["data"]["availability"], "available");
+        assert_eq!(available["data"]["cluster"]["state"], "complete");
+    }
+
+    #[test]
+    fn mrf_output_is_sorted_and_does_not_fabricate_object_rows() {
+        let mrf: ReplicationMrf = serde_json::from_str(
+            r#"{"Bucket":"source","Targets":[
+            {"ARN":"z","FailedCount":1,"FailedSize":2,"ObservationScope":"node_local"},
+            {"ARN":"a","FailedCount":2,"FailedSize":3,"ObservationScope":"partial_cluster"}],
+            "TotalFailedCount":3,"TotalFailedSize":5,"QueuedCount":4,"QueuedSize":6,
+            "PerObjectEntriesAvailable":false,"RuntimeStatsAvailable":true,
+            "ClusterComplete":false,"ObservedNodeCount":1,"ExpectedNodeCount":2,
+            "DurableBacklogAvailable":true,"DurableCount":7,"DurableSize":8,
+            "PerTargetDurableEntriesAvailable":false}"#,
+        )
+        .expect("MRF");
+        let value =
+            serde_json::to_value(replication_mrf_output(mrf)).expect("deterministic MRF JSON");
+        assert_eq!(value["data"]["targets"][0]["target_arn"], "a");
+        assert_eq!(value["data"]["per_object_entries_available"], false);
+        assert!(value["data"].get("entries").is_none());
+        assert!(value["data"]["targets"][0].get("queued_count").is_none());
+    }
+
+    #[test]
+    fn inspection_human_output_sanitizes_server_strings() {
+        let mrf: ReplicationMrf = serde_json::from_str(
+            r#"{"Bucket":"source\nspoof","Targets":[
+            {"ARN":"arn:\tspoof","FailedCount":0,"FailedSize":0,"ObservationScope":"future\rvalue"}],
+            "TotalFailedCount":0,"TotalFailedSize":0,"QueuedCount":0,"QueuedSize":0,
+            "PerObjectEntriesAvailable":false,"RuntimeStatsAvailable":true,
+            "ClusterComplete":true,"ObservedNodeCount":1,"ExpectedNodeCount":1,
+            "DurableBacklogAvailable":false,"DurableCount":0,"DurableSize":0,
+            "PerTargetDurableEntriesAvailable":false}"#,
+        )
+        .expect("MRF");
+        let formatter = Formatter::new(OutputConfig {
+            no_color: true,
+            ..OutputConfig::default()
+        });
+        let output = replication_mrf_lines(&mrf, &formatter).join("\n");
+        assert!(output.contains("source\\nspoof"));
+        assert!(output.contains("arn:\\tspoof"));
+        assert!(output.contains("future\\rvalue"));
+        assert!(!output.contains('\r'));
+        assert!(!output.contains('\t'));
     }
 }
