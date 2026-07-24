@@ -1,0 +1,25 @@
+{
+  "schema_version": 3,
+  "type": "iam_access_keys",
+  "status": "success",
+  "data": {
+    "operation": "list",
+    "keys": [
+      {
+        "access_key": "svc-a",
+        "kind": "service_account",
+        "provider": "builtin",
+        "parent_user": "alice",
+        "account_status": "on"
+      }
+    ],
+    "failures": [],
+    "pagination": {
+      "offset": 0,
+      "limit": 100,
+      "total": 1,
+      "truncated": false,
+      "next_offset": null
+    }
+  }
+}

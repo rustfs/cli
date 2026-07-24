@@ -43,6 +43,8 @@ rc admin user <ls|add|info|rm|enable|disable> ...
 rc admin policy <ls|create|info|rm|attach|detach|entities> ...
 rc admin policy detach <ALIAS> <POLICY>... (--user USER | --group GROUP)
 rc admin policy entities <ALIAS> [--user USER]... [--group GROUP]... [--policy POLICY]...
+rc admin access-key info <ALIAS> <ACCESS_KEY>
+rc admin access-key ls <ALIAS> [--provider builtin|ldap|openid]... [--user USER]... [--all] [OPTIONS]
 rc admin group <ls|add|info|rm|enable|disable|add-members|rm-members> ...
 rc admin service-account <ls|create|info|rm> ...
 rc admin service <restart|stop|freeze|unfreeze> <ALIAS>
@@ -75,6 +77,7 @@ rc admin replicate remove <ALIAS> <--all|--site <NAME>>
 | `rebalance` | Manage post-expansion rebalancing. |
 | `user` | Manage IAM users. |
 | `policy` | Manage IAM policies and attachments. |
+| `access-key` | Inspect individual or bounded pages of secret-free access-key metadata. |
 | `group` | Manage IAM groups and group membership. |
 | `service-account` | Manage service accounts. |
 | `iam` | Export or import bounded, versioned IAM archives. |
@@ -358,6 +361,42 @@ malformed and oversized replies fail without displaying their contents.
 Authentication denial, missing entities, unsupported routes, validation
 failures, conflicts, and network failures retain distinct error classes and
 exit codes.
+
+## Bulk Access-Key Inspection
+
+`rc admin access-key ls` reads RustFS's bulk access-key routes through a typed
+response model. The default provider is `builtin`; repeat `--provider` (or use
+a comma-separated value) to combine `builtin`, `ldap`, and `openid` scopes.
+LDAP and OpenID requests are sent only when capability discovery marks their
+exact provider route available. Missing, disabled, stubbed, unknown, and
+permission-denied capability states fail closed without probing the route.
+
+Use repeated `--user` selectors for specific parent identities, no selector
+for the caller's own identity, or `--all` for every identity visible to the
+caller. `--all` conflicts with `--user`. `--key-type` accepts `all`,
+`users-only`, `sts`, or `service-account`. At most 1,000 user selectors are
+accepted; `--request-batch-size` bounds each request and defaults to 100.
+
+Results are sorted by provider, parent, key type, and access key. `--offset`
+and `--limit` select a deterministic output page; the default limit is 1,000
+and the hard limit is 10,000. JSON uses the `iam_access_keys` output-v3 family
+and includes `total`, `truncated`, and `next_offset`. Each record contains only
+the access-key identifier, key type, provider, parent, status, expiration,
+name, description, and implied-policy flag when RustFS supplied them. Secret
+keys, session tokens, and unknown server fields are never retained in the
+public response model.
+
+Provider or selector failures are retained in `data.failures`. A page with any
+failure exits non-zero; partial data uses exit code 1, while a uniform
+all-failed result preserves the specific usage (2), network (3),
+authorization (4), not-found (5), conflict (6), unsupported (7), or
+interrupted (130) class.
+
+```bash
+rc admin access-key ls local --user alice --user bob
+rc admin access-key ls local --provider builtin,ldap --all --key-type service-account
+rc --json admin access-key ls local --provider openid --all --offset 100 --limit 100
+```
 
 ## KMS Key Lifecycle Workflow
 

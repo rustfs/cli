@@ -45,7 +45,8 @@
         "oidc",
         "iam_policy_entities",
         "iam_policy_detach",
-        "admin_iam_archive"
+        "admin_iam_archive",
+        "iam_access_keys"
       ]
     },
     "pagination": {
@@ -1163,6 +1164,71 @@
         "updated_at": { "$ref": "#/definitions/timestamp" }
       }
     },
+    "iamAccessKey": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["access_key", "kind", "provider", "parent_user"],
+      "properties": {
+        "access_key": { "type": "string", "minLength": 1 },
+        "kind": { "type": "string", "enum": ["service_account", "sts"] },
+        "provider": { "type": "string", "enum": ["builtin", "ldap", "openid"] },
+        "parent_user": { "type": "string", "minLength": 1 },
+        "account_status": { "type": "string" },
+        "expiration": { "type": "string" },
+        "name": { "type": "string" },
+        "description": { "type": "string" },
+        "implied_policy": { "type": "boolean" }
+      }
+    },
+    "iamAccessKeyFailure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "target", "type", "message", "retryable"],
+      "properties": {
+        "provider": { "type": "string", "enum": ["builtin", "ldap", "openid"] },
+        "target": { "type": "string", "minLength": 1 },
+        "type": {
+          "type": "string",
+          "enum": [
+            "general_error", "usage_error", "network_error", "auth_error",
+            "not_found", "conflict", "unsupported_feature", "interrupted"
+          ]
+        },
+        "message": { "type": "string", "minLength": 1 },
+        "retryable": { "type": "boolean" }
+      }
+    },
+    "iamAccessKeyPagination": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["offset", "limit", "total", "truncated", "next_offset"],
+      "properties": {
+        "offset": { "type": "integer", "minimum": 0 },
+        "limit": { "type": "integer", "minimum": 1, "maximum": 10000 },
+        "total": { "type": "integer", "minimum": 0, "maximum": 10000 },
+        "truncated": { "type": "boolean" },
+        "next_offset": { "type": ["integer", "null"], "minimum": 0 }
+      }
+    },
+    "iamAccessKeysData": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operation", "keys", "failures", "pagination"],
+      "properties": {
+        "operation": { "const": "list" },
+        "keys": {
+          "type": "array",
+          "maxItems": 10000,
+          "items": { "$ref": "#/definitions/iamAccessKey" }
+        },
+        "failures": {
+          "type": "array",
+          "maxItems": 3000,
+          "items": { "$ref": "#/definitions/iamAccessKeyFailure" }
+        },
+        "pagination": { "$ref": "#/definitions/iamAccessKeyPagination" }
+      }
+    },
     "replicationDiffEntry": {
       "type": "object",
       "required": [
@@ -1472,6 +1538,17 @@
           "properties": {
             "type": { "const": "iam_policy_detach" },
             "data": { "$ref": "#/definitions/iamPolicyDetachData" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/definitions/successEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "iam_access_keys" },
+            "data": { "$ref": "#/definitions/iamAccessKeysData" }
           }
         }
       ]

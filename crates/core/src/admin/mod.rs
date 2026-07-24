@@ -3,6 +3,7 @@
 //! This module provides the AdminApi trait and types for managing
 //! IAM users, policies, groups, service accounts, and cluster operations.
 
+mod access_keys;
 mod bucket_metadata;
 mod capabilities;
 mod cluster;
@@ -18,6 +19,13 @@ mod site;
 pub mod tier;
 mod types;
 
+pub use access_keys::{
+    AccessKeyKind, AccessKeyListType, AccessKeyProvider, AccessKeyRecord, BulkAccessKeyApi,
+    BulkAccessKeyQuery, IAM_ACCESS_KEYS_BULK_CAPABILITY, IAM_ACCESS_KEYS_BULK_LDAP_CAPABILITY,
+    IAM_ACCESS_KEYS_BULK_OPENID_CAPABILITY, MAX_IAM_ACCESS_KEY_RESULTS,
+    MAX_IAM_ACCESS_KEY_SELECTOR_BYTES, MAX_IAM_ACCESS_KEY_SELECTORS,
+    MAX_IAM_ACCESS_KEYS_RESPONSE_BYTES,
+};
 pub use bucket_metadata::{
     BUCKET_METADATA_CAPABILITY, BucketMetadataApi, BucketMetadataArchive,
     MAX_BUCKET_METADATA_ARCHIVE_BYTES,

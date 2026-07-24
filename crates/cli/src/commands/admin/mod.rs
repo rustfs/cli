@@ -583,6 +583,43 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_admin_access_key_bulk_list() {
+        let cli = TestCli::parse_from([
+            "rc",
+            "access-key",
+            "ls",
+            "local",
+            "--provider",
+            "builtin,ldap",
+            "--user",
+            "alice",
+            "--key-type",
+            "service-account",
+            "--offset",
+            "10",
+            "--limit",
+            "20",
+        ]);
+
+        match cli.command {
+            AdminCommands::AccessKey(access_key::AccessKeyCommands::List(args)) => {
+                assert_eq!(
+                    args.provider,
+                    vec![
+                        access_key::ProviderArg::Builtin,
+                        access_key::ProviderArg::Ldap
+                    ]
+                );
+                assert_eq!(args.user, vec!["alice"]);
+                assert_eq!(args.key_type, access_key::KeyTypeArg::ServiceAccount);
+                assert_eq!(args.offset, 10);
+                assert_eq!(args.limit, 20);
+            }
+            _ => panic!("Unexpected command parsing result"),
+        }
+    }
+
+    #[test]
     fn test_parse_admin_heal_start_options() {
         let cli = TestCli::parse_from([
             "rc",

@@ -14,20 +14,23 @@ use aws_sigv4::sign::v4;
 use bytes::Bytes;
 use futures::StreamExt;
 use rc_core::admin::{
-    AccessKeyInfo, AdminApi, BucketMetadataApi, BucketMetadataArchive, BucketQuota, CapabilityApi,
+    AccessKeyInfo, AccessKeyKind, AccessKeyProvider, AccessKeyRecord, AdminApi, BucketMetadataApi,
+    BucketMetadataArchive, BucketQuota, BulkAccessKeyApi, BulkAccessKeyQuery, CapabilityApi,
     CapabilityAvailability, CapabilityEntry, CapabilityReport, ClusterInfo,
     ClusterSnapshotDocument, ClusterSnapshotMetadata, ClusterSnapshotSummary, ConfigApi,
     ConfigDocument, ConfigHelp, ConfigHistoryEntry, ConfigMutationResult,
     CreateServiceAccountRequest, DecommissionPoolStatus, DecommissionStatus,
     DetailedHealthSnapshot, DiagnosticCapability, DiagnosticReadApi, ExtensionsCatalog, Group,
     GroupStatus, HealRuntimeState, HealScanMode, HealStartRequest, HealStatus, HealTaskRequest,
-    IAM_POLICY_DETACH_CAPABILITY, IAM_POLICY_ENTITIES_CAPABILITY, IamArchiveApi,
-    IamArchiveImportResult, IamArchiveImportSection, IamArchiveInventory, IamArchiveResultEntities,
-    IamMutationApi, IamReadApi, KmsApi, KmsBackendKind, KmsCacheSummary,
-    KmsCancelKeyDeletionResult, KmsConfigSummary, KmsConfigureRequest, KmsCreateKeyRequest,
-    KmsCreateKeyResult, KmsDeleteKeyRequest, KmsDeleteKeyResult, KmsKey, KmsKeyPage, KmsKeyState,
-    KmsKeyUsage, KmsServiceState, KmsStatus, MAX_BUCKET_METADATA_ARCHIVE_BYTES,
-    MAX_DIAGNOSTIC_RESPONSE_BYTES, MAX_IAM_ARCHIVE_BYTES, MAX_IAM_IMPORT_RESPONSE_BYTES,
+    IAM_ACCESS_KEYS_BULK_CAPABILITY, IAM_ACCESS_KEYS_BULK_LDAP_CAPABILITY,
+    IAM_ACCESS_KEYS_BULK_OPENID_CAPABILITY, IAM_POLICY_DETACH_CAPABILITY,
+    IAM_POLICY_ENTITIES_CAPABILITY, IamArchiveApi, IamArchiveImportResult, IamArchiveImportSection,
+    IamArchiveInventory, IamArchiveResultEntities, IamMutationApi, IamReadApi, KmsApi,
+    KmsBackendKind, KmsCacheSummary, KmsCancelKeyDeletionResult, KmsConfigSummary,
+    KmsConfigureRequest, KmsCreateKeyRequest, KmsCreateKeyResult, KmsDeleteKeyRequest,
+    KmsDeleteKeyResult, KmsKey, KmsKeyPage, KmsKeyState, KmsKeyUsage, KmsServiceState, KmsStatus,
+    MAX_BUCKET_METADATA_ARCHIVE_BYTES, MAX_DIAGNOSTIC_RESPONSE_BYTES, MAX_IAM_ACCESS_KEY_RESULTS,
+    MAX_IAM_ACCESS_KEYS_RESPONSE_BYTES, MAX_IAM_ARCHIVE_BYTES, MAX_IAM_IMPORT_RESPONSE_BYTES,
     MAX_IAM_POLICY_DETACH_REQUEST_BYTES, MAX_IAM_POLICY_DETACH_RESPONSE_BYTES,
     MAX_IAM_POLICY_ENTITIES_RESPONSE_BYTES, MAX_METRICS_LINE_BYTES, MAX_METRICS_RESPONSE_BYTES,
     MAX_METRICS_SAMPLES, MAX_OIDC_RESPONSE_BYTES, MAX_REPLICATION_DIFF_RESPONSE_BYTES,
@@ -1247,6 +1250,26 @@ impl AdminClient {
             )),
         }
     }
+
+    fn map_iam_access_keys_error(&self, status: StatusCode, _body: &str) -> Error {
+        match status {
+            StatusCode::NOT_FOUND
+            | StatusCode::METHOD_NOT_ALLOWED
+            | StatusCode::NOT_IMPLEMENTED => Error::UnsupportedFeature(
+                "Bulk access-key inspection is not supported by this RustFS server".to_string(),
+            ),
+            StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED => {
+                Error::Auth("Permission denied for bulk access-key inspection".to_string())
+            }
+            StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
+                Error::InvalidPath("RustFS rejected the bulk access-key query".to_string())
+            }
+            _ => Error::Network(format!(
+                "Bulk access-key inspection failed with HTTP {}",
+                status.as_u16()
+            )),
+        }
+    }
 }
 
 fn site_replication_response_rejected(
@@ -2120,6 +2143,17 @@ fn add_known_server_capabilities(version: Option<&str>, capabilities: &mut Vec<C
         availability: CapabilityAvailability::Available,
         reason: None,
     });
+    for name in [
+        IAM_ACCESS_KEYS_BULK_CAPABILITY,
+        IAM_ACCESS_KEYS_BULK_LDAP_CAPABILITY,
+        IAM_ACCESS_KEYS_BULK_OPENID_CAPABILITY,
+    ] {
+        capabilities.push(CapabilityEntry {
+            name: name.to_string(),
+            availability: CapabilityAvailability::Available,
+            reason: None,
+        });
+    }
 
     for (name, reason) in [
         (
@@ -3004,6 +3038,152 @@ impl IamReadApi for AdminClient {
             .await?;
         result.normalize()
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BulkAccessKeyWireEntry {
+    access_key: String,
+    #[serde(default)]
+    parent_user: String,
+    #[serde(default)]
+    account_status: Option<String>,
+    #[serde(default)]
+    expiration: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    implied_policy: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BulkAccessKeyWireGroup {
+    #[serde(default)]
+    service_accounts: Vec<BulkAccessKeyWireEntry>,
+    #[serde(default)]
+    sts_keys: Vec<BulkAccessKeyWireEntry>,
+}
+
+#[async_trait]
+impl BulkAccessKeyApi for AdminClient {
+    async fn list_access_keys_bulk(
+        &self,
+        query: &BulkAccessKeyQuery,
+    ) -> Result<Vec<AccessKeyRecord>> {
+        query.validate()?;
+
+        let mut parameters = Vec::with_capacity(query.users.len() + 2);
+        parameters.extend(query.users.iter().map(|user| ("users", user.as_str())));
+        if query.all {
+            parameters.push(("all", "true"));
+        }
+        parameters.push(("listType", query.list_type.wire_value()));
+
+        let path = match query.provider {
+            AccessKeyProvider::Builtin => "/list-access-keys-bulk",
+            AccessKeyProvider::Ldap => "/idp/ldap/list-access-keys-bulk",
+            AccessKeyProvider::Openid => "/idp/openid/list-access-keys-bulk",
+        };
+        let response: BTreeMap<String, BulkAccessKeyWireGroup> = self
+            .request_bounded_json(
+                Method::GET,
+                path,
+                Some(parameters.as_slice()),
+                None,
+                BoundedJsonResponse {
+                    max_bytes: MAX_IAM_ACCESS_KEYS_RESPONSE_BYTES,
+                    name: "bulk access-key response",
+                    error_mapper: Self::map_iam_access_keys_error,
+                },
+            )
+            .await
+            .map_err(|error| match error {
+                Error::Json(_) => Error::General(
+                    "RustFS returned a malformed bulk access-key response".to_string(),
+                ),
+                other => other,
+            })?;
+
+        normalize_access_key_response(response, query.provider)
+    }
+}
+
+fn normalize_access_key_response(
+    response: BTreeMap<String, BulkAccessKeyWireGroup>,
+    provider: AccessKeyProvider,
+) -> Result<Vec<AccessKeyRecord>> {
+    let count = response.values().fold(0_usize, |count, group| {
+        count
+            .saturating_add(group.service_accounts.len())
+            .saturating_add(group.sts_keys.len())
+    });
+    if count > MAX_IAM_ACCESS_KEY_RESULTS {
+        return Err(Error::General(format!(
+            "RustFS bulk access-key response exceeds the {MAX_IAM_ACCESS_KEY_RESULTS} item limit"
+        )));
+    }
+
+    let mut records = Vec::with_capacity(count);
+    for (parent, group) in response {
+        for (kind, entries) in [
+            (AccessKeyKind::ServiceAccount, group.service_accounts),
+            (AccessKeyKind::Sts, group.sts_keys),
+        ] {
+            for entry in entries {
+                if entry.access_key.trim().is_empty() {
+                    return Err(Error::General(
+                        "RustFS bulk access-key response contains an empty access key".to_string(),
+                    ));
+                }
+                let parent_user = if entry.parent_user.trim().is_empty() {
+                    parent.clone()
+                } else {
+                    entry.parent_user
+                };
+                if parent_user.trim().is_empty() {
+                    return Err(Error::General(
+                        "RustFS bulk access-key response contains an empty parent identity"
+                            .to_string(),
+                    ));
+                }
+                records.push(AccessKeyRecord {
+                    access_key: entry.access_key,
+                    kind,
+                    provider,
+                    parent_user,
+                    account_status: entry.account_status,
+                    expiration: entry.expiration,
+                    name: entry.name,
+                    description: entry.description,
+                    implied_policy: entry.implied_policy,
+                });
+            }
+        }
+    }
+    records.sort_by(|left, right| {
+        (
+            left.provider,
+            left.parent_user.as_str(),
+            left.kind,
+            left.access_key.as_str(),
+        )
+            .cmp(&(
+                right.provider,
+                right.parent_user.as_str(),
+                right.kind,
+                right.access_key.as_str(),
+            ))
+    });
+    records.dedup_by(|left, right| {
+        left.provider == right.provider
+            && left.parent_user == right.parent_user
+            && left.kind == right.kind
+            && left.access_key == right.access_key
+    });
+    Ok(records)
 }
 
 #[async_trait]
@@ -5987,6 +6167,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bulk_access_keys_classifies_mixed_types_and_drops_secret_canaries() {
+        let response = r#"{
+            "alice":{
+                "serviceAccounts":[{
+                    "accessKey":"svc-b",
+                    "parentUser":"alice",
+                    "accountStatus":"on",
+                    "expiration":"2027-01-01T00:00:00Z",
+                    "impliedPolicy":true,
+                    "secretKey":"must-not-survive"
+                }],
+                "stsKeys":[{
+                    "accessKey":"sts-a",
+                    "parentUser":"alice",
+                    "sessionToken":"must-not-survive"
+                }]
+            }
+        }"#;
+        let (endpoint, receiver, handle) = start_admin_test_server("200 OK", response);
+        let client = admin_client_for_endpoint(&endpoint);
+        let result = client
+            .list_access_keys_bulk(&BulkAccessKeyQuery {
+                provider: AccessKeyProvider::Builtin,
+                users: vec!["alice@example.com".to_string(), "bob".to_string()],
+                all: false,
+                list_type: rc_core::admin::AccessKeyListType::All,
+            })
+            .await
+            .expect("bulk access-key request");
+
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(
+            request.target,
+            "/rustfs/admin/v3/list-access-keys-bulk?users=alice%40example.com&users=bob&listType=all"
+        );
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].kind, AccessKeyKind::ServiceAccount);
+        assert_eq!(result[1].kind, AccessKeyKind::Sts);
+        assert!(result.iter().all(|record| {
+            record.provider == AccessKeyProvider::Builtin && record.parent_user == "alice"
+        }));
+        let encoded = serde_json::to_string(&result).expect("serialize safe records");
+        assert!(!encoded.contains("must-not-survive"));
+        assert!(!encoded.contains("secretKey"));
+        assert!(!encoded.contains("sessionToken"));
+        handle.join().expect("join bulk access-key server");
+    }
+
+    #[tokio::test]
+    async fn bulk_access_keys_uses_advertised_federated_routes() {
+        for (provider, expected_path) in [
+            (
+                AccessKeyProvider::Ldap,
+                "/rustfs/admin/v3/idp/ldap/list-access-keys-bulk?all=true&listType=svcacc-only",
+            ),
+            (
+                AccessKeyProvider::Openid,
+                "/rustfs/admin/v3/idp/openid/list-access-keys-bulk?all=true&listType=svcacc-only",
+            ),
+        ] {
+            let (endpoint, receiver, handle) =
+                start_admin_test_server("200 OK", r#"{"parent":{"serviceAccounts":[]}}"#);
+            let client = admin_client_for_endpoint(&endpoint);
+            let result = client
+                .list_access_keys_bulk(&BulkAccessKeyQuery {
+                    provider,
+                    users: Vec::new(),
+                    all: true,
+                    list_type: rc_core::admin::AccessKeyListType::ServiceAccountsOnly,
+                })
+                .await
+                .expect("federated bulk request");
+
+            assert!(result.is_empty());
+            assert_eq!(
+                receiver.recv().expect("captured request").target,
+                expected_path
+            );
+            handle.join().expect("join federated route server");
+        }
+    }
+
+    #[tokio::test]
     async fn iam_policy_detach_rejects_malformed_and_oversized_responses() {
         let request = PolicyDetachRequest::new(
             vec!["readonly".to_string()],
@@ -6037,6 +6300,42 @@ mod tests {
         assert!(
             matches!(error, Error::InvalidPath(message) if message.contains("request exceeds"))
         );
+    }
+
+    #[tokio::test]
+    async fn bulk_access_keys_distinguishes_malformed_denied_unsupported_and_oversized() {
+        for (status, body, expected) in [
+            ("200 OK", "{", "malformed"),
+            ("403 Forbidden", "secret server body", "denied"),
+            ("501 Not Implemented", "secret server body", "unsupported"),
+        ] {
+            let (endpoint, _receiver, handle) = start_admin_test_server(status, body);
+            let client = admin_client_for_endpoint(&endpoint);
+            let error = client
+                .list_access_keys_bulk(&BulkAccessKeyQuery::default())
+                .await
+                .expect_err("bulk request should fail");
+            match expected {
+                "malformed" => assert!(matches!(error, Error::General(_))),
+                "denied" => assert!(matches!(error, Error::Auth(_))),
+                "unsupported" => assert!(matches!(error, Error::UnsupportedFeature(_))),
+                _ => unreachable!(),
+            }
+            assert!(!error.to_string().contains("secret server body"));
+            handle.join().expect("join bulk error server");
+        }
+
+        let (endpoint, _receiver, handle) =
+            start_admin_declared_length_server("200 OK", MAX_IAM_ACCESS_KEYS_RESPONSE_BYTES + 1);
+        let client = admin_client_for_endpoint(&endpoint);
+        let oversized = client
+            .list_access_keys_bulk(&BulkAccessKeyQuery::default())
+            .await
+            .expect_err("oversized bulk response must fail");
+        assert!(
+            matches!(oversized, Error::General(message) if message.contains("bulk access-key response exceeded"))
+        );
+        handle.join().expect("join oversized bulk response server");
     }
 
     #[test]
