@@ -688,7 +688,9 @@ fn nested_subcommand_help_contract() {
         HelpCase {
             args: &["admin", "idp", "openid"],
             usage: "Usage: rc admin idp openid [OPTIONS] <COMMAND>",
-            expected_tokens: &["list", "get", "validate"],
+            expected_tokens: &[
+                "list", "get", "validate", "set", "update", "enable", "disable",
+            ],
         },
         HelpCase {
             args: &["admin", "idp", "openid", "get"],
@@ -707,6 +709,28 @@ fn nested_subcommand_help_contract() {
                 "--redirect-uri",
                 "--static-redirect",
             ],
+        },
+        HelpCase {
+            args: &["admin", "idp", "openid", "set"],
+            usage: "Usage: rc admin idp openid set [OPTIONS] <ALIAS> <PROVIDER_ID>",
+            expected_tokens: &[
+                "--config-url",
+                "--client-id",
+                "--client-secret-stdin",
+                "--client-secret-file",
+                "--replace-client-secret",
+                "--dry-run",
+            ],
+        },
+        HelpCase {
+            args: &["admin", "idp", "openid", "update"],
+            usage: "Usage: rc admin idp openid update [OPTIONS] <ALIAS> <PROVIDER_ID>",
+            expected_tokens: &["--display-name", "--clear-issuer", "--dry-run"],
+        },
+        HelpCase {
+            args: &["admin", "idp", "openid", "enable"],
+            usage: "Usage: rc admin idp openid enable [OPTIONS] <ALIAS> <PROVIDER_ID>",
+            expected_tokens: &["--dry-run"],
         },
         HelpCase {
             args: &["admin", "metrics"],

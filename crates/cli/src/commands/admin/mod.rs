@@ -63,7 +63,7 @@ pub enum AdminCommands {
     #[command(subcommand)]
     Ilm(ilm::IlmCommands),
 
-    /// Inspect identity-provider configuration
+    /// Inspect, validate, and manage identity-provider configuration
     #[command(subcommand)]
     Idp(idp::IdpCommands),
 

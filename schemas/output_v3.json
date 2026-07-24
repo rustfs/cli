@@ -937,11 +937,40 @@
         "token_endpoint": { "$ref": "#/definitions/nullableString" }
       }
     },
+    "oidcChange": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["field", "before", "after"],
+      "properties": {
+        "field": { "type": "string", "minLength": 1 },
+        "before": {},
+        "after": {}
+      }
+    },
+    "oidcMutationData": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation", "provider_id", "created", "dry_run", "restart_required", "changes"
+      ],
+      "properties": {
+        "operation": { "type": "string", "enum": ["set", "update", "enable", "disable"] },
+        "provider_id": { "type": "string", "minLength": 1 },
+        "created": { "type": "boolean" },
+        "dry_run": { "type": "boolean" },
+        "restart_required": { "type": "boolean" },
+        "changes": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/oidcChange" }
+        }
+      }
+    },
     "oidcData": {
       "oneOf": [
         { "$ref": "#/definitions/oidcListData" },
         { "$ref": "#/definitions/oidcGetData" },
-        { "$ref": "#/definitions/oidcValidationData" }
+        { "$ref": "#/definitions/oidcValidationData" },
+        { "$ref": "#/definitions/oidcMutationData" }
       ]
     },
     "adminOperation": {

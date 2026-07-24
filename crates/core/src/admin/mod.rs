@@ -72,8 +72,9 @@ pub use observability::{
     StorageDiskMetrics, StorageInfo,
 };
 pub use oidc::{
-    MAX_OIDC_RESPONSE_BYTES, OidcProvider, OidcProviderList, OidcProviderSource, OidcReadApi,
-    OidcValidationRequest, OidcValidationResult,
+    MAX_OIDC_RESPONSE_BYTES, OidcMutationApi, OidcMutationRequest, OidcMutationResult,
+    OidcProvider, OidcProviderList, OidcProviderSource, OidcReadApi, OidcValidationRequest,
+    OidcValidationResult,
 };
 pub use replication::{
     MAX_REPLICATION_DIFF_RESPONSE_BYTES, ReplicationDiff, ReplicationDiffApi, ReplicationDiffEntry,

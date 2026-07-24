@@ -29,14 +29,15 @@ use rc_core::admin::{
     MAX_SITE_REPLICATION_ERROR_RESPONSE_BYTES, MAX_SITE_REPLICATION_REQUEST_BYTES,
     MAX_SITE_REPLICATION_SUCCESS_RESPONSE_BYTES, ManualTransitionRunRequest,
     ManualTransitionRunResponse, MetricsBatch, MetricsQuery, ModuleSwitches, ObservabilityApi,
-    OidcProvider, OidcProviderList, OidcReadApi, OidcValidationRequest, OidcValidationResult,
-    PeerSiteSpec, Policy, PolicyEntitiesQuery, PolicyEntitiesResult, PolicyEntity, PolicyInfo,
-    PoolStatus, PoolTarget, RealtimeMetrics, RebalanceStartResult, RebalanceStatus,
-    ReplicateEditStatus, ReplicationDiff, ReplicationDiffApi, RuntimeCapabilitiesSnapshot,
-    RuntimeCapabilityStatus, ScannerStatus, ServiceAccount, ServiceAccountCreateResponse,
-    ServiceActionResult, SiteRemoveSpec, SiteReplicationInfo, SiteReplicationPeer,
-    SiteReplicationResyncOperation, SiteReplicationResyncStatus, SiteStatusOptions, StorageInfo,
-    UpdateGroupMembersRequest, UpdateServiceAccountRequest, User, UserStatus,
+    OidcMutationApi, OidcMutationRequest, OidcMutationResult, OidcProvider, OidcProviderList,
+    OidcReadApi, OidcValidationRequest, OidcValidationResult, PeerSiteSpec, Policy,
+    PolicyEntitiesQuery, PolicyEntitiesResult, PolicyEntity, PolicyInfo, PoolStatus, PoolTarget,
+    RealtimeMetrics, RebalanceStartResult, RebalanceStatus, ReplicateEditStatus, ReplicationDiff,
+    ReplicationDiffApi, RuntimeCapabilitiesSnapshot, RuntimeCapabilityStatus, ScannerStatus,
+    ServiceAccount, ServiceAccountCreateResponse, ServiceActionResult, SiteRemoveSpec,
+    SiteReplicationInfo, SiteReplicationPeer, SiteReplicationResyncOperation,
+    SiteReplicationResyncStatus, SiteStatusOptions, StorageInfo, UpdateGroupMembersRequest,
+    UpdateServiceAccountRequest, User, UserStatus,
 };
 use rc_core::{Alias, Error, Result};
 use reqwest::header::{CONTENT_TYPE, HOST, HeaderMap, HeaderName, HeaderValue};
@@ -643,12 +644,61 @@ impl AdminClient {
                     "The RustFS OIDC administration route is unavailable".to_string(),
                 ),
                 StatusCode::BAD_REQUEST => {
-                    Error::General("OIDC validation request was rejected".to_string())
+                    Error::General("OIDC issuer validation failed".to_string())
                 }
                 _ => Error::Network("OIDC administration service is unavailable".to_string()),
             });
         }
 
+        serde_json::from_slice(&response_body)
+            .map_err(|_| Error::General("RustFS returned a malformed OIDC response".to_string()))
+    }
+
+    async fn request_oidc_mutation<T: for<'de> Deserialize<'de>>(
+        &self,
+        path: &str,
+        body: Zeroizing<Vec<u8>>,
+    ) -> Result<T> {
+        let url = self.admin_url(path);
+        let headers = self.request_headers(body.as_slice())?;
+        let signed_headers = self
+            .sign_request(&Method::PUT, &url, &headers, body.as_slice())
+            .await?;
+        let mut request = self.http_client.put(&url);
+        for (name, value) in &signed_headers {
+            request = request.header(name, value);
+        }
+        let response = request
+            .body(Bytes::from_owner(SensitiveRequestBody(body)))
+            .send()
+            .await
+            .map_err(|_| Error::Network("OIDC administration request failed".to_string()))?;
+        let status = response.status();
+        let response_body = read_bounded_response_body(
+            response,
+            MAX_OIDC_RESPONSE_BYTES,
+            "OIDC administration response",
+        )
+        .await?;
+        if !status.is_success() {
+            return Err(match status {
+                StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED => {
+                    Error::Auth("OIDC administration permission was denied".to_string())
+                }
+                StatusCode::NOT_FOUND
+                | StatusCode::METHOD_NOT_ALLOWED
+                | StatusCode::NOT_IMPLEMENTED => Error::UnsupportedFeature(
+                    "The RustFS OIDC mutation route is unavailable".to_string(),
+                ),
+                StatusCode::CONFLICT | StatusCode::PRECONDITION_FAILED => {
+                    Error::Conflict("OIDC provider changed concurrently".to_string())
+                }
+                StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
+                    Error::General("OIDC configuration request was rejected".to_string())
+                }
+                _ => Error::Network("OIDC administration service is unavailable".to_string()),
+            });
+        }
         serde_json::from_slice(&response_body)
             .map_err(|_| Error::General("RustFS returned a malformed OIDC response".to_string()))
     }
@@ -2749,6 +2799,26 @@ impl IamReadApi for AdminClient {
             )
             .await?;
         result.normalize()
+    }
+}
+
+#[async_trait]
+impl OidcMutationApi for AdminClient {
+    async fn oidc_upsert_provider(
+        &self,
+        request: OidcMutationRequest,
+    ) -> Result<OidcMutationResult> {
+        request.validate()?;
+        let provider_id = request.provider_id.clone();
+        let body = Zeroizing::new(serde_json::to_vec(&request).map_err(|_| {
+            Error::General("Failed to encode OIDC configuration request".to_string())
+        })?);
+        let path = format!("/oidc/config/{}", urlencoding::encode(&provider_id));
+        let response: OidcMutationResult = self.request_oidc_mutation(&path, body).await?;
+        response.validate_response().map_err(|_| {
+            Error::General("RustFS returned an invalid OIDC mutation response".to_string())
+        })?;
+        Ok(response)
     }
 }
 

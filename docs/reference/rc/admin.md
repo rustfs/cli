@@ -16,6 +16,9 @@ rc admin scanner status <ALIAS>
 rc admin idp openid list <ALIAS>
 rc admin idp openid get <ALIAS> <PROVIDER_ID>
 rc admin idp openid validate <ALIAS> <PROVIDER_ID> --config-url URL --client-id ID
+rc admin idp openid set <ALIAS> <PROVIDER_ID> [OPTIONS]
+rc admin idp openid update <ALIAS> <PROVIDER_ID> [OPTIONS]
+rc admin idp openid <enable|disable> <ALIAS> <PROVIDER_ID> [--dry-run]
 rc admin metrics <ALIAS> [OPTIONS]
 rc admin kms status <ALIAS>
 rc admin kms configure <ALIAS> <--config-file PATH|--stdin>
@@ -62,7 +65,7 @@ rc admin replicate remove <ALIAS> <--all|--site <NAME>>
 | `scanner` | Inspect scanner health, freshness, and cycle state. |
 | `metrics` | Query bounded realtime metrics as normalized JSON Lines or raw server records. |
 | `kms` | Inspect KMS state and manage safe native key lifecycle operations. |
-| `idp openid` | Inspect effective OIDC providers and run non-persisting discovery validation. |
+| `idp openid` | Inspect, validate, and safely mutate effective OIDC providers. |
 | `heal` | Start, stop, or inspect healing operations. |
 | `pool` | List pools and inspect pool status. |
 | `expand` | Manage post-expansion data rebalancing. Alias: `scale`. |
@@ -331,29 +334,47 @@ The v3 lifecycle success operations are `configure`, `reconfigure`, `start`, `re
 
 `kms key status` describes native RustFS key lifecycle metadata. It does not claim compatibility with the `mc admin kms key status` encryption/decryption probe. The round-trip diagnostic uses only the S3 object API and does not call an Admin API key-generation route. RustFS beta.10 has no direct decrypt-test Admin API or KMS-specific metrics route/selector contract, so `rc` does not offer KMS-specific metrics and intentionally does not expose the legacy `generate-data-key` response because that response contains plaintext data-key material.
 
-## OIDC Read-Only Administration
+## OIDC Administration
 
 These commands target RustFS's native typed OIDC routes. They do not use LDAP compatibility
-configuration, browser login endpoints, or a guessed per-provider route:
+configuration or browser login endpoints:
 
 | Command | Behavior |
 |---|---|
 | `rc admin idp openid list <ALIAS>` | List all effective persisted and environment-managed providers. |
 | `rc admin idp openid get <ALIAS> <PROVIDER_ID>` | Select one exact provider from the server's typed configuration list. |
 | `rc admin idp openid validate <ALIAS> <PROVIDER_ID> --config-url URL --client-id ID` | Run live discovery validation without saving or changing server configuration. |
+| `rc admin idp openid set <ALIAS> <PROVIDER_ID> [OPTIONS]` | Create a provider or update an existing provider after GET-and-merge and discovery preflight. |
+| `rc admin idp openid update <ALIAS> <PROVIDER_ID> [OPTIONS]` | Update an existing provider and fail if it does not exist. |
+| `rc admin idp openid enable <ALIAS> <PROVIDER_ID> [--dry-run]` | Enable a persisted provider while preserving every other field. |
+| `rc admin idp openid disable <ALIAS> <PROVIDER_ID> [--dry-run]` | Disable a persisted provider while preserving every other field. |
 
 Provider output includes only the server's `client_secret_configured` boolean. Client-secret
-values are not accepted by this read-only command family, sent in validation requests, or included
-in human/JSON output. Remote text is terminal-sanitized, response bodies are bounded, and unknown
-or incomplete provider shapes fail closed. Missing/unsupported routes use the
-`unsupported_feature` exit code, permission failures use the authentication exit code, a missing
-exact provider uses `not_found`, and locally invalid URLs use the usage exit code.
+values are never accepted as command-line literals, sent in validation requests, or included in
+human/JSON output. A replacement must use `--client-secret-stdin` or
+`--client-secret-file <PATH>` together with `--replace-client-secret`. Secret files must be regular
+files, must not be symbolic links, and on Unix must grant no group or other permissions. Omitting a
+secret preserves the server-side value.
 
-JSON output uses schema v3 family `oidc` with operations `list`, `get`, and `validate`. Validation
-supports repeated `--scope` and `--other-audience` options, optional `--issuer`, claim-name
-overrides, and `--redirect-uri --static-redirect`. Scopes must include `openid`; URLs must be
-absolute HTTP(S) URLs. RustFS still applies its server-side outbound URL safety policy before
-performing discovery.
+Every mutation first reads the current effective provider, rejects environment-managed or
+otherwise non-editable providers, merges only explicitly supplied options, and runs the native
+validation endpoint. `--dry-run` performs GET and validation and emits the same deterministic,
+redacted change list without issuing PUT. Successful changes explicitly report
+`restart_required`; multiple providers are addressed independently by exact provider ID.
+
+Remote text is terminal-sanitized, response bodies are bounded, and unknown or incomplete provider
+or mutation shapes fail closed. Missing/unsupported routes use the
+`unsupported_feature` exit code, permission failures use the authentication exit code, a missing
+exact provider uses `not_found`, conflicts use the conflict exit code, and locally invalid URLs use
+the usage exit code.
+
+JSON output uses schema v3 family `oidc` with operations `list`, `get`, `validate`, `set`, `update`,
+`enable`, and `disable`. Validation supports repeated `--scope` and `--other-audience` options,
+optional `--issuer`, claim-name overrides, and `--redirect-uri --static-redirect`. Mutation fields
+use the same options, while `--clear-issuer`, `--clear-redirect-uri`,
+`--replace-other-audiences`, and the paired boolean flags express explicit resets. Scopes must
+include `openid`; URLs must be absolute HTTP(S) URLs. RustFS still applies its server-side outbound
+URL safety policy before performing discovery.
 
 `rc admin heal status <ALIAS>` reports aggregate background heal status. Manual heals started with `rc admin heal start` are token-scoped tasks; the start output includes a client token. Root recursive tasks are inspected or stopped with `--client-token`, while bucket or prefix tasks additionally pass `--bucket` and optional `--prefix`.
 
