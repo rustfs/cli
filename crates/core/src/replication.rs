@@ -7,6 +7,109 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::time::Duration;
 
+/// Overall or per-target outcome of an active replication check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReplicationCheckStatus {
+    #[serde(rename = "OK")]
+    Ok,
+    #[serde(rename = "FAILED")]
+    Failed,
+}
+
+/// Outcome of one phase in an active replication check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReplicationCheckPhaseState {
+    #[serde(rename = "OK")]
+    Ok,
+    #[serde(rename = "FAILED")]
+    Failed,
+    #[serde(rename = "SKIPPED")]
+    Skipped,
+}
+
+/// One phase of the server's active target validation state machine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicationCheckPhase {
+    #[serde(rename = "Status")]
+    pub status: ReplicationCheckPhaseState,
+    #[serde(rename = "Error", default)]
+    pub error: Option<String>,
+}
+
+/// All phases reported for one configured replication target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicationCheckPhases {
+    #[serde(rename = "Bucket")]
+    pub bucket: ReplicationCheckPhase,
+    #[serde(rename = "Versioning")]
+    pub versioning: ReplicationCheckPhase,
+    #[serde(rename = "ObjectLock")]
+    pub object_lock: ReplicationCheckPhase,
+    #[serde(rename = "Put")]
+    pub put: ReplicationCheckPhase,
+    #[serde(rename = "DeleteMarker")]
+    pub delete_marker: ReplicationCheckPhase,
+    #[serde(rename = "VersionDelete")]
+    pub version_delete: ReplicationCheckPhase,
+    #[serde(rename = "Cleanup")]
+    pub cleanup: ReplicationCheckPhase,
+}
+
+/// Structured outcome for one configured replication target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicationCheckTarget {
+    #[serde(rename = "Arn")]
+    pub target_arn: String,
+    #[serde(rename = "Bucket")]
+    pub bucket: String,
+    #[serde(rename = "Status")]
+    pub status: ReplicationCheckStatus,
+    #[serde(rename = "Error", default)]
+    pub error: Option<String>,
+    #[serde(rename = "Phases")]
+    pub phases: ReplicationCheckPhases,
+}
+
+/// Result of the active replication-target validation extension.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicationCheckResult {
+    /// Optional explicit contract version for forward-compatible servers.
+    #[serde(rename = "Version", default, skip_serializing_if = "Option::is_none")]
+    pub contract_version: Option<u32>,
+    #[serde(rename = "Status")]
+    pub status: ReplicationCheckStatus,
+    #[serde(rename = "ActiveMutation")]
+    pub active_mutation: bool,
+    #[serde(rename = "MutationDescription")]
+    pub mutation_description: String,
+    #[serde(rename = "ProbeNamespace")]
+    pub probe_namespace: String,
+    #[serde(rename = "Targets")]
+    pub targets: Vec<ReplicationCheckTarget>,
+    /// True only for the successful empty-body contract used by older servers.
+    #[serde(skip)]
+    pub legacy_empty_response: bool,
+}
+
+impl ReplicationCheckResult {
+    /// Represent the legacy server contract that returned no target detail.
+    pub fn legacy_success() -> Self {
+        Self {
+            contract_version: None,
+            status: ReplicationCheckStatus::Ok,
+            active_mutation: true,
+            mutation_description: "Legacy active write/delete replication probe".to_string(),
+            probe_namespace: String::new(),
+            targets: Vec::new(),
+            legacy_empty_response: true,
+        }
+    }
+
+    pub fn succeeded(&self) -> bool {
+        self.status == ReplicationCheckStatus::Ok
+    }
+}
+
 /// Options for starting a RustFS bucket replication resync.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ReplicationResyncStartOptions {

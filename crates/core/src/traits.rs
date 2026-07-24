@@ -22,8 +22,8 @@ use crate::object_lock::{
 };
 use crate::path::RemotePath;
 use crate::replication::{
-    ReplicationConfiguration, ReplicationResyncStartOptions, ReplicationResyncStartResult,
-    ReplicationResyncStatus,
+    ReplicationCheckResult, ReplicationConfiguration, ReplicationResyncStartOptions,
+    ReplicationResyncStartResult, ReplicationResyncStatus,
 };
 use crate::select::SelectOptions;
 use crate::transfer_options::{
@@ -1053,8 +1053,19 @@ pub trait ObjectStore: Send + Sync {
     /// Delete bucket replication configuration.
     async fn delete_bucket_replication(&self, bucket: &str) -> Result<()>;
 
-    /// Actively validate configured replication targets.
+    /// Actively validate configured replication targets using the legacy
+    /// success/failure contract.
     async fn check_bucket_replication(&self, bucket: &str) -> Result<()>;
+
+    /// Actively validate configured replication targets and retain structured
+    /// per-target and cleanup outcomes when the server provides them.
+    async fn check_bucket_replication_detailed(
+        &self,
+        bucket: &str,
+    ) -> Result<ReplicationCheckResult> {
+        self.check_bucket_replication(bucket).await?;
+        Ok(ReplicationCheckResult::legacy_success())
+    }
 
     /// Start a server-side bucket replication resync.
     async fn start_bucket_replication_resync(

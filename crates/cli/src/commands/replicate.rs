@@ -7,14 +7,17 @@ use clap::{Args, Subcommand};
 use comfy_table::{Cell, Table};
 use rc_core::admin::{AdminApi, ReplicationDiff, ReplicationDiffApi, ReplicationDiffEntry};
 use rc_core::replication::{
-    BucketTarget, BucketTargetCredentials, ReplicationConfiguration, ReplicationDestination,
-    ReplicationResyncStartOptions, ReplicationResyncStartResult, ReplicationResyncStatus,
-    ReplicationResyncTargetStatus, ReplicationRule, ReplicationRuleStatus,
+    BucketTarget, BucketTargetCredentials, ReplicationCheckPhase, ReplicationCheckPhaseState,
+    ReplicationCheckPhases, ReplicationCheckResult, ReplicationCheckStatus, ReplicationCheckTarget,
+    ReplicationConfiguration, ReplicationDestination, ReplicationResyncStartOptions,
+    ReplicationResyncStartResult, ReplicationResyncStatus, ReplicationResyncTargetStatus,
+    ReplicationRule, ReplicationRuleStatus,
 };
 use rc_core::{AliasManager, Error, ObjectStore as _};
 use rc_s3::{AdminClient, S3Client};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::io::{BufRead as _, IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
 
 use crate::exit_code::ExitCode;
@@ -350,6 +353,14 @@ struct ReplicationV3Data {
     bucket: String,
     valid: Option<bool>,
     targets: Vec<ReplicationV3Target>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    active_mutation: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mutation_description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    probe_namespace: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    legacy_empty_response: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -367,6 +378,29 @@ struct ReplicationV3Target {
     failed_size: Option<u64>,
     current_bucket: Option<String>,
     current_object: Option<String>,
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_bucket: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    check_status: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phases: Option<ReplicationV3CheckPhases>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReplicationV3CheckPhases {
+    bucket: ReplicationV3CheckPhase,
+    versioning: ReplicationV3CheckPhase,
+    object_lock: ReplicationV3CheckPhase,
+    put: ReplicationV3CheckPhase,
+    delete_marker: ReplicationV3CheckPhase,
+    version_delete: ReplicationV3CheckPhase,
+    cleanup: ReplicationV3CheckPhase,
+}
+
+#[derive(Debug, Serialize)]
+struct ReplicationV3CheckPhase {
+    status: &'static str,
     error: Option<String>,
 }
 
@@ -1500,33 +1534,213 @@ async fn execute_check(args: CheckArgs, output_config: OutputConfig) -> ExitCode
         Ok(validated) => validated,
         Err(error) => return fail_replication(&formatter, &error, "check"),
     };
-    if !args.yes {
-        return fail_replication(
-            &formatter,
-            &Error::InvalidPath(
-                "Replication check performs a remote write/delete probe; pass --yes to confirm"
-                    .to_string(),
-            ),
-            "check",
-        );
+    if let Err(error) = confirm_replication_check(args.yes, &formatter) {
+        return fail_replication(&formatter, &error, "check");
     }
 
     let client = match setup_replication_operation_client(&alias, args.force).await {
         Ok(client) => client,
         Err(error) => return fail_replication(&formatter, &error, "check"),
     };
-    match client.check_bucket_replication(&bucket).await {
-        Ok(()) => {
-            output_replication_success(&formatter, "check", bucket.clone(), Some(true), Vec::new());
-            if !formatter.is_json() {
-                let display_path = formatter.sanitize_text(&format!("{alias}/{bucket}"));
-                formatter.success(&format!(
-                    "Replication targets for '{display_path}' passed the active validation probe."
-                ));
+    match client.check_bucket_replication_detailed(&bucket).await {
+        Ok(result) => {
+            let succeeded = result.succeeded();
+            output_replication_check(&formatter, &alias, &bucket, result);
+            if succeeded {
+                ExitCode::Success
+            } else {
+                ExitCode::Conflict
             }
-            ExitCode::Success
         }
         Err(error) => fail_replication(&formatter, &error, "check"),
+    }
+}
+
+fn confirm_replication_check(yes: bool, formatter: &Formatter) -> rc_core::Result<()> {
+    if yes {
+        return Ok(());
+    }
+    if formatter.is_json() || !std::io::stdin().is_terminal() {
+        return Err(Error::InvalidPath(
+            "Replication check performs temporary remote writes and deletes; pass --yes in non-interactive or JSON mode"
+                .to_string(),
+        ));
+    }
+
+    let mut stderr = std::io::stderr().lock();
+    write!(
+        stderr,
+        "Replication check writes and deletes a temporary object on every configured target. Continue? [y/N] "
+    )
+    .map_err(Error::Io)?;
+    stderr.flush().map_err(Error::Io)?;
+    let mut answer = String::new();
+    std::io::stdin()
+        .lock()
+        .read_line(&mut answer)
+        .map_err(Error::Io)?;
+    if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        Ok(())
+    } else {
+        Err(Error::Interrupted(
+            "Replication check was declined".to_string(),
+        ))
+    }
+}
+
+fn output_replication_check(
+    formatter: &Formatter,
+    alias: &str,
+    bucket: &str,
+    result: ReplicationCheckResult,
+) {
+    if formatter.is_json() {
+        let succeeded = result.succeeded();
+        let targets = result
+            .targets
+            .into_iter()
+            .map(replication_check_target_output)
+            .collect();
+        formatter.json(&ReplicationV3Output {
+            schema_version: 3,
+            output_type: "replication_operations",
+            status: "success",
+            data: ReplicationV3Data {
+                operation: "check",
+                bucket: bucket.to_string(),
+                valid: Some(succeeded),
+                targets,
+                active_mutation: Some(result.active_mutation),
+                mutation_description: Some(result.mutation_description),
+                probe_namespace: (!result.probe_namespace.is_empty())
+                    .then_some(result.probe_namespace),
+                legacy_empty_response: Some(result.legacy_empty_response),
+            },
+        });
+        return;
+    }
+
+    let display_path = formatter.sanitize_text(&format!("{alias}/{bucket}"));
+    if result.legacy_empty_response {
+        formatter.warning(
+            "The server returned the legacy empty response; no per-target or cleanup detail is available.",
+        );
+        formatter.success(&format!(
+            "Replication targets for '{display_path}' passed the legacy active validation probe."
+        ));
+        return;
+    }
+
+    formatter.warning(&formatter.sanitize_text(&result.mutation_description));
+    formatter.println(&format!(
+        "Replication target check for '{display_path}' (probe namespace '{}'):",
+        formatter.sanitize_text(&result.probe_namespace)
+    ));
+    for target in &result.targets {
+        output_replication_check_target(formatter, target);
+    }
+    if result.succeeded() {
+        formatter.success("Every configured replication target passed all active check phases.");
+    } else {
+        formatter.warning(
+            "One or more targets failed; inspect cleanup first because a temporary probe artifact may remain.",
+        );
+    }
+}
+
+fn replication_check_target_output(target: ReplicationCheckTarget) -> ReplicationV3Target {
+    ReplicationV3Target {
+        target_arn: target.target_arn,
+        reset_id: String::new(),
+        reset_before: None,
+        started_at: None,
+        last_updated_at: None,
+        state: None,
+        server_state: None,
+        replicated_count: None,
+        replicated_size: None,
+        failed_count: None,
+        failed_size: None,
+        current_bucket: None,
+        current_object: None,
+        error: target.error,
+        target_bucket: Some(target.bucket),
+        check_status: Some(replication_check_status_name(target.status)),
+        phases: Some(replication_check_phases_output(target.phases)),
+    }
+}
+
+fn replication_check_phases_output(phases: ReplicationCheckPhases) -> ReplicationV3CheckPhases {
+    ReplicationV3CheckPhases {
+        bucket: replication_check_phase_output(phases.bucket),
+        versioning: replication_check_phase_output(phases.versioning),
+        object_lock: replication_check_phase_output(phases.object_lock),
+        put: replication_check_phase_output(phases.put),
+        delete_marker: replication_check_phase_output(phases.delete_marker),
+        version_delete: replication_check_phase_output(phases.version_delete),
+        cleanup: replication_check_phase_output(phases.cleanup),
+    }
+}
+
+fn replication_check_phase_output(phase: ReplicationCheckPhase) -> ReplicationV3CheckPhase {
+    ReplicationV3CheckPhase {
+        status: replication_check_phase_name(phase.status),
+        error: phase.error,
+    }
+}
+
+const fn replication_check_status_name(status: ReplicationCheckStatus) -> &'static str {
+    match status {
+        ReplicationCheckStatus::Ok => "ok",
+        ReplicationCheckStatus::Failed => "failed",
+    }
+}
+
+const fn replication_check_phase_name(status: ReplicationCheckPhaseState) -> &'static str {
+    match status {
+        ReplicationCheckPhaseState::Ok => "ok",
+        ReplicationCheckPhaseState::Failed => "failed",
+        ReplicationCheckPhaseState::Skipped => "skipped",
+    }
+}
+
+fn output_replication_check_target(formatter: &Formatter, target: &ReplicationCheckTarget) {
+    formatter.println(&format!(
+        "  {} -> {} [{}]",
+        formatter.sanitize_text(&target.target_arn),
+        formatter.sanitize_text(&target.bucket),
+        replication_check_status_name(target.status)
+    ));
+    let phases = [
+        ("bucket", &target.phases.bucket),
+        ("versioning", &target.phases.versioning),
+        ("object lock", &target.phases.object_lock),
+        ("put", &target.phases.put),
+        ("delete marker", &target.phases.delete_marker),
+        ("version delete", &target.phases.version_delete),
+        ("cleanup", &target.phases.cleanup),
+    ];
+    for (name, phase) in phases {
+        let detail = phase
+            .error
+            .as_deref()
+            .map(|error| format!(": {}", formatter.sanitize_text(error)))
+            .unwrap_or_default();
+        let line = format!(
+            "    {name}: {}{detail}",
+            replication_check_phase_name(phase.status)
+        );
+        if phase.status == ReplicationCheckPhaseState::Failed {
+            formatter.warning(&line);
+        } else {
+            formatter.println(&line);
+        }
+    }
+    if let Some(error) = target.error.as_deref() {
+        formatter.warning(&format!(
+            "    target error: {}",
+            formatter.sanitize_text(error)
+        ));
     }
 }
 
@@ -1738,6 +1952,10 @@ fn output_replication_success(
                 bucket,
                 valid,
                 targets,
+                active_mutation: None,
+                mutation_description: None,
+                probe_namespace: None,
+                legacy_empty_response: None,
             },
         });
     }
@@ -1759,6 +1977,9 @@ fn start_target_output(result: &ReplicationResyncStartResult) -> ReplicationV3Ta
         current_bucket: None,
         current_object: None,
         error: None,
+        target_bucket: None,
+        check_status: None,
+        phases: None,
     }
 }
 
@@ -1778,6 +1999,9 @@ fn status_target_output(target: ReplicationResyncTargetStatus) -> ReplicationV3T
         current_bucket: target.current_bucket,
         current_object: target.current_object,
         error: target.error,
+        target_bucket: None,
+        check_status: None,
+        phases: None,
     }
 }
 
@@ -2920,6 +3144,10 @@ mod tests {
                 bucket: "source-bucket".to_string(),
                 valid: None,
                 targets: vec![target],
+                active_mutation: None,
+                mutation_description: None,
+                probe_namespace: None,
+                legacy_empty_response: None,
             },
         })
         .expect("serialize replication v3 output");
@@ -2928,6 +3156,70 @@ mod tests {
         assert_eq!(value["type"], "replication_operations");
         assert_eq!(value["data"]["targets"][0]["state"], "unknown");
         assert_eq!(value["data"]["targets"][0]["server_state"], "FutureState");
+    }
+
+    #[test]
+    fn replication_check_output_preserves_partial_and_cleanup_detail() {
+        let ok = || ReplicationCheckPhase {
+            status: ReplicationCheckPhaseState::Ok,
+            error: None,
+        };
+        let target = replication_check_target_output(ReplicationCheckTarget {
+            target_arn: "arn:rustfs:replication::id:backup".to_string(),
+            bucket: "replica".to_string(),
+            status: ReplicationCheckStatus::Failed,
+            error: Some("probe cleanup failed".to_string()),
+            phases: ReplicationCheckPhases {
+                bucket: ok(),
+                versioning: ok(),
+                object_lock: ok(),
+                put: ok(),
+                delete_marker: ok(),
+                version_delete: ok(),
+                cleanup: ReplicationCheckPhase {
+                    status: ReplicationCheckPhaseState::Failed,
+                    error: Some("cleanup denied".to_string()),
+                },
+            },
+        });
+        let value = serde_json::to_value(ReplicationV3Output {
+            schema_version: 3,
+            output_type: "replication_operations",
+            status: "success",
+            data: ReplicationV3Data {
+                operation: "check",
+                bucket: "source-bucket".to_string(),
+                valid: Some(false),
+                targets: vec![target],
+                active_mutation: Some(true),
+                mutation_description: Some("temporary probe".to_string()),
+                probe_namespace: Some(".rustfs.sys/replication-check/".to_string()),
+                legacy_empty_response: Some(false),
+            },
+        })
+        .expect("serialize structured check output");
+
+        assert_eq!(value["data"]["valid"], false);
+        assert_eq!(value["data"]["active_mutation"], true);
+        assert_eq!(value["data"]["targets"][0]["check_status"], "failed");
+        assert_eq!(
+            value["data"]["targets"][0]["phases"]["cleanup"]["status"],
+            "failed"
+        );
+        assert_eq!(
+            value["data"]["targets"][0]["phases"]["cleanup"]["error"],
+            "cleanup denied"
+        );
+    }
+
+    #[test]
+    fn legacy_check_result_is_explicit_without_target_fabrication() {
+        let result = ReplicationCheckResult::legacy_success();
+
+        assert!(result.succeeded());
+        assert!(result.legacy_empty_response);
+        assert!(result.targets.is_empty());
+        assert!(result.probe_namespace.is_empty());
     }
 
     #[test]

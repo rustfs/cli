@@ -44,10 +44,12 @@ use rc_core::{
     ObjectEncryptionRequest, ObjectInfo, ObjectLockOptions, ObjectReadOptions, ObjectRetention,
     ObjectStore, ObjectTransferMetadata, ObjectVersion, ObjectVersionIdentifier,
     ObjectVersionListResult, ObjectWriteEncryption, ObjectWriteOptions, RemotePath,
-    ReplicationConfiguration, ReplicationResyncStartOptions, ReplicationResyncStartResult,
-    ReplicationResyncState, ReplicationResyncStatus, ReplicationResyncTargetStatus, RequestHeader,
-    Result, RetentionDuration, RetentionDurationUnit, RetentionMode, SelectOptions, SseCustomerKey,
-    TransferCopyOptions, TransferReadOptions, global_request_headers,
+    ReplicationCheckPhase, ReplicationCheckPhaseState, ReplicationCheckResult,
+    ReplicationCheckStatus, ReplicationConfiguration, ReplicationResyncStartOptions,
+    ReplicationResyncStartResult, ReplicationResyncState, ReplicationResyncStatus,
+    ReplicationResyncTargetStatus, RequestHeader, Result, RetentionDuration, RetentionDurationUnit,
+    RetentionMode, SelectOptions, SseCustomerKey, TransferCopyOptions, TransferReadOptions,
+    global_request_headers,
 };
 use reqwest::Method;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
@@ -68,6 +70,70 @@ const S3_SERVICE_NAME: &str = "s3";
 const S3_REPLICATION_XML_NAMESPACE: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 const RUSTFS_FORCE_DELETE_HEADER: &str = "x-rustfs-force-delete";
 const REPLICATION_EXTENSION_BODY_LIMIT: u64 = 1024 * 1024;
+const REPLICATION_CHECK_PROBE_NAMESPACE: &str = ".rustfs.sys/replication-check/";
+const REPLICATION_CHECK_ERROR_LIMIT: usize = 512;
+const REPLICATION_CHECK_DESCRIPTION_LIMIT: usize = 1024;
+
+fn contains_control_characters(value: &str) -> bool {
+    value.chars().any(char::is_control)
+}
+
+fn validate_replication_check_error(error: Option<&str>) -> Result<()> {
+    if error.is_some_and(|value| {
+        value.is_empty()
+            || value.len() > REPLICATION_CHECK_ERROR_LIMIT
+            || contains_control_characters(value)
+    }) {
+        return Err(Error::General(
+            "Malformed structured replication check response".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_replication_check_phase(phase: &ReplicationCheckPhase) -> Result<()> {
+    validate_replication_check_error(phase.error.as_deref())?;
+    let error_matches_status = match phase.status {
+        ReplicationCheckPhaseState::Failed => phase.error.is_some(),
+        ReplicationCheckPhaseState::Ok | ReplicationCheckPhaseState::Skipped => {
+            phase.error.is_none()
+        }
+    };
+    if !error_matches_status {
+        return Err(Error::General(
+            "Malformed structured replication check response".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn replication_check_phases(
+    phases: &rc_core::ReplicationCheckPhases,
+) -> [&ReplicationCheckPhase; 7] {
+    [
+        &phases.bucket,
+        &phases.versioning,
+        &phases.object_lock,
+        &phases.put,
+        &phases.delete_marker,
+        &phases.version_delete,
+        &phases.cleanup,
+    ]
+}
+
+fn replication_check_phases_mut(
+    phases: &mut rc_core::ReplicationCheckPhases,
+) -> [&mut ReplicationCheckPhase; 7] {
+    [
+        &mut phases.bucket,
+        &mut phases.versioning,
+        &mut phases.object_lock,
+        &mut phases.put,
+        &mut phases.delete_marker,
+        &mut phases.version_delete,
+        &mut phases.cleanup,
+    ]
+}
 
 #[derive(Debug, Clone, Copy)]
 enum ObjectWritePrecondition<'a> {
@@ -2908,6 +2974,102 @@ impl S3Client {
             Error::Network(message)
         } else {
             Error::General(message)
+        }
+    }
+
+    fn parse_replication_check_response(&self, body: &[u8]) -> Result<ReplicationCheckResult> {
+        if body.is_empty() {
+            return Ok(ReplicationCheckResult::legacy_success());
+        }
+
+        let mut result = serde_json::from_slice::<ReplicationCheckResult>(body).map_err(|_| {
+            Error::General("Malformed structured replication check response".to_string())
+        })?;
+        if result.contract_version.is_some_and(|version| version != 1)
+            || !result.active_mutation
+            || result.probe_namespace != REPLICATION_CHECK_PROBE_NAMESPACE
+            || result.mutation_description.is_empty()
+            || result.mutation_description.len() > REPLICATION_CHECK_DESCRIPTION_LIMIT
+            || contains_control_characters(&result.mutation_description)
+            || result.targets.is_empty()
+        {
+            return Err(Error::General(
+                "Malformed structured replication check response".to_string(),
+            ));
+        }
+
+        let expected_status = if result
+            .targets
+            .iter()
+            .all(|target| target.status == ReplicationCheckStatus::Ok)
+        {
+            ReplicationCheckStatus::Ok
+        } else {
+            ReplicationCheckStatus::Failed
+        };
+        if result.status != expected_status {
+            return Err(Error::General(
+                "Malformed structured replication check response".to_string(),
+            ));
+        }
+
+        for target in &mut result.targets {
+            if target.target_arn.is_empty()
+                || target.bucket.is_empty()
+                || contains_control_characters(&target.target_arn)
+                || contains_control_characters(&target.bucket)
+            {
+                return Err(Error::General(
+                    "Malformed structured replication check response".to_string(),
+                ));
+            }
+            target.target_arn = self.redact_sensitive_text(std::mem::take(&mut target.target_arn));
+            target.bucket = self.redact_sensitive_text(std::mem::take(&mut target.bucket));
+            validate_replication_check_error(target.error.as_deref())?;
+            if let Some(error) = target.error.take() {
+                target.error = Some(self.sanitize_replication_check_error(error));
+            }
+            for phase in replication_check_phases_mut(&mut target.phases) {
+                validate_replication_check_phase(phase)?;
+                if let Some(error) = phase.error.take() {
+                    phase.error = Some(self.sanitize_replication_check_error(error));
+                }
+            }
+
+            let any_failed = replication_check_phases(&target.phases)
+                .into_iter()
+                .any(|phase| phase.status == ReplicationCheckPhaseState::Failed);
+            if (target.status == ReplicationCheckStatus::Failed)
+                != (any_failed || target.error.is_some())
+            {
+                return Err(Error::General(
+                    "Malformed structured replication check response".to_string(),
+                ));
+            }
+        }
+
+        result.mutation_description = self.redact_sensitive_text(result.mutation_description);
+        Ok(result)
+    }
+
+    fn sanitize_replication_check_error(&self, error: String) -> String {
+        let redacted = self.redact_sensitive_text(error);
+        let lower = redacted.to_ascii_lowercase();
+        if [
+            "http://",
+            "https://",
+            "authorization",
+            "x-amz-credential",
+            "x-amz-signature",
+            "secret-key",
+            "access-key",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+        {
+            "server reported a redacted replication check failure".to_string()
+        } else {
+            redacted
         }
     }
 
@@ -6409,16 +6571,25 @@ impl ObjectStore for S3Client {
     }
 
     async fn check_bucket_replication(&self, bucket: &str) -> Result<()> {
+        let result = self.check_bucket_replication_detailed(bucket).await?;
+        if result.succeeded() {
+            Ok(())
+        } else {
+            Err(Error::Conflict(
+                "One or more replication targets failed the active check".to_string(),
+            ))
+        }
+    }
+
+    async fn check_bucket_replication_detailed(
+        &self,
+        bucket: &str,
+    ) -> Result<ReplicationCheckResult> {
         let url = self.replication_extension_url(bucket, "replication-check", &[])?;
         let body = self
             .signed_replication_extension_request(Method::GET, url)
             .await?;
-        if !body.is_empty() {
-            return Err(Error::General(
-                "Malformed replication check response: expected an empty body".to_string(),
-            ));
-        }
-        Ok(())
+        self.parse_replication_check_response(&body)
     }
 
     async fn start_bucket_replication_resync(
@@ -8974,10 +9145,12 @@ mod tests {
         );
         let (client, _) = test_s3_client_with_endpoint(&endpoint, None);
 
-        client
-            .check_bucket_replication("source-bucket")
+        let result = client
+            .check_bucket_replication_detailed("source-bucket")
             .await
             .expect("replication check should succeed");
+        assert!(result.legacy_empty_response);
+        assert!(result.succeeded());
 
         let request = receiver
             .recv_timeout(Duration::from_secs(5))
@@ -9315,7 +9488,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replication_check_rejects_nonempty_success_body() {
+    async fn replication_check_rejects_malformed_nonempty_success_body() {
         let response =
             b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok".to_vec();
         let (endpoint, _receiver, handle) = start_replication_extension_test_server(response);
@@ -9328,6 +9501,97 @@ mod tests {
 
         assert!(matches!(error, Error::General(_)));
         handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn replication_check_retains_structured_partial_and_cleanup_outcomes() {
+        let body = br#"{"Status":"FAILED","ActiveMutation":true,"MutationDescription":"Writes and deletes a temporary probe.","ProbeNamespace":".rustfs.sys/replication-check/","Targets":[{"Arn":"arn:target","Bucket":"replica","Status":"FAILED","Error":"probe cleanup failed","Phases":{"Bucket":{"Status":"OK"},"Versioning":{"Status":"OK"},"ObjectLock":{"Status":"OK"},"Put":{"Status":"OK"},"DeleteMarker":{"Status":"OK"},"VersionDelete":{"Status":"OK"},"Cleanup":{"Status":"FAILED","Error":"cleanup denied"}}}]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes()
+        .into_iter()
+        .chain(body.iter().copied())
+        .collect();
+        let (endpoint, _receiver, handle) = start_replication_extension_test_server(response);
+        let (client, _) = test_s3_client_with_endpoint(&endpoint, None);
+
+        let result = client
+            .check_bucket_replication_detailed("source-bucket")
+            .await
+            .expect("structured failure is a completed check");
+
+        assert!(!result.succeeded());
+        assert!(!result.legacy_empty_response);
+        assert_eq!(result.targets.len(), 1);
+        assert_eq!(
+            result.targets[0].phases.cleanup.status,
+            ReplicationCheckPhaseState::Failed
+        );
+        assert_eq!(
+            result.targets[0].phases.cleanup.error.as_deref(),
+            Some("cleanup denied")
+        );
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn legacy_replication_check_method_maps_structured_failure_to_conflict() {
+        let body = br#"{"Status":"FAILED","ActiveMutation":true,"MutationDescription":"probe","ProbeNamespace":".rustfs.sys/replication-check/","Targets":[{"Arn":"arn:target","Bucket":"replica","Status":"FAILED","Error":"bucket unavailable","Phases":{"Bucket":{"Status":"FAILED","Error":"bucket unavailable"},"Versioning":{"Status":"SKIPPED"},"ObjectLock":{"Status":"SKIPPED"},"Put":{"Status":"SKIPPED"},"DeleteMarker":{"Status":"SKIPPED"},"VersionDelete":{"Status":"SKIPPED"},"Cleanup":{"Status":"OK"}}}]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes()
+        .into_iter()
+        .chain(body.iter().copied())
+        .collect();
+        let (endpoint, _receiver, handle) = start_replication_extension_test_server(response);
+        let (client, _) = test_s3_client_with_endpoint(&endpoint, None);
+
+        let error = client
+            .check_bucket_replication("source-bucket")
+            .await
+            .expect_err("legacy method must not discard structured failure");
+
+        assert!(matches!(error, Error::Conflict(_)));
+        handle.join().expect("server thread should finish");
+    }
+
+    #[test]
+    fn replication_check_rejects_inconsistent_or_unsafe_structured_results() {
+        let (client, _) = test_s3_client(None);
+        let inconsistent = br#"{"Status":"OK","ActiveMutation":true,"MutationDescription":"probe","ProbeNamespace":".rustfs.sys/replication-check/","Targets":[{"Arn":"arn:target","Bucket":"replica","Status":"FAILED","Error":"failed","Phases":{"Bucket":{"Status":"FAILED","Error":"failed"},"Versioning":{"Status":"SKIPPED"},"ObjectLock":{"Status":"SKIPPED"},"Put":{"Status":"SKIPPED"},"DeleteMarker":{"Status":"SKIPPED"},"VersionDelete":{"Status":"SKIPPED"},"Cleanup":{"Status":"OK"}}}]}"#;
+        let control_character = br#"{"Status":"FAILED","ActiveMutation":true,"MutationDescription":"probe","ProbeNamespace":".rustfs.sys/replication-check/","Targets":[{"Arn":"arn:target","Bucket":"replica","Status":"FAILED","Error":"unsafe\nline","Phases":{"Bucket":{"Status":"FAILED","Error":"failed"},"Versioning":{"Status":"SKIPPED"},"ObjectLock":{"Status":"SKIPPED"},"Put":{"Status":"SKIPPED"},"DeleteMarker":{"Status":"SKIPPED"},"VersionDelete":{"Status":"SKIPPED"},"Cleanup":{"Status":"OK"}}}]}"#;
+        let unsupported_version = br#"{"Version":2,"Status":"OK","ActiveMutation":true,"MutationDescription":"probe","ProbeNamespace":".rustfs.sys/replication-check/","Targets":[{"Arn":"arn:target","Bucket":"replica","Status":"OK","Phases":{"Bucket":{"Status":"OK"},"Versioning":{"Status":"OK"},"ObjectLock":{"Status":"OK"},"Put":{"Status":"OK"},"DeleteMarker":{"Status":"OK"},"VersionDelete":{"Status":"OK"},"Cleanup":{"Status":"OK"}}}]}"#;
+
+        for body in [
+            inconsistent.as_slice(),
+            control_character.as_slice(),
+            unsupported_version.as_slice(),
+        ] {
+            assert!(matches!(
+                client.parse_replication_check_response(body),
+                Err(Error::General(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn replication_check_redacts_endpoint_and_signature_details() {
+        let (client, _) = test_s3_client(None);
+        let body = br#"{"Status":"FAILED","ActiveMutation":true,"MutationDescription":"probe","ProbeNamespace":".rustfs.sys/replication-check/","Targets":[{"Arn":"arn:target","Bucket":"replica","Status":"FAILED","Error":"request https://user:pass@example.test?X-Amz-Signature=secret failed","Phases":{"Bucket":{"Status":"FAILED","Error":"request https://example.test failed"},"Versioning":{"Status":"SKIPPED"},"ObjectLock":{"Status":"SKIPPED"},"Put":{"Status":"SKIPPED"},"DeleteMarker":{"Status":"SKIPPED"},"VersionDelete":{"Status":"SKIPPED"},"Cleanup":{"Status":"OK"}}}]}"#;
+
+        let result = client
+            .parse_replication_check_response(body)
+            .expect("unsafe remote details should be replaced");
+        let serialized = serde_json::to_string(&result).expect("serialize redacted result");
+
+        assert!(serialized.contains("redacted replication check failure"));
+        assert!(!serialized.contains("example.test"));
+        assert!(!serialized.contains("X-Amz-Signature"));
+        assert!(!serialized.contains("user:pass"));
     }
 
     #[test]
