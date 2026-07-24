@@ -689,7 +689,7 @@ fn nested_subcommand_help_contract() {
             args: &["admin", "idp", "openid"],
             usage: "Usage: rc admin idp openid [OPTIONS] <COMMAND>",
             expected_tokens: &[
-                "list", "get", "validate", "set", "update", "enable", "disable",
+                "list", "get", "validate", "set", "update", "enable", "disable", "delete",
             ],
         },
         HelpCase {
@@ -731,6 +731,11 @@ fn nested_subcommand_help_contract() {
             args: &["admin", "idp", "openid", "enable"],
             usage: "Usage: rc admin idp openid enable [OPTIONS] <ALIAS> <PROVIDER_ID>",
             expected_tokens: &["--dry-run"],
+        },
+        HelpCase {
+            args: &["admin", "idp", "openid", "delete"],
+            usage: "Usage: rc admin idp openid delete [OPTIONS] <ALIAS> <PROVIDER_ID>",
+            expected_tokens: &["--yes"],
         },
         HelpCase {
             args: &["admin", "metrics"],

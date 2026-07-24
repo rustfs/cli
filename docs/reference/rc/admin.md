@@ -348,6 +348,7 @@ configuration or browser login endpoints:
 | `rc admin idp openid update <ALIAS> <PROVIDER_ID> [OPTIONS]` | Update an existing provider and fail if it does not exist. |
 | `rc admin idp openid enable <ALIAS> <PROVIDER_ID> [--dry-run]` | Enable a persisted provider while preserving every other field. |
 | `rc admin idp openid disable <ALIAS> <PROVIDER_ID> [--dry-run]` | Disable a persisted provider while preserving every other field. |
+| `rc admin idp openid delete <ALIAS> <PROVIDER_ID> [--yes]` | Display a secret-free provider summary, confirm, and delete one persisted provider. Use `--yes` for automation. |
 
 Provider output includes only the server's `client_secret_configured` boolean. Client-secret
 values are never accepted as command-line literals, sent in validation requests, or included in
@@ -369,7 +370,10 @@ exact provider uses `not_found`, conflicts use the conflict exit code, and local
 the usage exit code.
 
 JSON output uses schema v3 family `oidc` with operations `list`, `get`, `validate`, `set`, `update`,
-`enable`, and `disable`. Validation supports repeated `--scope` and `--other-audience` options,
+`enable`, `disable`, and `delete`. A delete reads the exact provider before mutation, refuses
+environment-managed or otherwise non-editable providers, and requires an interactive confirmation
+or `--yes` in non-interactive/JSON mode. A repeated delete returns deterministic `not_found`
+without issuing DELETE. Validation supports repeated `--scope` and `--other-audience` options,
 optional `--issuer`, claim-name overrides, and `--redirect-uri --static-redirect`. Mutation fields
 use the same options, while `--clear-issuer`, `--clear-redirect-uri`,
 `--replace-other-audiences`, and the paired boolean flags express explicit resets. Scopes must

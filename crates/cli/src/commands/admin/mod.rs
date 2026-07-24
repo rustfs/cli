@@ -216,6 +216,7 @@ fn observability_error_type(error: &Error) -> &'static str {
         Error::NotFound(_) | Error::AliasNotFound(_) => "not_found",
         Error::Conflict(_) | Error::AliasExists(_) => "conflict",
         Error::UnsupportedFeature(_) => "unsupported_feature",
+        Error::Interrupted(_) => "interrupted",
         _ => "general_error",
     }
 }
@@ -226,6 +227,7 @@ fn observability_error_suggestion(error: &Error) -> Option<&'static str> {
         Error::Network(_) => Some("Verify the endpoint and network connectivity, then retry."),
         Error::Auth(_) => Some("Verify credentials and required admin permissions, then retry."),
         Error::UnsupportedFeature(_) => Some("Upgrade RustFS to beta.10 or later."),
+        Error::Interrupted(_) => Some("Retry with --yes if deletion is still intended."),
         _ => None,
     }
 }

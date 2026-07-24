@@ -965,12 +965,23 @@
         }
       }
     },
+    "oidcDeleteData": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operation", "provider", "restart_required"],
+      "properties": {
+        "operation": { "const": "delete" },
+        "provider": { "$ref": "#/definitions/oidcProvider" },
+        "restart_required": { "type": "boolean" }
+      }
+    },
     "oidcData": {
       "oneOf": [
         { "$ref": "#/definitions/oidcListData" },
         { "$ref": "#/definitions/oidcGetData" },
         { "$ref": "#/definitions/oidcValidationData" },
-        { "$ref": "#/definitions/oidcMutationData" }
+        { "$ref": "#/definitions/oidcMutationData" },
+        { "$ref": "#/definitions/oidcDeleteData" }
       ]
     },
     "adminOperation": {

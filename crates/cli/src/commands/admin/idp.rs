@@ -9,7 +9,7 @@ use rc_core::{Error, Result};
 use serde::Serialize;
 use serde_json::Value;
 use std::fs::File;
-use std::io::Read;
+use std::io::{BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
@@ -46,6 +46,9 @@ pub enum OpenidCommands {
 
     /// Disable an existing OIDC provider
     Disable(OidcToggleArgs),
+
+    /// Delete an editable OIDC provider after explicit confirmation
+    Delete(OidcDeleteArgs),
 }
 
 #[derive(Args, Debug)]
@@ -254,6 +257,19 @@ pub struct OidcToggleArgs {
     pub dry_run: bool,
 }
 
+#[derive(Args, Debug)]
+pub struct OidcDeleteArgs {
+    /// Alias name of the server
+    pub alias: String,
+
+    /// Exact OIDC provider ID
+    pub provider_id: String,
+
+    /// Confirm deletion without an interactive prompt
+    #[arg(long)]
+    pub yes: bool,
+}
+
 #[derive(Debug, Serialize)]
 struct OidcSuccessOutput<T> {
     schema_version: u8,
@@ -301,6 +317,13 @@ struct OidcMutationData<'a> {
     changes: &'a [OidcChange],
 }
 
+#[derive(Debug, Serialize)]
+struct OidcDeleteData<'a> {
+    operation: &'static str,
+    provider: &'a OidcProvider,
+    restart_required: bool,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum MutationMode {
     Set,
@@ -344,6 +367,7 @@ pub async fn execute(command: IdpCommands, formatter: &Formatter) -> ExitCode {
             OpenidCommands::Disable(args) => {
                 execute_toggle(args, MutationMode::Disable, formatter).await
             }
+            OpenidCommands::Delete(args) => execute_delete(args, formatter).await,
         },
     }
 }
@@ -493,6 +517,71 @@ async fn execute_toggle(
             &error,
             formatter,
         ),
+    }
+}
+
+async fn execute_delete(args: OidcDeleteArgs, formatter: &Formatter) -> ExitCode {
+    let client = match get_admin_client(&args.alias, formatter) {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
+    match prepare_and_delete(&client, args, formatter).await {
+        Ok(()) => ExitCode::Success,
+        Err(error) => emit_observability_error(
+            "oidc",
+            "admin.oidc-config-write",
+            "Failed to delete OIDC provider",
+            &error,
+            formatter,
+        ),
+    }
+}
+
+async fn prepare_and_delete(
+    client: &rc_s3::AdminClient,
+    args: OidcDeleteArgs,
+    formatter: &Formatter,
+) -> Result<()> {
+    let provider = client.oidc_get_provider(&args.provider_id).await?;
+    ensure_editable(&provider)?;
+    if !formatter.is_json() {
+        print_delete_summary(&provider, formatter);
+    }
+    confirm_delete(&provider, args.yes, formatter)?;
+    let result = client.oidc_delete_provider(&args.provider_id).await?;
+    print_delete(&provider, result.restart_required, formatter);
+    Ok(())
+}
+
+fn confirm_delete(provider: &OidcProvider, yes: bool, formatter: &Formatter) -> Result<()> {
+    if yes {
+        return Ok(());
+    }
+    if formatter.is_json() || !std::io::stdin().is_terminal() {
+        return Err(Error::InvalidPath(
+            "OIDC provider deletion requires --yes in non-interactive or JSON mode".to_string(),
+        ));
+    }
+
+    let mut stderr = std::io::stderr().lock();
+    write!(
+        stderr,
+        "Delete OIDC provider '{}'? [y/N] ",
+        safe(&provider.provider_id, formatter)
+    )
+    .map_err(Error::Io)?;
+    stderr.flush().map_err(Error::Io)?;
+    let mut answer = String::new();
+    std::io::stdin()
+        .lock()
+        .read_line(&mut answer)
+        .map_err(Error::Io)?;
+    if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        Ok(())
+    } else {
+        Err(Error::Interrupted(
+            "OIDC provider deletion was declined".to_string(),
+        ))
     }
 }
 
@@ -931,6 +1020,47 @@ fn print_mutation(
             ));
         }
     }
+}
+
+fn print_delete_summary(provider: &OidcProvider, formatter: &Formatter) {
+    formatter.println(&formatter.style_name("OIDC Provider Deletion"));
+    formatter.println("");
+    formatter.println(&format!(
+        "Provider ID:  {}",
+        safe(&provider.provider_id, formatter)
+    ));
+    formatter.println(&format!(
+        "Display name: {}",
+        safe(&provider.display_name, formatter)
+    ));
+    formatter.println(&format!("Enabled:      {}", provider.enabled));
+    formatter.println(&format!(
+        "Source:       {}",
+        match provider.source {
+            OidcProviderSource::Env => "env",
+            OidcProviderSource::Persisted => "persisted",
+        }
+    ));
+    formatter.println(&format!("Editable:     {}", provider.editable));
+}
+
+fn print_delete(provider: &OidcProvider, restart_required: bool, formatter: &Formatter) {
+    if formatter.is_json() {
+        formatter.json(&OidcSuccessOutput {
+            schema_version: 3,
+            output_type: "oidc",
+            status: "success",
+            data: OidcDeleteData {
+                operation: "delete",
+                provider,
+                restart_required,
+            },
+        });
+        return;
+    }
+    formatter.println("");
+    formatter.println("Deleted:      true");
+    formatter.println(&format!("Restart required: {restart_required}"));
 }
 
 fn print_list(list: &OidcProviderList, formatter: &Formatter) {

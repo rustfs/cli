@@ -639,3 +639,172 @@ fn oidc_secret_input_requires_explicit_replacement_acknowledgement() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn oidc_delete_requires_confirmation_after_redacted_get_and_sends_no_delete() {
+    let config_dir = tempfile::tempdir().expect("create config dir");
+    let (endpoint, receiver, handle) =
+        start_admin_sequence_test_server(vec![("200 OK", PROVIDERS)]);
+    let output = Command::new(rc_binary())
+        .args([
+            "--json", "admin", "idp", "openid", "delete", "myalias", "corp",
+        ])
+        .env("RC_CONFIG_DIR", config_dir.path())
+        .env("RC_HOST_myalias", rc_host_alias(&endpoint))
+        .output()
+        .expect("run rc");
+
+    assert_eq!(output.status.code(), Some(2));
+    let error: Value = serde_json::from_slice(&output.stderr).expect("error JSON");
+    assert_eq!(error["error"]["type"], "usage_error");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("--yes"))
+    );
+    let get = receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("GET request");
+    assert_eq!(get.method, "GET");
+    assert_eq!(get.target, "/rustfs/admin/v3/oidc/config");
+    assert!(
+        receiver.try_recv().is_err(),
+        "refusal must not issue DELETE"
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("client_secret"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("SECRET_KEY"));
+    handle.join().expect("server");
+}
+
+#[test]
+fn oidc_delete_uses_exact_typed_route_and_emits_secret_free_v3_output() {
+    let config_dir = tempfile::tempdir().expect("create config dir");
+    let delete_ok = r#"{"success":true,"message":"OIDC provider deleted","restart_required":true}"#;
+    let (endpoint, receiver, handle) =
+        start_admin_sequence_test_server(vec![("200 OK", PROVIDERS), ("200 OK", delete_ok)]);
+    let output = Command::new(rc_binary())
+        .args([
+            "--json", "admin", "idp", "openid", "delete", "myalias", "corp", "--yes",
+        ])
+        .env("RC_CONFIG_DIR", config_dir.path())
+        .env("RC_HOST_myalias", rc_host_alias(&endpoint))
+        .output()
+        .expect("run rc");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("JSON stdout");
+    assert_eq!(value["data"]["operation"], "delete");
+    assert_eq!(value["data"]["provider"]["provider_id"], "corp");
+    assert_eq!(value["data"]["provider"]["client_secret_configured"], true);
+    assert_eq!(value["data"]["restart_required"], true);
+    assert!(value["data"]["provider"].get("client_secret").is_none());
+    assert_valid_v3(&value);
+
+    let get = receiver.recv().expect("GET request");
+    let delete = receiver.recv().expect("DELETE request");
+    assert_eq!(get.method, "GET");
+    assert_eq!(delete.method, "DELETE");
+    assert_eq!(delete.target, "/rustfs/admin/v3/oidc/config/corp");
+    assert!(delete.body.is_empty());
+    handle.join().expect("server");
+}
+
+#[test]
+fn oidc_delete_retry_is_deterministic_not_found_without_delete() {
+    let config_dir = tempfile::tempdir().expect("create config dir");
+    let (endpoint, receiver, handle) =
+        start_admin_sequence_test_server(vec![("200 OK", EMPTY_PROVIDERS)]);
+    let output = Command::new(rc_binary())
+        .args([
+            "--json", "admin", "idp", "openid", "delete", "myalias", "corp", "--yes",
+        ])
+        .env("RC_CONFIG_DIR", config_dir.path())
+        .env("RC_HOST_myalias", rc_host_alias(&endpoint))
+        .output()
+        .expect("run rc");
+
+    assert_eq!(output.status.code(), Some(5));
+    let error: Value = serde_json::from_slice(&output.stderr).expect("error JSON");
+    assert_eq!(error["error"]["type"], "not_found");
+    assert_eq!(receiver.recv().expect("GET").method, "GET");
+    assert!(receiver.try_recv().is_err());
+    handle.join().expect("server");
+}
+
+#[test]
+fn oidc_delete_refuses_environment_provider_before_delete() {
+    let config_dir = tempfile::tempdir().expect("create config dir");
+    let (endpoint, receiver, handle) =
+        start_admin_sequence_test_server(vec![("200 OK", ENV_PROVIDER)]);
+    let output = Command::new(rc_binary())
+        .args([
+            "--json", "admin", "idp", "openid", "delete", "myalias", "corp", "--yes",
+        ])
+        .env("RC_CONFIG_DIR", config_dir.path())
+        .env("RC_HOST_myalias", rc_host_alias(&endpoint))
+        .output()
+        .expect("run rc");
+
+    assert_eq!(output.status.code(), Some(6));
+    let error: Value = serde_json::from_slice(&output.stderr).expect("error JSON");
+    assert_eq!(error["error"]["type"], "conflict");
+    assert_eq!(receiver.recv().expect("GET").method, "GET");
+    assert!(receiver.try_recv().is_err());
+    handle.join().expect("server");
+}
+
+#[test]
+fn oidc_delete_distinguishes_permission_not_found_unsupported_and_server_failure() {
+    for (status, expected_code, expected_type) in [
+        ("403 Forbidden", 4, "auth_error"),
+        ("400 Bad Request", 5, "not_found"),
+        ("404 Not Found", 7, "unsupported_feature"),
+        ("500 Internal Server Error", 3, "network_error"),
+    ] {
+        let config_dir = tempfile::tempdir().expect("create config dir");
+        let (endpoint, receiver, handle) = start_admin_sequence_test_server(vec![
+            ("200 OK", PROVIDERS),
+            (status, r#"{"message":"MUST_NOT_APPEAR"}"#),
+        ]);
+        let output = Command::new(rc_binary())
+            .args([
+                "--json", "admin", "idp", "openid", "delete", "myalias", "corp", "--yes",
+            ])
+            .env("RC_CONFIG_DIR", config_dir.path())
+            .env("RC_HOST_myalias", rc_host_alias(&endpoint))
+            .output()
+            .expect("run rc");
+
+        assert_eq!(output.status.code(), Some(expected_code));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("MUST_NOT_APPEAR"));
+        let error: Value = serde_json::from_slice(&output.stderr).expect("error JSON");
+        assert_eq!(error["error"]["type"], expected_type);
+        assert_eq!(receiver.recv().expect("GET").method, "GET");
+        assert_eq!(receiver.recv().expect("DELETE").method, "DELETE");
+        handle.join().expect("server");
+    }
+}
+
+#[test]
+fn oidc_delete_rejects_invalid_provider_id_before_network_io() {
+    let config_dir = tempfile::tempdir().expect("create config dir");
+    let output = Command::new(rc_binary())
+        .args([
+            "--json", "admin", "idp", "openid", "delete", "myalias", "../corp", "--yes",
+        ])
+        .env("RC_CONFIG_DIR", config_dir.path())
+        .env(
+            "RC_HOST_myalias",
+            "http://ACCESS_KEY:SECRET_KEY@127.0.0.1:1",
+        )
+        .output()
+        .expect("run rc");
+
+    assert_eq!(output.status.code(), Some(2));
+    let error: Value = serde_json::from_slice(&output.stderr).expect("error JSON");
+    assert_eq!(error["error"]["type"], "usage_error");
+}

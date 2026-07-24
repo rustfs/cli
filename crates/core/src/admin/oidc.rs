@@ -417,6 +417,12 @@ pub trait OidcMutationApi: OidcReadApi {
         &self,
         request: OidcMutationRequest,
     ) -> Result<OidcMutationResult>;
+
+    /// Delete one persisted provider by exact ID.
+    ///
+    /// Implementations must reject invalid IDs locally and preserve not-found semantics so
+    /// callers can distinguish a completed retry from an unavailable route.
+    async fn oidc_delete_provider(&self, provider_id: &str) -> Result<OidcMutationResult>;
 }
 
 fn validate_provider_id(provider_id: &str) -> Result<()> {

@@ -703,6 +703,56 @@ impl AdminClient {
             .map_err(|_| Error::General("RustFS returned a malformed OIDC response".to_string()))
     }
 
+    async fn request_oidc_delete<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T> {
+        let url = self.admin_url(path);
+        let headers = self.request_headers(&[])?;
+        let signed_headers = self
+            .sign_request(&Method::DELETE, &url, &headers, &[])
+            .await?;
+        let mut request = self.http_client.delete(&url);
+        for (name, value) in &signed_headers {
+            request = request.header(name, value);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|_| Error::Network("OIDC administration request failed".to_string()))?;
+        let status = response.status();
+        let response_body = read_bounded_response_body(
+            response,
+            MAX_OIDC_RESPONSE_BYTES,
+            "OIDC administration response",
+        )
+        .await?;
+        if !status.is_success() {
+            return Err(match status {
+                StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED => {
+                    Error::Auth("OIDC administration permission was denied".to_string())
+                }
+                StatusCode::NOT_FOUND
+                | StatusCode::METHOD_NOT_ALLOWED
+                | StatusCode::NOT_IMPLEMENTED => Error::UnsupportedFeature(
+                    "The RustFS OIDC deletion route is unavailable".to_string(),
+                ),
+                // RustFS deliberately reports an absent persisted provider as InvalidRequest.
+                // Provider IDs are validated locally, so this status has deterministic retry
+                // semantics instead of being collapsed into a generic server rejection.
+                StatusCode::BAD_REQUEST => {
+                    Error::NotFound("OIDC provider was not found".to_string())
+                }
+                StatusCode::CONFLICT | StatusCode::PRECONDITION_FAILED => {
+                    Error::Conflict("OIDC provider changed concurrently".to_string())
+                }
+                StatusCode::UNPROCESSABLE_ENTITY => {
+                    Error::General("OIDC deletion request was rejected".to_string())
+                }
+                _ => Error::Network("OIDC administration service is unavailable".to_string()),
+            });
+        }
+        serde_json::from_slice(&response_body)
+            .map_err(|_| Error::General("RustFS returned a malformed OIDC response".to_string()))
+    }
+
     /// Send a KMS request while retaining ownership of its body in zeroizing storage.
     async fn request_sensitive<T: for<'de> Deserialize<'de>>(
         &self,
@@ -2817,6 +2867,24 @@ impl OidcMutationApi for AdminClient {
         let response: OidcMutationResult = self.request_oidc_mutation(&path, body).await?;
         response.validate_response().map_err(|_| {
             Error::General("RustFS returned an invalid OIDC mutation response".to_string())
+        })?;
+        Ok(response)
+    }
+
+    async fn oidc_delete_provider(&self, provider_id: &str) -> Result<OidcMutationResult> {
+        if provider_id.is_empty()
+            || !provider_id.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+            })
+        {
+            return Err(Error::InvalidPath(
+                "OIDC provider ID must contain only ASCII letters, digits, '_' or '-'".to_string(),
+            ));
+        }
+        let path = format!("/oidc/config/{}", urlencoding::encode(provider_id));
+        let response: OidcMutationResult = self.request_oidc_delete(&path).await?;
+        response.validate_response().map_err(|_| {
+            Error::General("RustFS returned an invalid OIDC deletion response".to_string())
         })?;
         Ok(response)
     }
