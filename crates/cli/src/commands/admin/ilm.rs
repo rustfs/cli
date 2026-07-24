@@ -150,6 +150,10 @@ fn print_manual_transition_run(response: &ManualTransitionRunResponse, formatter
         report.skipped_not_transition
     ));
     formatter.println(&format!(
+        "Already moved:  {}",
+        report.skipped_already_transitioned
+    ));
+    formatter.println(&format!(
         "Queue pressure: {}",
         report.skipped_queue_full + report.skipped_queue_closed + report.skipped_queue_timeout
     ));

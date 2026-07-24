@@ -28,6 +28,7 @@ const MANUAL_TRANSITION_RESPONSE: &str = r#"{
     "skipped_delete_marker":0,
     "skipped_directory":0,
     "skipped_replication":0,
+    "skipped_already_transitioned":1,
     "skipped_already_in_flight":0,
     "skipped_queue_full":0,
     "skipped_queue_closed":0,
@@ -57,6 +58,7 @@ const MANUAL_TRANSITION_CONTROL_RESPONSE: &str = r#"{
     "skipped_delete_marker":0,
     "skipped_directory":0,
     "skipped_replication":0,
+    "skipped_already_transitioned":0,
     "skipped_already_in_flight":0,
     "skipped_queue_full":0,
     "skipped_queue_closed":0,
@@ -137,6 +139,7 @@ fn ilm_transition_run_json_calls_manual_transition_endpoint() {
     assert_eq!(value["type"], "manual_transition_run");
     assert_eq!(value["data"]["state"], "completed");
     assert_eq!(value["data"]["report"]["dry_run_eligible"], 2);
+    assert_eq!(value["data"]["report"]["skipped_already_transitioned"], 1);
 
     let request = receiver
         .recv_timeout(Duration::from_secs(5))
@@ -192,6 +195,7 @@ fn ilm_transition_run_human_output_exposes_counts_without_keys() {
     let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
     assert!(stdout.contains("Manual Transition Run"), "stdout: {stdout}");
     assert!(stdout.contains("Eligible:       2"), "stdout: {stdout}");
+    assert!(stdout.contains("Already moved:  1"), "stdout: {stdout}");
     assert!(stdout.contains("Duration hit:   true"), "stdout: {stdout}");
     assert!(!stdout.contains("next_marker"), "stdout: {stdout}");
     assert!(!stdout.contains("\x1b["), "stdout: {stdout}");
@@ -274,6 +278,7 @@ fn ilm_transition_run_accepts_legacy_response_without_duration_flag() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+    assert!(stdout.contains("Already moved:  0"), "stdout: {stdout}");
     assert!(stdout.contains("Duration hit:   false"), "stdout: {stdout}");
     handle.join().expect("admin test server finished");
 }

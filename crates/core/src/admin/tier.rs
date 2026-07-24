@@ -325,6 +325,8 @@ pub struct ManualTransitionRunReport {
     pub skipped_delete_marker: u64,
     pub skipped_directory: u64,
     pub skipped_replication: u64,
+    #[serde(default)]
+    pub skipped_already_transitioned: u64,
     pub skipped_already_in_flight: u64,
     pub skipped_queue_full: u64,
     pub skipped_queue_closed: u64,
