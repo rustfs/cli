@@ -40,7 +40,8 @@ rc admin decommission <start|cancel|clear> <ALIAS> <POOL> [OPTIONS]
 rc admin decommission status <ALIAS> [POOL] [OPTIONS]
 rc admin rebalance <start|status|stop> <ALIAS>
 rc admin user <ls|add|info|rm|enable|disable> ...
-rc admin policy <ls|create|info|rm|attach|entities> ...
+rc admin policy <ls|create|info|rm|attach|detach|entities> ...
+rc admin policy detach <ALIAS> <POLICY>... (--user USER | --group GROUP)
 rc admin policy entities <ALIAS> [--user USER]... [--group GROUP]... [--policy POLICY]...
 rc admin group <ls|add|info|rm|enable|disable|add-members|rm-members> ...
 rc admin service-account <ls|create|info|rm> ...
@@ -192,6 +193,12 @@ Create a user and attach a policy:
 ```bash
 rc admin user add local analyst STRONG_PASSWORD
 rc admin policy attach local readonly --user analyst
+
+# Detach several policies from exactly one user.
+rc admin policy detach local readonly diagnostics --user analyst
+
+# A comma-separated policy list is accepted too.
+rc admin policy detach local readonly,diagnostics --group operations
 ```
 
 Inspect policy-to-entity mappings:
@@ -297,6 +304,25 @@ only the server timestamp, user mappings, inherited group mappings, group
 mappings, and policy mappings. Unknown response fields are discarded, and
 secret keys, session tokens, credentials, and raw server error bodies are never
 included in output.
+
+## IAM Policy Detach
+
+`rc admin policy detach` uses the native RustFS
+`POST /rustfs/admin/v3/idp/builtin/policy/detach` mutation. The target must be
+exactly one `--user` or `--group`; policy and entity selectors are validated
+before capability discovery or mutation traffic. The command fails closed
+unless the server advertises `admin.iam.policy-detach` as available.
+
+Detach is idempotent. JSON schema-v3 output uses the `iam_policy_detach` family
+and reports the affected entity, the server-reported `attached` and `detached`
+sets, and an `unchanged` set derived from requested policies that were already
+detached. A successful retry therefore returns `changed: false` instead of
+turning a prior success into an error. Requests are bounded to 512 KiB and
+responses to 1 MiB;
+malformed and oversized replies fail without displaying their contents.
+Authentication denial, missing entities, unsupported routes, validation
+failures, conflicts, and network failures retain distinct error classes and
+exit codes.
 
 ## KMS Key Lifecycle Workflow
 

@@ -1,4 +1,4 @@
-//! Typed contracts for read-only IAM policy-entity inspection.
+//! Typed contracts for IAM policy inspection and mutation.
 
 use async_trait::async_trait;
 use jiff::Timestamp;
@@ -9,14 +9,122 @@ use crate::{Error, Result};
 /// Capability name used to guard policy-entity inspection.
 pub const IAM_POLICY_ENTITIES_CAPABILITY: &str = "admin.iam.policy-entities";
 
+/// Capability name used to guard builtin policy detach mutations.
+pub const IAM_POLICY_DETACH_CAPABILITY: &str = "admin.iam.policy-detach";
+
 /// Maximum encoded size accepted for one policy-entity response.
 pub const MAX_IAM_POLICY_ENTITIES_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Maximum encoded size accepted for one policy detach response.
+pub const MAX_IAM_POLICY_DETACH_RESPONSE_BYTES: usize = 1024 * 1024;
+
+/// Maximum encoded size sent for one policy detach request.
+pub const MAX_IAM_POLICY_DETACH_REQUEST_BYTES: usize = 512 * 1024;
 
 /// Maximum number of selectors accepted in a single request.
 pub const MAX_IAM_POLICY_ENTITY_SELECTORS: usize = 1_000;
 
 /// Maximum UTF-8 byte length accepted for one selector.
 pub const MAX_IAM_POLICY_ENTITY_SELECTOR_BYTES: usize = 1_024;
+
+/// Maximum number of policies accepted by one detach request.
+pub const MAX_IAM_POLICY_DETACH_POLICIES: usize = 1_000;
+
+/// Maximum UTF-8 byte length accepted for a detach selector.
+pub const MAX_IAM_POLICY_DETACH_SELECTOR_BYTES: usize = 1_024;
+
+/// A builtin IAM entity affected by a policy mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PolicyDetachEntity {
+    User,
+    Group,
+}
+
+impl std::fmt::Display for PolicyDetachEntity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::User => formatter.write_str("user"),
+            Self::Group => formatter.write_str("group"),
+        }
+    }
+}
+
+/// A validated, retry-safe builtin policy detach request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyDetachRequest {
+    pub policies: Vec<String>,
+    pub entity: PolicyDetachEntity,
+    pub entity_name: String,
+}
+
+impl PolicyDetachRequest {
+    /// Validate and normalize selectors before any network request is made.
+    pub fn new(
+        mut policies: Vec<String>,
+        entity: PolicyDetachEntity,
+        entity_name: String,
+    ) -> Result<Self> {
+        validate_detach_selector("entity", &entity_name)?;
+        if policies.is_empty() {
+            return Err(Error::InvalidPath(
+                "At least one policy name is required".to_string(),
+            ));
+        }
+        if policies.len() > MAX_IAM_POLICY_DETACH_POLICIES {
+            return Err(Error::InvalidPath(format!(
+                "Policy detach accepts at most {MAX_IAM_POLICY_DETACH_POLICIES} policies"
+            )));
+        }
+        for policy in &policies {
+            validate_detach_selector("policy", policy)?;
+        }
+        policies.sort();
+        policies.dedup();
+        Ok(Self {
+            policies,
+            entity,
+            entity_name,
+        })
+    }
+}
+
+fn validate_detach_selector(kind: &str, selector: &str) -> Result<()> {
+    if selector.is_empty() || selector.trim() != selector {
+        return Err(Error::InvalidPath(format!(
+            "Policy detach {kind} selector cannot be empty or contain surrounding whitespace"
+        )));
+    }
+    if selector.len() > MAX_IAM_POLICY_DETACH_SELECTOR_BYTES {
+        return Err(Error::InvalidPath(format!(
+            "Policy detach {kind} selector exceeds {MAX_IAM_POLICY_DETACH_SELECTOR_BYTES} bytes"
+        )));
+    }
+    if selector.chars().any(char::is_control) {
+        return Err(Error::InvalidPath(format!(
+            "Policy detach {kind} selector cannot contain control characters"
+        )));
+    }
+    Ok(())
+}
+
+/// Normalized outcome for an idempotent builtin policy detach.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyDetachResult {
+    pub entity: PolicyDetachEntity,
+    pub entity_name: String,
+    pub attached: Vec<String>,
+    pub detached: Vec<String>,
+    pub unchanged: Vec<String>,
+    pub updated_at: Timestamp,
+}
+
+/// Typed builtin IAM mutation operations.
+#[async_trait]
+pub trait IamMutationApi: Send + Sync {
+    /// Detach only the requested policies from exactly one user or group.
+    async fn detach_policies(&self, request: &PolicyDetachRequest) -> Result<PolicyDetachResult>;
+}
 
 /// Filters for a policy-entity inspection request.
 ///
@@ -283,5 +391,33 @@ mod tests {
         )
         .expect("decode invalid response");
         assert!(matches!(invalid.normalize(), Err(Error::General(_))));
+    }
+
+    #[test]
+    fn detach_request_normalizes_policies_and_rejects_ambiguous_selectors() {
+        let request = PolicyDetachRequest::new(
+            vec!["write".to_string(), "read".to_string(), "write".to_string()],
+            PolicyDetachEntity::User,
+            "alice".to_string(),
+        )
+        .expect("valid detach request");
+        assert_eq!(request.policies, ["read", "write"]);
+
+        assert!(matches!(
+            PolicyDetachRequest::new(
+                vec!["read".to_string()],
+                PolicyDetachEntity::Group,
+                " ops ".to_string(),
+            ),
+            Err(Error::InvalidPath(_))
+        ));
+        assert!(matches!(
+            PolicyDetachRequest::new(
+                vec!["".to_string()],
+                PolicyDetachEntity::User,
+                "alice".to_string(),
+            ),
+            Err(Error::InvalidPath(_))
+        ));
     }
 }

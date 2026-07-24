@@ -43,7 +43,8 @@
         "cluster_snapshot",
         "extension_catalog",
         "oidc",
-        "iam_policy_entities"
+        "iam_policy_entities",
+        "iam_policy_detach"
       ]
     },
     "pagination": {
@@ -1060,6 +1061,39 @@
         }
       }
     },
+    "iamPolicyDetachData": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation", "entity", "changed", "attached", "detached", "unchanged", "updated_at"
+      ],
+      "properties": {
+        "operation": { "const": "detach" },
+        "entity": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "name"],
+          "properties": {
+            "type": { "enum": ["user", "group"] },
+            "name": { "type": "string", "minLength": 1 }
+          }
+        },
+        "changed": { "type": "boolean" },
+        "attached": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "detached": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "unchanged": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "updated_at": { "$ref": "#/definitions/timestamp" }
+      }
+    },
     "replicationDiffEntry": {
       "type": "object",
       "required": [
@@ -1346,6 +1380,17 @@
           "properties": {
             "type": { "const": "iam_policy_entities" },
             "data": { "$ref": "#/definitions/iamPolicyEntitiesData" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/definitions/successEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "iam_policy_detach" },
+            "data": { "$ref": "#/definitions/iamPolicyDetachData" }
           }
         }
       ]

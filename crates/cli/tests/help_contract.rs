@@ -1036,6 +1036,11 @@ fn nested_subcommand_help_contract() {
             expected_tokens: &["--user", "--group"],
         },
         HelpCase {
+            args: &["admin", "policy", "detach"],
+            usage: "Usage: rc admin policy detach [OPTIONS] <ALIAS> <POLICIES>...",
+            expected_tokens: &["--user", "--group", "<POLICIES>..."],
+        },
+        HelpCase {
             args: &["admin", "policy", "entities"],
             usage: "Usage: rc admin policy entities [OPTIONS] <ALIAS>",
             expected_tokens: &["--user", "--group", "--policy"],

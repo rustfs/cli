@@ -1,0 +1,17 @@
+{
+  "schema_version": 3,
+  "type": "iam_policy_detach",
+  "status": "success",
+  "data": {
+    "operation": "detach",
+    "entity": {
+      "type": "group",
+      "name": "ops"
+    },
+    "changed": false,
+    "attached": [],
+    "detached": [],
+    "unchanged": ["readonly"],
+    "updated_at": "2026-07-24T08:00:00Z"
+  }
+}

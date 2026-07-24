@@ -166,6 +166,9 @@ rc admin policy create local/ readonly --file policy.json
 # Attach policy to user
 rc admin policy attach local/ readonly --user newuser
 
+# Detach multiple policies from a user
+rc admin policy detach local/ readonly diagnostics --user newuser
+
 # Create a service account (access_key + secret_key)
 rc admin service-account create local/ AKIAIOSFODNN7EXAMPLE wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
 
@@ -395,7 +398,7 @@ For full command documentation, see the [`rc` command reference](docs/reference/
 | Command                 | Description                                                                           |
 |-------------------------|---------------------------------------------------------------------------------------|
 | `admin user`            | Manage IAM users (add, remove, list, info, enable, disable)                           |
-| `admin policy`          | Manage IAM policies and inspect entity mappings (create, remove, list, info, attach, entities) |
+| `admin policy`          | Manage IAM policies and inspect entity mappings (create, remove, list, info, attach, detach, entities) |
 | `admin group`           | Manage IAM groups (add, remove, list, info, enable, disable, add-members, rm-members) |
 | `admin service-account` | Manage service accounts (create, update, remove, list, info)                          |
 | `admin access-key`      | Inspect access key identity and metadata (info)                                       |

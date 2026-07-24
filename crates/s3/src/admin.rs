@@ -20,19 +20,22 @@ use rc_core::admin::{
     ConfigMutationResult, CreateServiceAccountRequest, DecommissionPoolStatus, DecommissionStatus,
     DetailedHealthSnapshot, DiagnosticCapability, DiagnosticReadApi, ExtensionsCatalog, Group,
     GroupStatus, HealRuntimeState, HealScanMode, HealStartRequest, HealStatus, HealTaskRequest,
-    IAM_POLICY_ENTITIES_CAPABILITY, IamReadApi, KmsApi, KmsBackendKind, KmsCacheSummary,
-    KmsCancelKeyDeletionResult, KmsConfigSummary, KmsConfigureRequest, KmsCreateKeyRequest,
-    KmsCreateKeyResult, KmsDeleteKeyRequest, KmsDeleteKeyResult, KmsKey, KmsKeyPage, KmsKeyState,
-    KmsKeyUsage, KmsServiceState, KmsStatus, MAX_DIAGNOSTIC_RESPONSE_BYTES,
-    MAX_IAM_POLICY_ENTITIES_RESPONSE_BYTES, MAX_METRICS_LINE_BYTES, MAX_METRICS_RESPONSE_BYTES,
-    MAX_METRICS_SAMPLES, MAX_OIDC_RESPONSE_BYTES, MAX_REPLICATION_DIFF_RESPONSE_BYTES,
+    IAM_POLICY_DETACH_CAPABILITY, IAM_POLICY_ENTITIES_CAPABILITY, IamMutationApi, IamReadApi,
+    KmsApi, KmsBackendKind, KmsCacheSummary, KmsCancelKeyDeletionResult, KmsConfigSummary,
+    KmsConfigureRequest, KmsCreateKeyRequest, KmsCreateKeyResult, KmsDeleteKeyRequest,
+    KmsDeleteKeyResult, KmsKey, KmsKeyPage, KmsKeyState, KmsKeyUsage, KmsServiceState, KmsStatus,
+    MAX_DIAGNOSTIC_RESPONSE_BYTES, MAX_IAM_POLICY_DETACH_REQUEST_BYTES,
+    MAX_IAM_POLICY_DETACH_RESPONSE_BYTES, MAX_IAM_POLICY_ENTITIES_RESPONSE_BYTES,
+    MAX_METRICS_LINE_BYTES, MAX_METRICS_RESPONSE_BYTES, MAX_METRICS_SAMPLES,
+    MAX_OIDC_RESPONSE_BYTES, MAX_REPLICATION_DIFF_RESPONSE_BYTES,
     MAX_SITE_REPLICATION_ERROR_RESPONSE_BYTES, MAX_SITE_REPLICATION_REQUEST_BYTES,
     MAX_SITE_REPLICATION_SUCCESS_RESPONSE_BYTES, ManualTransitionRunRequest,
     ManualTransitionRunResponse, MetricsBatch, MetricsQuery, ModuleSwitches, ObservabilityApi,
     OidcMutationApi, OidcMutationRequest, OidcMutationResult, OidcProvider, OidcProviderList,
     OidcReadApi, OidcValidationRequest, OidcValidationResult, PeerSiteSpec, Policy,
-    PolicyEntitiesQuery, PolicyEntitiesResult, PolicyEntity, PolicyInfo, PoolStatus, PoolTarget,
-    RealtimeMetrics, RebalanceStartResult, RebalanceStatus, ReplicateEditStatus, ReplicationDiff,
+    PolicyDetachEntity, PolicyDetachRequest, PolicyDetachResult, PolicyEntitiesQuery,
+    PolicyEntitiesResult, PolicyEntity, PolicyInfo, PoolStatus, PoolTarget, RealtimeMetrics,
+    RebalanceStartResult, RebalanceStatus, ReplicateEditStatus, ReplicationDiff,
     ReplicationDiffApi, RuntimeCapabilitiesSnapshot, RuntimeCapabilityStatus, ScannerStatus,
     ServiceAccount, ServiceAccountCreateResponse, ServiceActionResult, SiteRemoveSpec,
     SiteReplicationInfo, SiteReplicationPeer, SiteReplicationResyncOperation,
@@ -55,6 +58,25 @@ struct BoundedJsonResponse {
     max_bytes: usize,
     name: &'static str,
     error_mapper: fn(&AdminClient, StatusCode, &str) -> Error,
+}
+
+#[derive(Debug, Serialize)]
+struct PolicyDetachWireRequest<'a> {
+    policies: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    group: Option<&'a str>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PolicyDetachWireResponse {
+    #[serde(default)]
+    policies_attached: Vec<String>,
+    #[serde(default)]
+    policies_detached: Vec<String>,
+    updated_at: jiff::Timestamp,
 }
 
 impl AsRef<[u8]> for SensitiveRequestBody {
@@ -1048,6 +1070,58 @@ impl AdminClient {
             )),
         }
     }
+
+    fn map_iam_policy_detach_error(&self, status: StatusCode, body: &str) -> Error {
+        let structured = parse_admin_error(body);
+        let is_missing_entity = structured.as_ref().is_some_and(|error| {
+            let code = error
+                .code
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let message = error
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            code.contains("nosuchuser")
+                || code.contains("nosuchgroup")
+                || message.contains("user not exist")
+                || message.contains("group not exist")
+                || message.contains("no such user")
+                || message.contains("no such group")
+        });
+        if is_missing_entity {
+            return Error::NotFound("The requested IAM entity does not exist".to_string());
+        }
+
+        match status {
+            StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_IMPLEMENTED => {
+                Error::UnsupportedFeature(
+                    "Builtin IAM policy detach is not supported by this RustFS server".to_string(),
+                )
+            }
+            StatusCode::NOT_FOUND if structured.is_none() => Error::UnsupportedFeature(
+                "Builtin IAM policy detach is not supported by this RustFS server".to_string(),
+            ),
+            StatusCode::NOT_FOUND => {
+                Error::NotFound("The requested IAM entity was not found".to_string())
+            }
+            StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED => {
+                Error::Auth("Permission denied for IAM policy detach".to_string())
+            }
+            StatusCode::BAD_REQUEST => {
+                Error::InvalidPath("RustFS rejected the policy detach selectors".to_string())
+            }
+            StatusCode::CONFLICT => {
+                Error::Conflict("IAM policy mappings changed concurrently".to_string())
+            }
+            _ => Error::Network(format!(
+                "IAM policy detach failed with HTTP {}",
+                status.as_u16()
+            )),
+        }
+    }
 }
 
 fn site_replication_response_rejected(
@@ -1913,6 +1987,11 @@ fn add_known_server_capabilities(version: Option<&str>, capabilities: &mut Vec<C
     });
     capabilities.push(CapabilityEntry {
         name: IAM_POLICY_ENTITIES_CAPABILITY.to_string(),
+        availability: CapabilityAvailability::Available,
+        reason: None,
+    });
+    capabilities.push(CapabilityEntry {
+        name: IAM_POLICY_DETACH_CAPABILITY.to_string(),
         availability: CapabilityAvailability::Available,
         reason: None,
     });
@@ -2823,6 +2902,97 @@ impl OidcMutationApi for AdminClient {
 }
 
 #[async_trait]
+impl IamMutationApi for AdminClient {
+    async fn detach_policies(&self, request: &PolicyDetachRequest) -> Result<PolicyDetachResult> {
+        let request = PolicyDetachRequest::new(
+            request.policies.clone(),
+            request.entity,
+            request.entity_name.clone(),
+        )?;
+        let wire = PolicyDetachWireRequest {
+            policies: &request.policies,
+            user: (request.entity == PolicyDetachEntity::User)
+                .then_some(request.entity_name.as_str()),
+            group: (request.entity == PolicyDetachEntity::Group)
+                .then_some(request.entity_name.as_str()),
+        };
+        let body = serde_json::to_vec(&wire).map_err(Error::Json)?;
+        if body.len() > MAX_IAM_POLICY_DETACH_REQUEST_BYTES {
+            return Err(Error::InvalidPath(format!(
+                "Policy detach request exceeds the {MAX_IAM_POLICY_DETACH_REQUEST_BYTES}-byte limit"
+            )));
+        }
+        let response: PolicyDetachWireResponse = self
+            .request_bounded_json(
+                Method::POST,
+                "/idp/builtin/policy/detach",
+                None,
+                Some(&body),
+                BoundedJsonResponse {
+                    max_bytes: MAX_IAM_POLICY_DETACH_RESPONSE_BYTES,
+                    name: "IAM policy detach response",
+                    error_mapper: Self::map_iam_policy_detach_error,
+                },
+            )
+            .await
+            .map_err(|error| match error {
+                Error::Json(_) => {
+                    Error::General("RustFS returned a malformed policy detach response".to_string())
+                }
+                other => other,
+            })?;
+
+        let mut attached = response.policies_attached;
+        let mut detached = response.policies_detached;
+        normalize_policy_detach_response_names("attached", &mut attached)?;
+        normalize_policy_detach_response_names("detached", &mut detached)?;
+        if attached
+            .iter()
+            .any(|policy| !request.policies.contains(policy))
+            || detached
+                .iter()
+                .any(|policy| !request.policies.contains(policy))
+        {
+            return Err(Error::General(
+                "RustFS policy detach response contains an unrequested policy".to_string(),
+            ));
+        }
+        if attached.iter().any(|policy| detached.contains(policy)) {
+            return Err(Error::General(
+                "RustFS policy detach response reports a policy as both attached and detached"
+                    .to_string(),
+            ));
+        }
+
+        let unchanged = request
+            .policies
+            .iter()
+            .filter(|policy| !detached.contains(policy))
+            .cloned()
+            .collect();
+        Ok(PolicyDetachResult {
+            entity: request.entity,
+            entity_name: request.entity_name,
+            attached,
+            detached,
+            unchanged,
+            updated_at: response.updated_at,
+        })
+    }
+}
+
+fn normalize_policy_detach_response_names(kind: &str, names: &mut Vec<String>) -> Result<()> {
+    if names.iter().any(|name| name.trim().is_empty()) {
+        return Err(Error::General(format!(
+            "RustFS policy detach response contains an empty {kind} policy"
+        )));
+    }
+    names.sort();
+    names.dedup();
+    Ok(())
+}
+
+#[async_trait]
 impl DiagnosticReadApi for AdminClient {
     async fn health_snapshot(&self) -> Result<DetailedHealthSnapshot> {
         self.request_bounded_json_url(Method::GET, self.admin_url("/healthinfo"))
@@ -3449,14 +3619,15 @@ impl AdminApi for AdminClient {
         entity_type: PolicyEntity,
         entity_name: &str,
     ) -> Result<()> {
-        // Detach by setting empty policy
-        // RustFS replaces the previous policy association when a new one is set.
-        // For detach, we need to get current policies and remove the specified ones
-        let _ = (policy_names, entity_type, entity_name);
-        Err(Error::UnsupportedFeature(
-            "Policy detach not directly supported. Use attach with remaining policies instead."
-                .to_string(),
-        ))
+        let entity = match entity_type {
+            PolicyEntity::User => PolicyDetachEntity::User,
+            PolicyEntity::Group => PolicyDetachEntity::Group,
+        };
+        let request =
+            PolicyDetachRequest::new(policy_names.to_vec(), entity, entity_name.to_string())?;
+        IamMutationApi::detach_policies(self, &request)
+            .await
+            .map(|_| ())
     }
 
     // ==================== Group Operations ====================
@@ -4326,6 +4497,10 @@ mod tests {
         assert!(report.cluster.summary.is_some());
         assert!(report.capabilities.iter().any(|capability| {
             capability.name == IAM_POLICY_ENTITIES_CAPABILITY
+                && capability.availability == CapabilityAvailability::Available
+        }));
+        assert!(report.capabilities.iter().any(|capability| {
+            capability.name == IAM_POLICY_DETACH_CAPABILITY
                 && capability.availability == CapabilityAvailability::Available
         }));
         assert!(report.capabilities.iter().any(|capability| {
@@ -5285,6 +5460,162 @@ mod tests {
             matches!(oversized, Error::General(message) if message.contains("IAM policy-entity response exceeded"))
         );
         handle.join().expect("join oversized response server");
+    }
+
+    #[tokio::test]
+    async fn iam_policy_detach_sends_one_typed_target_and_normalizes_multi_policy_result() {
+        let response = r#"{
+            "policiesAttached":[],
+            "policiesDetached":["readonly","diagnostics","readonly"],
+            "updatedAt":"2026-07-24T08:00:00Z"
+        }"#;
+        let (endpoint, receiver, handle) = start_admin_test_server("200 OK", response);
+        let client = admin_client_for_endpoint(&endpoint);
+        let request = PolicyDetachRequest::new(
+            vec![
+                "writeonly".to_string(),
+                "readonly".to_string(),
+                "diagnostics".to_string(),
+            ],
+            PolicyDetachEntity::Group,
+            "ops".to_string(),
+        )
+        .expect("valid detach request");
+        let result = client
+            .detach_policies(&request)
+            .await
+            .expect("policy detach request");
+
+        let captured = receiver.recv().expect("captured request");
+        assert_eq!(captured.method, "POST");
+        assert_eq!(
+            captured.target,
+            "/rustfs/admin/v3/idp/builtin/policy/detach"
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&captured.body).expect("typed JSON request");
+        assert_eq!(body["group"], "ops");
+        assert!(body.get("user").is_none());
+        assert_eq!(
+            body["policies"],
+            serde_json::json!(["diagnostics", "readonly", "writeonly"])
+        );
+        assert_eq!(result.detached, ["diagnostics", "readonly"]);
+        assert_eq!(result.unchanged, ["writeonly"]);
+        assert!(result.attached.is_empty());
+        assert_eq!(result.entity, PolicyDetachEntity::Group);
+        assert_eq!(result.entity_name, "ops");
+        handle.join().expect("join policy detach server");
+    }
+
+    #[tokio::test]
+    async fn iam_policy_detach_noop_retry_reports_every_requested_policy_unchanged() {
+        let response = r#"{"policiesDetached":[],"updatedAt":"2026-07-24T08:00:00Z"}"#;
+        let (endpoint, _receiver, handle) = start_admin_test_server("200 OK", response);
+        let client = admin_client_for_endpoint(&endpoint);
+        let request = PolicyDetachRequest::new(
+            vec!["readonly".to_string(), "diagnostics".to_string()],
+            PolicyDetachEntity::User,
+            "alice".to_string(),
+        )
+        .expect("valid detach request");
+        let result = client
+            .detach_policies(&request)
+            .await
+            .expect("idempotent no-op detach");
+
+        assert!(result.detached.is_empty());
+        assert_eq!(result.unchanged, ["diagnostics", "readonly"]);
+        handle.join().expect("join policy detach server");
+    }
+
+    #[tokio::test]
+    async fn iam_policy_detach_classifies_missing_entity_and_access_denial() {
+        for (status, body, expected) in [
+            (
+                "400 Bad Request",
+                r#"{"Code":"InvalidArgument","Message":"user not exist"}"#,
+                "missing",
+            ),
+            (
+                "403 Forbidden",
+                r#"{"Code":"AccessDenied","Message":"do not echo this"}"#,
+                "auth",
+            ),
+        ] {
+            let (endpoint, _receiver, handle) = start_admin_test_server(status, body);
+            let client = admin_client_for_endpoint(&endpoint);
+            let request = PolicyDetachRequest::new(
+                vec!["readonly".to_string()],
+                PolicyDetachEntity::User,
+                "missing".to_string(),
+            )
+            .expect("valid detach request");
+            let error = client
+                .detach_policies(&request)
+                .await
+                .expect_err("detach should fail");
+            match expected {
+                "missing" => assert!(matches!(error, Error::NotFound(_))),
+                "auth" => assert!(matches!(error, Error::Auth(_))),
+                _ => unreachable!(),
+            }
+            assert!(!error.to_string().contains("do not echo this"));
+            handle.join().expect("join policy detach error server");
+        }
+    }
+
+    #[tokio::test]
+    async fn iam_policy_detach_rejects_malformed_and_oversized_responses() {
+        let request = PolicyDetachRequest::new(
+            vec!["readonly".to_string()],
+            PolicyDetachEntity::User,
+            "alice".to_string(),
+        )
+        .expect("valid detach request");
+
+        let (endpoint, _receiver, handle) = start_admin_test_server("200 OK", "{");
+        let malformed = admin_client_for_endpoint(&endpoint)
+            .detach_policies(&request)
+            .await
+            .expect_err("malformed response must fail");
+        assert!(
+            matches!(malformed, Error::General(message) if message.contains("malformed policy detach response"))
+        );
+        handle.join().expect("join malformed detach server");
+
+        let (endpoint, _receiver, handle) =
+            start_admin_declared_length_server("200 OK", MAX_IAM_POLICY_DETACH_RESPONSE_BYTES + 1);
+        let oversized = admin_client_for_endpoint(&endpoint)
+            .detach_policies(&request)
+            .await
+            .expect_err("oversized response must fail");
+        assert!(
+            matches!(oversized, Error::General(message) if message.contains("IAM policy detach response exceeded"))
+        );
+        handle.join().expect("join oversized detach server");
+    }
+
+    #[tokio::test]
+    async fn iam_policy_detach_rejects_oversized_request_before_network_access() {
+        let policies = (0..rc_core::admin::MAX_IAM_POLICY_DETACH_POLICIES)
+            .map(|index| {
+                format!(
+                    "{index:04}-{}",
+                    "p".repeat(rc_core::admin::MAX_IAM_POLICY_DETACH_SELECTOR_BYTES - 5)
+                )
+            })
+            .collect();
+        let request =
+            PolicyDetachRequest::new(policies, PolicyDetachEntity::User, "alice".to_string())
+                .expect("individual selectors fit their limits");
+        let error = admin_client_for_endpoint("http://127.0.0.1:9")
+            .detach_policies(&request)
+            .await
+            .expect_err("oversized request must fail locally");
+        assert!(
+            matches!(error, Error::InvalidPath(message) if message.contains("request exceeds"))
+        );
     }
 
     #[test]

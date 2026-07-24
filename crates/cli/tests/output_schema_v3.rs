@@ -26,6 +26,7 @@ const V3_FAMILIES: &[&str] = &[
     "replication_operations",
     "bucket_operations",
     "iam_policy_entities",
+    "iam_policy_detach",
 ];
 
 fn repository_root() -> PathBuf {

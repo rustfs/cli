@@ -48,10 +48,13 @@ pub use diagnostics::{
     MAX_DIAGNOSTIC_RESPONSE_BYTES,
 };
 pub use iam::{
-    GroupPolicyEntities, IAM_POLICY_ENTITIES_CAPABILITY, IamReadApi,
-    MAX_IAM_POLICY_ENTITIES_RESPONSE_BYTES, MAX_IAM_POLICY_ENTITY_SELECTOR_BYTES,
-    MAX_IAM_POLICY_ENTITY_SELECTORS, PolicyEntities, PolicyEntitiesQuery, PolicyEntitiesResult,
-    UserPolicyEntities,
+    GroupPolicyEntities, IAM_POLICY_DETACH_CAPABILITY, IAM_POLICY_ENTITIES_CAPABILITY,
+    IamMutationApi, IamReadApi, MAX_IAM_POLICY_DETACH_POLICIES,
+    MAX_IAM_POLICY_DETACH_REQUEST_BYTES, MAX_IAM_POLICY_DETACH_RESPONSE_BYTES,
+    MAX_IAM_POLICY_DETACH_SELECTOR_BYTES, MAX_IAM_POLICY_ENTITIES_RESPONSE_BYTES,
+    MAX_IAM_POLICY_ENTITY_SELECTOR_BYTES, MAX_IAM_POLICY_ENTITY_SELECTORS, PolicyDetachEntity,
+    PolicyDetachRequest, PolicyDetachResult, PolicyEntities, PolicyEntitiesQuery,
+    PolicyEntitiesResult, UserPolicyEntities,
 };
 pub use kms::{
     KmsApi, KmsBackendKind, KmsCacheSummary, KmsCancelKeyDeletionResult, KmsConfigSummary,

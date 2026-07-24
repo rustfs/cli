@@ -1,0 +1,11 @@
+{
+  "schema_version": 3,
+  "type": "iam_policy_detach",
+  "status": "error",
+  "error": {
+    "type": "auth_error",
+    "message": "Failed to detach IAM policies: permission denied",
+    "retryable": false,
+    "suggestion": "Verify credentials and the attach-policy admin permission, then retry."
+  }
+}
