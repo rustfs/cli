@@ -653,6 +653,34 @@ fn nested_subcommand_help_contract() {
             expected_tokens: &[],
         },
         HelpCase {
+            args: &["admin", "idp"],
+            usage: "Usage: rc admin idp [OPTIONS] <COMMAND>",
+            expected_tokens: &["openid"],
+        },
+        HelpCase {
+            args: &["admin", "idp", "openid"],
+            usage: "Usage: rc admin idp openid [OPTIONS] <COMMAND>",
+            expected_tokens: &["list", "get", "validate"],
+        },
+        HelpCase {
+            args: &["admin", "idp", "openid", "get"],
+            usage: "Usage: rc admin idp openid get [OPTIONS] <ALIAS> <PROVIDER_ID>",
+            expected_tokens: &[],
+        },
+        HelpCase {
+            args: &["admin", "idp", "openid", "validate"],
+            usage: "Usage: rc admin idp openid validate [OPTIONS] --config-url <CONFIG_URL> --client-id <CLIENT_ID> <ALIAS> <PROVIDER_ID>",
+            expected_tokens: &[
+                "--config-url",
+                "--client-id",
+                "--issuer",
+                "--scope",
+                "--other-audience",
+                "--redirect-uri",
+                "--static-redirect",
+            ],
+        },
+        HelpCase {
             args: &["admin", "metrics"],
             usage: "Usage: rc admin metrics [OPTIONS] <ALIAS>",
             expected_tokens: &[

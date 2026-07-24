@@ -13,6 +13,9 @@ rc [GLOBAL OPTIONS] admin <COMMAND>
 rc admin diagnostics <health|cluster|extensions> <ALIAS>
 rc admin info <cluster|server|disk|storage> <ALIAS> [OPTIONS]
 rc admin scanner status <ALIAS>
+rc admin idp openid list <ALIAS>
+rc admin idp openid get <ALIAS> <PROVIDER_ID>
+rc admin idp openid validate <ALIAS> <PROVIDER_ID> --config-url URL --client-id ID
 rc admin metrics <ALIAS> [OPTIONS]
 rc admin kms status <ALIAS>
 rc admin kms configure <ALIAS> <--config-file PATH|--stdin>
@@ -58,6 +61,7 @@ rc admin replicate remove <ALIAS> <--all|--site <NAME>>
 | `scanner` | Inspect scanner health, freshness, and cycle state. |
 | `metrics` | Query bounded realtime metrics as normalized JSON Lines or raw server records. |
 | `kms` | Inspect KMS state and manage safe native key lifecycle operations. |
+| `idp openid` | Inspect effective OIDC providers and run non-persisting discovery validation. |
 | `heal` | Start, stop, or inspect healing operations. |
 | `pool` | List pools and inspect pool status. |
 | `expand` | Manage post-expansion data rebalancing. Alias: `scale`. |
@@ -292,6 +296,30 @@ The v3 lifecycle success operations are `configure`, `reconfigure`, `start`, `re
 `kms roundtrip` refuses to run without `--yes`. It generates exactly 4 KiB of random test content internally, writes one randomly named temporary object with explicit SSE-KMS headers, reads and compares the decrypted bytes without creating or reporting a digest, and always attempts permanent deletion even when write, read, or verification fails. The read is bounded to 4 KiB. Application-owned plaintext buffers are zeroized; the temporary object name, plaintext, ciphertext, digest, and generated key material never appear in debug, human, JSON, or error output. A successful v3 result reports only `bucket`, `key_id`, `passed`, `cleanup_passed`, and write/read/cleanup/total milliseconds. Cleanup failure is a distinct error, and a primary failure explicitly reports when cleanup also failed.
 
 `kms key status` describes native RustFS key lifecycle metadata. It does not claim compatibility with the `mc admin kms key status` encryption/decryption probe. The round-trip diagnostic uses only the S3 object API and does not call an Admin API key-generation route. RustFS beta.10 has no direct decrypt-test Admin API or KMS-specific metrics route/selector contract, so `rc` does not offer KMS-specific metrics and intentionally does not expose the legacy `generate-data-key` response because that response contains plaintext data-key material.
+
+## OIDC Read-Only Administration
+
+These commands target RustFS's native typed OIDC routes. They do not use LDAP compatibility
+configuration, browser login endpoints, or a guessed per-provider route:
+
+| Command | Behavior |
+|---|---|
+| `rc admin idp openid list <ALIAS>` | List all effective persisted and environment-managed providers. |
+| `rc admin idp openid get <ALIAS> <PROVIDER_ID>` | Select one exact provider from the server's typed configuration list. |
+| `rc admin idp openid validate <ALIAS> <PROVIDER_ID> --config-url URL --client-id ID` | Run live discovery validation without saving or changing server configuration. |
+
+Provider output includes only the server's `client_secret_configured` boolean. Client-secret
+values are not accepted by this read-only command family, sent in validation requests, or included
+in human/JSON output. Remote text is terminal-sanitized, response bodies are bounded, and unknown
+or incomplete provider shapes fail closed. Missing/unsupported routes use the
+`unsupported_feature` exit code, permission failures use the authentication exit code, a missing
+exact provider uses `not_found`, and locally invalid URLs use the usage exit code.
+
+JSON output uses schema v3 family `oidc` with operations `list`, `get`, and `validate`. Validation
+supports repeated `--scope` and `--other-audience` options, optional `--issuer`, claim-name
+overrides, and `--redirect-uri --static-redirect`. Scopes must include `openid`; URLs must be
+absolute HTTP(S) URLs. RustFS still applies its server-side outbound URL safety policy before
+performing discovery.
 
 `rc admin heal status <ALIAS>` reports aggregate background heal status. Manual heals started with `rc admin heal start` are token-scoped tasks; the start output includes a client token. Root recursive tasks are inspected or stopped with `--client-token`, while bucket or prefix tasks additionally pass `--bucket` and optional `--prefix`.
 

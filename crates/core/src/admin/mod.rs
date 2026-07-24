@@ -10,6 +10,7 @@ mod diagnostics;
 mod kms;
 mod kms_diagnostic;
 mod observability;
+mod oidc;
 mod replication;
 mod site;
 pub mod tier;
@@ -62,6 +63,10 @@ pub use observability::{
     ScannerCycleSchedule, ScannerFreshness, ScannerHealth, ScannerMetrics, ScannerRuntimeConfig,
     ScannerRuntimeConfigValue, ScannerStatus, StorageBackend, StorageBackendKind, StorageDisk,
     StorageDiskMetrics, StorageInfo,
+};
+pub use oidc::{
+    MAX_OIDC_RESPONSE_BYTES, OidcProvider, OidcProviderList, OidcProviderSource, OidcReadApi,
+    OidcValidationRequest, OidcValidationResult,
 };
 pub use replication::{
     MAX_REPLICATION_DIFF_RESPONSE_BYTES, ReplicationDiff, ReplicationDiffApi, ReplicationDiffEntry,

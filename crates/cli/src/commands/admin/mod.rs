@@ -11,6 +11,7 @@ mod diagnostics;
 mod expand;
 mod group;
 mod heal;
+mod idp;
 mod ilm;
 mod info;
 mod kms;
@@ -61,6 +62,10 @@ pub enum AdminCommands {
     /// Manage lifecycle transition operations
     #[command(subcommand)]
     Ilm(ilm::IlmCommands),
+
+    /// Inspect identity-provider configuration
+    #[command(subcommand)]
+    Idp(idp::IdpCommands),
 
     /// Display cluster information (servers, disks, usage)
     #[command(subcommand)]
@@ -127,6 +132,7 @@ pub async fn execute(cmd: AdminCommands, output_config: OutputConfig) -> ExitCod
         AdminCommands::Kms(kms_cmd) => kms::execute(kms_cmd, &formatter).await,
         AdminCommands::Scanner(scanner_cmd) => scanner::execute(scanner_cmd, &formatter).await,
         AdminCommands::Ilm(ilm_cmd) => ilm::execute(ilm_cmd, &formatter).await,
+        AdminCommands::Idp(idp_cmd) => idp::execute(idp_cmd, &formatter).await,
         AdminCommands::Info(info_cmd) => info::execute(info_cmd, &formatter).await,
         AdminCommands::Heal(heal_cmd) => heal::execute(heal_cmd, &formatter).await,
         AdminCommands::Pool(pool_cmd) => pool::execute(pool_cmd, &formatter).await,

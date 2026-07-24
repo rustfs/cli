@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | [`output_v1.json`](../../../schemas/output_v1.json) | Original S3 and alias command output | Preserved unchanged |
 | [`output_v2.json`](../../../schemas/output_v2.json) | Existing cluster and administrative output | Preserved unchanged |
-| [`output_v3.json`](../../../schemas/output_v3.json) | New capability, version, lock, multipart, watch, health, usage, metrics, diagnostic snapshot, scanner-status, storage-info, KMS, admin-operation, replication, and bucket-operation families | Contract for new implementations |
+| [`output_v3.json`](../../../schemas/output_v3.json) | New capability, version, lock, multipart, watch, health, usage, metrics, diagnostic snapshot, scanner-status, storage-info, KMS, OIDC, admin-operation, replication, and bucket-operation families | Contract for new implementations |
 
 Adding v3 does not silently change the JSON emitted by existing commands. Each command implementation must document when it adopts v3. Consumers should choose a parser from the command's documented output version instead of inferring a version from the installed `rc` release.
 
@@ -76,6 +76,7 @@ When migrating:
 6. For normalized metrics, retain labels and per-sample `collected_at` timestamps; do not infer one timestamp for the entire stream.
 7. Ignore unknown object properties while continuing to require documented fields and types.
 8. For KMS operations, treat `not-configured` as a successful status state; dispatch configuration/service results by `configure`, `reconfigure`, `start`, `restart`, or `stop`; dispatch key results by `key_create`, `key_delete`, or `key_cancel_deletion`; dispatch the non-exporting object diagnostic by `roundtrip`; and never expect temporary object names, content, digests, secret configuration, ciphertext, or data-key fields.
+9. For OIDC operations, dispatch `list`, `get`, and `validate`; provider records expose only `client_secret_configured`, never a client-secret value.
 
 Commands adopting version-operation records migrate only their version-aware JSON paths. Legacy JSON remains unchanged for unversioned `stat`, `rm`, and `cp` results where the server reports no version identifiers. Scripts selecting versions must dispatch on `schema_version: 3` and read operation fields under `data`.
 

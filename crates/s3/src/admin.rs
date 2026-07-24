@@ -24,10 +24,11 @@ use rc_core::admin::{
     KmsConfigureRequest, KmsCreateKeyRequest, KmsCreateKeyResult, KmsDeleteKeyRequest,
     KmsDeleteKeyResult, KmsKey, KmsKeyPage, KmsKeyState, KmsKeyUsage, KmsServiceState, KmsStatus,
     MAX_DIAGNOSTIC_RESPONSE_BYTES, MAX_METRICS_LINE_BYTES, MAX_METRICS_RESPONSE_BYTES,
-    MAX_METRICS_SAMPLES, MAX_REPLICATION_DIFF_RESPONSE_BYTES,
+    MAX_METRICS_SAMPLES, MAX_OIDC_RESPONSE_BYTES, MAX_REPLICATION_DIFF_RESPONSE_BYTES,
     MAX_SITE_REPLICATION_ERROR_RESPONSE_BYTES, MAX_SITE_REPLICATION_REQUEST_BYTES,
     MAX_SITE_REPLICATION_SUCCESS_RESPONSE_BYTES, ManualTransitionRunRequest,
     ManualTransitionRunResponse, MetricsBatch, MetricsQuery, ModuleSwitches, ObservabilityApi,
+    OidcProvider, OidcProviderList, OidcReadApi, OidcValidationRequest, OidcValidationResult,
     PeerSiteSpec, Policy, PolicyEntity, PolicyInfo, PoolStatus, PoolTarget, RealtimeMetrics,
     RebalanceStartResult, RebalanceStatus, ReplicateEditStatus, ReplicationDiff,
     ReplicationDiffApi, RuntimeCapabilitiesSnapshot, RuntimeCapabilityStatus, ScannerStatus,
@@ -590,6 +591,58 @@ impl AdminClient {
         }
 
         serde_json::from_slice(&response_body).map_err(Error::Json)
+    }
+
+    async fn request_oidc<T: for<'de> Deserialize<'de>>(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&[u8]>,
+    ) -> Result<T> {
+        let url = self.admin_url(path);
+        let body_bytes = body.unwrap_or_default();
+        let headers = self.request_headers(body_bytes)?;
+        let signed_headers = self
+            .sign_request(&method, &url, &headers, body_bytes)
+            .await?;
+        let mut request = self.http_client.request(method, &url);
+        for (name, value) in &signed_headers {
+            request = request.header(name, value);
+        }
+        if !body_bytes.is_empty() {
+            request = request.body(body_bytes.to_vec());
+        }
+
+        let response = request
+            .send()
+            .await
+            .map_err(|_| Error::Network("OIDC administration request failed".to_string()))?;
+        let status = response.status();
+        let response_body = read_bounded_response_body(
+            response,
+            MAX_OIDC_RESPONSE_BYTES,
+            "OIDC administration response",
+        )
+        .await?;
+        if !status.is_success() {
+            return Err(match status {
+                StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED => {
+                    Error::Auth("OIDC administration permission was denied".to_string())
+                }
+                StatusCode::NOT_FOUND
+                | StatusCode::METHOD_NOT_ALLOWED
+                | StatusCode::NOT_IMPLEMENTED => Error::UnsupportedFeature(
+                    "The RustFS OIDC administration route is unavailable".to_string(),
+                ),
+                StatusCode::BAD_REQUEST => {
+                    Error::General("OIDC validation request was rejected".to_string())
+                }
+                _ => Error::Network("OIDC administration service is unavailable".to_string()),
+            });
+        }
+
+        serde_json::from_slice(&response_body)
+            .map_err(|_| Error::General("RustFS returned a malformed OIDC response".to_string()))
     }
 
     /// Send a KMS request while retaining ownership of its body in zeroizing storage.
@@ -2586,6 +2639,49 @@ impl CapabilityApi for AdminClient {
         let report = self.discover_capabilities_uncached().await?;
         self.store_capabilities(&report)?;
         Ok(report)
+    }
+}
+
+#[async_trait]
+impl OidcReadApi for AdminClient {
+    async fn oidc_list_providers(&self) -> Result<OidcProviderList> {
+        let response: OidcProviderList =
+            self.request_oidc(Method::GET, "/oidc/config", None).await?;
+        response.validate_response().map_err(|_| {
+            Error::General("RustFS returned an invalid OIDC provider list".to_string())
+        })?;
+        Ok(response)
+    }
+
+    async fn oidc_get_provider(&self, provider_id: &str) -> Result<OidcProvider> {
+        if provider_id.is_empty()
+            || !provider_id.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+            })
+        {
+            return Err(Error::InvalidPath(
+                "OIDC provider ID must contain only ASCII letters, digits, '_' or '-'".to_string(),
+            ));
+        }
+        self.oidc_list_providers()
+            .await?
+            .providers
+            .into_iter()
+            .find(|provider| provider.provider_id == provider_id)
+            .ok_or_else(|| Error::NotFound(format!("OIDC provider '{provider_id}' was not found")))
+    }
+
+    async fn oidc_validate(&self, request: OidcValidationRequest) -> Result<OidcValidationResult> {
+        request.validate()?;
+        let body = serde_json::to_vec(&request)
+            .map_err(|_| Error::General("Failed to encode OIDC validation request".to_string()))?;
+        let response: OidcValidationResult = self
+            .request_oidc(Method::POST, "/oidc/validate", Some(&body))
+            .await?;
+        response.validate_response().map_err(|_| {
+            Error::General("RustFS returned an invalid OIDC validation response".to_string())
+        })?;
+        Ok(response)
     }
 }
 

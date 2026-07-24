@@ -41,7 +41,8 @@
         "kms",
         "health_snapshot",
         "cluster_snapshot",
-        "extension_catalog"
+        "extension_catalog",
+        "oidc"
       ]
     },
     "pagination": {
@@ -863,6 +864,85 @@
         { "$ref": "#/definitions/kmsRoundTripData" }
       ]
     },
+    "oidcProvider": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider_id", "source", "editable", "enabled", "display_name", "config_url",
+        "issuer", "client_id", "client_secret_configured", "scopes", "other_audiences",
+        "redirect_uri", "redirect_uri_dynamic", "claim_name", "claim_prefix", "role_policy",
+        "groups_claim", "roles_claim", "email_claim", "username_claim", "hide_from_ui"
+      ],
+      "properties": {
+        "provider_id": { "type": "string", "minLength": 1 },
+        "source": { "type": "string", "enum": ["env", "persisted"] },
+        "editable": { "type": "boolean" },
+        "enabled": { "type": "boolean" },
+        "display_name": { "type": "string" },
+        "config_url": { "type": "string", "minLength": 1 },
+        "issuer": { "$ref": "#/definitions/nullableString" },
+        "client_id": { "type": "string", "minLength": 1 },
+        "client_secret_configured": { "type": "boolean" },
+        "scopes": { "type": "array", "items": { "type": "string" } },
+        "other_audiences": { "type": "array", "items": { "type": "string" } },
+        "redirect_uri": { "$ref": "#/definitions/nullableString" },
+        "redirect_uri_dynamic": { "type": "boolean" },
+        "claim_name": { "type": "string" },
+        "claim_prefix": { "type": "string" },
+        "role_policy": { "type": "string" },
+        "groups_claim": { "type": "string" },
+        "roles_claim": { "type": "string" },
+        "email_claim": { "type": "string" },
+        "username_claim": { "type": "string" },
+        "hide_from_ui": { "type": "boolean" }
+      }
+    },
+    "oidcListData": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operation", "restart_required", "providers"],
+      "properties": {
+        "operation": { "const": "list" },
+        "restart_required": { "type": "boolean" },
+        "providers": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/oidcProvider" }
+        }
+      }
+    },
+    "oidcGetData": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operation", "provider"],
+      "properties": {
+        "operation": { "const": "get" },
+        "provider": { "$ref": "#/definitions/oidcProvider" }
+      }
+    },
+    "oidcValidationData": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation", "provider_id", "valid", "message", "issuer",
+        "authorization_endpoint", "token_endpoint"
+      ],
+      "properties": {
+        "operation": { "const": "validate" },
+        "provider_id": { "type": "string", "minLength": 1 },
+        "valid": { "const": true },
+        "message": { "type": "string" },
+        "issuer": { "type": "string", "minLength": 1 },
+        "authorization_endpoint": { "type": "string", "minLength": 1 },
+        "token_endpoint": { "$ref": "#/definitions/nullableString" }
+      }
+    },
+    "oidcData": {
+      "oneOf": [
+        { "$ref": "#/definitions/oidcListData" },
+        { "$ref": "#/definitions/oidcGetData" },
+        { "$ref": "#/definitions/oidcValidationData" }
+      ]
+    },
     "adminOperation": {
       "type": "object",
       "required": [
@@ -1308,6 +1388,17 @@
           "properties": {
             "type": { "const": "kms" },
             "data": { "$ref": "#/definitions/kmsData" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/definitions/successEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "oidc" },
+            "data": { "$ref": "#/definitions/oidcData" }
           }
         }
       ]
