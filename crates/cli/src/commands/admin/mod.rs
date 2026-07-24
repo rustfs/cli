@@ -12,6 +12,7 @@ mod diagnostics;
 mod expand;
 mod group;
 mod heal;
+mod iam;
 mod idp;
 mod ilm;
 mod info;
@@ -116,6 +117,10 @@ pub enum AdminCommands {
     #[command(name = "bucket-metadata", subcommand)]
     BucketMetadata(bucket_metadata::BucketMetadataCommands),
 
+    /// Export or import versioned IAM archives
+    #[command(subcommand)]
+    Iam(iam::IamCommands),
+
     /// Control the server process (restart, stop, freeze, unfreeze)
     #[command(subcommand)]
     Service(service::ServiceCommands),
@@ -158,6 +163,7 @@ pub async fn execute(cmd: AdminCommands, output_config: OutputConfig) -> ExitCod
         AdminCommands::BucketMetadata(command) => {
             bucket_metadata::execute(command, &formatter).await
         }
+        AdminCommands::Iam(iam_cmd) => iam::execute(iam_cmd, &formatter).await,
         AdminCommands::Service(service_cmd) => service::execute(service_cmd, &formatter).await,
         AdminCommands::Replicate(replicate_cmd) => {
             replicate::execute(replicate_cmd, &formatter).await

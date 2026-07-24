@@ -6,6 +6,77 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result};
 
+/// Maximum accepted IAM archive size. This matches RustFS's import body limit.
+pub const MAX_IAM_ARCHIVE_BYTES: usize = 10 * 1024 * 1024;
+
+/// Maximum accepted structured response from an IAM import.
+pub const MAX_IAM_IMPORT_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Names contained in an IAM archive, used for conflict preflight.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IamArchiveInventory {
+    pub users: Vec<String>,
+    pub groups: Vec<String>,
+    pub policies: Vec<String>,
+    pub service_accounts: Vec<String>,
+}
+
+/// One category in RustFS's structured IAM import report.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IamArchiveResultEntities {
+    #[serde(default)]
+    pub policies: Vec<String>,
+    #[serde(default)]
+    pub users: Vec<String>,
+    #[serde(default)]
+    pub groups: Vec<String>,
+    #[serde(default)]
+    pub service_accounts: Vec<String>,
+    #[serde(default)]
+    pub user_policies: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub group_policies: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub sts_policies: Vec<serde_json::Value>,
+}
+
+/// A failed IAM entity. Error text is intentionally discarded at the client
+/// boundary because a backend error may include credential material.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IamArchiveImportSection {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub policies: Vec<String>,
+}
+
+/// Secret-safe typed summary of an IAM import.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct IamArchiveImportResult {
+    pub skipped: IamArchiveResultEntities,
+    pub removed: IamArchiveResultEntities,
+    pub added: IamArchiveResultEntities,
+    pub failed: Vec<IamArchiveImportSection>,
+}
+
+/// Bounded RustFS IAM archive transport.
+#[async_trait]
+pub trait IamArchiveApi: Send + Sync {
+    /// Download the server IAM archive.
+    async fn export_iam_archive(&self) -> Result<Vec<u8>>;
+
+    /// Import one already validated IAM archive. Implementations must not retry
+    /// this mutation because a disconnected response has an unknown outcome.
+    async fn import_iam_archive(&self, archive: Vec<u8>) -> Result<IamArchiveImportResult>;
+
+    /// Return names which already exist on the destination.
+    async fn iam_archive_conflicts(
+        &self,
+        inventory: &IamArchiveInventory,
+    ) -> Result<IamArchiveInventory>;
+}
+
 /// Capability name used to guard policy-entity inspection.
 pub const IAM_POLICY_ENTITIES_CAPABILITY: &str = "admin.iam.policy-entities";
 

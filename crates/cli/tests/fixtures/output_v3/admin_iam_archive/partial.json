@@ -1,0 +1,1 @@
+{"schema_version":3,"type":"admin_iam_archive","status":"partial","data":{"operation":"iam.import","archive_version":1,"dry_run":false,"conflict_policy":"overwrite","inventory":{"users":2,"groups":1,"policies":1,"service_accounts":1},"conflicts":{"users":1,"groups":0,"policies":1,"service_accounts":0},"result":{"added":3,"skipped":0,"removed":0,"failed":1,"partial":true}}}

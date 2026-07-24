@@ -77,10 +77,43 @@ rc admin replicate remove <ALIAS> <--all|--site <NAME>>
 | `policy` | Manage IAM policies and attachments. |
 | `group` | Manage IAM groups and group membership. |
 | `service-account` | Manage service accounts. |
+| `iam` | Export or import bounded, versioned IAM archives. |
 | `service` | Control the server process: restart, stop, freeze, unfreeze. |
 | `config` | Inspect, plan, export, and mutate RustFS server configuration. |
 | `bucket-metadata` | Export or import validated per-bucket configuration archives. |
 | `replicate` | Manage site replication across clusters. |
+
+## IAM archive migration
+
+`rc admin iam` round-trips RustFS users, groups, policies, mappings, and supported
+service-account metadata through the native RustFS IAM archive routes.
+
+```bash
+rc admin iam export source --file source-iam.zip
+rc admin iam import target --file source-iam.zip --dry-run
+rc admin iam import target --file source-iam.zip --conflict overwrite --yes
+```
+
+Exports are normalized to version 1 with deterministic JSON key and ZIP entry
+ordering. The output is created atomically with owner-only permissions and an
+existing path is never overwritten. Archives contain IAM credentials required
+for a round trip, so export to protected storage; archive bytes and server error
+bodies are never printed.
+
+Imports accept `--file -` for stdin. Files must be regular, non-symlink files
+with no group or other permissions on Unix, and compressed plus expanded input
+is bounded to 10 MiB. Every import performs local format validation and a
+destination conflict preflight. The default `--conflict fail` stops before
+mutation; `--conflict overwrite` must be selected explicitly when replacement
+is intended. `--dry-run` validates and reports counts without calling the import
+route, while a real import additionally requires `--yes`.
+
+Safe GET exports retry transient network failures up to three times. Import
+mutations are never retried automatically: a disconnect can leave an unknown
+outcome, so inspect destination IAM state before retrying. Structured output
+uses the v3 `admin_iam_archive` family and reports entity counts only; it never
+contains secret keys, tokens, credential values, archive contents, or
+server-provided failure text.
 
 ## Examples
 

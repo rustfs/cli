@@ -44,7 +44,8 @@
         "extension_catalog",
         "oidc",
         "iam_policy_entities",
-        "iam_policy_detach"
+        "iam_policy_detach",
+        "admin_iam_archive"
       ]
     },
     "pagination": {
@@ -1427,6 +1428,17 @@
           }
         }
       ]
+    },
+    "iamArchiveOutput": {
+      "type": "object",
+      "required": ["schema_version", "type", "status", "data"],
+      "properties": {
+        "schema_version": { "const": 3 },
+        "type": { "const": "admin_iam_archive" },
+        "status": { "enum": ["success", "partial"] },
+        "data": { "type": "object" },
+        "meta": { "$ref": "#/definitions/meta" }
+      }
     }
   },
   "oneOf": [
@@ -1452,6 +1464,7 @@
         }
       ]
     },
+    { "$ref": "#/definitions/iamArchiveOutput" },
     {
       "allOf": [
         { "$ref": "#/definitions/successEnvelope" },

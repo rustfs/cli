@@ -1135,6 +1135,21 @@ fn nested_subcommand_help_contract() {
             expected_tokens: &[],
         },
         HelpCase {
+            args: &["admin", "iam"],
+            usage: "Usage: rc admin iam [OPTIONS] <COMMAND>",
+            expected_tokens: &["export", "import"],
+        },
+        HelpCase {
+            args: &["admin", "iam", "export"],
+            usage: "Usage: rc admin iam export [OPTIONS] --file <FILE> <ALIAS>",
+            expected_tokens: &["--file"],
+        },
+        HelpCase {
+            args: &["admin", "iam", "import"],
+            usage: "Usage: rc admin iam import [OPTIONS] --file <FILE> <ALIAS>",
+            expected_tokens: &["--file", "--dry-run", "--yes", "--conflict"],
+        },
+        HelpCase {
             args: &["version", "enable"],
             usage: "Usage: rc version enable [OPTIONS] <PATH>",
             expected_tokens: &["--force"],

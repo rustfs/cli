@@ -21,11 +21,13 @@ use rc_core::admin::{
     CreateServiceAccountRequest, DecommissionPoolStatus, DecommissionStatus,
     DetailedHealthSnapshot, DiagnosticCapability, DiagnosticReadApi, ExtensionsCatalog, Group,
     GroupStatus, HealRuntimeState, HealScanMode, HealStartRequest, HealStatus, HealTaskRequest,
-    IAM_POLICY_DETACH_CAPABILITY, IAM_POLICY_ENTITIES_CAPABILITY, IamMutationApi, IamReadApi,
-    KmsApi, KmsBackendKind, KmsCacheSummary, KmsCancelKeyDeletionResult, KmsConfigSummary,
-    KmsConfigureRequest, KmsCreateKeyRequest, KmsCreateKeyResult, KmsDeleteKeyRequest,
-    KmsDeleteKeyResult, KmsKey, KmsKeyPage, KmsKeyState, KmsKeyUsage, KmsServiceState, KmsStatus,
-    MAX_BUCKET_METADATA_ARCHIVE_BYTES, MAX_DIAGNOSTIC_RESPONSE_BYTES,
+    IAM_POLICY_DETACH_CAPABILITY, IAM_POLICY_ENTITIES_CAPABILITY, IamArchiveApi,
+    IamArchiveImportResult, IamArchiveImportSection, IamArchiveInventory, IamArchiveResultEntities,
+    IamMutationApi, IamReadApi, KmsApi, KmsBackendKind, KmsCacheSummary,
+    KmsCancelKeyDeletionResult, KmsConfigSummary, KmsConfigureRequest, KmsCreateKeyRequest,
+    KmsCreateKeyResult, KmsDeleteKeyRequest, KmsDeleteKeyResult, KmsKey, KmsKeyPage, KmsKeyState,
+    KmsKeyUsage, KmsServiceState, KmsStatus, MAX_BUCKET_METADATA_ARCHIVE_BYTES,
+    MAX_DIAGNOSTIC_RESPONSE_BYTES, MAX_IAM_ARCHIVE_BYTES, MAX_IAM_IMPORT_RESPONSE_BYTES,
     MAX_IAM_POLICY_DETACH_REQUEST_BYTES, MAX_IAM_POLICY_DETACH_RESPONSE_BYTES,
     MAX_IAM_POLICY_ENTITIES_RESPONSE_BYTES, MAX_METRICS_LINE_BYTES, MAX_METRICS_RESPONSE_BYTES,
     MAX_METRICS_SAMPLES, MAX_OIDC_RESPONSE_BYTES, MAX_REPLICATION_DIFF_RESPONSE_BYTES,
@@ -78,6 +80,77 @@ struct PolicyDetachWireResponse {
     #[serde(default)]
     policies_detached: Vec<String>,
     updated_at: jiff::Timestamp,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct WireIamImportFailures {
+    #[serde(default)]
+    policies: Vec<WireIamImportFailure>,
+    #[serde(default)]
+    users: Vec<WireIamImportFailure>,
+    #[serde(default)]
+    groups: Vec<WireIamImportFailure>,
+    #[serde(default, rename = "serviceAccounts")]
+    service_accounts: Vec<WireIamImportFailure>,
+    #[serde(default, rename = "userPolicies")]
+    user_policies: Vec<WireIamImportFailure>,
+    #[serde(default, rename = "groupPolicies")]
+    group_policies: Vec<WireIamImportFailure>,
+    #[serde(default, rename = "stsPolicies")]
+    sts_policies: Vec<WireIamImportFailure>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct WireIamImportFailure {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    policies: Vec<String>,
+    // Deliberately omit the server's `error` field: it is untrusted and may
+    // contain imported credential material.
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct WireIamImportResult {
+    #[serde(default)]
+    skipped: IamArchiveResultEntities,
+    #[serde(default)]
+    removed: IamArchiveResultEntities,
+    #[serde(default)]
+    added: IamArchiveResultEntities,
+    #[serde(default)]
+    failed: WireIamImportFailures,
+}
+
+impl WireIamImportResult {
+    fn into_safe_result(self) -> IamArchiveImportResult {
+        let mut failed = Vec::new();
+        for entries in [
+            self.failed.policies,
+            self.failed.users,
+            self.failed.groups,
+            self.failed.service_accounts,
+            self.failed.user_policies,
+            self.failed.group_policies,
+            self.failed.sts_policies,
+        ] {
+            failed.extend(entries.into_iter().map(|entry| IamArchiveImportSection {
+                name: entry.name,
+                policies: entry.policies,
+            }));
+        }
+        failed.sort_by(|left, right| {
+            left.name
+                .cmp(&right.name)
+                .then_with(|| left.policies.cmp(&right.policies))
+        });
+        IamArchiveImportResult {
+            skipped: self.skipped,
+            removed: self.removed,
+            added: self.added,
+            failed,
+        }
+    }
 }
 
 impl AsRef<[u8]> for SensitiveRequestBody {
@@ -3164,6 +3237,179 @@ fn bucket_metadata_status_error(status: StatusCode, mutation: bool) -> Error {
                 .to_string(),
         ),
         _ => Error::Network("Bucket metadata export service is unavailable".to_string()),
+    }
+}
+
+#[async_trait]
+impl IamArchiveApi for AdminClient {
+    async fn export_iam_archive(&self) -> Result<Vec<u8>> {
+        let url = self.admin_url("/export-iam");
+        let headers = self.request_headers(&[])?;
+        let signed_headers = self.sign_request(&Method::GET, &url, &headers, &[]).await?;
+        let mut request = self.http_client.request(Method::GET, &url);
+        for (name, value) in &signed_headers {
+            request = request.header(name, value);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|_| Error::Network("IAM export request failed".to_string()))?;
+        let status = response.status();
+        let body =
+            read_bounded_response_body(response, MAX_IAM_ARCHIVE_BYTES, "IAM export archive")
+                .await?;
+        if !status.is_success() {
+            return Err(iam_archive_status_error(status, false));
+        }
+        Ok(body)
+    }
+
+    async fn import_iam_archive(&self, archive: Vec<u8>) -> Result<IamArchiveImportResult> {
+        if archive.len() > MAX_IAM_ARCHIVE_BYTES {
+            return Err(Error::RequestRejected(format!(
+                "IAM archive exceeds the {MAX_IAM_ARCHIVE_BYTES} byte limit"
+            )));
+        }
+        let archive = Zeroizing::new(archive);
+        let url = self.admin_url("/import-iam-v2");
+        let mut headers = self.request_headers(&archive)?;
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/zip"));
+        let signed_headers = self
+            .sign_request(&Method::PUT, &url, &headers, &archive)
+            .await?;
+        let mut request = self.http_client.request(Method::PUT, &url);
+        for (name, value) in &signed_headers {
+            request = request.header(name, value);
+        }
+        request = request.body(Bytes::from_owner(SensitiveRequestBody(archive)));
+        let response = request.send().await.map_err(|_| {
+            Error::Network(
+                "IAM import outcome is unknown; the mutation was not retried".to_string(),
+            )
+        })?;
+        let status = response.status();
+        let body = read_bounded_response_body(
+            response,
+            MAX_IAM_IMPORT_RESPONSE_BYTES,
+            "IAM import response",
+        )
+        .await
+        .map_err(|_| {
+            Error::General(
+                "IAM import outcome is unknown because its response was rejected; inspect destination IAM state before retrying"
+                    .to_string(),
+            )
+        })?;
+        if !status.is_success() {
+            return Err(iam_archive_status_error(status, true));
+        }
+        let result: WireIamImportResult = serde_json::from_slice(&body).map_err(|_| {
+            Error::General(
+                "IAM import outcome is unknown because RustFS returned a malformed response; inspect destination IAM state before retrying"
+                    .to_string(),
+            )
+        })?;
+        Ok(result.into_safe_result())
+    }
+
+    async fn iam_archive_conflicts(
+        &self,
+        inventory: &IamArchiveInventory,
+    ) -> Result<IamArchiveInventory> {
+        let users = self
+            .list_users()
+            .await
+            .map_err(sanitize_iam_preflight_error)?
+            .into_iter()
+            .map(|entry| entry.access_key)
+            .collect::<std::collections::BTreeSet<_>>();
+        let groups = self
+            .list_groups()
+            .await
+            .map_err(sanitize_iam_preflight_error)?
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let policies = self
+            .list_policies()
+            .await
+            .map_err(sanitize_iam_preflight_error)?
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect::<std::collections::BTreeSet<_>>();
+        let service_accounts = self
+            .list_service_accounts(None)
+            .await
+            .map_err(sanitize_iam_preflight_error)?
+            .into_iter()
+            .map(|entry| entry.access_key)
+            .collect::<std::collections::BTreeSet<_>>();
+        Ok(IamArchiveInventory {
+            users: inventory
+                .users
+                .iter()
+                .filter(|name| users.contains(*name))
+                .cloned()
+                .collect(),
+            groups: inventory
+                .groups
+                .iter()
+                .filter(|name| groups.contains(*name))
+                .cloned()
+                .collect(),
+            policies: inventory
+                .policies
+                .iter()
+                .filter(|name| policies.contains(*name))
+                .cloned()
+                .collect(),
+            service_accounts: inventory
+                .service_accounts
+                .iter()
+                .filter(|name| service_accounts.contains(*name))
+                .cloned()
+                .collect(),
+        })
+    }
+}
+
+fn iam_archive_status_error(status: StatusCode, mutation: bool) -> Error {
+    let operation = if mutation { "import" } else { "export" };
+    match status {
+        StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED => {
+            Error::Auth(format!("Permission denied for IAM {operation}"))
+        }
+        StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_IMPLEMENTED => {
+            Error::UnsupportedFeature(format!(
+                "IAM {operation} is not supported by this RustFS server"
+            ))
+        }
+        StatusCode::CONFLICT => {
+            Error::Conflict("IAM import conflicts with destination state".to_string())
+        }
+        StatusCode::BAD_REQUEST => {
+            Error::General(format!("RustFS rejected the IAM {operation} request"))
+        }
+        _ if mutation => Error::General(format!(
+            "IAM import outcome is unknown after HTTP {}; inspect destination IAM state before retrying",
+            status.as_u16()
+        )),
+        _ => Error::Network(format!("IAM export failed with HTTP {}", status.as_u16())),
+    }
+}
+
+fn sanitize_iam_preflight_error(error: Error) -> Error {
+    match error {
+        Error::Auth(_) => {
+            Error::Auth("Permission denied during IAM conflict preflight".to_string())
+        }
+        Error::NotFound(_) | Error::UnsupportedFeature(_) => Error::UnsupportedFeature(
+            "IAM conflict preflight is not supported by this RustFS server".to_string(),
+        ),
+        Error::Network(_) => Error::Network("IAM conflict preflight request failed".to_string()),
+        Error::Conflict(_) => {
+            Error::Conflict("IAM conflict preflight could not read destination state".to_string())
+        }
+        _ => Error::General("IAM conflict preflight returned an invalid response".to_string()),
     }
 }
 
@@ -8780,5 +9026,120 @@ mod tests {
             }
             handle.join().expect("server thread should finish");
         }
+    }
+
+    #[test]
+    fn iam_import_wire_report_discards_server_error_text() {
+        let wire: WireIamImportResult = serde_json::from_str(
+            r#"{
+                "added": {"users": ["bob"]},
+                "failed": {
+                    "users": [{
+                        "name": "alice",
+                        "error": "secretKey=must-not-survive"
+                    }],
+                    "userPolicies": [{
+                        "name": "alice",
+                        "policies": ["readonly"],
+                        "error": "token=must-not-survive"
+                    }]
+                }
+            }"#,
+        )
+        .expect("wire response");
+        let safe = wire.into_safe_result();
+        assert_eq!(safe.added.users, ["bob"]);
+        assert_eq!(safe.failed.len(), 2);
+        let encoded = serde_json::to_string(&safe).expect("safe response");
+        assert!(!encoded.contains("must-not-survive"));
+        assert!(!encoded.contains("secretKey"));
+        assert!(!encoded.contains("token"));
+    }
+
+    #[test]
+    fn iam_archive_status_errors_never_echo_response_bodies() {
+        for (status, mutation) in [
+            (StatusCode::FORBIDDEN, false),
+            (StatusCode::BAD_REQUEST, true),
+            (StatusCode::INTERNAL_SERVER_ERROR, true),
+        ] {
+            let error = iam_archive_status_error(status, mutation);
+            assert!(!error.to_string().contains("secret"));
+        }
+    }
+
+    #[tokio::test]
+    async fn iam_import_uses_v2_route_and_returns_only_safe_outcomes() {
+        let body = r#"{
+            "added": {"users": ["bob"]},
+            "failed": {"users": [{"name": "alice", "error": "secretKey=hidden"}]}
+        }"#;
+        let (endpoint, receiver, handle) = start_admin_test_server("200 OK", body);
+        let client = admin_client_for_endpoint(&endpoint);
+        let archive = b"bounded archive".to_vec();
+        let result = client
+            .import_iam_archive(archive.clone())
+            .await
+            .expect("import result");
+        assert_eq!(result.added.users, ["bob"]);
+        assert_eq!(result.failed[0].name, "alice");
+        assert!(
+            !serde_json::to_string(&result)
+                .expect("result")
+                .contains("hidden")
+        );
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(request.method, "PUT");
+        assert_eq!(request.target, "/rustfs/admin/v3/import-iam-v2");
+        assert_eq!(request.body, archive);
+        assert!(
+            request
+                .headers
+                .to_ascii_lowercase()
+                .contains("content-type: application/zip")
+        );
+        handle.join().expect("server thread");
+    }
+
+    #[tokio::test]
+    async fn iam_export_rejects_declared_oversized_body() {
+        let (endpoint, _receiver, handle) =
+            start_admin_declared_length_server("200 OK", MAX_IAM_ARCHIVE_BYTES + 1);
+        let client = admin_client_for_endpoint(&endpoint);
+        let error = client
+            .export_iam_archive()
+            .await
+            .expect_err("oversized archive");
+        assert!(!error.to_string().contains("secret"));
+        handle.join().expect("server thread");
+    }
+
+    #[tokio::test]
+    async fn iam_import_permission_error_does_not_echo_server_body() {
+        let (endpoint, _receiver, handle) =
+            start_admin_test_server("403 Forbidden", r#"{"error":"secretKey=hidden"}"#);
+        let client = admin_client_for_endpoint(&endpoint);
+        let error = client
+            .import_iam_archive(b"archive".to_vec())
+            .await
+            .expect_err("permission denied");
+        assert!(matches!(error, Error::Auth(_)));
+        assert!(!error.to_string().contains("hidden"));
+        handle.join().expect("server thread");
+    }
+
+    #[tokio::test]
+    async fn iam_import_disconnect_reports_unknown_outcome_without_retry() {
+        let (endpoint, receiver, handle) = start_admin_disconnect_server();
+        let client = admin_client_for_endpoint(&endpoint);
+        let error = client
+            .import_iam_archive(b"archive".to_vec())
+            .await
+            .expect_err("disconnect");
+        assert!(matches!(error, Error::Network(_)));
+        assert!(error.to_string().contains("outcome is unknown"));
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(request.target, "/rustfs/admin/v3/import-iam-v2");
+        handle.join().expect("server thread");
     }
 }
