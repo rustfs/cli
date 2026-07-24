@@ -4,6 +4,7 @@
 //! service accounts, and cluster operations through the RustFS Admin API.
 
 mod access_key;
+mod bucket_metadata;
 mod capabilities;
 mod config;
 mod decommission;
@@ -111,6 +112,10 @@ pub enum AdminCommands {
     #[command(name = "access-key", subcommand)]
     AccessKey(access_key::AccessKeyCommands),
 
+    /// Export or import validated per-bucket metadata archives
+    #[command(name = "bucket-metadata", subcommand)]
+    BucketMetadata(bucket_metadata::BucketMetadataCommands),
+
     /// Control the server process (restart, stop, freeze, unfreeze)
     #[command(subcommand)]
     Service(service::ServiceCommands),
@@ -149,6 +154,9 @@ pub async fn execute(cmd: AdminCommands, output_config: OutputConfig) -> ExitCod
         AdminCommands::ServiceAccount(sa_cmd) => service_account::execute(sa_cmd, &formatter).await,
         AdminCommands::AccessKey(access_key_cmd) => {
             access_key::execute(access_key_cmd, &formatter).await
+        }
+        AdminCommands::BucketMetadata(command) => {
+            bucket_metadata::execute(command, &formatter).await
         }
         AdminCommands::Service(service_cmd) => service::execute(service_cmd, &formatter).await,
         AdminCommands::Replicate(replicate_cmd) => {

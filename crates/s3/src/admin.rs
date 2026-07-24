@@ -14,20 +14,21 @@ use aws_sigv4::sign::v4;
 use bytes::Bytes;
 use futures::StreamExt;
 use rc_core::admin::{
-    AccessKeyInfo, AdminApi, BucketQuota, CapabilityApi, CapabilityAvailability, CapabilityEntry,
-    CapabilityReport, ClusterInfo, ClusterSnapshotDocument, ClusterSnapshotMetadata,
-    ClusterSnapshotSummary, ConfigApi, ConfigDocument, ConfigHelp, ConfigHistoryEntry,
-    ConfigMutationResult, CreateServiceAccountRequest, DecommissionPoolStatus, DecommissionStatus,
+    AccessKeyInfo, AdminApi, BucketMetadataApi, BucketMetadataArchive, BucketQuota, CapabilityApi,
+    CapabilityAvailability, CapabilityEntry, CapabilityReport, ClusterInfo,
+    ClusterSnapshotDocument, ClusterSnapshotMetadata, ClusterSnapshotSummary, ConfigApi,
+    ConfigDocument, ConfigHelp, ConfigHistoryEntry, ConfigMutationResult,
+    CreateServiceAccountRequest, DecommissionPoolStatus, DecommissionStatus,
     DetailedHealthSnapshot, DiagnosticCapability, DiagnosticReadApi, ExtensionsCatalog, Group,
     GroupStatus, HealRuntimeState, HealScanMode, HealStartRequest, HealStatus, HealTaskRequest,
     IAM_POLICY_DETACH_CAPABILITY, IAM_POLICY_ENTITIES_CAPABILITY, IamMutationApi, IamReadApi,
     KmsApi, KmsBackendKind, KmsCacheSummary, KmsCancelKeyDeletionResult, KmsConfigSummary,
     KmsConfigureRequest, KmsCreateKeyRequest, KmsCreateKeyResult, KmsDeleteKeyRequest,
     KmsDeleteKeyResult, KmsKey, KmsKeyPage, KmsKeyState, KmsKeyUsage, KmsServiceState, KmsStatus,
-    MAX_DIAGNOSTIC_RESPONSE_BYTES, MAX_IAM_POLICY_DETACH_REQUEST_BYTES,
-    MAX_IAM_POLICY_DETACH_RESPONSE_BYTES, MAX_IAM_POLICY_ENTITIES_RESPONSE_BYTES,
-    MAX_METRICS_LINE_BYTES, MAX_METRICS_RESPONSE_BYTES, MAX_METRICS_SAMPLES,
-    MAX_OIDC_RESPONSE_BYTES, MAX_REPLICATION_DIFF_RESPONSE_BYTES,
+    MAX_BUCKET_METADATA_ARCHIVE_BYTES, MAX_DIAGNOSTIC_RESPONSE_BYTES,
+    MAX_IAM_POLICY_DETACH_REQUEST_BYTES, MAX_IAM_POLICY_DETACH_RESPONSE_BYTES,
+    MAX_IAM_POLICY_ENTITIES_RESPONSE_BYTES, MAX_METRICS_LINE_BYTES, MAX_METRICS_RESPONSE_BYTES,
+    MAX_METRICS_SAMPLES, MAX_OIDC_RESPONSE_BYTES, MAX_REPLICATION_DIFF_RESPONSE_BYTES,
     MAX_SITE_REPLICATION_ERROR_RESPONSE_BYTES, MAX_SITE_REPLICATION_REQUEST_BYTES,
     MAX_SITE_REPLICATION_SUCCESS_RESPONSE_BYTES, ManualTransitionRunRequest,
     ManualTransitionRunResponse, MetricsBatch, MetricsQuery, ModuleSwitches, ObservabilityApi,
@@ -102,6 +103,7 @@ static CAPABILITY_CACHE: OnceLock<Mutex<HashMap<CapabilityCacheKey, CapabilityRe
     OnceLock::new();
 
 const MAX_CONFIG_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_BUCKET_METADATA_MUTATION_RESPONSE_BYTES: usize = 64 * 1024;
 
 fn capability_cache() -> &'static Mutex<HashMap<CapabilityCacheKey, CapabilityReport>> {
     CAPABILITY_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -3058,6 +3060,111 @@ fn normalize_policy_detach_response_names(kind: &str, names: &mut Vec<String>) -
     names.sort();
     names.dedup();
     Ok(())
+}
+
+#[async_trait]
+impl BucketMetadataApi for AdminClient {
+    async fn export_bucket_metadata(&self, bucket: Option<&str>) -> Result<BucketMetadataArchive> {
+        let mut url = self.admin_url("/export-bucket-metadata");
+        if let Some(bucket) = bucket {
+            url.push_str("?bucket=");
+            url.push_str(&urlencoding::encode(bucket));
+        }
+        let headers = self.request_headers(&[])?;
+        let signed_headers = self.sign_request(&Method::GET, &url, &headers, &[]).await?;
+        let mut request = self.http_client.get(&url);
+        for (name, value) in &signed_headers {
+            request = request.header(name, value);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|_| Error::Network("Bucket metadata export request failed".to_string()))?;
+        let status = response.status();
+        let bytes = read_bounded_response_body(
+            response,
+            MAX_BUCKET_METADATA_ARCHIVE_BYTES,
+            "Bucket metadata export response",
+        )
+        .await?;
+        if !status.is_success() {
+            return Err(bucket_metadata_status_error(status, false));
+        }
+        BucketMetadataArchive::new(bytes)
+    }
+
+    async fn import_bucket_metadata(&self, archive: BucketMetadataArchive) -> Result<()> {
+        let body = archive.into_bytes();
+        let url = self.admin_url("/import-bucket-metadata");
+        let mut headers = self.request_headers(body.as_slice())?;
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/zip"));
+        let signed_headers = self
+            .sign_request(&Method::PUT, &url, &headers, body.as_slice())
+            .await?;
+        let mut request = self.http_client.put(&url);
+        for (name, value) in &signed_headers {
+            request = request.header(name, value);
+        }
+        let response = request
+            .body(Bytes::from_owner(SensitiveRequestBody(body)))
+            .send()
+            .await
+            .map_err(|_| {
+                Error::Network(
+                    "Bucket metadata import outcome is unknown; the mutation was not retried"
+                        .to_string(),
+                )
+            })?;
+        let status = response.status();
+        let response_body = read_bounded_response_body(
+            response,
+            MAX_BUCKET_METADATA_MUTATION_RESPONSE_BYTES,
+            "Bucket metadata import response",
+        )
+        .await
+        .map_err(|_| {
+            Error::Network(
+                "Bucket metadata import outcome is unknown; inspect every selected bucket before retrying"
+                    .to_string(),
+            )
+        })?;
+        if !status.is_success() {
+            return Err(bucket_metadata_status_error(status, true));
+        }
+        if !response_body.is_empty()
+            && serde_json::from_slice::<serde_json::Value>(&response_body).is_err()
+        {
+            return Err(Error::Network(
+                "Bucket metadata import returned an unexpected response; inspect every selected bucket before retrying"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn bucket_metadata_status_error(status: StatusCode, mutation: bool) -> Error {
+    match status {
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+            Error::Auth("Bucket metadata administration permission was denied".to_string())
+        }
+        StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_IMPLEMENTED => {
+            Error::UnsupportedFeature(
+                "The RustFS bucket metadata archive route is unavailable".to_string(),
+            )
+        }
+        StatusCode::CONFLICT | StatusCode::PRECONDITION_FAILED => {
+            Error::Conflict("Bucket metadata changed concurrently".to_string())
+        }
+        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
+            Error::Config("RustFS rejected the bucket metadata archive".to_string())
+        }
+        _ if mutation => Error::Network(
+            "Bucket metadata import may be partially applied; inspect every selected bucket before retrying"
+                .to_string(),
+        ),
+        _ => Error::Network("Bucket metadata export service is unavailable".to_string()),
+    }
 }
 
 #[async_trait]

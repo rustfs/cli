@@ -49,6 +49,7 @@ rc admin service <restart|stop|freeze|unfreeze> <ALIAS>
 rc admin diagnostics client-devnull <ALIAS> [--size <SIZE>] [--timeout <DURATION>] [--concurrency <N>] --yes
 rc admin config <get|set|delete|help|history|restore|export|import> ...
 rc admin config module-switch <get|set> ...
+rc admin bucket-metadata <export|import> <ALIAS> ...
 rc admin replicate add <ALIAS> <ALIAS> [<ALIAS>...]
 rc admin replicate <info|status> <ALIAS> [OPTIONS]
 rc admin replicate edit <ALIAS> --site <DEPLOYMENT_ID|NAME> [EDIT OPTIONS] --yes
@@ -78,6 +79,7 @@ rc admin replicate remove <ALIAS> <--all|--site <NAME>>
 | `service-account` | Manage service accounts. |
 | `service` | Control the server process: restart, stop, freeze, unfreeze. |
 | `config` | Inspect, plan, export, and mutate RustFS server configuration. |
+| `bucket-metadata` | Export or import validated per-bucket configuration archives. |
 | `replicate` | Manage site replication across clusters. |
 
 ## Examples
@@ -524,6 +526,23 @@ Full imports and restores require `--yes`. RustFS beta.10 history entries contai
 Exports are always redacted because secret values are not a portable client output contract. Replace any required secret values through an approved secret-management workflow before importing; `rc` rejects the `*redacted*` placeholder for secret-bearing fields.
 
 Value files are limited to 1 MiB of single-line UTF-8 text. On Unix they must be regular, non-symlink files without group or other permissions; trailing line endings are removed. If server help metadata is incomplete or unavailable, `set`, `delete`, and `import` emit a warning and defer final validation to the mutation endpoint.
+
+## Bucket Metadata Archive Workflow
+
+`rc admin bucket-metadata` exports and imports the per-bucket configuration families supported by the RustFS v3 archive routes: policy, notification, lifecycle, encryption, tagging, quota, object lock, versioning, replication, and replication targets.
+
+| Command | Description |
+| --- | --- |
+| `rc admin bucket-metadata export <ALIAS> --file <PATH> [--bucket <BUCKET>...] [--force]` | Export all buckets or an explicit selection to a deterministic, owner-private ZIP. The file is created atomically; `--force` is required to replace an existing path. |
+| `rc admin bucket-metadata import <ALIAS> --file <PATH\|-> [--bucket <BUCKET>...] --conflict <fail\|overwrite\|skip> [--dry-run] [--yes]` | Validate a protected ZIP, compare it with current metadata, and apply the explicit conflict policy. Mutating imports require `--yes`; dry runs never send a mutation. |
+
+Archives are bounded to 100 MiB compressed, 128 MiB expanded, 4,096 entries, and 16 MiB per entry. Entry paths must be exactly `<BUCKET>/<SUPPORTED_CONFIG>`; duplicate, empty, nested, traversal, and unknown entries fail before mutation. On Unix, file input must be a regular non-symlink file with no group or other permissions. Standard input is available through `--file -` for an explicitly protected pipeline.
+
+Server exports redact replication-target credentials. The client never prints archive contents and rejects an import whose target metadata contains a missing or redacted secret, because importing it would overwrite a working credential. Supply real target credentials only through a protected archive or standard input.
+
+`--conflict fail` stops before mutation if any imported config differs from current state. `overwrite` sends differing configs, while `skip` removes only conflicting entries from the outgoing archive. Identical entries are never resent. Missing destination buckets remain eligible for the server's create-on-import behavior, while a selected bucket absent from the source archive is a distinct not-found error.
+
+An import is one bounded PUT and is never automatically retried. A transport failure or server error can mean that only part of the archive was applied; inspect every selected bucket before deciding whether to retry. Successful JSON output uses output schema v3 with one `admin_operations` result per selected bucket.
 
 ## Site Replication Workflow
 

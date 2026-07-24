@@ -261,6 +261,53 @@ pub fn start_admin_sequence_test_server(
     (endpoint, receiver, handle)
 }
 
+#[allow(dead_code)]
+pub fn start_admin_binary_sequence_test_server(
+    responses: Vec<(&'static str, &'static str, Vec<u8>)>,
+) -> (String, Receiver<CapturedAdminRequest>, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind admin test server");
+    listener
+        .set_nonblocking(true)
+        .expect("set admin test server nonblocking");
+    let endpoint = format!("http://{}", listener.local_addr().expect("server address"));
+    let (sender, receiver) = mpsc::channel();
+
+    let handle = thread::spawn(move || {
+        for (response_status, content_type, response_body) in responses {
+            let deadline = Instant::now() + Duration::from_secs(120);
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(accepted) => break accepted,
+                    Err(error)
+                        if error.kind() == ErrorKind::WouldBlock && Instant::now() < deadline =>
+                    {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept admin request: {error}"),
+                }
+            };
+            stream
+                .set_nonblocking(false)
+                .expect("set admin request stream blocking");
+            let request = read_admin_request(&mut stream);
+            sender.send(request).expect("send captured request");
+
+            let headers = format!(
+                "HTTP/1.1 {response_status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                response_body.len()
+            );
+            stream
+                .write_all(headers.as_bytes())
+                .expect("write admin response headers");
+            stream
+                .write_all(&response_body)
+                .expect("write admin response body");
+        }
+    });
+
+    (endpoint, receiver, handle)
+}
+
 pub fn rc_host_alias(endpoint: &str) -> String {
     let (_, endpoint_authority) = endpoint.split_once("://").expect("endpoint has scheme");
     format!("http://ACCESS_KEY:SECRET_KEY@{endpoint_authority}")

@@ -3,6 +3,7 @@
 //! This module provides the AdminApi trait and types for managing
 //! IAM users, policies, groups, service accounts, and cluster operations.
 
+mod bucket_metadata;
 mod capabilities;
 mod cluster;
 mod configuration;
@@ -17,6 +18,10 @@ mod site;
 pub mod tier;
 mod types;
 
+pub use bucket_metadata::{
+    BUCKET_METADATA_CAPABILITY, BucketMetadataApi, BucketMetadataArchive,
+    MAX_BUCKET_METADATA_ARCHIVE_BYTES,
+};
 pub use capabilities::{
     CapabilityAvailability, CapabilityEntry, CapabilityReport, ClusterSnapshotMetadata,
     ClusterSnapshotSummary, DiagnosticCapability, DiagnosticCapabilityGuardError,

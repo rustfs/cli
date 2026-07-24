@@ -68,6 +68,7 @@ rustls-pki-types = "1.15"
 x509-parser = "0.18"
 zeroize = "1.8"
 getrandom = "0.4"
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
 
 # HTTP client for Admin API
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "rustls-tls-webpki-roots", "json", "stream"] }
