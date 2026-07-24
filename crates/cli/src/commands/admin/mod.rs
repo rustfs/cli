@@ -325,6 +325,8 @@ mod tests {
             "--dry-run",
             "--max-objects",
             "25",
+            "--max-duration-seconds",
+            "30",
         ]);
 
         match cli.command {
@@ -337,6 +339,7 @@ mod tests {
                 assert_eq!(args.tier.as_deref(), Some("COLDTIER"));
                 assert!(args.dry_run);
                 assert_eq!(args.max_objects, 25);
+                assert_eq!(args.max_duration_seconds, Some(30));
             }
             _ => panic!("Unexpected ILM transition run command"),
         }

@@ -3467,6 +3467,12 @@ impl AdminApi for AdminClient {
             ("dryRun", dry_run),
             ("maxObjects", max_objects.as_str()),
         ];
+        let max_duration_seconds = request
+            .max_duration_seconds
+            .map(|duration| duration.to_string());
+        if let Some(max_duration_seconds) = max_duration_seconds.as_deref() {
+            query.push(("maxDurationSeconds", max_duration_seconds));
+        }
         if let Some(tier) = request.tier.as_deref() {
             query.push(("tier", tier));
         }
