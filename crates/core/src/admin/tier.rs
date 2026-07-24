@@ -295,6 +295,7 @@ pub struct ManualTransitionRunRequest {
     pub tier: Option<String>,
     pub dry_run: bool,
     pub max_objects: u64,
+    pub max_duration_seconds: Option<u64>,
 }
 
 /// Response returned by the manual lifecycle transition endpoint.
@@ -329,6 +330,8 @@ pub struct ManualTransitionRunReport {
     pub skipped_queue_closed: u64,
     pub skipped_queue_timeout: u64,
     pub truncated_by_limit: bool,
+    #[serde(default)]
+    pub truncated_by_duration: bool,
 }
 
 // ==================== Per-type sub-configs ====================

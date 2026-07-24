@@ -9,6 +9,7 @@ use crate::exit_code::ExitCode;
 use crate::output::Formatter;
 
 const MAX_MANUAL_TRANSITION_OBJECTS: u64 = 100_000;
+const MAX_MANUAL_TRANSITION_DURATION_SECONDS: u64 = 3600;
 
 #[derive(Subcommand, Debug)]
 pub enum IlmCommands {
@@ -46,6 +47,10 @@ pub struct ManualTransitionRunArgs {
     /// Maximum number of object versions to scan
     #[arg(long, default_value_t = 10_000, value_parser = clap::value_parser!(u64).range(1..=MAX_MANUAL_TRANSITION_OBJECTS))]
     pub max_objects: u64,
+
+    /// Best-effort seconds budget checked between listed object versions
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=MAX_MANUAL_TRANSITION_DURATION_SECONDS))]
+    pub max_duration_seconds: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -80,6 +85,7 @@ async fn execute_manual_transition_run(
         tier: args.tier,
         dry_run: args.dry_run,
         max_objects: args.max_objects,
+        max_duration_seconds: args.max_duration_seconds,
     };
 
     match client.run_manual_transition(request).await {
@@ -147,7 +153,8 @@ fn print_manual_transition_run(response: &ManualTransitionRunResponse, formatter
         "Queue pressure: {}",
         report.skipped_queue_full + report.skipped_queue_closed + report.skipped_queue_timeout
     ));
-    formatter.println(&format!("Truncated:      {}", report.truncated_by_limit));
+    formatter.println(&format!("Limit reached:  {}", report.truncated_by_limit));
+    formatter.println(&format!("Duration hit:   {}", report.truncated_by_duration));
 }
 
 fn value_or_all(value: &str) -> &str {
