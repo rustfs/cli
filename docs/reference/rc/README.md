@@ -3,6 +3,8 @@
 This reference documents the operations exposed by `rc`, the RustFS S3-compatible command-line client. The structure follows the command-reference style used by MinIO `mc`: each operation describes its purpose, syntax, parameters, examples, and behavior, while keeping the examples specific to `rc`.
 
 For installation and quick-start usage, see the [project README](../../../README.md).
+For migration status and intentionally unavailable MinIO `mc` command families,
+see the [mc compatibility matrix](mc-compatibility.md).
 
 `rc` supports both noun-first command groups and legacy command names. Prefer the noun-first groups for new scripts:
 

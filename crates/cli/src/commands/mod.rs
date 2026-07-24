@@ -13,6 +13,15 @@ use rc_core::{ConfigManager, RequestHeader, set_global_request_headers};
 use crate::exit_code::ExitCode;
 use crate::output::{Formatter, OutputConfig};
 
+const COMPATIBILITY_AFTER_HELP: &str = "\
+Compatibility:
+  Canonical commands: alias, admin, bucket, object, and operational utilities
+  Compatibility aliases: mc-style names delegate to canonical rc implementations
+  Version gated: commands fail closed when RustFS does not advertise required support
+  Server blocked: unavailable mc families are listed with blockers in the compatibility matrix
+
+See: https://github.com/rustfs/cli/blob/main/docs/reference/rc/mc-compatibility.md";
+
 mod admin;
 mod alias;
 mod anonymous;
@@ -75,6 +84,7 @@ fn validate_version_selector(version_id: Option<&str>, rewind: Option<&str>) -> 
 #[derive(Parser, Debug)]
 #[command(name = "rc")]
 #[command(author, version, about, long_about = None)]
+#[command(after_help = COMPATIBILITY_AFTER_HELP)]
 #[command(propagate_version = true)]
 pub struct Cli {
     /// Output format: auto-detect, human-readable, or JSON

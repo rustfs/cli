@@ -153,6 +153,12 @@ fn top_level_command_help_contract() {
                 "du",
                 "ping",
                 "ready",
+                "Compatibility:",
+                "Canonical commands:",
+                "Compatibility aliases:",
+                "Version gated:",
+                "Server blocked:",
+                "mc-compatibility.md",
             ],
         },
         HelpCase {

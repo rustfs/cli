@@ -7,6 +7,9 @@
 
 A S3-compatible command-line client written in Rust.
 
+Migrating from MinIO `mc`? See the
+[mc compatibility and server-blocker matrix](docs/reference/rc/mc-compatibility.md).
+
 ## Features
 
 - 🚀 **High Performance** - Written in Rust with async concurrent operations
