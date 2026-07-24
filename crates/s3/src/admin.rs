@@ -26,9 +26,10 @@ use rc_core::admin::{
     MAX_DIAGNOSTIC_RESPONSE_BYTES, MAX_METRICS_LINE_BYTES, MAX_METRICS_RESPONSE_BYTES,
     MAX_METRICS_SAMPLES, MAX_REPLICATION_DIFF_RESPONSE_BYTES,
     MAX_SITE_REPLICATION_ERROR_RESPONSE_BYTES, MAX_SITE_REPLICATION_REQUEST_BYTES,
-    MAX_SITE_REPLICATION_SUCCESS_RESPONSE_BYTES, MetricsBatch, MetricsQuery, ModuleSwitches,
-    ObservabilityApi, PeerSiteSpec, Policy, PolicyEntity, PolicyInfo, PoolStatus, PoolTarget,
-    RealtimeMetrics, RebalanceStartResult, RebalanceStatus, ReplicateEditStatus, ReplicationDiff,
+    MAX_SITE_REPLICATION_SUCCESS_RESPONSE_BYTES, ManualTransitionRunRequest,
+    ManualTransitionRunResponse, MetricsBatch, MetricsQuery, ModuleSwitches, ObservabilityApi,
+    PeerSiteSpec, Policy, PolicyEntity, PolicyInfo, PoolStatus, PoolTarget, RealtimeMetrics,
+    RebalanceStartResult, RebalanceStatus, ReplicateEditStatus, ReplicationDiff,
     ReplicationDiffApi, RuntimeCapabilitiesSnapshot, RuntimeCapabilityStatus, ScannerStatus,
     ServiceAccount, ServiceAccountCreateResponse, ServiceActionResult, SiteRemoveSpec,
     SiteReplicationInfo, SiteReplicationPeer, SiteReplicationResyncOperation,
@@ -3452,6 +3453,26 @@ impl AdminApi for AdminClient {
             self.request_no_response(Method::DELETE, &path, None, None)
                 .await
         }
+    }
+
+    async fn run_manual_transition(
+        &self,
+        request: ManualTransitionRunRequest,
+    ) -> Result<ManualTransitionRunResponse> {
+        let dry_run = if request.dry_run { "true" } else { "false" };
+        let max_objects = request.max_objects.to_string();
+        let mut query = vec![
+            ("bucket", request.bucket.as_str()),
+            ("prefix", request.prefix.as_str()),
+            ("dryRun", dry_run),
+            ("maxObjects", max_objects.as_str()),
+        ];
+        if let Some(tier) = request.tier.as_deref() {
+            query.push(("tier", tier));
+        }
+
+        self.request(Method::POST, "/ilm/transition/run", Some(&query), None)
+            .await
     }
 
     // ==================== Replication Target Operations ====================

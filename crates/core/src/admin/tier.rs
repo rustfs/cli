@@ -287,6 +287,50 @@ pub struct TierCreds {
     pub secret_key: String,
 }
 
+/// Request for a bounded manual lifecycle transition run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManualTransitionRunRequest {
+    pub bucket: String,
+    pub prefix: String,
+    pub tier: Option<String>,
+    pub dry_run: bool,
+    pub max_objects: u64,
+}
+
+/// Response returned by the manual lifecycle transition endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManualTransitionRunResponse {
+    pub state: String,
+    pub mode: String,
+    pub job_id: Option<String>,
+    pub status_endpoint: Option<String>,
+    pub report: ManualTransitionRunReport,
+}
+
+/// Aggregate report for a manual lifecycle transition run.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManualTransitionRunReport {
+    pub bucket: String,
+    pub prefix: String,
+    pub tier: Option<String>,
+    pub dry_run: bool,
+    pub lifecycle_config_found: bool,
+    pub scanned: u64,
+    pub eligible: u64,
+    pub enqueued: u64,
+    pub dry_run_eligible: u64,
+    pub skipped_not_transition: u64,
+    pub skipped_tier: u64,
+    pub skipped_delete_marker: u64,
+    pub skipped_directory: u64,
+    pub skipped_replication: u64,
+    pub skipped_already_in_flight: u64,
+    pub skipped_queue_full: u64,
+    pub skipped_queue_closed: u64,
+    pub skipped_queue_timeout: u64,
+    pub truncated_by_limit: bool,
+}
+
 // ==================== Per-type sub-configs ====================
 // These match the RustFS backend JSON format exactly.
 

@@ -74,8 +74,9 @@ pub use site::{
     SiteReplicationResyncStatus, SiteStatusOptions, validate_site_replication_ca_bundle,
 };
 pub use tier::{
-    TierAliyun, TierAzure, TierConfig, TierCreds, TierGCS, TierHuaweicloud, TierMinIO, TierR2,
-    TierRustFS, TierS3, TierTencent, TierType,
+    ManualTransitionRunReport, ManualTransitionRunRequest, ManualTransitionRunResponse, TierAliyun,
+    TierAzure, TierConfig, TierCreds, TierGCS, TierHuaweicloud, TierMinIO, TierR2, TierRustFS,
+    TierS3, TierTencent, TierType,
 };
 pub use types::{
     AccessKeyDetails, AccessKeyInfo, BucketQuota, CreateServiceAccountRequest, Group, GroupStatus,
@@ -266,6 +267,12 @@ pub trait AdminApi: Send + Sync {
 
     /// Remove a storage tier
     async fn remove_tier(&self, name: &str, force: bool) -> Result<()>;
+
+    /// Run bounded manual lifecycle transition evaluation for a bucket scope.
+    async fn run_manual_transition(
+        &self,
+        request: ManualTransitionRunRequest,
+    ) -> Result<ManualTransitionRunResponse>;
 
     // ==================== Replication Target Operations ====================
 

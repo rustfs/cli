@@ -11,6 +11,7 @@ mod diagnostics;
 mod expand;
 mod group;
 mod heal;
+mod ilm;
 mod info;
 mod kms;
 mod metrics;
@@ -56,6 +57,10 @@ pub enum AdminCommands {
     /// Inspect scanner health and freshness
     #[command(subcommand)]
     Scanner(scanner::ScannerCommands),
+
+    /// Manage lifecycle transition operations
+    #[command(subcommand)]
+    Ilm(ilm::IlmCommands),
 
     /// Display cluster information (servers, disks, usage)
     #[command(subcommand)]
@@ -121,6 +126,7 @@ pub async fn execute(cmd: AdminCommands, output_config: OutputConfig) -> ExitCod
         AdminCommands::Metrics(args) => metrics::execute(args, &formatter).await,
         AdminCommands::Kms(kms_cmd) => kms::execute(kms_cmd, &formatter).await,
         AdminCommands::Scanner(scanner_cmd) => scanner::execute(scanner_cmd, &formatter).await,
+        AdminCommands::Ilm(ilm_cmd) => ilm::execute(ilm_cmd, &formatter).await,
         AdminCommands::Info(info_cmd) => info::execute(info_cmd, &formatter).await,
         AdminCommands::Heal(heal_cmd) => heal::execute(heal_cmd, &formatter).await,
         AdminCommands::Pool(pool_cmd) => pool::execute(pool_cmd, &formatter).await,
@@ -300,6 +306,39 @@ mod tests {
                 assert!(args.refresh);
             }
             _ => panic!("Unexpected command parsing result"),
+        }
+    }
+
+    #[test]
+    fn test_parse_admin_ilm_transition_run() {
+        let cli = TestCli::parse_from([
+            "rc",
+            "ilm",
+            "transition",
+            "run",
+            "local",
+            "photos",
+            "--prefix",
+            "logs/",
+            "--tier",
+            "COLDTIER",
+            "--dry-run",
+            "--max-objects",
+            "25",
+        ]);
+
+        match cli.command {
+            AdminCommands::Ilm(ilm::IlmCommands::Transition(ilm::TransitionCommands::Run(
+                args,
+            ))) => {
+                assert_eq!(args.alias, "local");
+                assert_eq!(args.bucket, "photos");
+                assert_eq!(args.prefix, "logs/");
+                assert_eq!(args.tier.as_deref(), Some("COLDTIER"));
+                assert!(args.dry_run);
+                assert_eq!(args.max_objects, 25);
+            }
+            _ => panic!("Unexpected ILM transition run command"),
         }
     }
 
