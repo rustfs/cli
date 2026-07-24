@@ -633,7 +633,76 @@
       "properties": {
         "summary": { "$ref": "#/definitions/storageSummary" },
         "backend": { "type": "object" },
-        "disks": { "type": "array", "items": { "type": "object" } }
+        "disks": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/storageInfoDisk" }
+        }
+      }
+    },
+    "storageInfoDisk": {
+      "type": "object",
+      "required": [
+        "endpoint", "path", "state", "runtime_state", "total_space",
+        "used_space", "available_space", "healing", "scanning", "pool_index",
+        "set_index", "disk_index", "offline_duration_seconds"
+      ],
+      "properties": {
+        "endpoint": { "type": "string" },
+        "path": { "type": "string" },
+        "state": { "type": "string" },
+        "runtime_state": { "$ref": "#/definitions/nullableString" },
+        "total_space": { "type": "integer", "minimum": 0 },
+        "used_space": { "type": "integer", "minimum": 0 },
+        "available_space": { "type": "integer", "minimum": 0 },
+        "healing": { "type": "boolean" },
+        "scanning": { "type": "boolean" },
+        "pool_index": { "type": "integer" },
+        "set_index": { "type": "integer" },
+        "disk_index": { "type": "integer" },
+        "offline_duration_seconds": { "type": ["integer", "null"], "minimum": 0 },
+        "observations": { "$ref": "#/definitions/storageDiskObservations" }
+      }
+    },
+    "storageDiskObservations": {
+      "type": "object",
+      "required": [
+        "source", "mode", "read_throughput", "write_throughput",
+        "read_latency", "write_latency", "utilization", "operation_counters"
+      ],
+      "properties": {
+        "source": { "const": "storage_info" },
+        "mode": { "const": "observed" },
+        "read_throughput": { "type": ["number", "null"] },
+        "write_throughput": { "type": ["number", "null"] },
+        "read_latency": { "type": ["number", "null"] },
+        "write_latency": { "type": ["number", "null"] },
+        "utilization": { "type": ["number", "null"] },
+        "operation_counters": {
+          "oneOf": [
+            { "$ref": "#/definitions/storageDiskOperationCounters" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "storageDiskOperationCounters": {
+      "type": "object",
+      "required": [
+        "last_minute", "api_calls", "total_waiting",
+        "total_errors_availability", "total_errors_timeout",
+        "total_writes", "total_deletes"
+      ],
+      "properties": {
+        "last_minute": { "type": "object" },
+        "api_calls": {
+          "type": "object",
+          "additionalProperties": { "type": "integer", "minimum": 0 }
+        },
+        "total_waiting": { "type": "integer", "minimum": 0 },
+        "total_errors_availability": { "type": "integer", "minimum": 0 },
+        "total_errors_timeout": { "type": "integer", "minimum": 0 },
+        "total_writes": { "type": "integer", "minimum": 0 },
+        "total_deletes": { "type": "integer", "minimum": 0 }
       }
     },
     "kmsCacheSummary": {

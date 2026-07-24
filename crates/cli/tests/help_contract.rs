@@ -640,7 +640,7 @@ fn nested_subcommand_help_contract() {
         HelpCase {
             args: &["admin", "info", "storage"],
             usage: "Usage: rc admin info storage [OPTIONS] <ALIAS>",
-            expected_tokens: &[],
+            expected_tokens: &["--metrics"],
         },
         HelpCase {
             args: &["admin", "scanner"],

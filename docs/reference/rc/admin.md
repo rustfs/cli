@@ -97,6 +97,7 @@ Inspect scanner health and storage topology:
 ```bash
 rc admin scanner status local
 rc admin info storage local
+rc admin info storage local --metrics
 ```
 
 Collect two scanner and disk metric snapshots:
@@ -230,7 +231,7 @@ The read-only observability commands target RustFS Admin API v3 routes introduce
 | Command | Description |
 | --- | --- |
 | `rc admin scanner status <ALIAS>` | Classify scanner state as `healthy`, `stale`, `empty`, `partial`, or `disabled` and retain current server diagnostic fields. |
-| `rc admin info storage <ALIAS>` | Show backend topology, disk health, and aggregate capacity. |
+| `rc admin info storage <ALIAS> [--metrics]` | Show backend topology, disk health, and aggregate capacity; optionally include observed drive telemetry. |
 | `rc admin metrics <ALIAS> [OPTIONS]` | Stream bounded realtime metric snapshots. |
 
 `admin metrics` accepts these query and output options:
@@ -246,6 +247,13 @@ The read-only observability commands target RustFS Admin API v3 routes introduce
 | `--metrics-format normalized\|raw` | Emit v3 normalized JSON Lines or bounded raw server JSON records. |
 
 Normalized metrics always use one compact v3 JSON object per line, including numeric samples, labels, per-sample timestamps, errors, partial/final markers, and the retained raw snapshot. Raw mode intentionally omits the v3 wrapper. The client rejects responses above 16 MiB, individual records above 1 MiB, and records beyond the requested sample count.
+
+`admin info storage --metrics` reads only `/rustfs/admin/v3/storageinfo` after
+confirming the `admin.diagnostics.drive-observations` capability. It reports
+server-observed throughput, latency, utilization, and operation counters; it
+does not run `/v3/speedtest/drive` and must not be interpreted as a benchmark.
+Missing observations are shown as `unavailable` in human output and `null` in
+JSON rather than being fabricated as zero.
 
 Permission failures return the authentication exit code. A missing observability route returns `unsupported_feature`, allowing automation to distinguish an older RustFS server from missing credentials. Malformed and oversized responses fail without emitting partial normalized records.
 

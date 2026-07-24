@@ -463,15 +463,15 @@ pub struct StorageDisk {
     #[serde(rename = "availspace", default)]
     pub available_space: u64,
     #[serde(rename = "readthroughput", default)]
-    pub read_throughput: f64,
+    pub read_throughput: Option<f64>,
     #[serde(rename = "writethroughput", default)]
-    pub write_throughput: f64,
+    pub write_throughput: Option<f64>,
     #[serde(rename = "readlatency", default)]
-    pub read_latency: f64,
+    pub read_latency: Option<f64>,
     #[serde(rename = "writelatency", default)]
-    pub write_latency: f64,
+    pub write_latency: Option<f64>,
     #[serde(default)]
-    pub utilization: f64,
+    pub utilization: Option<f64>,
     #[serde(default)]
     pub metrics: Option<StorageDiskMetrics>,
     #[serde(default)]
@@ -718,6 +718,31 @@ mod tests {
         assert_eq!(info.disks[0].used_space, 40);
         assert_eq!(info.backend.kind, StorageBackendKind::Erasure);
         assert_eq!(info.backend.online_disks.values().sum::<usize>(), 1);
+    }
+
+    #[test]
+    fn storage_info_preserves_missing_observations_as_unavailable() {
+        let info: StorageInfo = serde_json::from_str(
+            r#"{
+                "disks":[{
+                    "endpoint":"http://node1:9000",
+                    "path":"/data1",
+                    "state":"online",
+                    "totalspace":100,
+                    "usedspace":40,
+                    "availspace":60
+                }],
+                "backend":{"BackendType":"Erasure"}
+            }"#,
+        )
+        .expect("storage info should deserialize");
+
+        assert!(info.disks[0].read_throughput.is_none());
+        assert!(info.disks[0].write_throughput.is_none());
+        assert!(info.disks[0].read_latency.is_none());
+        assert!(info.disks[0].write_latency.is_none());
+        assert!(info.disks[0].utilization.is_none());
+        assert!(info.disks[0].metrics.is_none());
     }
 
     fn scanner_fixture(

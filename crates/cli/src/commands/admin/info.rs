@@ -9,9 +9,10 @@ use std::collections::BTreeSet;
 use super::{emit_observability_error, get_admin_client};
 use crate::exit_code::ExitCode;
 use crate::output::Formatter;
+use rc_core::Error;
 use rc_core::admin::{
-    AdminApi, ClusterInfo, DiskInfo, ObservabilityApi, ServerInfo, StorageBackend, StorageDisk,
-    StorageInfo,
+    AdminApi, CapabilityApi, CapabilityAvailability, ClusterInfo, DiagnosticCapability, DiskInfo,
+    ObservabilityApi, ServerInfo, StorageBackend, StorageDisk, StorageDiskMetrics, StorageInfo,
 };
 
 /// Info subcommands
@@ -64,6 +65,10 @@ pub struct DiskArgs {
 pub struct StorageArgs {
     /// Alias name of the server
     pub alias: String,
+
+    /// Include observed drive metrics from storage information
+    #[arg(long)]
+    pub metrics: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -115,6 +120,20 @@ struct StorageDiskOutput<'a> {
     set_index: i32,
     disk_index: i32,
     offline_duration_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observations: Option<StorageDiskObservations<'a>>,
+}
+
+#[derive(Debug, Serialize)]
+struct StorageDiskObservations<'a> {
+    source: &'static str,
+    mode: &'static str,
+    read_throughput: Option<f64>,
+    write_throughput: Option<f64>,
+    read_latency: Option<f64>,
+    write_latency: Option<f64>,
+    utilization: Option<f64>,
+    operation_counters: Option<&'a StorageDiskMetrics>,
 }
 
 /// JSON output for cluster info
@@ -228,12 +247,42 @@ async fn execute_storage(args: StorageArgs, formatter: &Formatter) -> ExitCode {
         Err(code) => return code,
     };
 
+    if args.metrics {
+        let report = match client.discover_capabilities(false).await {
+            Ok(report) => report,
+            Err(error) => {
+                return emit_observability_error(
+                    "storage_info",
+                    DiagnosticCapability::DriveObservations.name(),
+                    "Failed to discover storage metric capabilities",
+                    &error,
+                    formatter,
+                );
+            }
+        };
+        if let Err(error) =
+            report.require_diagnostic_capability(DiagnosticCapability::DriveObservations)
+        {
+            let error = match error.availability() {
+                CapabilityAvailability::PermissionDenied => Error::Auth(error.to_string()),
+                _ => Error::UnsupportedFeature(error.to_string()),
+            };
+            return emit_observability_error(
+                "storage_info",
+                DiagnosticCapability::DriveObservations.name(),
+                "Observed storage metrics are unavailable",
+                &error,
+                formatter,
+            );
+        }
+    }
+
     match client.storage_info().await {
         Ok(info) => {
             if formatter.is_json() {
-                formatter.json(&storage_success_output(&info));
+                formatter.json(&storage_success_output(&info, args.metrics));
             } else {
-                print_storage_info(&info, formatter);
+                print_storage_info(&info, args.metrics, formatter);
             }
             ExitCode::Success
         }
@@ -247,7 +296,7 @@ async fn execute_storage(args: StorageArgs, formatter: &Formatter) -> ExitCode {
     }
 }
 
-fn storage_success_output(info: &StorageInfo) -> StorageSuccessOutput<'_> {
+fn storage_success_output(info: &StorageInfo, include_metrics: bool) -> StorageSuccessOutput<'_> {
     let online_disks = info.online_disks();
     let total_capacity = info.total_capacity();
     let used_capacity = info.used_capacity();
@@ -266,7 +315,11 @@ fn storage_success_output(info: &StorageInfo) -> StorageSuccessOutput<'_> {
                 available_capacity_bytes: total_capacity.saturating_sub(used_capacity),
             },
             backend: storage_backend_output(&info.backend),
-            disks: info.disks.iter().map(storage_disk_output).collect(),
+            disks: info
+                .disks
+                .iter()
+                .map(|disk| storage_disk_output(disk, include_metrics))
+                .collect(),
         },
     }
 }
@@ -279,7 +332,7 @@ fn storage_backend_output(backend: &StorageBackend) -> StorageBackendOutput<'_> 
     }
 }
 
-fn storage_disk_output(disk: &StorageDisk) -> StorageDiskOutput<'_> {
+fn storage_disk_output(disk: &StorageDisk, include_metrics: bool) -> StorageDiskOutput<'_> {
     StorageDiskOutput {
         endpoint: &disk.endpoint,
         path: &disk.drive_path,
@@ -294,10 +347,20 @@ fn storage_disk_output(disk: &StorageDisk) -> StorageDiskOutput<'_> {
         set_index: disk.set_index,
         disk_index: disk.disk_index,
         offline_duration_seconds: disk.offline_duration_seconds,
+        observations: include_metrics.then_some(StorageDiskObservations {
+            source: "storage_info",
+            mode: "observed",
+            read_throughput: disk.read_throughput,
+            write_throughput: disk.write_throughput,
+            read_latency: disk.read_latency,
+            write_latency: disk.write_latency,
+            utilization: disk.utilization,
+            operation_counters: disk.metrics.as_ref(),
+        }),
     }
 }
 
-fn print_storage_info(info: &StorageInfo, formatter: &Formatter) {
+fn print_storage_info(info: &StorageInfo, include_metrics: bool, formatter: &Formatter) {
     let online = info.online_disks();
     let offline = info.disks.len().saturating_sub(online);
     formatter.println(&formatter.style_name("Storage Information"));
@@ -329,6 +392,50 @@ fn print_storage_info(info: &StorageInfo, formatter: &Formatter) {
             ));
         }
     }
+    if include_metrics {
+        formatter.println("");
+        formatter.println("Observed storage metrics (server-reported; not a benchmark)");
+        for disk in &info.disks {
+            formatter.println(&format!(
+                "{} {}",
+                formatter.sanitize_text(&disk.endpoint),
+                formatter.sanitize_text(&disk.drive_path)
+            ));
+            formatter.println(&format!(
+                "  read_throughput={} write_throughput={} read_latency={} write_latency={} utilization={}",
+                observed_value(disk.read_throughput),
+                observed_value(disk.write_throughput),
+                observed_value(disk.read_latency),
+                observed_value(disk.write_latency),
+                observed_value(disk.utilization),
+            ));
+            if let Some(metrics) = &disk.metrics {
+                formatter.println(&format!(
+                    "  waiting={} availability_errors={} timeout_errors={} writes={} deletes={}",
+                    metrics.total_waiting,
+                    metrics.total_errors_availability,
+                    metrics.total_errors_timeout,
+                    metrics.total_writes,
+                    metrics.total_deletes,
+                ));
+                if !metrics.api_calls.is_empty() {
+                    let api_calls = metrics
+                        .api_calls
+                        .iter()
+                        .map(|(name, count)| format!("{}={count}", formatter.sanitize_text(name)))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    formatter.println(&format!("  api_calls: {api_calls}"));
+                }
+            } else {
+                formatter.println("  operation_counters=unavailable");
+            }
+        }
+    }
+}
+
+fn observed_value(value: Option<f64>) -> String {
+    value.map_or_else(|| "unavailable".to_string(), |value| value.to_string())
 }
 
 async fn execute_cluster(args: ClusterArgs, formatter: &Formatter) -> ExitCode {
