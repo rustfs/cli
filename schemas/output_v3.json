@@ -42,7 +42,8 @@
         "health_snapshot",
         "cluster_snapshot",
         "extension_catalog",
-        "oidc"
+        "oidc",
+        "iam_policy_entities"
       ]
     },
     "pagination": {
@@ -970,6 +971,66 @@
         }
       }
     },
+    "iamGroupPolicyMapping": {
+      "type": "object",
+      "required": ["group", "policies"],
+      "properties": {
+        "group": { "type": "string", "minLength": 1 },
+        "policies": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "iamUserPolicyMapping": {
+      "type": "object",
+      "required": ["user", "policies", "member_of_mappings"],
+      "properties": {
+        "user": { "type": "string", "minLength": 1 },
+        "policies": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "member_of_mappings": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/iamGroupPolicyMapping" }
+        }
+      }
+    },
+    "iamPolicyEntityMapping": {
+      "type": "object",
+      "required": ["policy", "users", "groups"],
+      "properties": {
+        "policy": { "type": "string", "minLength": 1 },
+        "users": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "groups": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "iamPolicyEntitiesData": {
+      "type": "object",
+      "required": ["timestamp", "user_mappings", "group_mappings", "policy_mappings"],
+      "properties": {
+        "timestamp": { "$ref": "#/definitions/timestamp" },
+        "user_mappings": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/iamUserPolicyMapping" }
+        },
+        "group_mappings": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/iamGroupPolicyMapping" }
+        },
+        "policy_mappings": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/iamPolicyEntityMapping" }
+        }
+      }
+    },
     "replicationDiffEntry": {
       "type": "object",
       "required": [
@@ -1245,6 +1306,17 @@
           "properties": {
             "type": { "const": "capabilities" },
             "data": { "$ref": "#/definitions/capabilitiesData" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/definitions/successEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "iam_policy_entities" },
+            "data": { "$ref": "#/definitions/iamPolicyEntitiesData" }
           }
         }
       ]

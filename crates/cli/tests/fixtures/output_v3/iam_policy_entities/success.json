@@ -1,0 +1,33 @@
+{
+  "schema_version": 3,
+  "type": "iam_policy_entities",
+  "status": "success",
+  "data": {
+    "timestamp": "2026-07-24T08:00:00Z",
+    "user_mappings": [
+      {
+        "user": "alice",
+        "policies": ["readonly"],
+        "member_of_mappings": [
+          {
+            "group": "ops",
+            "policies": ["diagnostics"]
+          }
+        ]
+      }
+    ],
+    "group_mappings": [
+      {
+        "group": "ops",
+        "policies": ["diagnostics"]
+      }
+    ],
+    "policy_mappings": [
+      {
+        "policy": "readonly",
+        "users": ["alice"],
+        "groups": []
+      }
+    ]
+  }
+}

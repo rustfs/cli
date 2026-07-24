@@ -1,0 +1,11 @@
+{
+  "schema_version": 3,
+  "type": "iam_policy_entities",
+  "status": "error",
+  "error": {
+    "type": "auth_error",
+    "message": "Failed to inspect IAM policy entities: permission denied",
+    "retryable": false,
+    "suggestion": "Verify credentials and the required RustFS admin permissions."
+  }
+}

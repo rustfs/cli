@@ -1,0 +1,11 @@
+{
+  "schema_version": 3,
+  "type": "iam_policy_entities",
+  "status": "success",
+  "data": {
+    "timestamp": "2026-07-24T08:00:00Z",
+    "user_mappings": [],
+    "group_mappings": [],
+    "policy_mappings": []
+  }
+}

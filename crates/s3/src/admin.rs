@@ -20,22 +20,23 @@ use rc_core::admin::{
     ConfigMutationResult, CreateServiceAccountRequest, DecommissionPoolStatus, DecommissionStatus,
     DetailedHealthSnapshot, DiagnosticCapability, DiagnosticReadApi, ExtensionsCatalog, Group,
     GroupStatus, HealRuntimeState, HealScanMode, HealStartRequest, HealStatus, HealTaskRequest,
-    KmsApi, KmsBackendKind, KmsCacheSummary, KmsCancelKeyDeletionResult, KmsConfigSummary,
-    KmsConfigureRequest, KmsCreateKeyRequest, KmsCreateKeyResult, KmsDeleteKeyRequest,
-    KmsDeleteKeyResult, KmsKey, KmsKeyPage, KmsKeyState, KmsKeyUsage, KmsServiceState, KmsStatus,
-    MAX_DIAGNOSTIC_RESPONSE_BYTES, MAX_METRICS_LINE_BYTES, MAX_METRICS_RESPONSE_BYTES,
+    IAM_POLICY_ENTITIES_CAPABILITY, IamReadApi, KmsApi, KmsBackendKind, KmsCacheSummary,
+    KmsCancelKeyDeletionResult, KmsConfigSummary, KmsConfigureRequest, KmsCreateKeyRequest,
+    KmsCreateKeyResult, KmsDeleteKeyRequest, KmsDeleteKeyResult, KmsKey, KmsKeyPage, KmsKeyState,
+    KmsKeyUsage, KmsServiceState, KmsStatus, MAX_DIAGNOSTIC_RESPONSE_BYTES,
+    MAX_IAM_POLICY_ENTITIES_RESPONSE_BYTES, MAX_METRICS_LINE_BYTES, MAX_METRICS_RESPONSE_BYTES,
     MAX_METRICS_SAMPLES, MAX_OIDC_RESPONSE_BYTES, MAX_REPLICATION_DIFF_RESPONSE_BYTES,
     MAX_SITE_REPLICATION_ERROR_RESPONSE_BYTES, MAX_SITE_REPLICATION_REQUEST_BYTES,
     MAX_SITE_REPLICATION_SUCCESS_RESPONSE_BYTES, ManualTransitionRunRequest,
     ManualTransitionRunResponse, MetricsBatch, MetricsQuery, ModuleSwitches, ObservabilityApi,
     OidcProvider, OidcProviderList, OidcReadApi, OidcValidationRequest, OidcValidationResult,
-    PeerSiteSpec, Policy, PolicyEntity, PolicyInfo, PoolStatus, PoolTarget, RealtimeMetrics,
-    RebalanceStartResult, RebalanceStatus, ReplicateEditStatus, ReplicationDiff,
-    ReplicationDiffApi, RuntimeCapabilitiesSnapshot, RuntimeCapabilityStatus, ScannerStatus,
-    ServiceAccount, ServiceAccountCreateResponse, ServiceActionResult, SiteRemoveSpec,
-    SiteReplicationInfo, SiteReplicationPeer, SiteReplicationResyncOperation,
-    SiteReplicationResyncStatus, SiteStatusOptions, StorageInfo, UpdateGroupMembersRequest,
-    UpdateServiceAccountRequest, User, UserStatus,
+    PeerSiteSpec, Policy, PolicyEntitiesQuery, PolicyEntitiesResult, PolicyEntity, PolicyInfo,
+    PoolStatus, PoolTarget, RealtimeMetrics, RebalanceStartResult, RebalanceStatus,
+    ReplicateEditStatus, ReplicationDiff, ReplicationDiffApi, RuntimeCapabilitiesSnapshot,
+    RuntimeCapabilityStatus, ScannerStatus, ServiceAccount, ServiceAccountCreateResponse,
+    ServiceActionResult, SiteRemoveSpec, SiteReplicationInfo, SiteReplicationPeer,
+    SiteReplicationResyncOperation, SiteReplicationResyncStatus, SiteStatusOptions, StorageInfo,
+    UpdateGroupMembersRequest, UpdateServiceAccountRequest, User, UserStatus,
 };
 use rc_core::{Alias, Error, Result};
 use reqwest::header::{CONTENT_TYPE, HOST, HeaderMap, HeaderName, HeaderValue};
@@ -48,6 +49,12 @@ use std::time::{Duration, SystemTime};
 use zeroize::{Zeroize, Zeroizing};
 
 struct SensitiveRequestBody(Zeroizing<Vec<u8>>);
+
+struct BoundedJsonResponse {
+    max_bytes: usize,
+    name: &'static str,
+    error_mapper: fn(&AdminClient, StatusCode, &str) -> Error,
+}
 
 impl AsRef<[u8]> for SensitiveRequestBody {
     fn as_ref(&self) -> &[u8] {
@@ -542,8 +549,7 @@ impl AdminClient {
         path: &str,
         query: Option<&[(&str, &str)]>,
         body: Option<&[u8]>,
-        max_response_bytes: usize,
-        response_name: &str,
+        response: BoundedJsonResponse,
     ) -> Result<T> {
         let mut url = self.admin_url(path);
         if let Some(query) = query {
@@ -577,17 +583,19 @@ impl AdminClient {
             request_builder = request_builder.body(body_bytes.to_vec());
         }
 
-        let response = request_builder
+        let http_response = request_builder
             .send()
             .await
             .map_err(|error| Error::Network(format!("Request failed: {error}")))?;
-        let status = response.status();
+        let status = http_response.status();
         let response_body =
-            read_bounded_response_body(response, max_response_bytes, response_name).await?;
+            read_bounded_response_body(http_response, response.max_bytes, response.name).await?;
         if !status.is_success() {
-            return Err(
-                self.map_replication_diff_error(status, &String::from_utf8_lossy(&response_body))
-            );
+            return Err((response.error_mapper)(
+                self,
+                status,
+                &String::from_utf8_lossy(&response_body),
+            ));
         }
 
         serde_json::from_slice(&response_body).map_err(Error::Json)
@@ -969,6 +977,26 @@ impl AdminClient {
             .filter(|message| !message.trim().is_empty())
             .unwrap_or_else(|| "the replication diff route was not found".to_string());
         Error::UnsupportedFeature(reason)
+    }
+
+    fn map_iam_policy_entities_error(&self, status: StatusCode, _body: &str) -> Error {
+        match status {
+            StatusCode::NOT_FOUND
+            | StatusCode::METHOD_NOT_ALLOWED
+            | StatusCode::NOT_IMPLEMENTED => Error::UnsupportedFeature(
+                "IAM policy-entity inspection is not supported by this RustFS server".to_string(),
+            ),
+            StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED => {
+                Error::Auth("Permission denied for IAM policy-entity inspection".to_string())
+            }
+            StatusCode::BAD_REQUEST => {
+                Error::InvalidPath("RustFS rejected the IAM policy-entity query".to_string())
+            }
+            _ => Error::Network(format!(
+                "IAM policy-entity inspection failed with HTTP {}",
+                status.as_u16()
+            )),
+        }
     }
 }
 
@@ -1833,6 +1861,11 @@ fn add_known_server_capabilities(version: Option<&str>, capabilities: &mut Vec<C
         availability: CapabilityAvailability::Available,
         reason: None,
     });
+    capabilities.push(CapabilityEntry {
+        name: IAM_POLICY_ENTITIES_CAPABILITY.to_string(),
+        availability: CapabilityAvailability::Available,
+        reason: None,
+    });
 
     for (name, reason) in [
         (
@@ -2682,6 +2715,40 @@ impl OidcReadApi for AdminClient {
             Error::General("RustFS returned an invalid OIDC validation response".to_string())
         })?;
         Ok(response)
+    }
+}
+
+#[async_trait]
+impl IamReadApi for AdminClient {
+    async fn policy_entities(&self, query: &PolicyEntitiesQuery) -> Result<PolicyEntitiesResult> {
+        query.validate()?;
+
+        let mut parameters =
+            Vec::with_capacity(query.users.len() + query.groups.len() + query.policies.len());
+        parameters.extend(query.users.iter().map(|value| ("user", value.as_str())));
+        parameters.extend(query.groups.iter().map(|value| ("group", value.as_str())));
+        parameters.extend(
+            query
+                .policies
+                .iter()
+                .map(|value| ("policy", value.as_str())),
+        );
+        let query = (!parameters.is_empty()).then_some(parameters.as_slice());
+
+        let result: PolicyEntitiesResult = self
+            .request_bounded_json(
+                Method::GET,
+                "/idp/builtin/policy-entities",
+                query,
+                None,
+                BoundedJsonResponse {
+                    max_bytes: MAX_IAM_POLICY_ENTITIES_RESPONSE_BYTES,
+                    name: "IAM policy-entity response",
+                    error_mapper: Self::map_iam_policy_entities_error,
+                },
+            )
+            .await?;
+        result.normalize()
     }
 }
 
@@ -3769,8 +3836,11 @@ impl ReplicationDiffApi for AdminClient {
             "/replication/diff",
             Some(&query),
             None,
-            MAX_REPLICATION_DIFF_RESPONSE_BYTES,
-            "Replication diff response",
+            BoundedJsonResponse {
+                max_bytes: MAX_REPLICATION_DIFF_RESPONSE_BYTES,
+                name: "Replication diff response",
+                error_mapper: Self::map_replication_diff_error,
+            },
         )
         .await
     }
@@ -4184,6 +4254,10 @@ mod tests {
         assert_eq!(report.server_version.as_deref(), Some("1.0.0-beta.10"));
         assert_eq!(report.extensions.len(), 1);
         assert!(report.cluster.summary.is_some());
+        assert!(report.capabilities.iter().any(|capability| {
+            capability.name == IAM_POLICY_ENTITIES_CAPABILITY
+                && capability.availability == CapabilityAvailability::Available
+        }));
         assert!(report.capabilities.iter().any(|capability| {
             capability.name == "runtime.userspace-profiling"
                 && capability.availability == CapabilityAvailability::Disabled
@@ -5043,6 +5117,104 @@ mod tests {
             let error = client.map_error(StatusCode::BAD_REQUEST, body);
             assert!(matches!(error, Error::Auth(_)));
         }
+    }
+
+    #[tokio::test]
+    async fn iam_policy_entities_uses_repeated_typed_filters_and_drops_unknown_secrets() {
+        let response = r#"{
+            "timestamp":"2026-07-24T08:00:00Z",
+            "userMappings":[{
+                "user":"alice",
+                "policies":["readonly"],
+                "memberOfMappings":[{"group":"ops","policies":["diagnostics"]}],
+                "secretKey":"server-secret"
+            }],
+            "groupMappings":[{"group":"ops","policies":["diagnostics"]}],
+            "policyMappings":[{"policy":"readonly","users":["alice"],"groups":[]}],
+            "sessionToken":"server-token"
+        }"#;
+        let (endpoint, receiver, handle) = start_admin_test_server("200 OK", response);
+        let client = admin_client_for_endpoint(&endpoint);
+        let result = client
+            .policy_entities(&PolicyEntitiesQuery {
+                users: vec!["alice@example.com".to_string(), "bob".to_string()],
+                groups: vec!["ops/team".to_string()],
+                policies: vec!["read only".to_string()],
+            })
+            .await
+            .expect("policy entities request");
+
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(request.method, "GET");
+        assert_eq!(
+            request.target,
+            "/rustfs/admin/v3/idp/builtin/policy-entities?user=alice%40example.com&user=bob&group=ops%2Fteam&policy=read%20only"
+        );
+        assert!(request.body.is_empty());
+        assert_eq!(result.user_mappings[0].user, "alice");
+        let encoded = serde_json::to_string(&result).expect("serialize typed result");
+        assert!(!encoded.contains("server-secret"));
+        assert!(!encoded.contains("server-token"));
+        handle.join().expect("join policy entities server");
+    }
+
+    #[tokio::test]
+    async fn iam_policy_entities_maps_route_absence_and_permission_without_echoing_body() {
+        for (status, body, expected) in [
+            (
+                "404 Not Found",
+                r#"{"Code":"NoSuchRoute","Message":"access secret leaked"}"#,
+                "unsupported",
+            ),
+            (
+                "405 Method Not Allowed",
+                "access secret leaked",
+                "unsupported",
+            ),
+            ("501 Not Implemented", "access secret leaked", "unsupported"),
+            ("403 Forbidden", "access secret leaked", "auth"),
+        ] {
+            let (endpoint, _receiver, handle) = start_admin_test_server(status, body);
+            let client = admin_client_for_endpoint(&endpoint);
+            let error = client
+                .policy_entities(&PolicyEntitiesQuery::default())
+                .await
+                .expect_err("request must fail");
+
+            match expected {
+                "unsupported" => assert!(matches!(error, Error::UnsupportedFeature(_))),
+                "auth" => assert!(matches!(error, Error::Auth(_))),
+                _ => unreachable!(),
+            }
+            assert!(!error.to_string().contains("access secret leaked"));
+            handle.join().expect("join policy entities error server");
+        }
+    }
+
+    #[tokio::test]
+    async fn iam_policy_entities_rejects_malformed_and_oversized_responses() {
+        let (endpoint, _receiver, handle) = start_admin_test_server("200 OK", "{");
+        let client = admin_client_for_endpoint(&endpoint);
+        let malformed = client
+            .policy_entities(&PolicyEntitiesQuery::default())
+            .await
+            .expect_err("malformed JSON must fail");
+        assert!(matches!(malformed, Error::Json(_)));
+        handle.join().expect("join malformed response server");
+
+        let (endpoint, _receiver, handle) = start_admin_declared_length_server(
+            "200 OK",
+            MAX_IAM_POLICY_ENTITIES_RESPONSE_BYTES + 1,
+        );
+        let client = admin_client_for_endpoint(&endpoint);
+        let oversized = client
+            .policy_entities(&PolicyEntitiesQuery::default())
+            .await
+            .expect_err("oversized response must fail");
+        assert!(
+            matches!(oversized, Error::General(message) if message.contains("IAM policy-entity response exceeded"))
+        );
+        handle.join().expect("join oversized response server");
     }
 
     #[test]

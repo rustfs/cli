@@ -395,7 +395,7 @@ For full command documentation, see the [`rc` command reference](docs/reference/
 | Command                 | Description                                                                           |
 |-------------------------|---------------------------------------------------------------------------------------|
 | `admin user`            | Manage IAM users (add, remove, list, info, enable, disable)                           |
-| `admin policy`          | Manage IAM policies (create, remove, list, info, attach)                              |
+| `admin policy`          | Manage IAM policies and inspect entity mappings (create, remove, list, info, attach, entities) |
 | `admin group`           | Manage IAM groups (add, remove, list, info, enable, disable, add-members, rm-members) |
 | `admin service-account` | Manage service accounts (create, update, remove, list, info)                          |
 | `admin access-key`      | Inspect access key identity and metadata (info)                                       |

@@ -7,6 +7,7 @@ mod capabilities;
 mod cluster;
 mod configuration;
 mod diagnostics;
+mod iam;
 mod kms;
 mod kms_diagnostic;
 mod observability;
@@ -45,6 +46,12 @@ pub use diagnostics::{
     HealthMemorySnapshot, HealthOsSnapshot, HealthProcessSnapshot,
     MAX_CLIENT_DEVNULL_AGGREGATE_BYTES, MAX_CLIENT_DEVNULL_CONCURRENCY, MAX_CLIENT_DEVNULL_TIMEOUT,
     MAX_DIAGNOSTIC_RESPONSE_BYTES,
+};
+pub use iam::{
+    GroupPolicyEntities, IAM_POLICY_ENTITIES_CAPABILITY, IamReadApi,
+    MAX_IAM_POLICY_ENTITIES_RESPONSE_BYTES, MAX_IAM_POLICY_ENTITY_SELECTOR_BYTES,
+    MAX_IAM_POLICY_ENTITY_SELECTORS, PolicyEntities, PolicyEntitiesQuery, PolicyEntitiesResult,
+    UserPolicyEntities,
 };
 pub use kms::{
     KmsApi, KmsBackendKind, KmsCacheSummary, KmsCancelKeyDeletionResult, KmsConfigSummary,

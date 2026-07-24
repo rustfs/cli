@@ -37,7 +37,8 @@ rc admin decommission <start|cancel|clear> <ALIAS> <POOL> [OPTIONS]
 rc admin decommission status <ALIAS> [POOL] [OPTIONS]
 rc admin rebalance <start|status|stop> <ALIAS>
 rc admin user <ls|add|info|rm|enable|disable> ...
-rc admin policy <ls|create|info|rm|attach> ...
+rc admin policy <ls|create|info|rm|attach|entities> ...
+rc admin policy entities <ALIAS> [--user USER]... [--group GROUP]... [--policy POLICY]...
 rc admin group <ls|add|info|rm|enable|disable|add-members|rm-members> ...
 rc admin service-account <ls|create|info|rm> ...
 rc admin service <restart|stop|freeze|unfreeze> <ALIAS>
@@ -190,6 +191,19 @@ rc admin user add local analyst STRONG_PASSWORD
 rc admin policy attach local readonly --user analyst
 ```
 
+Inspect policy-to-entity mappings:
+
+```bash
+# List every policy with its directly attached users and groups.
+rc admin policy entities local
+
+# Inspect direct and inherited policies for selected users and groups.
+rc admin policy entities local --user analyst --group operations
+
+# Find the users and groups attached to selected policies.
+rc --json admin policy entities local --policy readonly --policy diagnostics
+```
+
 Create a service account with a policy file:
 
 ```bash
@@ -260,6 +274,26 @@ Missing observations are shown as `unavailable` in human output and `null` in
 JSON rather than being fabricated as zero.
 
 Permission failures return the authentication exit code. A missing observability route returns `unsupported_feature`, allowing automation to distinguish an older RustFS server from missing credentials. Malformed and oversized responses fail without emitting partial normalized records.
+
+## IAM Policy-Entity Inspection
+
+`rc admin policy entities` is a read-only view of the native RustFS
+`/rustfs/admin/v3/idp/builtin/policy-entities` route. With no filters it returns
+policy-to-user/group mappings. Repeated `--user`, `--group`, and `--policy`
+filters are URL encoded independently, so names containing spaces, slashes, or
+identity-provider characters are not split or concatenated.
+
+Before sending the IAM request, the CLI requires capability discovery to
+advertise `admin.iam.policy-entities` as available. Missing, unknown, disabled,
+stubbed, and version-gated states fail closed with the
+`unsupported_feature` exit code. Permission denial remains an authentication
+error. Responses are limited to 8 MiB.
+
+JSON output uses schema v3 with the `iam_policy_entities` family. It includes
+only the server timestamp, user mappings, inherited group mappings, group
+mappings, and policy mappings. Unknown response fields are discarded, and
+secret keys, session tokens, credentials, and raw server error bodies are never
+included in output.
 
 ## KMS Key Lifecycle Workflow
 
