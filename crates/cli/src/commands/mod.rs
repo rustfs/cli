@@ -1233,11 +1233,62 @@ mod tests {
             Commands::Bucket(args) => match args.command {
                 bucket::BucketCommands::Remove(arg) => {
                     assert_eq!(arg.target, "local/my-bucket");
+                    assert!(!arg.force);
+                    assert!(!arg.dangerous);
+                    assert!(!arg.yes);
                 }
                 other => panic!("expected bucket remove command, got {:?}", other),
             },
             other => panic!("expected bucket command, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn cli_requires_complete_dangerous_bucket_remove_guards() {
+        let cli = Cli::try_parse_from([
+            "rc",
+            "bucket",
+            "remove",
+            "local/my-bucket",
+            "--force",
+            "--dangerous",
+            "--yes",
+        ])
+        .expect("parse guarded bucket remove");
+        match cli.command {
+            Commands::Bucket(args) => match args.command {
+                bucket::BucketCommands::Remove(arg) => {
+                    assert!(arg.force);
+                    assert!(arg.dangerous);
+                    assert!(arg.yes);
+                }
+                other => panic!("expected bucket remove command, got {other:?}"),
+            },
+            other => panic!("expected bucket command, got {other:?}"),
+        }
+
+        assert!(
+            Cli::try_parse_from([
+                "rc",
+                "bucket",
+                "remove",
+                "local/my-bucket",
+                "--dangerous",
+                "--yes",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "rc",
+                "bucket",
+                "remove",
+                "local/my-bucket",
+                "--force",
+                "--dangerous",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

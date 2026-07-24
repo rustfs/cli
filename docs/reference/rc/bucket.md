@@ -54,8 +54,9 @@ rc bucket replication <add|update|list|status|diff|remove|export|import|check|re
 | `--mode governance\|compliance` | Select the default mode for `bucket lock set`. |
 | `--days COUNT` | Set a positive default retention duration in days. Conflicts with `--years`. |
 | `--years COUNT` | Set a positive default retention duration in years. Conflicts with `--days`. |
-| `--force` | Force destructive or capability-gated operations where supported. |
-| `--dangerous` | Remove a bucket even when incomplete multipart uploads exist. |
+| `--force` | Force destructive or capability-gated operations; for `bucket remove`, run staged cleanup before ordinary deletion. |
+| `--dangerous` | Permit bounded abort of pre-discovered multipart uploads during removal. Requires `--force --yes`. |
+| `--yes` | Confirm dangerous multipart cleanup. |
 
 ## Examples
 

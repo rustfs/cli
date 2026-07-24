@@ -4712,13 +4712,33 @@ impl ObjectStore for S3Client {
             .await
             .map_err(|e| {
                 let err_str = Self::format_sdk_error(&e);
-                if err_str.contains("NotFound") || err_str.contains("NoSuchBucket") {
+                let mapped = if let aws_sdk_s3::error::SdkError::ServiceError(service_error) = &e {
+                    let status = service_error.raw().status().as_u16();
+                    let code = service_error.err().code();
+                    if matches!(status, 401 | 403)
+                        || matches!(
+                            code,
+                            Some("AccessDenied") | Some("Forbidden") | Some("Unauthorized")
+                        )
+                    {
+                        Error::Auth(err_str)
+                    } else if status == 404
+                        || matches!(code, Some("NotFound") | Some("NoSuchBucket"))
+                    {
+                        Error::NotFound(format!("Bucket not found: {bucket}"))
+                    } else if status == 409 || matches!(code, Some("BucketNotEmpty")) {
+                        Error::Conflict(err_str)
+                    } else {
+                        Error::Network(err_str)
+                    }
+                } else if err_str.contains("NotFound") || err_str.contains("NoSuchBucket") {
                     Error::NotFound(format!("Bucket not found: {bucket}"))
                 } else if err_str.contains("BucketNotEmpty") {
                     Error::Conflict(err_str)
                 } else {
                     Error::Network(err_str)
-                }
+                };
+                self.redact_sensitive_error(mapped)
             })?;
 
         Ok(())
@@ -11977,6 +11997,29 @@ mod tests {
         match result {
             Err(Error::Network(message)) => assert!(message.contains("InternalError")),
             other => panic!("Expected Network for delete bucket failure, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_bucket_keeps_authentication_failures_distinct() {
+        let response = http::Response::builder()
+            .status(403)
+            .header("x-amz-error-code", "AccessDenied")
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error>
+  <Code>AccessDenied</Code>
+  <Message>Access denied.</Message>
+</Error>"#,
+            ))
+            .expect("build delete bucket auth response");
+        let (client, _request_receiver) = test_s3_client(Some(response));
+
+        let result = client.delete_bucket("bucket").await;
+
+        match result {
+            Err(Error::Auth(message)) => assert!(message.contains("AccessDenied")),
+            other => panic!("Expected Auth for delete bucket denial, got: {other:?}"),
         }
     }
 

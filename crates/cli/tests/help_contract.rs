@@ -303,7 +303,7 @@ fn top_level_command_help_contract() {
         HelpCase {
             args: &["rb"],
             usage: "Usage: rc rb [OPTIONS] <TARGET>",
-            expected_tokens: &["--force"],
+            expected_tokens: &["--force", "--dangerous", "--yes"],
         },
         HelpCase {
             args: &["cat"],
