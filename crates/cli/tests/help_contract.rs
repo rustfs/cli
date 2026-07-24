@@ -128,6 +128,8 @@ fn top_level_command_help_contract() {
                 "head",
                 "stat",
                 "cp",
+                "get",
+                "put",
                 "mv",
                 "rm",
                 "pipe",
@@ -533,6 +535,26 @@ fn top_level_command_help_contract() {
                 "--versions",
                 "--incomplete",
                 "client-side S3 scan",
+            ],
+        },
+        HelpCase {
+            args: &["get"],
+            usage: "Usage: rc get [OPTIONS] <SOURCE> <TARGET>",
+            expected_tokens: &[
+                "Download one remote object",
+                "--enc-c-source-key-file",
+                "--retry-attempts",
+                "rc get local/my-bucket/report.json ./report.json",
+            ],
+        },
+        HelpCase {
+            args: &["put"],
+            usage: "Usage: rc put [OPTIONS] <SOURCE>... <TARGET>",
+            expected_tokens: &[
+                "Upload one or more local paths",
+                "--storage-class",
+                "--concurrency",
+                "rc put ./report.json local/my-bucket/reports/",
             ],
         },
     ];

@@ -249,6 +249,12 @@ pub enum Commands {
     /// Deprecated: use `rc object copy`
     Cp(Box<cp::CpArgs>),
 
+    /// Download one remote object to the local filesystem
+    Get(Box<cp::GetArgs>),
+
+    /// Upload one or more local paths to remote object storage
+    Put(Box<cp::PutArgs>),
+
     /// Deprecated: use `rc object move`
     Mv(mv::MvArgs),
 
@@ -415,6 +421,12 @@ pub async fn execute(cli: Cli) -> ExitCode {
         }
         Commands::Cp(args) => {
             cp::execute(*args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
+        Commands::Get(args) => {
+            cp::execute_get(*args, output_options.resolve(OutputBehavior::HumanDefault)).await
+        }
+        Commands::Put(args) => {
+            cp::execute_put(*args, output_options.resolve(OutputBehavior::HumanDefault)).await
         }
         Commands::Mv(args) => {
             mv::execute(args, output_options.resolve(OutputBehavior::HumanDefault)).await
@@ -1419,6 +1431,62 @@ mod tests {
                 assert!(args.summary);
             }
             other => panic!("expected cp command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_get_with_copy_options() {
+        let cli = Cli::try_parse_from([
+            "rc",
+            "get",
+            "local/reports/report.json",
+            "./report.json",
+            "--enc-c-source-key-env",
+            "RC_SSE_C_KEY",
+            "--retry-attempts",
+            "5",
+        ])
+        .expect("parse get compatibility command");
+
+        match cli.command {
+            Commands::Get(args) => {
+                assert_eq!(args.transfer.sources, ["local/reports/report.json"]);
+                assert_eq!(args.transfer.target, "./report.json");
+                assert_eq!(
+                    args.transfer.enc_c_source_key_env.as_deref(),
+                    Some("RC_SSE_C_KEY")
+                );
+                assert_eq!(args.transfer.retry_attempts, Some(5));
+            }
+            other => panic!("expected get command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_put_with_multiple_sources_and_copy_options() {
+        let cli = Cli::try_parse_from([
+            "rc",
+            "put",
+            "./january.csv",
+            "./february.csv",
+            "local/reports/",
+            "--storage-class",
+            "STANDARD",
+            "--concurrency",
+            "8",
+            "--summary",
+        ])
+        .expect("parse put compatibility command");
+
+        match cli.command {
+            Commands::Put(args) => {
+                assert_eq!(args.transfer.sources, ["./january.csv", "./february.csv"]);
+                assert_eq!(args.transfer.target, "local/reports/");
+                assert_eq!(args.transfer.storage_class.as_deref(), Some("STANDARD"));
+                assert_eq!(args.transfer.concurrency, Some(8));
+                assert!(args.transfer.summary);
+            }
+            other => panic!("expected put command, got {other:?}"),
         }
     }
 

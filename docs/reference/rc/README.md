@@ -10,7 +10,7 @@ For installation and quick-start usage, see the [project README](../../../README
 | --- | --- | --- |
 | Configure targets | [`rc alias`](alias.md) | none |
 | Bucket workflows | [`rc bucket`](bucket.md) | `rc ls`, `rc mb`, `rc rb`, `rc event`, `rc cors`, `rc version`, `rc anonymous`, `rc quota`, `rc ilm`, `rc replicate`, `rc retention --default` |
-| Object workflows | [`rc object`](object.md) | `rc ls`, `rc cp`, `rc mv`, `rc rm`, `rc cat`, `rc head`, `rc stat`, `rc find`, `rc tree`, `rc share`, [`rc retention`](retention.md), [`rc legalhold`](legalhold.md) |
+| Object workflows | [`rc object`](object.md) | `rc ls`, `rc cp`, [`rc get`](get.md), [`rc put`](put.md), `rc mv`, `rc rm`, `rc cat`, `rc head`, `rc stat`, `rc find`, `rc tree`, `rc share`, [`rc retention`](retention.md), [`rc legalhold`](legalhold.md) |
 | Administrative workflows | [`rc admin`](admin.md) | none |
 | Operational health and usage | [`rc ping`, `rc ready`, `rc du`](ops.md) | none |
 | Encryption guide | [`Encryption workflows`](encryption.md) | `rc bucket encryption`, `rc cp --enc-*`, `rc mv --enc-*`, `rc pipe --enc-*` |
@@ -31,6 +31,8 @@ Legacy command pages remain documented for users migrating from MinIO `mc`-style
 - [`rc head`](head.md)
 - [`rc stat`](stat.md)
 - [`rc cp`](cp.md)
+- [`rc get`](get.md)
+- [`rc put`](put.md)
 - [`rc mv`](mv.md)
 - [`rc rm`](rm.md)
 - [`rc find`](find.md)

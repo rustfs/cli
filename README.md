@@ -134,6 +134,13 @@ rc cp -r ./reports/ local/archive/ --include '*.csv' --exclude 'private-*' --new
 rc cp -r ./reports/ local/archive/ --rate-limit 10MiB/s --retry-attempts 5 --continue-on-error
 ```
 
+Direction-safe `mc` compatibility commands reuse the same copy planner:
+
+```bash
+rc get local/reports/report.json ./report.json
+rc put ./report.json local/reports/
+```
+
 When include rules are present, a path must match at least one of them. Exclude rules are applied
 after include rules and always win, regardless of flag order. Age filters compare source metadata in
 UTC: newer/older boundaries are strict, while `--rewind` includes the specified boundary. Rate,

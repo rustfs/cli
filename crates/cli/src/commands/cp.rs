@@ -32,6 +32,16 @@ Examples:
   rc cp ./report.json local/my-bucket/reports/
   rc object copy local/source-bucket/archive.tar.gz ./downloads/archive.tar.gz";
 
+pub(crate) const GET_AFTER_HELP: &str = "\
+Examples:
+  rc get local/my-bucket/report.json ./report.json
+  rc get local/my-bucket/archive.tar.gz ./downloads/archive.tar.gz";
+
+pub(crate) const PUT_AFTER_HELP: &str = "\
+Examples:
+  rc put ./report.json local/my-bucket/reports/
+  rc put ./january.csv ./february.csv local/my-bucket/reports/";
+
 const REMOTE_PATH_SUGGESTION: &str =
     "Use a local filesystem path or a remote path in the form alias/bucket[/key].";
 const DEFAULT_TRANSFER_CONCURRENCY: usize = 4;
@@ -226,6 +236,32 @@ impl CpArgs {
     }
 }
 
+/// Download one remote object through the canonical copy implementation.
+#[derive(Args, Debug)]
+#[command(
+    override_usage = "rc get [OPTIONS] <SOURCE> <TARGET>",
+    after_help = GET_AFTER_HELP
+)]
+pub struct GetArgs {
+    #[command(flatten)]
+    pub transfer: CpArgs,
+}
+
+/// Upload one or more local paths through the canonical copy implementation.
+#[derive(Args, Debug)]
+#[command(after_help = PUT_AFTER_HELP)]
+pub struct PutArgs {
+    #[command(flatten)]
+    pub transfer: CpArgs,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TransferAlias {
+    Copy,
+    Get,
+    Put,
+}
+
 #[derive(Debug, Serialize)]
 struct CpOutput {
     status: &'static str,
@@ -253,8 +289,33 @@ struct VersionCopyData {
 }
 
 /// Execute the cp command
-pub async fn execute(mut args: CpArgs, output_config: OutputConfig) -> ExitCode {
+pub async fn execute(args: CpArgs, output_config: OutputConfig) -> ExitCode {
+    execute_with_alias(args, output_config, TransferAlias::Copy).await
+}
+
+/// Execute the mc-compatible `get` command through the canonical copy path.
+pub async fn execute_get(args: GetArgs, output_config: OutputConfig) -> ExitCode {
+    execute_with_alias(args.transfer, output_config, TransferAlias::Get).await
+}
+
+/// Execute the mc-compatible `put` command through the canonical copy path.
+pub async fn execute_put(args: PutArgs, output_config: OutputConfig) -> ExitCode {
+    execute_with_alias(args.transfer, output_config, TransferAlias::Put).await
+}
+
+async fn execute_with_alias(
+    mut args: CpArgs,
+    output_config: OutputConfig,
+    alias: TransferAlias,
+) -> ExitCode {
     let formatter = Formatter::new(output_config);
+
+    if alias == TransferAlias::Get && args.sources.len() != 1 {
+        return formatter.fail(
+            ExitCode::UsageError,
+            "get requires exactly one remote source and one local target",
+        );
+    }
 
     if let Err(error) = validate_destination_storage_class(args.storage_class.as_deref()) {
         return formatter.fail(exit_code_for_core_error(&error), &error.to_string());
@@ -290,7 +351,15 @@ pub async fn execute(mut args: CpArgs, output_config: OutputConfig) -> ExitCode 
     // Parse every operand before starting any transfer.
     let mut sources = Vec::with_capacity(args.sources.len());
     for source in &args.sources {
-        match parse_cp_path(source, alias_manager.as_ref().ok()) {
+        let parsed = match alias {
+            // `put` defines every source operand as a local path, including
+            // relative paths containing a slash that do not exist yet.
+            TransferAlias::Put => Ok(ParsedPath::Local(PathBuf::from(source))),
+            TransferAlias::Copy | TransferAlias::Get => {
+                parse_cp_path(source, alias_manager.as_ref().ok())
+            }
+        };
+        match parsed {
             Ok(path) => sources.push(path),
             Err(error) => {
                 return formatter.fail_with_suggestion(
@@ -302,7 +371,15 @@ pub async fn execute(mut args: CpArgs, output_config: OutputConfig) -> ExitCode 
         }
     }
 
-    let target = match parse_cp_path(&args.target, alias_manager.as_ref().ok()) {
+    let parsed_target = match alias {
+        // `get` defines its target operand as a local path. Do not reinterpret
+        // a non-existent `directory/file` path as an alias and bucket.
+        TransferAlias::Get => Ok(ParsedPath::Local(PathBuf::from(&args.target))),
+        TransferAlias::Copy | TransferAlias::Put => {
+            parse_cp_path(&args.target, alias_manager.as_ref().ok())
+        }
+    };
+    let target = match parsed_target {
         Ok(p) => p,
         Err(e) => {
             return formatter.fail_with_suggestion(
@@ -312,6 +389,9 @@ pub async fn execute(mut args: CpArgs, output_config: OutputConfig) -> ExitCode 
             );
         }
     };
+    if let Err(error) = validate_alias_direction(alias, &sources, &target) {
+        return formatter.fail(ExitCode::UsageError, error);
+    }
     if let Err(error) = validate_fidelity_directions(&args, &sources, &target) {
         return formatter.fail(exit_code_for_core_error(&error), &error.to_string());
     }
@@ -442,6 +522,24 @@ pub async fn execute(mut args: CpArgs, output_config: OutputConfig) -> ExitCode 
         target_encryption.as_ref(),
     )
     .await
+}
+
+fn validate_alias_direction(
+    alias: TransferAlias,
+    sources: &[ParsedPath],
+    target: &ParsedPath,
+) -> Result<(), &'static str> {
+    match alias {
+        TransferAlias::Copy => Ok(()),
+        TransferAlias::Get if sources.len() == 1 && sources[0].is_remote() && target.is_local() => {
+            Ok(())
+        }
+        TransferAlias::Get => Err("get requires exactly one remote source and one local target"),
+        TransferAlias::Put if sources.iter().all(ParsedPath::is_local) && target.is_remote() => {
+            Ok(())
+        }
+        TransferAlias::Put => Err("put requires one or more local sources and one remote target"),
+    }
 }
 
 fn uses_transfer_planner(args: &CpArgs) -> bool {
@@ -3709,5 +3807,49 @@ mod tests {
             validate_storage_class_plan(&plan, Some("STANDARD")),
             Err(Error::UnsupportedFeature(_))
         ));
+    }
+
+    #[test]
+    fn get_alias_accepts_only_one_remote_source_and_local_target() {
+        let remote = ParsedPath::Remote(RemotePath::new("local", "reports", "report.json"));
+        let other_remote = ParsedPath::Remote(RemotePath::new("local", "reports", "other.json"));
+        let local = ParsedPath::Local(PathBuf::from("./report.json"));
+
+        assert_eq!(
+            validate_alias_direction(TransferAlias::Get, std::slice::from_ref(&remote), &local),
+            Ok(())
+        );
+        assert_eq!(
+            validate_alias_direction(TransferAlias::Get, &[remote.clone(), other_remote], &local),
+            Err("get requires exactly one remote source and one local target")
+        );
+        assert_eq!(
+            validate_alias_direction(TransferAlias::Get, std::slice::from_ref(&local), &remote),
+            Err("get requires exactly one remote source and one local target")
+        );
+    }
+
+    #[test]
+    fn put_alias_accepts_only_local_sources_and_remote_target() {
+        let first_local = ParsedPath::Local(PathBuf::from("./january.csv"));
+        let second_local = ParsedPath::Local(PathBuf::from("./february.csv"));
+        let remote = ParsedPath::Remote(RemotePath::new("local", "reports", ""));
+
+        assert_eq!(
+            validate_alias_direction(
+                TransferAlias::Put,
+                &[first_local.clone(), second_local],
+                &remote
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_alias_direction(
+                TransferAlias::Put,
+                std::slice::from_ref(&remote),
+                &first_local
+            ),
+            Err("put requires one or more local sources and one remote target")
+        );
     }
 }
