@@ -33,20 +33,21 @@ use quick_xml::de::from_str as from_xml_str;
 pub use rc_core::DeleteRequestOptions;
 use rc_core::admin::KmsDiagnosticStore;
 use rc_core::{
-    Alias, BucketEncryption, BucketNotification, BucketObjectLockConfiguration, Capabilities,
-    ChecksumAlgorithm, ChecksumRequest, CopyObjectOptions, CorsRule, CreateBucketOptions,
-    DefaultRetention, DeleteObjectFailure, DeleteObjectsResult, DeletedObject, Error,
-    LegalHoldStatus, LifecycleRule, ListObjectVersionsOptions, ListOptions, ListResult,
-    MetadataDirective, MultipartAbortStatus, MultipartCopyCancellation, MultipartCopyOptions,
-    MultipartCopyPlan, MultipartCopyProgress, MultipartCopyResult, NotificationTarget,
-    ObjectAttributes, ObjectChecksum, ObjectEncryptionRequest, ObjectInfo, ObjectLockOptions,
-    ObjectReadOptions, ObjectRetention, ObjectStore, ObjectTransferMetadata, ObjectVersion,
-    ObjectVersionIdentifier, ObjectVersionListResult, ObjectWriteEncryption, ObjectWriteOptions,
-    RemotePath, ReplicationConfiguration, ReplicationResyncStartOptions,
-    ReplicationResyncStartResult, ReplicationResyncState, ReplicationResyncStatus,
-    ReplicationResyncTargetStatus, RequestHeader, Result, RetentionDuration, RetentionDurationUnit,
-    RetentionMode, SelectOptions, SseCustomerKey, TransferCopyOptions, TransferReadOptions,
-    global_request_headers,
+    AbortMultipartUploadRequest, Alias, BucketEncryption, BucketNotification,
+    BucketObjectLockConfiguration, Capabilities, ChecksumAlgorithm, ChecksumRequest,
+    CopyObjectOptions, CorsRule, CreateBucketOptions, DefaultRetention, DeleteObjectFailure,
+    DeleteObjectsResult, DeletedObject, Error, LegalHoldStatus, LifecycleRule,
+    ListObjectVersionsOptions, ListOptions, ListResult, MetadataDirective, MultipartAbortStatus,
+    MultipartCopyCancellation, MultipartCopyOptions, MultipartCopyPlan, MultipartCopyProgress,
+    MultipartCopyResult, MultipartIdentity, MultipartUpload, MultipartUploadListOptions,
+    MultipartUploadListResult, NotificationTarget, ObjectAttributes, ObjectChecksum,
+    ObjectEncryptionRequest, ObjectInfo, ObjectLockOptions, ObjectReadOptions, ObjectRetention,
+    ObjectStore, ObjectTransferMetadata, ObjectVersion, ObjectVersionIdentifier,
+    ObjectVersionListResult, ObjectWriteEncryption, ObjectWriteOptions, RemotePath,
+    ReplicationConfiguration, ReplicationResyncStartOptions, ReplicationResyncStartResult,
+    ReplicationResyncState, ReplicationResyncStatus, ReplicationResyncTargetStatus, RequestHeader,
+    Result, RetentionDuration, RetentionDurationUnit, RetentionMode, SelectOptions, SseCustomerKey,
+    TransferCopyOptions, TransferReadOptions, global_request_headers,
 };
 use reqwest::Method;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
@@ -4027,6 +4028,31 @@ fn validate_continuation_token(
     Ok(())
 }
 
+fn validate_multipart_upload_markers(
+    truncated: bool,
+    current_key_marker: Option<&str>,
+    current_upload_id_marker: Option<&str>,
+    next_key_marker: Option<&str>,
+    next_upload_id_marker: Option<&str>,
+) -> Result<()> {
+    if !truncated {
+        return Ok(());
+    }
+    if next_key_marker.is_none() || next_upload_id_marker.is_none() {
+        return Err(Error::Network(
+            "S3 returned a truncated multipart upload listing without a complete marker pair"
+                .to_string(),
+        ));
+    }
+    if current_key_marker == next_key_marker && current_upload_id_marker == next_upload_id_marker {
+        return Err(Error::Network(
+            "S3 returned a truncated multipart upload listing without advancing its markers"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn kms_diagnostic_sdk_error<E>(error: &aws_sdk_s3::error::SdkError<E>) -> Error {
     let status = match error {
         aws_sdk_s3::error::SdkError::ServiceError(service_error) => {
@@ -4243,6 +4269,153 @@ impl ObjectStore for S3Client {
             truncated,
             continuation_token,
         })
+    }
+
+    async fn list_multipart_uploads(
+        &self,
+        bucket: &str,
+        options: MultipartUploadListOptions,
+    ) -> Result<MultipartUploadListResult> {
+        let mut request = self.inner.list_multipart_uploads().bucket(bucket);
+        if let Some(prefix) = &options.prefix {
+            request = request.prefix(prefix);
+        }
+        if let Some(delimiter) = &options.delimiter {
+            request = request.delimiter(delimiter);
+        }
+        if let Some(key_marker) = &options.key_marker {
+            request = request.key_marker(key_marker);
+        }
+        if let Some(upload_id_marker) = &options.upload_id_marker {
+            request = request.upload_id_marker(upload_id_marker);
+        }
+        if let Some(max_uploads) = options.max_uploads {
+            request = request.max_uploads(max_uploads);
+        }
+
+        let response = request.send().await.map_err(|error| {
+            let message = Self::format_sdk_error(&error);
+            if let aws_sdk_s3::error::SdkError::ServiceError(service_error) = &error {
+                let status = service_error.raw().status().as_u16();
+                let code = service_error.err().code();
+                if matches!(status, 401 | 403) {
+                    return Error::Auth(message);
+                }
+                if status == 501 || matches!(code, Some("NotImplemented")) {
+                    return Error::UnsupportedFeature(message);
+                }
+                if status == 404 || matches!(code, Some("NoSuchBucket") | Some("NotFound")) {
+                    return Error::NotFound(format!("Bucket not found: {bucket}"));
+                }
+                return Error::Network(format!("{message} (HTTP {status})"));
+            }
+            Error::Network(message)
+        })?;
+
+        let truncated = response.is_truncated().unwrap_or(false);
+        let uploads = response
+            .uploads()
+            .iter()
+            .map(|upload| {
+                let key = upload.key().ok_or_else(|| {
+                    Error::Network(
+                        "S3 returned a multipart upload without an object key".to_string(),
+                    )
+                })?;
+                let upload_id = upload.upload_id().ok_or_else(|| {
+                    Error::Network(
+                        "S3 returned a multipart upload without an upload ID".to_string(),
+                    )
+                })?;
+                Ok(MultipartUpload {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                    upload_id: upload_id.to_string(),
+                    initiated: upload.initiated().and_then(|value| {
+                        Timestamp::new(value.secs(), value.subsec_nanos() as i32).ok()
+                    }),
+                    size_bytes: None,
+                    storage_class: upload
+                        .storage_class()
+                        .map(|value| value.as_str().to_string()),
+                    initiator: upload.initiator().map(|identity| MultipartIdentity {
+                        id: identity.id().map(ToString::to_string),
+                        display_name: identity.display_name().map(ToString::to_string),
+                    }),
+                    owner: upload.owner().map(|identity| MultipartIdentity {
+                        id: identity.id().map(ToString::to_string),
+                        display_name: identity.display_name().map(ToString::to_string),
+                    }),
+                    checksum_algorithm: upload
+                        .checksum_algorithm()
+                        .map(|value| value.as_str().to_string()),
+                    checksum_type: upload
+                        .checksum_type()
+                        .map(|value| value.as_str().to_string()),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let next_key_marker = response.next_key_marker().map(ToString::to_string);
+        let next_upload_id_marker = response.next_upload_id_marker().map(ToString::to_string);
+        validate_multipart_upload_markers(
+            truncated,
+            options.key_marker.as_deref(),
+            options.upload_id_marker.as_deref(),
+            next_key_marker.as_deref(),
+            next_upload_id_marker.as_deref(),
+        )?;
+        let common_prefixes = response
+            .common_prefixes()
+            .iter()
+            .filter_map(|prefix| prefix.prefix().map(ToString::to_string))
+            .collect();
+
+        Ok(MultipartUploadListResult {
+            uploads,
+            common_prefixes,
+            truncated,
+            next_key_marker,
+            next_upload_id_marker,
+        })
+    }
+
+    async fn abort_multipart_upload(&self, request: &AbortMultipartUploadRequest) -> Result<()> {
+        let result = self
+            .inner
+            .abort_multipart_upload()
+            .bucket(&request.bucket)
+            .key(&request.key)
+            .upload_id(&request.upload_id)
+            .send()
+            .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                let message = Self::format_sdk_error(&error);
+                if let aws_sdk_s3::error::SdkError::ServiceError(service_error) = &error {
+                    let status = service_error.raw().status().as_u16();
+                    let code = service_error.err().code();
+                    if matches!(status, 401 | 403) {
+                        return Err(Error::Auth(message));
+                    }
+                    if status == 404 && matches!(code, Some("NoSuchUpload")) {
+                        return Ok(());
+                    }
+                    if status == 501 || matches!(code, Some("NotImplemented")) {
+                        return Err(Error::UnsupportedFeature(message));
+                    }
+                    if status == 404 || matches!(code, Some("NoSuchBucket") | Some("NotFound")) {
+                        return Err(Error::NotFound(format!(
+                            "Multipart upload target not found: {}/{}",
+                            request.bucket, request.key
+                        )));
+                    }
+                    return Err(Error::Network(format!("{message} (HTTP {status})")));
+                }
+                Err(Error::Network(message))
+            }
+        }
     }
 
     async fn head_object(&self, path: &RemotePath) -> Result<ObjectInfo> {

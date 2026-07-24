@@ -460,6 +460,63 @@
         "pagination": { "$ref": "#/definitions/pagination" }
       }
     },
+    "multipartCleanupResult": {
+      "type": "object",
+      "required": ["target", "upload", "state", "error"],
+      "properties": {
+        "target": { "type": "string", "minLength": 1 },
+        "upload": {
+          "oneOf": [
+            { "$ref": "#/definitions/multipartUpload" },
+            { "type": "null" }
+          ]
+        },
+        "state": {
+          "type": "string",
+          "enum": ["aborted", "would_abort", "failed"]
+        },
+        "error": {
+          "oneOf": [
+            { "$ref": "#/definitions/unsupportedFeatureError" },
+            { "$ref": "#/definitions/standardError" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "multipartCleanupSummary": {
+      "type": "object",
+      "required": ["total", "succeeded", "failed"],
+      "properties": {
+        "total": { "type": "integer", "minimum": 0 },
+        "succeeded": { "type": "integer", "minimum": 0 },
+        "failed": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "multipartCleanupData": {
+      "type": "object",
+      "required": ["operation", "dry_run", "results", "summary"],
+      "properties": {
+        "operation": { "const": "abort" },
+        "dry_run": { "type": "boolean" },
+        "results": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/multipartCleanupResult" }
+        },
+        "summary": { "$ref": "#/definitions/multipartCleanupSummary" }
+      }
+    },
+    "multipartPartialOutput": {
+      "type": "object",
+      "required": ["schema_version", "type", "status", "data"],
+      "properties": {
+        "schema_version": { "const": 3 },
+        "type": { "const": "multipart_uploads" },
+        "status": { "const": "partial" },
+        "data": { "$ref": "#/definitions/multipartCleanupData" },
+        "meta": { "$ref": "#/definitions/meta" }
+      }
+    },
     "watchSource": {
       "type": "object",
       "properties": {
@@ -1404,11 +1461,17 @@
         {
           "properties": {
             "type": { "const": "multipart_uploads" },
-            "data": { "$ref": "#/definitions/multipartUploadsData" }
+            "data": {
+              "oneOf": [
+                { "$ref": "#/definitions/multipartUploadsData" },
+                { "$ref": "#/definitions/multipartCleanupData" }
+              ]
+            }
           }
         }
       ]
     },
+    { "$ref": "#/definitions/multipartPartialOutput" },
     {
       "allOf": [
         { "$ref": "#/definitions/successEnvelope" },

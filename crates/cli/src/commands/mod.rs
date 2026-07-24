@@ -42,6 +42,7 @@ mod lock;
 mod ls;
 mod mb;
 mod mirror;
+mod multipart;
 mod mv;
 mod object;
 mod ops_output;

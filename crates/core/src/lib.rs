@@ -69,10 +69,12 @@ pub use select::{
     SelectSseCustomerOptions,
 };
 pub use traits::{
-    BucketNotification, Capabilities, CopyObjectOptions, CreateBucketOptions, DeleteObjectFailure,
-    DeleteObjectsResult, DeleteRequestOptions, DeletedObject, ListObjectVersionsOptions,
-    ListOptions, ListResult, NotificationTarget, ObjectInfo, ObjectReadOptions, ObjectStore,
-    ObjectVersion, ObjectVersionIdentifier, ObjectVersionListResult,
+    AbortMultipartUploadRequest, BucketNotification, Capabilities, CopyObjectOptions,
+    CreateBucketOptions, DeleteObjectFailure, DeleteObjectsResult, DeleteRequestOptions,
+    DeletedObject, ListObjectVersionsOptions, ListOptions, ListResult, MultipartIdentity,
+    MultipartUpload, MultipartUploadListOptions, MultipartUploadListResult, NotificationTarget,
+    ObjectInfo, ObjectReadOptions, ObjectStore, ObjectVersion, ObjectVersionIdentifier,
+    ObjectVersionListResult,
 };
 pub use transfer::{
     TransferCancellation, TransferCandidate, TransferControls, TransferExecutor, TransferOutcome,
