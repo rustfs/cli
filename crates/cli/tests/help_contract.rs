@@ -156,7 +156,7 @@ fn top_level_command_help_contract() {
         HelpCase {
             args: &["alias"],
             usage: "Usage: rc alias [OPTIONS] <COMMAND>",
-            expected_tokens: &["set", "list", "remove"],
+            expected_tokens: &["set", "list", "remove", "export", "import"],
         },
         HelpCase {
             args: &["admin"],

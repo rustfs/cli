@@ -3,8 +3,12 @@
 //! Aliases are named references to S3-compatible storage endpoints,
 //! including connection details and credentials.
 
+use std::fs;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+
 use clap::Subcommand;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::exit_code::ExitCode;
 use crate::output::{Formatter, OutputConfig};
@@ -22,6 +26,12 @@ pub enum AliasCommands {
 
     /// Remove an alias
     Remove(RemoveArgs),
+
+    /// Export aliases as a portable JSON document
+    Export(ExportArgs),
+
+    /// Import aliases from a portable JSON document
+    Import(ImportArgs),
 }
 
 /// Arguments for the `alias set` command
@@ -87,6 +97,82 @@ pub struct RemoveArgs {
     pub name: String,
 }
 
+/// Arguments for the `alias export` command
+#[derive(clap::Args, Debug)]
+pub struct ExportArgs {
+    /// Alias names to export; omit to export every configured alias
+    pub names: Vec<String>,
+
+    /// Write the export to a file instead of stdout
+    #[arg(short, long, value_name = "FILE")]
+    pub output: Option<PathBuf>,
+
+    /// Include access keys and secret keys in the export
+    #[arg(long, requires = "acknowledge_credentials")]
+    pub include_credentials: bool,
+
+    /// Acknowledge that the exported document contains plaintext credentials
+    #[arg(long, requires = "include_credentials")]
+    pub acknowledge_credentials: bool,
+
+    /// Replace an existing output file
+    #[arg(long, requires = "output")]
+    pub force: bool,
+}
+
+/// Arguments for the `alias import` command
+#[derive(clap::Args, Debug)]
+pub struct ImportArgs {
+    /// Portable alias JSON document to import
+    pub input: PathBuf,
+
+    /// Replace aliases with conflicting names
+    #[arg(long)]
+    pub replace: bool,
+}
+
+const ALIAS_EXPORT_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AliasExportDocument {
+    schema_version: u32,
+    aliases: Vec<PortableAlias>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PortableAlias {
+    name: String,
+    endpoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    credentials: Option<PortableCredentials>,
+    #[serde(default)]
+    anonymous: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_cert: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_key: Option<String>,
+    region: String,
+    signature: String,
+    bucket_lookup: String,
+    #[serde(default)]
+    insecure: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ca_bundle: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retry: Option<rc_core::alias::RetryConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    timeout: Option<rc_core::alias::TimeoutConfig>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PortableCredentials {
+    access_key: String,
+    secret_key: String,
+}
+
 /// JSON output for alias list
 #[derive(Serialize)]
 struct AliasListOutput {
@@ -145,6 +231,8 @@ pub async fn execute(cmd: AliasCommands, output_config: OutputConfig) -> ExitCod
         AliasCommands::Set(args) => execute_set(*args, &alias_manager, &formatter).await,
         AliasCommands::List(args) => execute_list(args, &alias_manager, &formatter).await,
         AliasCommands::Remove(args) => execute_remove(args, &alias_manager, &formatter).await,
+        AliasCommands::Export(args) => execute_export(args, &alias_manager, &formatter),
+        AliasCommands::Import(args) => execute_import(args, &alias_manager, &formatter),
     }
 }
 
@@ -346,6 +434,272 @@ async fn execute_list(args: ListArgs, manager: &AliasManager, formatter: &Format
     }
 }
 
+fn execute_export(args: ExportArgs, manager: &AliasManager, formatter: &Formatter) -> ExitCode {
+    let aliases = if args.names.is_empty() {
+        manager.list()
+    } else {
+        args.names
+            .iter()
+            .map(|name| manager.get(name))
+            .collect::<rc_core::Result<Vec<_>>>()
+    };
+    let mut aliases = match aliases {
+        Ok(aliases) => aliases,
+        Err(error) => {
+            let code = exit_code_from_error(&error);
+            return formatter.fail(code, &error.to_string());
+        }
+    };
+    aliases.sort_by(|left, right| left.name.cmp(&right.name));
+
+    let document = AliasExportDocument {
+        schema_version: ALIAS_EXPORT_SCHEMA_VERSION,
+        aliases: aliases
+            .iter()
+            .map(|alias| PortableAlias::from_alias(alias, args.include_credentials))
+            .collect(),
+    };
+    let mut contents = match serde_json::to_vec_pretty(&document) {
+        Ok(contents) => contents,
+        Err(error) => {
+            return formatter.fail(
+                ExitCode::GeneralError,
+                &format!("Failed to serialize aliases: {error}"),
+            );
+        }
+    };
+    contents.push(b'\n');
+
+    if let Some(output) = args.output {
+        match write_export_file(&output, &contents, args.force) {
+            Ok(()) => {
+                formatter.success(&format!(
+                    "Exported {} alias(es) to {}.",
+                    document.aliases.len(),
+                    output.display()
+                ));
+                ExitCode::Success
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => formatter.fail(
+                ExitCode::Conflict,
+                &format!(
+                    "Export file '{}' already exists; retry with --force to replace it",
+                    output.display()
+                ),
+            ),
+            Err(error) => formatter.fail(
+                ExitCode::GeneralError,
+                &format!("Failed to write export '{}': {error}", output.display()),
+            ),
+        }
+    } else {
+        match io::stdout().write_all(&contents) {
+            Ok(()) => ExitCode::Success,
+            Err(error) => formatter.fail(
+                ExitCode::GeneralError,
+                &format!("Failed to write alias export: {error}"),
+            ),
+        }
+    }
+}
+
+fn execute_import(args: ImportArgs, manager: &AliasManager, formatter: &Formatter) -> ExitCode {
+    let contents = match fs::read(&args.input) {
+        Ok(contents) => contents,
+        Err(error) => {
+            return formatter.fail(
+                ExitCode::GeneralError,
+                &format!("Failed to read import '{}': {error}", args.input.display()),
+            );
+        }
+    };
+    let document: AliasExportDocument = match serde_json::from_slice(&contents) {
+        Ok(document) => document,
+        Err(error) => {
+            return formatter.fail(
+                ExitCode::UsageError,
+                &format!("Malformed alias import document: {error}"),
+            );
+        }
+    };
+    if document.schema_version != ALIAS_EXPORT_SCHEMA_VERSION {
+        return formatter.fail(
+            ExitCode::UsageError,
+            &format!(
+                "Unsupported alias export schema version {}; expected {}",
+                document.schema_version, ALIAS_EXPORT_SCHEMA_VERSION
+            ),
+        );
+    }
+    if document.aliases.is_empty() {
+        return formatter.fail(
+            ExitCode::UsageError,
+            "Alias import document contains no aliases",
+        );
+    }
+
+    let aliases = match document
+        .aliases
+        .into_iter()
+        .map(PortableAlias::into_alias)
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(aliases) => aliases,
+        Err(error) => return formatter.fail(ExitCode::UsageError, &error),
+    };
+    let imported = aliases.len();
+    match manager.import(aliases, args.replace) {
+        Ok(()) => {
+            formatter.success(&format!("Imported {imported} alias(es)."));
+            ExitCode::Success
+        }
+        Err(error) => {
+            let code = if matches!(&error, Error::Config(_)) {
+                ExitCode::Conflict
+            } else {
+                exit_code_from_error(&error)
+            };
+            formatter.fail(code, &error.to_string())
+        }
+    }
+}
+
+impl PortableAlias {
+    fn from_alias(alias: &Alias, include_credentials: bool) -> Self {
+        Self {
+            name: alias.name.clone(),
+            endpoint: alias.endpoint.clone(),
+            credentials: (include_credentials
+                && !alias.anonymous
+                && !alias.access_key.is_empty()
+                && !alias.secret_key.is_empty())
+            .then(|| PortableCredentials {
+                access_key: alias.access_key.clone(),
+                secret_key: alias.secret_key.clone(),
+            }),
+            anonymous: alias.anonymous,
+            client_cert: alias.client_cert.clone(),
+            client_key: alias.client_key.clone(),
+            region: alias.region.clone(),
+            signature: alias.signature.clone(),
+            bucket_lookup: alias.bucket_lookup.clone(),
+            insecure: alias.insecure,
+            ca_bundle: alias.ca_bundle.clone(),
+            retry: alias.retry.clone(),
+            timeout: alias.timeout.clone(),
+        }
+    }
+
+    fn into_alias(self) -> Result<Alias, String> {
+        if !is_valid_portable_alias_name(&self.name) {
+            return Err(format!(
+                "Invalid alias name '{}'; use letters, numbers, underscores, or hyphens",
+                self.name
+            ));
+        }
+        validate_alias_endpoint(&self.endpoint)
+            .map_err(|error| format!("Alias '{}' has an invalid endpoint: {error}", self.name))?;
+        if self.signature != "v4" {
+            return Err(format!(
+                "Alias '{}' uses unsupported signature '{}'; expected v4",
+                self.name, self.signature
+            ));
+        }
+        if !matches!(self.bucket_lookup.as_str(), "auto" | "path" | "dns") {
+            return Err(format!(
+                "Alias '{}' has invalid bucket lookup '{}'",
+                self.name, self.bucket_lookup
+            ));
+        }
+        if self.client_cert.is_some() != self.client_key.is_some() {
+            return Err(format!(
+                "Alias '{}' must include both client_cert and client_key",
+                self.name
+            ));
+        }
+
+        let (access_key, secret_key) = match self.credentials {
+            Some(credentials)
+                if credentials.access_key.is_empty() || credentials.secret_key.is_empty() =>
+            {
+                return Err(format!(
+                    "Alias '{}' contains incomplete credentials",
+                    self.name
+                ));
+            }
+            Some(credentials) => (credentials.access_key, credentials.secret_key),
+            None => (String::new(), String::new()),
+        };
+        if self.anonymous && (!access_key.is_empty() || !secret_key.is_empty()) {
+            return Err(format!(
+                "Anonymous alias '{}' must not include credentials",
+                self.name
+            ));
+        }
+
+        Ok(Alias {
+            name: self.name,
+            endpoint: self.endpoint,
+            access_key,
+            secret_key,
+            anonymous: self.anonymous,
+            client_cert: self.client_cert,
+            client_key: self.client_key,
+            region: self.region,
+            signature: self.signature,
+            bucket_lookup: self.bucket_lookup,
+            insecure: self.insecure,
+            ca_bundle: self.ca_bundle,
+            retry: self.retry,
+            timeout: self.timeout,
+        })
+    }
+}
+
+fn is_valid_portable_alias_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+}
+
+fn write_export_file(destination: &Path, contents: &[u8], force: bool) -> io::Result<()> {
+    let directory = destination.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "export destination has no parent directory",
+        )
+    })?;
+    let directory = if directory.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        directory
+    };
+    fs::create_dir_all(directory)?;
+
+    let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
+    temporary.write_all(contents)?;
+    temporary.as_file_mut().sync_all()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        temporary
+            .as_file_mut()
+            .set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+
+    if force {
+        temporary
+            .persist(destination)
+            .map_err(|error| error.error)?;
+    } else {
+        temporary
+            .persist_noclobber(destination)
+            .map_err(|error| error.error)?;
+    }
+    Ok(())
+}
+
 async fn execute_remove(
     args: RemoveArgs,
     manager: &AliasManager,
@@ -392,8 +746,11 @@ fn exit_code_from_error(error: &rc_core::Error) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    use crate::commands::{Cli, Commands};
 
     #[test]
     fn test_set_args_defaults() {
@@ -427,6 +784,130 @@ mod tests {
         assert_eq!(info.name, "test");
         assert_eq!(info.endpoint, "http://localhost:9000");
         assert_eq!(info.region, "us-east-1");
+    }
+
+    #[test]
+    fn export_redacts_credentials_by_default() {
+        let alias = Alias::new(
+            "local",
+            "http://localhost:9000",
+            "visible-access",
+            "visible-secret",
+        );
+
+        let encoded = serde_json::to_string(&PortableAlias::from_alias(&alias, false)).unwrap();
+
+        assert!(!encoded.contains("visible-access"));
+        assert!(!encoded.contains("visible-secret"));
+        assert!(!encoded.contains("credentials"));
+    }
+
+    #[test]
+    fn export_includes_credentials_only_when_requested() {
+        let alias = Alias::new(
+            "local",
+            "http://localhost:9000",
+            "visible-access",
+            "visible-secret",
+        );
+
+        let encoded = serde_json::to_string(&PortableAlias::from_alias(&alias, true)).unwrap();
+
+        assert!(encoded.contains("visible-access"));
+        assert!(encoded.contains("visible-secret"));
+    }
+
+    #[test]
+    fn cli_requires_explicit_credential_export_acknowledgement() {
+        let error =
+            Cli::try_parse_from(["rc", "alias", "export", "--include-credentials"]).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+
+        let cli = Cli::try_parse_from([
+            "rc",
+            "alias",
+            "export",
+            "--include-credentials",
+            "--acknowledge-credentials",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Alias(AliasCommands::Export(ExportArgs {
+                include_credentials: true,
+                acknowledge_credentials: true,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn import_rejects_unknown_fields_and_invalid_endpoints() {
+        let malformed = br#"{
+            "schema_version": 1,
+            "aliases": [],
+            "unexpected": true
+        }"#;
+        assert!(serde_json::from_slice::<AliasExportDocument>(malformed).is_err());
+
+        let portable = PortableAlias {
+            name: "local".to_string(),
+            endpoint: "ftp://localhost:9000".to_string(),
+            credentials: None,
+            anonymous: false,
+            client_cert: None,
+            client_key: None,
+            region: "us-east-1".to_string(),
+            signature: "v4".to_string(),
+            bucket_lookup: "auto".to_string(),
+            insecure: false,
+            ca_bundle: None,
+            retry: None,
+            timeout: None,
+        };
+        assert!(portable.into_alias().is_err());
+    }
+
+    #[test]
+    fn redacted_alias_imports_without_synthesizing_credentials() {
+        let portable = PortableAlias {
+            name: "local".to_string(),
+            endpoint: "http://localhost:9000".to_string(),
+            credentials: None,
+            anonymous: false,
+            client_cert: None,
+            client_key: None,
+            region: "us-east-1".to_string(),
+            signature: "v4".to_string(),
+            bucket_lookup: "auto".to_string(),
+            insecure: false,
+            ca_bundle: None,
+            retry: None,
+            timeout: None,
+        };
+
+        let alias = portable.into_alias().unwrap();
+
+        assert!(alias.access_key.is_empty());
+        assert!(alias.secret_key.is_empty());
+        assert!(!alias.anonymous);
+    }
+
+    #[test]
+    fn export_file_refuses_implicit_overwrite_and_force_is_atomic() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("nested/aliases.json");
+        write_export_file(&destination, b"first", false).unwrap();
+
+        let error = write_export_file(&destination, b"second", false).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&destination).unwrap(), b"first");
+
+        write_export_file(&destination, b"second", true).unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"second");
     }
 
     #[tokio::test]

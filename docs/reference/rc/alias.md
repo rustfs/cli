@@ -11,6 +11,8 @@ rc [GLOBAL OPTIONS] alias <COMMAND>
 rc [GLOBAL OPTIONS] alias set [OPTIONS] <NAME> <ENDPOINT> <ACCESS_KEY> <SECRET_KEY>
 rc [GLOBAL OPTIONS] alias list [-l|--long]
 rc [GLOBAL OPTIONS] alias remove <NAME>
+rc [GLOBAL OPTIONS] alias export [NAMES]... [--output <FILE>] [--include-credentials --acknowledge-credentials]
+rc [GLOBAL OPTIONS] alias import <FILE> [--replace]
 ```
 
 ## Commands
@@ -20,6 +22,8 @@ rc [GLOBAL OPTIONS] alias remove <NAME>
 | `set` | Add a new alias or replace an existing alias. |
 | `list` | List configured aliases. |
 | `remove` | Remove an alias from local configuration. |
+| `export` | Write selected aliases, or every alias, as portable JSON. |
+| `import` | Validate and import a portable alias JSON document. |
 
 ## Parameters
 
@@ -34,6 +38,11 @@ rc [GLOBAL OPTIONS] alias remove <NAME>
 | `--bucket-lookup` | Bucket lookup style: `auto`, `path`, or `dns`. Defaults to `auto`. |
 | `--insecure` | Allow insecure TLS connections for this alias. |
 | `-l, --long` | Show full alias details when listing aliases. |
+| `-o, --output <FILE>` | Write an alias export to a file instead of stdout. |
+| `--include-credentials` | Include plaintext access and secret keys in an export. |
+| `--acknowledge-credentials` | Explicitly acknowledge plaintext credential export. |
+| `--force` | Replace an existing export file. |
+| `--replace` | Replace conflicting local aliases during import. |
 
 ## Examples
 
@@ -61,9 +70,50 @@ Remove an alias:
 rc alias remove old-local
 ```
 
+Export connection settings without credentials:
+
+```bash
+rc alias export local s3 --output aliases.json
+```
+
+Export credentials after explicit acknowledgement:
+
+```bash
+rc alias export local \
+  --include-credentials \
+  --acknowledge-credentials \
+  --output aliases-with-credentials.json
+```
+
+Import aliases, rejecting every conflict before changing the configuration:
+
+```bash
+rc alias import aliases.json
+```
+
+Replace conflicting aliases:
+
+```bash
+rc alias import aliases.json --replace
+```
+
 ## Behavior
 
-`alias set` overwrites an existing alias with the same name. `alias list` does not print secret keys. Commands that need a remote service resolve the alias name before creating an S3 or admin client.
+`alias set` overwrites an existing alias with the same name. `alias list` does
+not print secret keys. Commands that need a remote service resolve the alias
+name before creating an S3 or admin client.
+
+Exports use a versioned JSON schema and are sorted by alias name for
+deterministic output. Credentials are absent by default. Importing a redacted
+authenticated alias preserves its endpoint and options with empty credentials;
+run `rc alias set` to supply credentials before using it. Credential-bearing
+exports require both explicit flags and files are created with owner-only
+permissions on Unix.
+
+Import validates the entire document, including schema version, duplicate
+names, endpoint URLs, signature mode, bucket lookup mode, and mTLS path pairs,
+before one configuration write. Existing aliases cause exit code 6 unless
+`--replace` is supplied. Malformed documents cause exit code 2.
 
 Global options shown in command syntax use the same meaning everywhere:
 

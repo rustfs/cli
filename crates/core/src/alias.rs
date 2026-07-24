@@ -493,6 +493,46 @@ impl AliasManager {
         self.config_manager.save(&config)
     }
 
+    /// Import aliases in one validated configuration write.
+    ///
+    /// When `replace` is false, every conflict is reported before the
+    /// configuration is modified.
+    pub fn import(&self, aliases: Vec<Alias>, replace: bool) -> Result<()> {
+        let mut names = std::collections::HashSet::new();
+        for alias in &aliases {
+            if !names.insert(alias.name.clone()) {
+                return Err(Error::Config(format!(
+                    "Import contains duplicate alias '{}'",
+                    alias.name
+                )));
+            }
+        }
+
+        let mut config = self.config_manager.load()?;
+        if !replace {
+            let mut conflicts = config
+                .aliases
+                .iter()
+                .filter(|alias| names.contains(&alias.name))
+                .map(|alias| alias.name.clone())
+                .collect::<Vec<_>>();
+            conflicts.sort();
+            if !conflicts.is_empty() {
+                return Err(Error::Config(format!(
+                    "Aliases already exist: {}. Retry with --replace to overwrite them",
+                    conflicts.join(", ")
+                )));
+            }
+        }
+
+        config.aliases.retain(|alias| !names.contains(&alias.name));
+        config.aliases.extend(aliases);
+        config
+            .aliases
+            .sort_by(|left, right| left.name.cmp(&right.name));
+        self.config_manager.save(&config)
+    }
+
     /// Remove an alias
     pub fn remove(&self, name: &str) -> Result<()> {
         let mut config = self.config_manager.load()?;
@@ -614,6 +654,66 @@ mod tests {
         let aliases = manager.list().unwrap();
         assert_eq!(aliases.len(), 1);
         assert_eq!(aliases[0].endpoint, "http://new:9000");
+    }
+
+    #[test]
+    fn import_rejects_all_conflicts_before_writing() {
+        let (manager, _temp_dir) = temp_alias_manager();
+        manager
+            .set(Alias::new("existing", "http://old:9000", "a", "b"))
+            .unwrap();
+
+        let result = manager.import(
+            vec![
+                Alias::new("new", "http://new:9000", "", ""),
+                Alias::new("existing", "http://replacement:9000", "", ""),
+            ],
+            false,
+        );
+
+        assert!(matches!(result, Err(Error::Config(_))));
+        assert!(matches!(manager.get("new"), Err(Error::AliasNotFound(_))));
+        assert_eq!(manager.get("existing").unwrap().endpoint, "http://old:9000");
+    }
+
+    #[test]
+    fn import_replaces_conflicts_in_one_write() {
+        let (manager, _temp_dir) = temp_alias_manager();
+        manager
+            .set(Alias::new("existing", "http://old:9000", "a", "b"))
+            .unwrap();
+
+        manager
+            .import(
+                vec![
+                    Alias::new("new", "http://new:9000", "", ""),
+                    Alias::new("existing", "http://replacement:9000", "", ""),
+                ],
+                true,
+            )
+            .unwrap();
+
+        assert_eq!(manager.list().unwrap().len(), 2);
+        assert_eq!(
+            manager.get("existing").unwrap().endpoint,
+            "http://replacement:9000"
+        );
+    }
+
+    #[test]
+    fn import_rejects_duplicate_names_before_writing() {
+        let (manager, _temp_dir) = temp_alias_manager();
+
+        let result = manager.import(
+            vec![
+                Alias::new("duplicate", "http://one:9000", "", ""),
+                Alias::new("duplicate", "http://two:9000", "", ""),
+            ],
+            true,
+        );
+
+        assert!(matches!(result, Err(Error::Config(_))));
+        assert!(manager.list().unwrap().is_empty());
     }
 
     #[test]
