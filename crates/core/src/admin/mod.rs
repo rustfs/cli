@@ -10,6 +10,7 @@ mod cluster;
 mod configuration;
 mod diagnostics;
 mod iam;
+mod inspect_archive;
 mod kms;
 mod kms_diagnostic;
 mod observability;
@@ -70,6 +71,16 @@ pub use iam::{
     MAX_IAM_POLICY_ENTITY_SELECTOR_BYTES, MAX_IAM_POLICY_ENTITY_SELECTORS, PolicyDetachEntity,
     PolicyDetachRequest, PolicyDetachResult, PolicyEntities, PolicyEntitiesQuery,
     PolicyEntitiesResult, UserPolicyEntities,
+};
+pub use inspect_archive::{
+    EncryptedInspectArchive, INSPECT_ARCHIVE_CAPABILITY, INSPECT_ARCHIVE_COMPLETION,
+    INSPECT_ARCHIVE_CONTENT_TYPE, INSPECT_ARCHIVE_ENCRYPTION, INSPECT_ARCHIVE_ROUTE,
+    INSPECT_ARCHIVE_VERSION, InspectArchiveApi, InspectArchiveCancellation,
+    InspectArchiveCapabilityContract, InspectArchiveKey, InspectArchiveManifest,
+    InspectArchiveTransportRequest, MAX_INSPECT_ARCHIVE_BYTES, MAX_INSPECT_ARCHIVE_DURATION,
+    MAX_INSPECT_ARCHIVE_METADATA_BYTES_PER_DRIVE, PublishedInspectArchive, VerifiedInspectArchive,
+    decrypt_and_validate_inspect_archive, decrypt_and_validate_inspect_archive_with_cancel,
+    publish_inspect_archive, validate_inspect_archive_output_directory,
 };
 pub use kms::{
     KmsApi, KmsBackendKind, KmsCacheSummary, KmsCancelKeyDeletionResult, KmsConfigSummary,

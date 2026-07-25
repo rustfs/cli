@@ -20,28 +20,31 @@ use rc_core::admin::{
     ClusterSnapshotDocument, ClusterSnapshotMetadata, ClusterSnapshotSummary, ConfigApi,
     ConfigDocument, ConfigHelp, ConfigHistoryEntry, ConfigMutationResult,
     CreateServiceAccountRequest, DecommissionPoolStatus, DecommissionStatus,
-    DetailedHealthSnapshot, DiagnosticCapability, DiagnosticReadApi, ExtensionsCatalog, Group,
-    GroupStatus, HealRuntimeState, HealScanMode, HealStartRequest, HealStatus, HealTaskRequest,
-    IAM_ACCESS_KEYS_BULK_CAPABILITY, IAM_ACCESS_KEYS_BULK_LDAP_CAPABILITY,
-    IAM_ACCESS_KEYS_BULK_OPENID_CAPABILITY, IAM_POLICY_DETACH_CAPABILITY,
-    IAM_POLICY_ENTITIES_CAPABILITY, IamArchiveApi, IamArchiveImportResult, IamArchiveImportSection,
-    IamArchiveInventory, IamArchiveResultEntities, IamMutationApi, IamReadApi, KmsApi,
-    KmsBackendKind, KmsCacheSummary, KmsCancelKeyDeletionResult, KmsConfigSummary,
-    KmsConfigureRequest, KmsCreateKeyRequest, KmsCreateKeyResult, KmsDeleteKeyRequest,
-    KmsDeleteKeyResult, KmsKey, KmsKeyPage, KmsKeyState, KmsKeyUsage, KmsServiceState, KmsStatus,
+    DetailedHealthSnapshot, DiagnosticCapability, DiagnosticReadApi, EncryptedInspectArchive,
+    ExtensionsCatalog, Group, GroupStatus, HealRuntimeState, HealScanMode, HealStartRequest,
+    HealStatus, HealTaskRequest, IAM_ACCESS_KEYS_BULK_CAPABILITY,
+    IAM_ACCESS_KEYS_BULK_LDAP_CAPABILITY, IAM_ACCESS_KEYS_BULK_OPENID_CAPABILITY,
+    IAM_POLICY_DETACH_CAPABILITY, IAM_POLICY_ENTITIES_CAPABILITY, INSPECT_ARCHIVE_COMPLETION,
+    INSPECT_ARCHIVE_CONTENT_TYPE, IamArchiveApi, IamArchiveImportResult, IamArchiveImportSection,
+    IamArchiveInventory, IamArchiveResultEntities, IamMutationApi, IamReadApi, InspectArchiveApi,
+    InspectArchiveCapabilityContract, InspectArchiveTransportRequest, KmsApi, KmsBackendKind,
+    KmsCacheSummary, KmsCancelKeyDeletionResult, KmsConfigSummary, KmsConfigureRequest,
+    KmsCreateKeyRequest, KmsCreateKeyResult, KmsDeleteKeyRequest, KmsDeleteKeyResult, KmsKey,
+    KmsKeyPage, KmsKeyState, KmsKeyUsage, KmsServiceState, KmsStatus,
     MAX_BUCKET_METADATA_ARCHIVE_BYTES, MAX_DIAGNOSTIC_RESPONSE_BYTES, MAX_IAM_ACCESS_KEY_RESULTS,
     MAX_IAM_ACCESS_KEYS_RESPONSE_BYTES, MAX_IAM_ARCHIVE_BYTES, MAX_IAM_IMPORT_RESPONSE_BYTES,
     MAX_IAM_POLICY_DETACH_REQUEST_BYTES, MAX_IAM_POLICY_DETACH_RESPONSE_BYTES,
-    MAX_IAM_POLICY_ENTITIES_RESPONSE_BYTES, MAX_METRICS_LINE_BYTES, MAX_METRICS_RESPONSE_BYTES,
-    MAX_METRICS_SAMPLES, MAX_OIDC_RESPONSE_BYTES, MAX_REPLICATION_DIFF_RESPONSE_BYTES,
-    MAX_REPLICATION_INSPECTION_RESPONSE_BYTES, MAX_SITE_REPLICATION_ERROR_RESPONSE_BYTES,
-    MAX_SITE_REPLICATION_REQUEST_BYTES, MAX_SITE_REPLICATION_SUCCESS_RESPONSE_BYTES,
-    ManualTransitionRunRequest, ManualTransitionRunResponse, MetricsBatch, MetricsQuery,
-    ModuleSwitches, ObservabilityApi, OidcMutationApi, OidcMutationRequest, OidcMutationResult,
-    OidcProvider, OidcProviderList, OidcReadApi, OidcValidationRequest, OidcValidationResult,
-    PeerSiteSpec, Policy, PolicyDetachEntity, PolicyDetachRequest, PolicyDetachResult,
-    PolicyEntitiesQuery, PolicyEntitiesResult, PolicyEntity, PolicyInfo, PoolStatus, PoolTarget,
-    RealtimeMetrics, RebalanceStartResult, RebalanceStatus, ReplicateEditStatus, ReplicationDiff,
+    MAX_IAM_POLICY_ENTITIES_RESPONSE_BYTES, MAX_INSPECT_ARCHIVE_BYTES, MAX_METRICS_LINE_BYTES,
+    MAX_METRICS_RESPONSE_BYTES, MAX_METRICS_SAMPLES, MAX_OIDC_RESPONSE_BYTES,
+    MAX_REPLICATION_DIFF_RESPONSE_BYTES, MAX_REPLICATION_INSPECTION_RESPONSE_BYTES,
+    MAX_SITE_REPLICATION_ERROR_RESPONSE_BYTES, MAX_SITE_REPLICATION_REQUEST_BYTES,
+    MAX_SITE_REPLICATION_SUCCESS_RESPONSE_BYTES, ManualTransitionRunRequest,
+    ManualTransitionRunResponse, MetricsBatch, MetricsQuery, ModuleSwitches, ObservabilityApi,
+    OidcMutationApi, OidcMutationRequest, OidcMutationResult, OidcProvider, OidcProviderList,
+    OidcReadApi, OidcValidationRequest, OidcValidationResult, PeerSiteSpec, Policy,
+    PolicyDetachEntity, PolicyDetachRequest, PolicyDetachResult, PolicyEntitiesQuery,
+    PolicyEntitiesResult, PolicyEntity, PolicyInfo, PoolStatus, PoolTarget, RealtimeMetrics,
+    RebalanceStartResult, RebalanceStatus, ReplicateEditStatus, ReplicationDiff,
     ReplicationDiffApi, ReplicationInspectionApi, ReplicationMetricScope, ReplicationMetrics,
     ReplicationMrf, RuntimeCapabilitiesSnapshot, RuntimeCapabilityStatus, ScannerStatus,
     ServiceAccount, ServiceAccountCreateResponse, ServiceActionResult, SiteRemoveSpec,
@@ -50,7 +53,7 @@ use rc_core::admin::{
     UpdateServiceAccountRequest, User, UserStatus,
 };
 use rc_core::{Alias, Error, Result};
-use reqwest::header::{CONTENT_TYPE, HOST, HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::{CACHE_CONTROL, CONTENT_TYPE, HOST, HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Client, Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -65,6 +68,13 @@ struct BoundedJsonResponse {
     max_bytes: usize,
     name: &'static str,
     error_mapper: fn(&AdminClient, StatusCode, &str) -> Error,
+}
+
+#[derive(Serialize)]
+struct InspectArchiveWireRequest<'a> {
+    bucket: &'a str,
+    object: &'a str,
+    public_key_pem: &'a str,
 }
 
 #[derive(Debug, Serialize)]
@@ -1263,6 +1273,47 @@ impl AdminClient {
         }
     }
 
+    fn map_inspect_archive_error(&self, status: StatusCode, body: &str) -> Error {
+        if matches!(status, StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED) {
+            return Error::Auth(
+                "Permission denied while requesting the diagnostic archive".to_string(),
+            );
+        }
+        let code = parse_admin_error(body).and_then(|error| error.code);
+        if status == StatusCode::NOT_FOUND
+            && matches!(
+                code.as_deref(),
+                Some("NoSuchBucket" | "NoSuchKey" | "NoSuchObject")
+            )
+        {
+            return Error::NotFound("Diagnostic archive target was not found".to_string());
+        }
+        match status {
+            StatusCode::NOT_FOUND
+            | StatusCode::METHOD_NOT_ALLOWED
+            | StatusCode::NOT_IMPLEMENTED => Error::UnsupportedFeature(
+                "Encrypted diagnostic archives are not supported by this RustFS server".to_string(),
+            ),
+            StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => Error::InvalidPath(
+                "RustFS rejected the diagnostic archive target or public key".to_string(),
+            ),
+            StatusCode::PAYLOAD_TOO_LARGE => Error::RequestRejected(
+                "RustFS rejected the diagnostic archive because a server limit was exceeded"
+                    .to_string(),
+            ),
+            StatusCode::REQUEST_TIMEOUT | StatusCode::GATEWAY_TIMEOUT => {
+                Error::Network("Diagnostic archive request timed out".to_string())
+            }
+            StatusCode::TOO_MANY_REQUESTS => Error::RequestRejected(
+                "RustFS diagnostic archive capacity limit was reached".to_string(),
+            ),
+            _ => Error::Network(format!(
+                "Diagnostic archive request failed with HTTP {}",
+                status.as_u16()
+            )),
+        }
+    }
+
     fn map_iam_policy_entities_error(&self, status: StatusCode, _body: &str) -> Error {
         match status {
             StatusCode::NOT_FOUND
@@ -2109,7 +2160,7 @@ impl AdminClient {
 }
 
 fn runtime_summary_entries(runtime: &RuntimeCapabilitiesSnapshot) -> Vec<CapabilityEntry> {
-    [
+    let mut entries = [
         ("runtime.observability", &runtime.summary.observability),
         (
             "runtime.userspace-profiling",
@@ -2125,7 +2176,15 @@ fn runtime_summary_entries(runtime: &RuntimeCapabilitiesSnapshot) -> Vec<Capabil
     ]
     .into_iter()
     .map(|(name, status)| capability_entry(name, status))
-    .collect()
+    .collect::<Vec<_>>();
+    if let Some(contract) = &runtime.inspect_archive {
+        entries.push(CapabilityEntry {
+            name: DiagnosticCapability::InspectArchive.name().to_string(),
+            availability: contract.state.availability(),
+            reason: contract.state.reason.clone(),
+        });
+    }
+    entries
 }
 
 fn capability_entry(name: &str, status: &RuntimeCapabilityStatus) -> CapabilityEntry {
@@ -2276,15 +2335,19 @@ fn add_uniform_diagnostic_capabilities(
     availability: CapabilityAvailability,
     reason: &str,
 ) {
-    capabilities.extend(
-        DiagnosticCapability::ALL
-            .into_iter()
-            .map(|capability| CapabilityEntry {
-                name: capability.name().to_string(),
-                availability,
-                reason: Some(reason.to_string()),
-            }),
-    );
+    for capability in DiagnosticCapability::ALL {
+        if capabilities
+            .iter()
+            .any(|entry| entry.name == capability.name())
+        {
+            continue;
+        }
+        capabilities.push(CapabilityEntry {
+            name: capability.name().to_string(),
+            availability,
+            reason: Some(reason.to_string()),
+        });
+    }
 }
 
 fn add_beta10_diagnostic_capabilities(capabilities: &mut Vec<CapabilityEntry>) {
@@ -2330,6 +2393,12 @@ fn add_beta10_diagnostic_capabilities(capabilities: &mut Vec<CapabilityEntry>) {
             "RustFS beta.10 site-replication netperf does not perform a peer network measurement",
         ),
     ] {
+        if capabilities
+            .iter()
+            .any(|entry| entry.name == capability.name())
+        {
+            continue;
+        }
         capabilities.push(CapabilityEntry {
             name: capability.name().to_string(),
             availability,
@@ -3699,6 +3768,168 @@ impl DiagnosticReadApi for AdminClient {
 }
 
 #[async_trait]
+impl InspectArchiveApi for AdminClient {
+    async fn inspect_archive_capability(&self) -> Result<InspectArchiveCapabilityContract> {
+        let runtime = self
+            .request_v4::<RuntimeCapabilitiesSnapshot>(Method::GET, "/runtime/capabilities")
+            .await
+            .map_err(|error| diagnostic_route_error(error, "Diagnostic archive capability"))?;
+        runtime.inspect_archive.ok_or_else(|| {
+            Error::UnsupportedFeature(
+                "RustFS did not advertise an encrypted diagnostic archive contract".to_string(),
+            )
+        })
+    }
+
+    async fn download_inspect_archive(
+        &self,
+        request: InspectArchiveTransportRequest,
+        temporary_directory: &std::path::Path,
+    ) -> Result<EncryptedInspectArchive> {
+        let operation = async {
+            let body = serde_json::to_vec(&InspectArchiveWireRequest {
+                bucket: &request.bucket,
+                object: &request.object,
+                public_key_pem: &request.public_key_pem,
+            })
+            .map_err(|_| {
+                Error::General("Failed to encode diagnostic archive request".to_string())
+            })?;
+            let url = self.admin_v4_url("/inspect/archive");
+            let headers = self.request_headers(&body)?;
+            let signed_headers = self
+                .sign_request(&Method::POST, &url, &headers, &body)
+                .await?;
+            let mut builder = self
+                .http_client
+                .request(Method::POST, &url)
+                .header(CONTENT_TYPE, "application/json")
+                .body(body);
+            for (name, value) in &signed_headers {
+                builder = builder.header(name, value);
+            }
+            let response = builder
+                .send()
+                .await
+                .map_err(|_| Error::Network("Diagnostic archive request failed".to_string()))?;
+            let status = response.status();
+            if !status.is_success() {
+                let body = read_bounded_response_body(
+                    response,
+                    64 * 1024,
+                    "Diagnostic archive error response",
+                )
+                .await?;
+                return Err(self.map_inspect_archive_error(status, &String::from_utf8_lossy(&body)));
+            }
+            let content_type = response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok());
+            let completion = response
+                .headers()
+                .get("x-rustfs-inspect-completion")
+                .and_then(|value| value.to_str().ok());
+            let cache_control = response
+                .headers()
+                .get(CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok());
+            if content_type != Some(INSPECT_ARCHIVE_CONTENT_TYPE)
+                || completion != Some(INSPECT_ARCHIVE_COMPLETION)
+                || !cache_control.is_some_and(|value| {
+                    value
+                        .split(',')
+                        .any(|directive| directive.trim().eq_ignore_ascii_case("no-store"))
+                })
+            {
+                return Err(Error::General(
+                    "Diagnostic archive response headers do not match the advertised contract"
+                        .to_string(),
+                ));
+            }
+            if response
+                .content_length()
+                .is_some_and(|length| length > request.max_bytes as u64)
+            {
+                return Err(Error::RequestRejected(
+                    "Diagnostic archive response exceeds the advertised byte limit".to_string(),
+                ));
+            }
+
+            let temporary = tempfile::Builder::new()
+                .prefix(".rc-inspect-encrypted-")
+                .tempfile_in(temporary_directory)
+                .map_err(|_| {
+                    Error::InvalidPath(
+                        "Failed to create private encrypted archive staging file".to_string(),
+                    )
+                })?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                temporary
+                    .as_file()
+                    .set_permissions(std::fs::Permissions::from_mode(0o600))
+                    .map_err(|_| {
+                        Error::InvalidPath(
+                            "Failed to protect encrypted archive staging file".to_string(),
+                        )
+                    })?;
+            }
+            let file = temporary.reopen().map_err(|_| {
+                Error::InvalidPath(
+                    "Failed to open private encrypted archive staging file".to_string(),
+                )
+            })?;
+            let mut file = tokio::fs::File::from_std(file);
+            let mut bytes = 0_usize;
+            let mut stream = response.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|_| {
+                    Error::Network("Diagnostic archive response stream failed".to_string())
+                })?;
+                bytes = bytes.checked_add(chunk.len()).ok_or_else(|| {
+                    Error::RequestRejected(
+                        "Diagnostic archive response byte accounting overflow".to_string(),
+                    )
+                })?;
+                if bytes > request.max_bytes || bytes > MAX_INSPECT_ARCHIVE_BYTES {
+                    return Err(Error::RequestRejected(
+                        "Diagnostic archive response exceeds the advertised byte limit".to_string(),
+                    ));
+                }
+                tokio::io::AsyncWriteExt::write_all(&mut file, &chunk)
+                    .await
+                    .map_err(|_| {
+                        Error::InvalidPath(
+                            "Failed to write encrypted archive staging file".to_string(),
+                        )
+                    })?;
+            }
+            tokio::io::AsyncWriteExt::flush(&mut file)
+                .await
+                .map_err(|_| {
+                    Error::InvalidPath("Failed to sync encrypted archive staging file".to_string())
+                })?;
+            file.into_std().await.sync_all().map_err(|_| {
+                Error::InvalidPath("Failed to sync encrypted archive staging file".to_string())
+            })?;
+            Ok(EncryptedInspectArchive {
+                file: temporary,
+                bytes: u64::try_from(bytes).map_err(|_| {
+                    Error::RequestRejected(
+                        "Diagnostic archive response byte accounting overflow".to_string(),
+                    )
+                })?,
+            })
+        };
+        tokio::time::timeout(request.timeout, operation)
+            .await
+            .map_err(|_| Error::Network("Diagnostic archive request timed out".to_string()))?
+    }
+}
+
+#[async_trait]
 impl ConfigApi for AdminClient {
     async fn get_config(&self, selector: &str) -> Result<ConfigDocument> {
         let (_, body) = self
@@ -5010,6 +5241,27 @@ mod tests {
         });
 
         (endpoint, handle)
+    }
+
+    fn start_admin_captured_raw_response_server(
+        response: Vec<u8>,
+    ) -> (
+        String,
+        mpsc::Receiver<CapturedAdminRequest>,
+        thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            sender
+                .send(read_admin_request(&mut stream))
+                .expect("send captured request");
+            let _ = stream.write_all(&response);
+        });
+
+        (endpoint, receiver, handle)
     }
 
     fn start_admin_owned_test_server(
@@ -9764,5 +10016,175 @@ mod tests {
         let request = receiver.recv().expect("captured request");
         assert_eq!(request.target, "/rustfs/admin/v3/import-iam-v2");
         handle.join().expect("server thread");
+    }
+
+    fn inspect_archive_request(max_bytes: usize) -> InspectArchiveTransportRequest {
+        InspectArchiveTransportRequest {
+            bucket: "diagnostics".to_string(),
+            object: "node/metadata.json".to_string(),
+            public_key_pem: "-----BEGIN PUBLIC KEY-----\nopaque\n-----END PUBLIC KEY-----"
+                .to_string(),
+            max_bytes,
+            timeout: Duration::from_secs(2),
+        }
+    }
+
+    #[tokio::test]
+    async fn inspect_archive_capability_uses_exact_v4_contract() {
+        let status = r#"{"state":"supported"}"#;
+        let body = format!(
+            r#"{{
+                "summary": {{
+                    "observability": {status},
+                    "userspace_profiling": {status},
+                    "memory_sampling": {status},
+                    "platform": {status},
+                    "topology": {status},
+                    "cluster_snapshot": {status}
+                }},
+                "inspect_archive": {{
+                    "state": {status},
+                    "route": "/rustfs/admin/v4/inspect/archive",
+                    "archive_version": 1,
+                    "content_type": "application/vnd.rustfs.inspect-archive.v1",
+                    "encryption": "RSA-OAEP-SHA256+AES-256-GCM-CHUNKED",
+                    "completion_contract": "authenticated-final-record-required",
+                    "max_bytes": 16777216,
+                    "max_duration_secs": 30,
+                    "max_metadata_bytes_per_drive": 1048576
+                }},
+                "cluster_snapshot_path": "/rustfs/admin/v4/cluster/snapshot",
+                "cluster_snapshot_summary": null,
+                "topology_status": {status}
+            }}"#
+        );
+        let (endpoint, receiver, handle) =
+            start_admin_owned_test_server("200 OK", "application/json", body);
+        let contract = admin_client_for_endpoint(&endpoint)
+            .inspect_archive_capability()
+            .await
+            .expect("exact inspect archive contract");
+        contract.validate().expect("valid contract");
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.target, "/rustfs/admin/v4/runtime/capabilities");
+        handle.join().expect("server thread");
+    }
+
+    #[tokio::test]
+    async fn inspect_archive_transport_streams_private_bounded_response() {
+        let payload = b"encrypted-frame-bytes";
+        let response = [
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: {INSPECT_ARCHIVE_CONTENT_TYPE}\r\nx-rustfs-inspect-completion: {INSPECT_ARCHIVE_COMPLETION}\r\ncache-control: no-store\r\nconnection: close\r\n\r\n",
+                payload.len()
+            )
+            .into_bytes(),
+            payload.to_vec(),
+        ]
+        .concat();
+        let (endpoint, receiver, handle) = start_admin_captured_raw_response_server(response);
+        let directory = tempdir().expect("temporary directory");
+        let encrypted = admin_client_for_endpoint(&endpoint)
+            .download_inspect_archive(inspect_archive_request(1024), directory.path())
+            .await
+            .expect("bounded response");
+        assert_eq!(
+            std::fs::read(encrypted.file.path()).expect("staged file"),
+            payload
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                encrypted
+                    .file
+                    .as_file()
+                    .metadata()
+                    .expect("metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        let request = receiver.recv().expect("captured request");
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.target, "/rustfs/admin/v4/inspect/archive");
+        let body: serde_json::Value = serde_json::from_slice(&request.body).expect("JSON body");
+        assert_eq!(body["bucket"], "diagnostics");
+        assert_eq!(body["object"], "node/metadata.json");
+        assert!(body["public_key_pem"].as_str().is_some());
+        handle.join().expect("server thread");
+    }
+
+    #[tokio::test]
+    async fn inspect_archive_transport_rejects_bad_headers_limits_and_write_failures() {
+        let bad_headers = b"HTTP/1.1 200 OK\r\ncontent-length: 1\r\ncontent-type: application/octet-stream\r\nconnection: close\r\n\r\nx".to_vec();
+        let (endpoint, handle) = start_admin_raw_response_server(bad_headers);
+        let directory = tempdir().expect("temporary directory");
+        let error = admin_client_for_endpoint(&endpoint)
+            .download_inspect_archive(inspect_archive_request(1024), directory.path())
+            .await
+            .err()
+            .expect("contract headers must match");
+        assert!(matches!(error, Error::General(_)));
+        handle.join().expect("server thread");
+
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: 2\r\ncontent-type: {INSPECT_ARCHIVE_CONTENT_TYPE}\r\nx-rustfs-inspect-completion: {INSPECT_ARCHIVE_COMPLETION}\r\ncache-control: no-store\r\nconnection: close\r\n\r\nxx"
+        )
+        .into_bytes();
+        let (endpoint, handle) = start_admin_raw_response_server(response);
+        let error = admin_client_for_endpoint(&endpoint)
+            .download_inspect_archive(inspect_archive_request(1), directory.path())
+            .await
+            .err()
+            .expect("declared limit");
+        assert!(matches!(error, Error::RequestRejected(_)));
+        handle.join().expect("server thread");
+
+        let missing = directory.path().join("missing");
+        let (endpoint, handle) = start_admin_raw_response_server(
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: 0\r\ncontent-type: {INSPECT_ARCHIVE_CONTENT_TYPE}\r\nx-rustfs-inspect-completion: {INSPECT_ARCHIVE_COMPLETION}\r\ncache-control: no-store\r\nconnection: close\r\n\r\n"
+            )
+            .into_bytes(),
+        );
+        let error = admin_client_for_endpoint(&endpoint)
+            .download_inspect_archive(inspect_archive_request(1024), &missing)
+            .await
+            .err()
+            .expect("staging write failure");
+        assert!(matches!(error, Error::InvalidPath(_)));
+        handle.join().expect("server thread");
+    }
+
+    #[tokio::test]
+    async fn inspect_archive_errors_are_classified_without_echoing_server_secrets() {
+        for (status, expected) in [
+            ("403 Forbidden", "auth"),
+            ("404 Not Found", "unsupported"),
+            ("413 Payload Too Large", "limit"),
+            ("504 Gateway Timeout", "timeout"),
+        ] {
+            let leaked = r#"{"message":"secretKey=do-not-echo"}"#;
+            let (endpoint, _receiver, handle) = start_admin_test_server(status, leaked);
+            let directory = tempdir().expect("temporary directory");
+            let error = admin_client_for_endpoint(&endpoint)
+                .download_inspect_archive(inspect_archive_request(1024), directory.path())
+                .await
+                .err()
+                .expect(expected);
+            assert!(!error.to_string().contains("do-not-echo"));
+            match expected {
+                "auth" => assert!(matches!(error, Error::Auth(_))),
+                "unsupported" => assert!(matches!(error, Error::UnsupportedFeature(_))),
+                "limit" => assert!(matches!(error, Error::RequestRejected(_))),
+                "timeout" => assert!(matches!(error, Error::Network(_))),
+                _ => unreachable!(),
+            }
+            handle.join().expect("server thread");
+        }
     }
 }

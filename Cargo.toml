@@ -68,6 +68,10 @@ rustls-pki-types = "1.15"
 x509-parser = "0.18"
 zeroize = "1.8"
 getrandom = "0.4"
+aes-gcm = "0.10"
+rsa = { version = "0.9", features = ["sha2", "pem"] }
+rand = "0.8"
+tar = "0.4"
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
 
 # HTTP client for Admin API

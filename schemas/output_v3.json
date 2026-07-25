@@ -42,6 +42,7 @@
         "health_snapshot",
         "cluster_snapshot",
         "extension_catalog",
+        "diagnostic_archive",
         "oidc",
         "iam_policy_entities",
         "iam_policy_detach",
@@ -138,6 +139,26 @@
         "runtime_capabilities": { "type": "object" },
         "cluster_snapshot": { "type": "object" },
         "external_plugin_flow": { "type": "object" }
+      }
+    },
+    "diagnosticArchiveData": {
+      "type": "object",
+      "required": [
+        "operation", "state", "output", "archive_version", "drive_count",
+        "encrypted_bytes", "plaintext_bytes", "plaintext_sha256"
+      ],
+      "properties": {
+        "operation": { "const": "retrieve" },
+        "state": { "const": "verified" },
+        "output": { "type": "string", "minLength": 1 },
+        "archive_version": { "const": 1 },
+        "drive_count": { "type": "integer", "minimum": 0 },
+        "encrypted_bytes": { "type": "integer", "minimum": 0 },
+        "plaintext_bytes": { "type": "integer", "minimum": 0 },
+        "plaintext_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
       }
     },
     "objectVersion": {
@@ -1567,7 +1588,8 @@
           "type": "string",
           "enum": [
             "general_error", "usage_error", "network_error", "auth_error",
-            "not_found", "conflict", "interrupted"
+            "not_found", "conflict", "interrupted", "invalid_target",
+            "server_limit", "cryptographic_verification", "local_io", "disabled"
           ]
         },
         "message": { "type": "string", "minLength": 1 },
@@ -1703,6 +1725,17 @@
           "properties": {
             "type": { "const": "extension_catalog" },
             "data": { "$ref": "#/definitions/extensionCatalogData" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/definitions/successEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "diagnostic_archive" },
+            "data": { "$ref": "#/definitions/diagnosticArchiveData" }
           }
         }
       ]

@@ -1,6 +1,7 @@
 //! RustFS read-only snapshots and explicitly confirmed bounded active diagnostics.
 
 mod client_devnull;
+mod inspect_archive;
 
 use std::collections::BTreeMap;
 
@@ -18,6 +19,7 @@ use crate::exit_code::ExitCode;
 use crate::output::Formatter;
 
 pub use client_devnull::ClientDevnullArgs;
+pub use inspect_archive::InspectArchiveArgs;
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum DiagnosticsCommands {
@@ -30,6 +32,9 @@ pub enum DiagnosticsCommands {
     /// Measure bounded client-to-server upload throughput without storing data
     #[command(name = "client-devnull")]
     ClientDevnull(ClientDevnullArgs),
+    /// Retrieve and verify an encrypted drive-metadata archive
+    #[command(name = "inspect-archive")]
+    InspectArchive(InspectArchiveArgs),
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -46,6 +51,7 @@ impl DiagnosticsCommands {
             Self::Cluster(_) => "cluster",
             Self::Extensions(_) => "extensions",
             Self::ClientDevnull(_) => "client-devnull",
+            Self::InspectArchive(_) => "inspect-archive",
         }
     }
 
@@ -53,6 +59,10 @@ impl DiagnosticsCommands {
         match self {
             Self::Health(args) | Self::Cluster(args) | Self::Extensions(args) => &args.alias,
             Self::ClientDevnull(args) => &args.alias,
+            Self::InspectArchive(args) => args
+                .target
+                .split_once('/')
+                .map_or(args.target.as_str(), |(alias, _)| alias),
         }
     }
 
@@ -62,6 +72,7 @@ impl DiagnosticsCommands {
             Self::Cluster(_) => DiagnosticCapability::ClusterSnapshot,
             Self::Extensions(_) => DiagnosticCapability::ExtensionsCatalog,
             Self::ClientDevnull(_) => DiagnosticCapability::ClientDevnull,
+            Self::InspectArchive(_) => DiagnosticCapability::InspectArchive,
         }
     }
 
@@ -71,6 +82,7 @@ impl DiagnosticsCommands {
             Self::Cluster(_) => "cluster_snapshot",
             Self::Extensions(_) => "extension_catalog",
             Self::ClientDevnull(_) => "admin_operations",
+            Self::InspectArchive(_) => "diagnostic_archive",
         }
     }
 }
@@ -119,6 +131,9 @@ pub async fn execute(command: DiagnosticsCommands, formatter: &Formatter) -> Exi
     match command {
         DiagnosticsCommands::ClientDevnull(args) => {
             client_devnull::execute_client_devnull(args, formatter).await
+        }
+        DiagnosticsCommands::InspectArchive(args) => {
+            inspect_archive::execute_inspect_archive(args, formatter).await
         }
         read_command => {
             let client = match get_admin_client(read_command.alias(), formatter) {
@@ -194,6 +209,12 @@ async fn execute_with_api(
             &Error::General(
                 "Client devnull must use the bounded active diagnostic executor".to_string(),
             ),
+            formatter,
+        ),
+        DiagnosticsCommands::InspectArchive(_) => emit_diagnostic_error(
+            &command,
+            "Failed to route diagnostic archive retrieval",
+            &Error::General("Inspect archive must use the encrypted archive executor".to_string()),
             formatter,
         ),
     }

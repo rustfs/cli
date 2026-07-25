@@ -90,6 +90,8 @@ pub struct RuntimeCapabilitiesSummary {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeCapabilitiesSnapshot {
     pub summary: RuntimeCapabilitiesSummary,
+    #[serde(default)]
+    pub inspect_archive: Option<super::InspectArchiveCapabilityContract>,
     pub cluster_snapshot_path: String,
     pub cluster_snapshot_summary: Option<RuntimeCapabilityStatus>,
     pub topology_status: RuntimeCapabilityStatus,

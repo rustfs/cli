@@ -295,6 +295,8 @@ pub fn get_admin_alias(alias_name: &str, formatter: &Formatter) -> Result<Alias,
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
     use clap::Parser;
 
@@ -566,6 +568,29 @@ mod tests {
             .expect_err("client devnull must require --yes");
 
         assert!(error.to_string().contains("--yes"));
+    }
+
+    #[test]
+    fn test_parse_admin_diagnostics_inspect_archive_options() {
+        let cli = TestCli::parse_from([
+            "rc",
+            "diagnostics",
+            "inspect-archive",
+            "local/diagnostics/node.json",
+            "--output",
+            "inspect.tar",
+            "--private-key",
+            "inspect-key.pem",
+        ]);
+
+        match cli.command {
+            AdminCommands::Diagnostics(diagnostics::DiagnosticsCommands::InspectArchive(args)) => {
+                assert_eq!(args.target, "local/diagnostics/node.json");
+                assert_eq!(args.output, PathBuf::from("inspect.tar"));
+                assert_eq!(args.private_key, Some(PathBuf::from("inspect-key.pem")));
+            }
+            _ => panic!("Unexpected command parsing result"),
+        }
     }
 
     #[test]
