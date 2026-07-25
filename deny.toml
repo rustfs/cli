@@ -1,0 +1,7 @@
+# RUSTSEC-2023-0071 affects network-observable RSA private-key operations.
+# Diagnostic archive RSA-OAEP decryption is performed only on the operator's
+# local machine with an ephemeral or explicitly local private key; rc exposes
+# no remote decryption oracle. The advisory currently has no patched release
+# and explicitly permits this local-only threat model as its workaround.
+[advisories]
+ignore = ["RUSTSEC-2023-0071"]
