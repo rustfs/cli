@@ -158,6 +158,69 @@ fn replication_status_and_mrf_fixtures_are_valid() {
 }
 
 #[test]
+fn site_repair_partial_fixture_preserves_every_checkpoint() {
+    let validator = load_validator(3);
+    let path = fixture_path("admin_operations", "site_repair_partial");
+    let fixture = load_json(&path);
+    assert_valid(&validator, &fixture, &path.display().to_string());
+
+    let operation = &fixture["data"]["operations"][0];
+    assert_eq!(
+        operation["operation_id"],
+        operation["result"]["operationId"]
+    );
+    assert_eq!(operation["result"]["status"], "partial");
+    assert_eq!(
+        operation["result"]["sites"]["dep-2"]["families"]["iam"]["tasks"]
+            .as_array()
+            .map(Vec::len),
+        Some(2)
+    );
+
+    let mut missing_checkpoint_id = fixture.clone();
+    missing_checkpoint_id["data"]["operations"][0]["result"]["sites"]["dep-2"]["families"]
+        ["iam"]["tasks"][0]
+        .as_object_mut()
+        .expect("task object")
+        .remove("taskId");
+    assert!(!validator.is_valid(&missing_checkpoint_id));
+
+    let mut unsafe_error = fixture;
+    unsafe_error["data"]["operations"][0]["result"]["sites"]["dep-2"]["families"]["iam"]["tasks"]
+        [1]["error"] = serde_json::json!("https://user:secret@example.test");
+    assert!(!validator.is_valid(&unsafe_error));
+
+    let preflight = serde_json::json!({
+        "schema_version": 3,
+        "type": "admin_operations",
+        "status": "success",
+        "data": {
+            "operations": [{
+                "operation": "site_replication_repair_dry_run",
+                "resource": "primary",
+                "state": "succeeded",
+                "operation_id": null,
+                "changed": false,
+                "result": {
+                    "mode": "dry-run",
+                    "status": "planned",
+                    "preflightToken": "abcdefghijklmnopqrstuvwxyzABCDEFGH012345678",
+                    "retryEvents": 0,
+                    "sites": {}
+                }
+            }]
+        }
+    });
+    assert_valid(&validator, &preflight, "site repair preflight output");
+    let mut missing_token = preflight;
+    missing_token["data"]["operations"][0]["result"]
+        .as_object_mut()
+        .expect("preflight result")
+        .remove("preflightToken");
+    assert!(!validator.is_valid(&missing_token));
+}
+
+#[test]
 fn multipart_partial_fixture_preserves_successes_and_per_upload_errors() {
     let validator = load_validator(3);
     let fixture = load_json(&fixture_path("multipart_uploads", "partial"));

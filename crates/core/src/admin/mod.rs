@@ -114,10 +114,16 @@ pub use replication::{
 };
 pub use site::{
     MAX_SITE_REPLICATION_CA_CERT_BYTES, MAX_SITE_REPLICATION_ERROR_RESPONSE_BYTES,
-    MAX_SITE_REPLICATION_REQUEST_BYTES, MAX_SITE_REPLICATION_SUCCESS_RESPONSE_BYTES, PeerSiteSpec,
-    ReplicateEditStatus, ServiceActionResult, SiteRemoveSpec, SiteReplicationInfo,
-    SiteReplicationPeer, SiteReplicationResyncBucketStatus, SiteReplicationResyncOperation,
-    SiteReplicationResyncStatus, SiteStatusOptions, validate_site_replication_ca_bundle,
+    MAX_SITE_REPLICATION_REPAIR_RESPONSE_BYTES, MAX_SITE_REPLICATION_REQUEST_BYTES,
+    MAX_SITE_REPLICATION_SUCCESS_RESPONSE_BYTES, PeerSiteSpec, ReplicateEditStatus,
+    SITE_REPLICATION_REPAIR_CAPABILITY, ServiceActionResult, SiteRemoveSpec, SiteReplicationInfo,
+    SiteReplicationPeer, SiteReplicationRepairApi, SiteReplicationRepairCapabilityContract,
+    SiteReplicationRepairFamilyStatus, SiteReplicationRepairOperationStatus,
+    SiteReplicationRepairPreflight, SiteReplicationRepairRequest, SiteReplicationRepairSiteStatus,
+    SiteReplicationRepairTaskStatus, SiteReplicationResyncBucketStatus,
+    SiteReplicationResyncOperation, SiteReplicationResyncStatus, SiteStatusOptions,
+    validate_site_replication_ca_bundle, validate_site_replication_repair_operation_id,
+    validate_site_replication_repair_token,
 };
 pub use tier::{
     ManualTransitionRunReport, ManualTransitionRunRequest, ManualTransitionRunResponse, TierAliyun,

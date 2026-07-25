@@ -1,0 +1,50 @@
+{
+  "schema_version": 3,
+  "type": "admin_operations",
+  "status": "success",
+  "data": {
+    "operations": [
+      {
+        "operation": "site_replication_repair_execute",
+        "resource": "primary",
+        "state": "failed",
+        "operation_id": "550e8400-e29b-41d4-a716-446655440000",
+        "changed": true,
+        "result": {
+          "mode": "execute",
+          "operationId": "550e8400-e29b-41d4-a716-446655440000",
+          "status": "partial",
+          "sites": {
+            "dep-2": {
+              "deploymentId": "dep-2",
+              "name": "secondary",
+              "families": {
+                "iam": {
+                  "planned": 2,
+                  "succeeded": 1,
+                  "failed": 1,
+                  "retryEvents": 1,
+                  "tasks": [
+                    {
+                      "taskId": "abcdefghijklmnopqrstuvwxyzABCDEFGH012345678",
+                      "status": "succeeded"
+                    },
+                    {
+                      "taskId": "bbcdefghijklmnopqrstuvwxyzABCDEFGH012345678",
+                      "status": "failed",
+                      "error": "remote-operation-failed"
+                    }
+                  ],
+                  "errors": ["remote-operation-failed"]
+                }
+              }
+            }
+          },
+          "createdAt": "2026-07-25T00:00:00Z",
+          "updatedAt": "2026-07-25T00:01:00Z",
+          "completedAt": null
+        }
+      }
+    ]
+  }
+}

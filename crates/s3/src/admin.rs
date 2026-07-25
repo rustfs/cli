@@ -37,18 +37,20 @@ use rc_core::admin::{
     MAX_IAM_POLICY_ENTITIES_RESPONSE_BYTES, MAX_INSPECT_ARCHIVE_BYTES, MAX_METRICS_LINE_BYTES,
     MAX_METRICS_RESPONSE_BYTES, MAX_METRICS_SAMPLES, MAX_OIDC_RESPONSE_BYTES,
     MAX_REPLICATION_DIFF_RESPONSE_BYTES, MAX_REPLICATION_INSPECTION_RESPONSE_BYTES,
-    MAX_SITE_REPLICATION_ERROR_RESPONSE_BYTES, MAX_SITE_REPLICATION_REQUEST_BYTES,
-    MAX_SITE_REPLICATION_SUCCESS_RESPONSE_BYTES, ManualTransitionRunRequest,
-    ManualTransitionRunResponse, MetricsBatch, MetricsQuery, ModuleSwitches, ObservabilityApi,
-    OidcMutationApi, OidcMutationRequest, OidcMutationResult, OidcProvider, OidcProviderList,
-    OidcReadApi, OidcValidationRequest, OidcValidationResult, PeerSiteSpec, Policy,
-    PolicyDetachEntity, PolicyDetachRequest, PolicyDetachResult, PolicyEntitiesQuery,
-    PolicyEntitiesResult, PolicyEntity, PolicyInfo, PoolStatus, PoolTarget, RealtimeMetrics,
-    RebalanceStartResult, RebalanceStatus, ReplicateEditStatus, ReplicationDiff,
+    MAX_SITE_REPLICATION_ERROR_RESPONSE_BYTES, MAX_SITE_REPLICATION_REPAIR_RESPONSE_BYTES,
+    MAX_SITE_REPLICATION_REQUEST_BYTES, MAX_SITE_REPLICATION_SUCCESS_RESPONSE_BYTES,
+    ManualTransitionRunRequest, ManualTransitionRunResponse, MetricsBatch, MetricsQuery,
+    ModuleSwitches, ObservabilityApi, OidcMutationApi, OidcMutationRequest, OidcMutationResult,
+    OidcProvider, OidcProviderList, OidcReadApi, OidcValidationRequest, OidcValidationResult,
+    PeerSiteSpec, Policy, PolicyDetachEntity, PolicyDetachRequest, PolicyDetachResult,
+    PolicyEntitiesQuery, PolicyEntitiesResult, PolicyEntity, PolicyInfo, PoolStatus, PoolTarget,
+    RealtimeMetrics, RebalanceStartResult, RebalanceStatus, ReplicateEditStatus, ReplicationDiff,
     ReplicationDiffApi, ReplicationInspectionApi, ReplicationMetricScope, ReplicationMetrics,
     ReplicationMrf, RuntimeCapabilitiesSnapshot, RuntimeCapabilityStatus, ScannerStatus,
     ServiceAccount, ServiceAccountCreateResponse, ServiceActionResult, SiteRemoveSpec,
-    SiteReplicationInfo, SiteReplicationPeer, SiteReplicationResyncOperation,
+    SiteReplicationInfo, SiteReplicationPeer, SiteReplicationRepairApi,
+    SiteReplicationRepairCapabilityContract, SiteReplicationRepairOperationStatus,
+    SiteReplicationRepairPreflight, SiteReplicationRepairRequest, SiteReplicationResyncOperation,
     SiteReplicationResyncStatus, SiteStatusOptions, StorageInfo, UpdateGroupMembersRequest,
     UpdateServiceAccountRequest, User, UserStatus,
 };
@@ -594,7 +596,11 @@ impl AdminClient {
         })?;
         let status = response.status();
         let limit = if status.is_success() {
-            MAX_SITE_REPLICATION_SUCCESS_RESPONSE_BYTES
+            if operation_label.starts_with("Site replication repair") {
+                MAX_SITE_REPLICATION_REPAIR_RESPONSE_BYTES
+            } else {
+                MAX_SITE_REPLICATION_SUCCESS_RESPONSE_BYTES
+            }
         } else {
             MAX_SITE_REPLICATION_ERROR_RESPONSE_BYTES
         };
@@ -1081,6 +1087,9 @@ impl AdminClient {
         body: &str,
         operation_label: &str,
     ) -> Error {
+        if operation_label.starts_with("Site replication repair") {
+            return map_site_replication_repair_error(status, body, operation_label);
+        }
         if matches!(
             status,
             StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_IMPLEMENTED
@@ -1407,13 +1416,102 @@ impl AdminClient {
     }
 }
 
+fn map_site_replication_repair_error(
+    status: StatusCode,
+    body: &str,
+    operation_label: &str,
+) -> Error {
+    if matches!(
+        status,
+        StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_IMPLEMENTED
+    ) {
+        return Error::UnsupportedFeature(format!(
+            "{operation_label} is not supported by this server"
+        ));
+    }
+    if matches!(status, StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED) {
+        return Error::Auth("Authentication failed for site-replication repair".to_string());
+    }
+
+    let message = parse_admin_error(body)
+        .and_then(|error| error.message)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    match status {
+        StatusCode::BAD_REQUEST if message == "repair operation was not found" => Error::NotFound(
+            "The durable site-replication repair operation was not found".to_string(),
+        ),
+        StatusCode::BAD_REQUEST
+            if message == "execute requires a valid preflighttoken"
+                || message == "dry-run does not accept preflighttoken or operationid" =>
+        {
+            Error::General(
+                "The site-replication repair preflight token or plan is invalid".to_string(),
+            )
+        }
+        StatusCode::BAD_REQUEST if message == "operationid must be a uuid" => {
+            Error::General("The site-replication repair operation ID is invalid".to_string())
+        }
+        StatusCode::CONFLICT
+            if message == "repair operation id is already bound to a different preflight" =>
+        {
+            Error::Conflict("The repair operation ID is bound to a different preflight".to_string())
+        }
+        StatusCode::CONFLICT if message == "another site replication repair is active" => {
+            Error::Conflict("Another site-replication repair operation is active".to_string())
+        }
+        StatusCode::CONFLICT => {
+            Error::Conflict("Site-replication repair has an operation ID conflict".to_string())
+        }
+        StatusCode::PRECONDITION_FAILED
+            if message == "site replication repair plan changed after partial execution" =>
+        {
+            Error::Conflict(
+                "The site-replication repair plan changed after partial execution".to_string(),
+            )
+        }
+        StatusCode::PRECONDITION_FAILED => Error::Conflict(
+            "The site-replication repair preflight or topology is stale".to_string(),
+        ),
+        status if status.is_server_error() => Error::General(
+            "RustFS reported an internal site-replication repair failure".to_string(),
+        ),
+        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
+            Error::General("RustFS rejected the site-replication repair request".to_string())
+        }
+        _ => Error::Network(format!(
+            "Site-replication repair request failed with HTTP {}",
+            status.as_u16()
+        )),
+    }
+}
+
+fn sanitize_site_replication_repair_capability_error(error: Error) -> Error {
+    match error.exit_code() {
+        3 => Error::Network("Site-replication repair capability discovery failed".to_string()),
+        4 => Error::Auth(
+            "Authentication failed while checking site-replication repair capability".to_string(),
+        ),
+        5 | 7 => Error::UnsupportedFeature(
+            "RustFS does not advertise durable site-replication repair".to_string(),
+        ),
+        6 => Error::Conflict(
+            "Site-replication repair capability discovery conflicted with server state".to_string(),
+        ),
+        _ => Error::General(
+            "RustFS returned an invalid site-replication repair capability response".to_string(),
+        ),
+    }
+}
+
 fn site_replication_response_rejected(
     mutation_outcome_label: Option<&str>,
     reason: String,
 ) -> Error {
     if let Some(label) = mutation_outcome_label {
         Error::General(format!(
-            "{label} outcome is unknown because the {reason}; do not retry blindly; inspect the persisted resync snapshot and storage state"
+            "{label} outcome is unknown because the {reason}; do not retry blindly; inspect the persisted operation status and storage state"
         ))
     } else {
         Error::General(format!("Site replication {reason}"))
@@ -1422,7 +1520,7 @@ fn site_replication_response_rejected(
 
 fn site_replication_response_unknown_network(label: &str, status: u16) -> Error {
     Error::Network(format!(
-        "{label} outcome is unknown after the server returned HTTP {status}; do not retry blindly; inspect the persisted resync snapshot and storage state"
+        "{label} outcome is unknown after the server returned HTTP {status}; do not retry blindly; inspect the persisted operation status and storage state"
     ))
 }
 
@@ -3926,6 +4024,100 @@ impl InspectArchiveApi for AdminClient {
         tokio::time::timeout(request.timeout, operation)
             .await
             .map_err(|_| Error::Network("Diagnostic archive request timed out".to_string()))?
+    }
+}
+
+#[async_trait]
+impl SiteReplicationRepairApi for AdminClient {
+    async fn site_replication_repair_capability(
+        &self,
+    ) -> Result<SiteReplicationRepairCapabilityContract> {
+        let runtime = self
+            .request_v4::<RuntimeCapabilitiesSnapshot>(Method::GET, "/runtime/capabilities")
+            .await
+            .map_err(sanitize_site_replication_repair_capability_error)?;
+        let contract = runtime.site_replication_repair.ok_or_else(|| {
+            Error::UnsupportedFeature(
+                "RustFS does not advertise durable site-replication repair".to_string(),
+            )
+        })?;
+        contract.validate()?;
+        Ok(contract)
+    }
+
+    async fn site_replication_repair_dry_run(&self) -> Result<SiteReplicationRepairPreflight> {
+        let body = serde_json::to_vec(&SiteReplicationRepairRequest {
+            mode: "dry-run".to_string(),
+            preflight_token: None,
+            operation_id: None,
+        })
+        .map_err(|_| Error::General("Failed to encode site-replication repair request".into()))?;
+        let response: SiteReplicationRepairPreflight = self
+            .request_site_replication(
+                Method::PUT,
+                "/site-replication/repair",
+                Some(&body),
+                "Site replication repair dry-run",
+                None,
+                None,
+            )
+            .await?;
+        response.validate()?;
+        Ok(response)
+    }
+
+    async fn site_replication_repair_execute(
+        &self,
+        preflight_token: &str,
+        operation_id: &str,
+    ) -> Result<SiteReplicationRepairOperationStatus> {
+        rc_core::admin::validate_site_replication_repair_token(preflight_token)?;
+        rc_core::admin::validate_site_replication_repair_operation_id(operation_id)?;
+        let body = Zeroizing::new(
+            serde_json::to_vec(&SiteReplicationRepairRequest {
+                mode: "execute".to_string(),
+                preflight_token: Some(preflight_token.to_string()),
+                operation_id: Some(operation_id.to_string()),
+            })
+            .map_err(|_| {
+                Error::General("Failed to encode site-replication repair request".into())
+            })?,
+        );
+        let response: SiteReplicationRepairOperationStatus = self
+            .request_site_replication(
+                Method::PUT,
+                "/site-replication/repair",
+                Some(&body),
+                "Site replication repair execute",
+                Some("Site replication repair execute"),
+                Some("Site replication repair execute"),
+            )
+            .await?;
+        response.validate(operation_id)?;
+        Ok(response)
+    }
+
+    async fn site_replication_repair_status(
+        &self,
+        operation_id: &str,
+    ) -> Result<SiteReplicationRepairOperationStatus> {
+        rc_core::admin::validate_site_replication_repair_operation_id(operation_id)?;
+        let path = format!(
+            "/site-replication/repair/status?operation-id={}",
+            urlencoding::encode(operation_id)
+        );
+        let response: SiteReplicationRepairOperationStatus = self
+            .request_site_replication(
+                Method::GET,
+                &path,
+                None,
+                "Site replication repair status",
+                None,
+                None,
+            )
+            .await?;
+        response.validate(operation_id)?;
+        Ok(response)
     }
 }
 
@@ -8614,6 +8806,177 @@ mod tests {
         "errorDetail":"",
         "generation":7
     }"#;
+
+    const SITE_REPLICATION_REPAIR_TOKEN: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGH012345678";
+    const SITE_REPLICATION_REPAIR_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    #[tokio::test]
+    async fn site_replication_repair_rejects_malformed_mutation_response_without_echoing_it() {
+        let (endpoint, _receiver, handle) = start_admin_test_server(
+            "200 OK",
+            r#"{"mode":"execute","credential":"MUST-NOT-ECHO"}"#,
+        );
+        let client = admin_client_for_endpoint(&endpoint);
+        let error = client
+            .site_replication_repair_execute(
+                SITE_REPLICATION_REPAIR_TOKEN,
+                SITE_REPLICATION_REPAIR_ID,
+            )
+            .await
+            .expect_err("malformed repair response must fail");
+        assert!(matches!(error, Error::General(_)));
+        assert!(error.to_string().contains("outcome is unknown"));
+        assert!(!error.to_string().contains("MUST-NOT-ECHO"));
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn site_replication_repair_maps_stale_preflight_to_conflict() {
+        let (endpoint, _receiver, handle) = start_admin_test_server(
+            "412 Precondition Failed",
+            r#"{"Code":"PreconditionFailed","Message":"token=DO-NOT-ECHO"}"#,
+        );
+        let client = admin_client_for_endpoint(&endpoint);
+        let error = client
+            .site_replication_repair_execute(
+                SITE_REPLICATION_REPAIR_TOKEN,
+                SITE_REPLICATION_REPAIR_ID,
+            )
+            .await
+            .expect_err("stale repair preflight must fail");
+        assert!(matches!(error, Error::Conflict(_)));
+        assert!(!error.to_string().contains("DO-NOT-ECHO"));
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn site_replication_repair_capability_errors_never_echo_server_bodies() {
+        for (status, expected_exit) in [
+            ("500 Internal Server Error", 3),
+            ("400 Bad Request", 1),
+            ("403 Forbidden", 4),
+        ] {
+            let (endpoint, _receiver, handle) = start_admin_test_server(
+                status,
+                r#"{"Message":"https://user:secret@example.test token=MUST-NOT-ECHO"}"#,
+            );
+            let client = admin_client_for_endpoint(&endpoint);
+            let error = client
+                .site_replication_repair_capability()
+                .await
+                .expect_err("capability failure must be sanitized");
+            assert_eq!(error.exit_code(), expected_exit);
+            assert!(!error.to_string().contains("MUST-NOT-ECHO"));
+            assert!(!error.to_string().contains("user:secret"));
+            handle.join().expect("server thread should finish");
+        }
+    }
+
+    #[tokio::test]
+    async fn site_replication_repair_errors_have_distinct_redacted_categories() {
+        for (status, body, expected_exit, expected_text) in [
+            (
+                "400 Bad Request",
+                r#"{"Message":"execute requires a valid preflightToken"}"#,
+                1,
+                "token or plan is invalid",
+            ),
+            (
+                "409 Conflict",
+                r#"{"Message":"repair operation ID is already bound to a different preflight"}"#,
+                6,
+                "bound to a different preflight",
+            ),
+            (
+                "409 Conflict",
+                r#"{"Message":"another site replication repair is active"}"#,
+                6,
+                "operation is active",
+            ),
+            (
+                "412 Precondition Failed",
+                r#"{"Message":"site replication repair plan changed after partial execution"}"#,
+                6,
+                "plan changed after partial execution",
+            ),
+            (
+                "500 Internal Server Error",
+                r#"{"Message":"secret=MUST-NOT-ECHO"}"#,
+                1,
+                "internal site-replication repair failure",
+            ),
+            (
+                "403 Forbidden",
+                r#"{"Message":"secret=MUST-NOT-ECHO"}"#,
+                4,
+                "Authentication failed",
+            ),
+        ] {
+            let (endpoint, _receiver, handle) = start_admin_test_server(status, body);
+            let client = admin_client_for_endpoint(&endpoint);
+            let error = client
+                .site_replication_repair_execute(
+                    SITE_REPLICATION_REPAIR_TOKEN,
+                    SITE_REPLICATION_REPAIR_ID,
+                )
+                .await
+                .expect_err("repair failure must remain typed");
+            assert_eq!(error.exit_code(), expected_exit);
+            assert!(error.to_string().contains(expected_text));
+            assert!(!error.to_string().contains("MUST-NOT-ECHO"));
+            handle.join().expect("server thread should finish");
+        }
+    }
+
+    #[tokio::test]
+    async fn site_replication_repair_enforces_success_and_error_body_bounds() {
+        let success_response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n",
+            MAX_SITE_REPLICATION_REPAIR_RESPONSE_BYTES + 1
+        )
+        .into_bytes();
+        let (endpoint, handle) = start_admin_raw_response_server(success_response);
+        let client = admin_client_for_endpoint(&endpoint);
+        let error = client
+            .site_replication_repair_status(SITE_REPLICATION_REPAIR_ID)
+            .await
+            .expect_err("oversized repair success must fail");
+        assert!(matches!(error, Error::General(_)));
+        handle.join().expect("server thread should finish");
+
+        let error_response = format!(
+            "HTTP/1.1 500 Internal Server Error\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n",
+            MAX_SITE_REPLICATION_ERROR_RESPONSE_BYTES + 1
+        )
+        .into_bytes();
+        let (endpoint, handle) = start_admin_raw_response_server(error_response);
+        let client = admin_client_for_endpoint(&endpoint);
+        let error = client
+            .site_replication_repair_status(SITE_REPLICATION_REPAIR_ID)
+            .await
+            .expect_err("oversized repair error must fail");
+        assert!(matches!(error, Error::General(_)));
+        handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn site_replication_repair_execute_disconnect_is_not_retried() {
+        let (endpoint, receiver, handle) = start_admin_disconnect_server();
+        let client = admin_client_for_endpoint(&endpoint);
+        let error = client
+            .site_replication_repair_execute(
+                SITE_REPLICATION_REPAIR_TOKEN,
+                SITE_REPLICATION_REPAIR_ID,
+            )
+            .await
+            .expect_err("disconnected repair execute must fail");
+        assert!(matches!(error, Error::Network(_)));
+        assert!(error.to_string().contains("outcome is unknown"));
+        let request = receiver.recv().expect("one execute request");
+        assert_eq!(request.method, "PUT");
+        assert_eq!(request.target, "/rustfs/admin/v3/site-replication/repair");
+        handle.join().expect("server thread should finish");
+    }
 
     #[tokio::test]
     async fn site_replication_resync_sends_exact_start_query_and_complete_peer() {

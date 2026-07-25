@@ -54,6 +54,130 @@ const RESYNC_START_RESPONSE: &str = r#"{
     "sessionToken":"MUST-NOT-PRINT"
 }"#;
 
+const REPAIR_OPERATION_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
+const REPAIR_PREFLIGHT_TOKEN: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGH012345678";
+const REPAIR_CAPABILITY_RESPONSE: &str = r#"{
+  "summary":{
+    "observability":{"state":"supported"},
+    "userspace_profiling":{"state":"supported"},
+    "memory_sampling":{"state":"supported"},
+    "platform":{"state":"supported"},
+    "topology":{"state":"supported"},
+    "cluster_snapshot":{"state":"supported"}
+  },
+  "site_replication_repair":{
+    "contract_version":1,
+    "status":{"state":"supported"},
+    "modes":["dry-run","execute"],
+    "execute_route":"/rustfs/admin/v3/site-replication/repair",
+    "status_route":"/rustfs/admin/v3/site-replication/repair/status",
+    "preflight_token_contract":"hmac-sha256-v1",
+    "operation_id_format":"uuid",
+    "max_retained_successful_operations":32,
+    "disabled_by_default":false
+  },
+  "cluster_snapshot_path":"/rustfs/admin/v4/cluster/snapshot",
+  "cluster_snapshot_summary":null,
+  "topology_status":{"state":"supported"}
+}"#;
+const REPAIR_PREFLIGHT_RESPONSE: &str = r#"{
+  "mode":"dry-run",
+  "status":"planned",
+  "preflightToken":"abcdefghijklmnopqrstuvwxyzABCDEFGH012345678",
+  "retryEvents":2,
+  "sites":{
+    "dep-2":{
+      "deploymentId":"dep-2",
+      "name":"secondary",
+      "families":{
+        "iam":{
+          "planned":1,
+          "succeeded":0,
+          "failed":0,
+          "retryEvents":2,
+          "tasks":[{"taskId":"abcdefghijklmnopqrstuvwxyzABCDEFGH012345678","status":"planned"}]
+        }
+      }
+    }
+  }
+}"#;
+const REPAIR_PARTIAL_RESPONSE: &str = r#"{
+  "mode":"execute",
+  "operationId":"550e8400-e29b-41d4-a716-446655440000",
+  "status":"partial",
+  "sites":{
+    "dep-2":{
+      "deploymentId":"dep-2",
+      "name":"secondary",
+      "families":{
+        "iam":{
+          "planned":2,
+          "succeeded":1,
+          "failed":1,
+          "retryEvents":1,
+          "tasks":[
+            {"taskId":"abcdefghijklmnopqrstuvwxyzABCDEFGH012345678","status":"succeeded"},
+            {"taskId":"bbcdefghijklmnopqrstuvwxyzABCDEFGH012345678","status":"failed","error":"remote-operation-failed"}
+          ],
+          "errors":["remote-operation-failed"]
+        }
+      }
+    }
+  },
+  "createdAt":"2026-07-25T00:00:00Z",
+  "updatedAt":"2026-07-25T00:01:00Z"
+}"#;
+const REPAIR_RETRY_SUCCESS_RESPONSE: &str = r#"{
+  "mode":"execute",
+  "operationId":"550e8400-e29b-41d4-a716-446655440000",
+  "status":"success",
+  "sites":{
+    "dep-2":{
+      "deploymentId":"dep-2",
+      "name":"secondary",
+      "families":{
+        "iam":{
+          "planned":2,
+          "succeeded":2,
+          "failed":0,
+          "retryEvents":2,
+          "tasks":[
+            {"taskId":"abcdefghijklmnopqrstuvwxyzABCDEFGH012345678","status":"skipped"},
+            {"taskId":"bbcdefghijklmnopqrstuvwxyzABCDEFGH012345678","status":"succeeded"}
+          ]
+        }
+      }
+    }
+  },
+  "createdAt":"2026-07-25T00:00:00Z",
+  "updatedAt":"2026-07-25T00:02:00Z",
+  "completedAt":"2026-07-25T00:02:00Z"
+}"#;
+const REPAIR_RUNNING_RESPONSE: &str = r#"{
+  "mode":"execute",
+  "operationId":"550e8400-e29b-41d4-a716-446655440000",
+  "status":"running",
+  "sites":{
+    "dep-2":{
+      "deploymentId":"dep-2",
+      "name":"secondary",
+      "families":{
+        "iam":{
+          "planned":1,
+          "succeeded":0,
+          "failed":0,
+          "retryEvents":0,
+          "tasks":[
+            {"taskId":"abcdefghijklmnopqrstuvwxyzABCDEFGH012345678","status":"running"}
+          ]
+        }
+      }
+    }
+  },
+  "createdAt":"2026-07-25T00:00:00Z",
+  "updatedAt":"2026-07-25T00:01:00Z"
+}"#;
+
 fn run_resync_command(
     operation: &str,
     info: &'static str,
@@ -1408,6 +1532,340 @@ fn replicate_resync_cancel_without_server_state_returns_conflict() {
 
     assert_eq!(output.status.code(), Some(6));
     assert_eq!(requests.len(), 2);
+}
+
+#[test]
+fn replicate_repair_dry_run_is_capability_gated_and_never_executes() {
+    let config_dir = tempfile::tempdir().expect("create config dir");
+    let (endpoint, receiver, handle) = start_admin_sequence_test_server(vec![
+        ("200 OK", REPAIR_CAPABILITY_RESPONSE),
+        ("200 OK", REPAIR_PREFLIGHT_RESPONSE),
+    ]);
+    let output = Command::new(rc_binary())
+        .args([
+            "--json",
+            "admin",
+            "replicate",
+            "repair",
+            "dry-run",
+            "myalias",
+        ])
+        .env("RC_CONFIG_DIR", config_dir.path())
+        .env("RC_HOST_myalias", rc_host_alias(&endpoint))
+        .output()
+        .expect("run repair dry-run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requests = (0..2)
+        .map(|_| {
+            receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("captured repair request")
+        })
+        .collect::<Vec<_>>();
+    handle.join().expect("admin test server finished");
+    assert_eq!(requests[0].target, "/rustfs/admin/v4/runtime/capabilities");
+    assert_eq!(
+        requests[1].target,
+        "/rustfs/admin/v3/site-replication/repair"
+    );
+    let request: serde_json::Value =
+        serde_json::from_slice(&requests[1].body).expect("repair request JSON");
+    assert_eq!(request, serde_json::json!({"mode":"dry-run"}));
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("repair output JSON");
+    assert_eq!(
+        payload["data"]["operations"][0]["result"]["preflightToken"],
+        REPAIR_PREFLIGHT_TOKEN
+    );
+    assert_eq!(
+        payload["data"]["operations"][0]["result"]["sites"]["dep-2"]["families"]["iam"]["retryEvents"],
+        2
+    );
+}
+
+#[test]
+fn replicate_repair_execute_requires_confirmation_before_alias_or_network() {
+    let config_dir = tempfile::tempdir().expect("create config dir");
+    let output = Command::new(rc_binary())
+        .args([
+            "--json",
+            "admin",
+            "replicate",
+            "repair",
+            "execute",
+            "missing",
+            "--preflight-token",
+            REPAIR_PREFLIGHT_TOKEN,
+            "--operation-id",
+            REPAIR_OPERATION_ID,
+        ])
+        .env("RC_CONFIG_DIR", config_dir.path())
+        .output()
+        .expect("run repair execute without confirmation");
+    assert_eq!(output.status.code(), Some(2));
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stderr).expect("usage error JSON");
+    assert_eq!(payload["error"]["type"], "usage_error");
+}
+
+#[test]
+fn replicate_repair_rejects_invalid_token_before_capability_or_mutation() {
+    let config_dir = tempfile::tempdir().expect("create config dir");
+    let output = Command::new(rc_binary())
+        .args([
+            "--json",
+            "admin",
+            "replicate",
+            "repair",
+            "execute",
+            "missing",
+            "--preflight-token",
+            "truncated",
+            "--operation-id",
+            REPAIR_OPERATION_ID,
+            "--yes",
+        ])
+        .env("RC_CONFIG_DIR", config_dir.path())
+        .output()
+        .expect("run repair execute with invalid token");
+    assert_eq!(output.status.code(), Some(2));
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stderr).expect("validation error JSON");
+    assert_eq!(payload["error"]["type"], "usage_error");
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(REPAIR_PREFLIGHT_TOKEN));
+}
+
+#[test]
+fn replicate_repair_older_server_stops_after_capability_gate() {
+    let config_dir = tempfile::tempdir().expect("create config dir");
+    let unsupported = r#"{
+      "summary":{
+        "observability":{"state":"supported"},
+        "userspace_profiling":{"state":"supported"},
+        "memory_sampling":{"state":"supported"},
+        "platform":{"state":"supported"},
+        "topology":{"state":"supported"},
+        "cluster_snapshot":{"state":"supported"}
+      },
+      "cluster_snapshot_path":"/rustfs/admin/v4/cluster/snapshot",
+      "cluster_snapshot_summary":null,
+      "topology_status":{"state":"supported"}
+    }"#;
+    let (endpoint, receiver, handle) = start_admin_test_server(unsupported);
+    let output = Command::new(rc_binary())
+        .args([
+            "--json",
+            "admin",
+            "replicate",
+            "repair",
+            "dry-run",
+            "myalias",
+        ])
+        .env("RC_CONFIG_DIR", config_dir.path())
+        .env("RC_HOST_myalias", rc_host_alias(&endpoint))
+        .output()
+        .expect("run unsupported repair");
+    assert_eq!(output.status.code(), Some(7));
+    let request = receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("captured capability request");
+    handle.join().expect("admin test server finished");
+    assert_eq!(request.target, "/rustfs/admin/v4/runtime/capabilities");
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stderr).expect("unsupported JSON");
+    assert_eq!(payload["error"]["type"], "unsupported_feature");
+}
+
+#[test]
+fn replicate_repair_partial_execute_retains_all_checkpoints_and_exits_nonzero() {
+    let config_dir = tempfile::tempdir().expect("create config dir");
+    let (endpoint, receiver, handle) = start_admin_sequence_test_server(vec![
+        ("200 OK", REPAIR_CAPABILITY_RESPONSE),
+        ("200 OK", REPAIR_PARTIAL_RESPONSE),
+    ]);
+    let output = Command::new(rc_binary())
+        .args([
+            "--json",
+            "admin",
+            "replicate",
+            "repair",
+            "execute",
+            "myalias",
+            "--preflight-token",
+            REPAIR_PREFLIGHT_TOKEN,
+            "--operation-id",
+            REPAIR_OPERATION_ID,
+            "--yes",
+        ])
+        .env("RC_CONFIG_DIR", config_dir.path())
+        .env("RC_HOST_myalias", rc_host_alias(&endpoint))
+        .output()
+        .expect("run partial repair execute");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty(), "partial JSON belongs on stdout");
+    let requests = (0..2)
+        .map(|_| {
+            receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("captured repair request")
+        })
+        .collect::<Vec<_>>();
+    handle.join().expect("admin test server finished");
+    let request: serde_json::Value =
+        serde_json::from_slice(&requests[1].body).expect("repair request JSON");
+    assert_eq!(request["mode"], "execute");
+    assert_eq!(request["preflightToken"], REPAIR_PREFLIGHT_TOKEN);
+    assert_eq!(request["operationId"], REPAIR_OPERATION_ID);
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("partial repair JSON");
+    let operation = &payload["data"]["operations"][0];
+    assert_eq!(operation["state"], "failed");
+    assert_eq!(operation["operation_id"], REPAIR_OPERATION_ID);
+    assert_eq!(
+        operation["result"]["sites"]["dep-2"]["families"]["iam"]["tasks"]
+            .as_array()
+            .expect("all task checkpoints")
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn replicate_repair_status_uses_only_the_durable_operation_id() {
+    let config_dir = tempfile::tempdir().expect("create config dir");
+    let (endpoint, receiver, handle) = start_admin_sequence_test_server(vec![
+        ("200 OK", REPAIR_CAPABILITY_RESPONSE),
+        ("200 OK", REPAIR_PARTIAL_RESPONSE),
+    ]);
+    let output = Command::new(rc_binary())
+        .args([
+            "--json",
+            "admin",
+            "replicate",
+            "repair",
+            "status",
+            "myalias",
+            "--operation-id",
+            REPAIR_OPERATION_ID,
+        ])
+        .env("RC_CONFIG_DIR", config_dir.path())
+        .env("RC_HOST_myalias", rc_host_alias(&endpoint))
+        .output()
+        .expect("run repair status");
+    assert_eq!(output.status.code(), Some(1));
+    let requests = (0..2)
+        .map(|_| {
+            receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("captured repair request")
+        })
+        .collect::<Vec<_>>();
+    handle.join().expect("admin test server finished");
+    assert_eq!(requests[1].method, "GET");
+    assert_eq!(
+        requests[1].target,
+        format!(
+            "/rustfs/admin/v3/site-replication/repair/status?operation-id={REPAIR_OPERATION_ID}"
+        )
+    );
+    assert!(requests[1].body.is_empty());
+}
+
+#[test]
+fn replicate_repair_same_id_retry_preserves_skip_and_retries_only_failed_task() {
+    let config_dir = tempfile::tempdir().expect("create config dir");
+    let (endpoint, receiver, handle) = start_admin_sequence_test_server(vec![
+        ("200 OK", REPAIR_CAPABILITY_RESPONSE),
+        ("200 OK", REPAIR_PARTIAL_RESPONSE),
+        ("200 OK", REPAIR_CAPABILITY_RESPONSE),
+        ("200 OK", REPAIR_RETRY_SUCCESS_RESPONSE),
+    ]);
+    let run = || {
+        Command::new(rc_binary())
+            .args([
+                "--json",
+                "admin",
+                "replicate",
+                "repair",
+                "execute",
+                "myalias",
+                "--preflight-token",
+                REPAIR_PREFLIGHT_TOKEN,
+                "--operation-id",
+                REPAIR_OPERATION_ID,
+                "--yes",
+            ])
+            .env("RC_CONFIG_DIR", config_dir.path())
+            .env("RC_HOST_myalias", rc_host_alias(&endpoint))
+            .output()
+            .expect("run repair execute")
+    };
+
+    let partial = run();
+    let retried = run();
+    assert_eq!(partial.status.code(), Some(1));
+    assert!(retried.status.success());
+    let requests = (0..4)
+        .map(|_| {
+            receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("captured retry lifecycle request")
+        })
+        .collect::<Vec<_>>();
+    handle.join().expect("admin test server finished");
+    for request in [&requests[1], &requests[3]] {
+        let body: serde_json::Value = serde_json::from_slice(&request.body).expect("execute JSON");
+        assert_eq!(body["operationId"], REPAIR_OPERATION_ID);
+        assert_eq!(body["preflightToken"], REPAIR_PREFLIGHT_TOKEN);
+    }
+    let payload: serde_json::Value =
+        serde_json::from_slice(&retried.stdout).expect("retry success JSON");
+    let family = &payload["data"]["operations"][0]["result"]["sites"]["dep-2"]["families"]["iam"];
+    assert_eq!(family["tasks"][0]["status"], "skipped");
+    assert_eq!(family["tasks"][1]["status"], "succeeded");
+    assert_eq!(family["retryEvents"], 2);
+}
+
+#[test]
+fn replicate_repair_running_status_remains_authoritative() {
+    let config_dir = tempfile::tempdir().expect("create config dir");
+    let (endpoint, receiver, handle) = start_admin_sequence_test_server(vec![
+        ("200 OK", REPAIR_CAPABILITY_RESPONSE),
+        ("200 OK", REPAIR_RUNNING_RESPONSE),
+    ]);
+    let output = Command::new(rc_binary())
+        .args([
+            "--json",
+            "admin",
+            "replicate",
+            "repair",
+            "status",
+            "myalias",
+            "--operation-id",
+            REPAIR_OPERATION_ID,
+        ])
+        .env("RC_CONFIG_DIR", config_dir.path())
+        .env("RC_HOST_myalias", rc_host_alias(&endpoint))
+        .output()
+        .expect("run repair running status");
+    assert!(output.status.success());
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("running status JSON");
+    assert_eq!(payload["data"]["operations"][0]["state"], "running");
+    assert_eq!(
+        payload["data"]["operations"][0]["result"]["status"],
+        "running"
+    );
+    for _ in 0..2 {
+        receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("captured status lifecycle request");
+    }
+    handle.join().expect("admin test server finished");
 }
 
 #[test]

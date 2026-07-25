@@ -92,6 +92,8 @@ pub struct RuntimeCapabilitiesSnapshot {
     pub summary: RuntimeCapabilitiesSummary,
     #[serde(default)]
     pub inspect_archive: Option<super::InspectArchiveCapabilityContract>,
+    #[serde(default)]
+    pub site_replication_repair: Option<super::SiteReplicationRepairCapabilityContract>,
     pub cluster_snapshot_path: String,
     pub cluster_snapshot_summary: Option<RuntimeCapabilityStatus>,
     pub topology_status: RuntimeCapabilityStatus,

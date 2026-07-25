@@ -666,6 +666,26 @@ fn nested_subcommand_help_contract() {
             expected_tokens: &["--site", "--yes"],
         },
         HelpCase {
+            args: &["admin", "replicate", "repair"],
+            usage: "Usage: rc admin replicate repair [OPTIONS] <COMMAND>",
+            expected_tokens: &["dry-run", "execute", "status"],
+        },
+        HelpCase {
+            args: &["admin", "replicate", "repair", "dry-run"],
+            usage: "Usage: rc admin replicate repair dry-run [OPTIONS] <ALIAS>",
+            expected_tokens: &[],
+        },
+        HelpCase {
+            args: &["admin", "replicate", "repair", "execute"],
+            usage: "Usage: rc admin replicate repair execute [OPTIONS] --preflight-token <PREFLIGHT_TOKEN> --operation-id <OPERATION_ID> <ALIAS>",
+            expected_tokens: &["--preflight-token", "--operation-id", "--yes"],
+        },
+        HelpCase {
+            args: &["admin", "replicate", "repair", "status"],
+            usage: "Usage: rc admin replicate repair status [OPTIONS] --operation-id <OPERATION_ID> <ALIAS>",
+            expected_tokens: &["--operation-id"],
+        },
+        HelpCase {
             args: &["admin", "info", "storage"],
             usage: "Usage: rc admin info storage [OPTIONS] <ALIAS>",
             expected_tokens: &["--metrics"],

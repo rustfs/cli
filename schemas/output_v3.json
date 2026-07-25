@@ -1065,6 +1065,108 @@
         { "$ref": "#/definitions/oidcDeleteData" }
       ]
     },
+    "siteRepairTask": {
+      "type": "object",
+      "required": ["taskId", "status"],
+      "properties": {
+        "taskId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{43}$"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["planned", "running", "succeeded", "failed", "skipped"]
+        },
+        "error": {
+          "type": "string",
+          "enum": [
+            "authorization-failed", "remote-timeout", "remote-dns-failed",
+            "remote-tls-failed", "remote-connect-failed", "remote-operation-failed"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "siteRepairFamily": {
+      "type": "object",
+      "required": ["planned", "succeeded", "failed", "retryEvents", "tasks", "errors"],
+      "properties": {
+        "planned": { "type": "integer", "minimum": 0 },
+        "succeeded": { "type": "integer", "minimum": 0 },
+        "failed": { "type": "integer", "minimum": 0 },
+        "retryEvents": { "type": "integer", "minimum": 0 },
+        "tasks": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/siteRepairTask" }
+        },
+        "errors": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "authorization-failed", "remote-timeout", "remote-dns-failed",
+              "remote-tls-failed", "remote-connect-failed", "remote-operation-failed"
+            ]
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "siteRepairSite": {
+      "type": "object",
+      "required": ["deploymentId", "name", "families"],
+      "properties": {
+        "deploymentId": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 },
+        "families": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/definitions/siteRepairFamily" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "siteRepairSites": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/definitions/siteRepairSite" }
+    },
+    "siteRepairPreflight": {
+      "type": "object",
+      "required": ["mode", "status", "preflightToken", "retryEvents", "sites"],
+      "properties": {
+        "mode": { "const": "dry-run" },
+        "status": { "const": "planned" },
+        "preflightToken": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{43}$"
+        },
+        "retryEvents": { "type": "integer", "minimum": 0 },
+        "sites": { "$ref": "#/definitions/siteRepairSites" }
+      },
+      "additionalProperties": false
+    },
+    "siteRepairOperation": {
+      "type": "object",
+      "required": [
+        "mode", "operationId", "status", "sites",
+        "createdAt", "updatedAt", "completedAt"
+      ],
+      "properties": {
+        "mode": { "const": "execute" },
+        "operationId": {
+          "type": "string",
+          "pattern": "^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["running", "success", "partial", "failed"]
+        },
+        "sites": { "$ref": "#/definitions/siteRepairSites" },
+        "createdAt": { "$ref": "#/definitions/timestamp" },
+        "updatedAt": { "$ref": "#/definitions/timestamp" },
+        "completedAt": { "$ref": "#/definitions/nullableTimestamp" }
+      },
+      "additionalProperties": false
+    },
     "adminOperation": {
       "type": "object",
       "required": [
@@ -1080,7 +1182,40 @@
         "operation_id": { "$ref": "#/definitions/nullableString" },
         "changed": { "type": "boolean" },
         "result": { "type": ["object", "null"] }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "operation": { "const": "site_replication_repair_dry_run" }
+            },
+            "required": ["operation"]
+          },
+          "then": {
+            "properties": {
+              "result": { "$ref": "#/definitions/siteRepairPreflight" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "enum": [
+                  "site_replication_repair_execute",
+                  "site_replication_repair_status"
+                ]
+              }
+            },
+            "required": ["operation"]
+          },
+          "then": {
+            "properties": {
+              "result": { "$ref": "#/definitions/siteRepairOperation" }
+            }
+          }
+        }
+      ]
     },
     "adminOperationsData": {
       "type": "object",

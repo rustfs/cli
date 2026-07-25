@@ -18,8 +18,10 @@ use crate::exit_code::ExitCode;
 use crate::output::Formatter;
 use rc_core::admin::{
     AdminApi, PeerSiteSpec, ReplicateEditStatus, SiteRemoveSpec, SiteReplicationInfo,
-    SiteReplicationPeer, SiteReplicationResyncOperation, SiteReplicationResyncStatus,
+    SiteReplicationPeer, SiteReplicationRepairApi, SiteReplicationRepairOperationStatus,
+    SiteReplicationRepairPreflight, SiteReplicationResyncOperation, SiteReplicationResyncStatus,
     SiteStatusOptions, validate_site_replication_ca_bundle,
+    validate_site_replication_repair_operation_id, validate_site_replication_repair_token,
 };
 use rc_core::{AliasManager, Error};
 use rc_s3::AdminClient;
@@ -38,6 +40,9 @@ pub enum ReplicateCommands {
 
     /// Manage persisted site resync operation snapshots
     Resync(ResyncArgs),
+
+    /// Plan, execute, or inspect durable site replication repair
+    Repair(RepairArgs),
 
     /// Show site replication status
     Status(StatusArgs),
@@ -141,6 +146,70 @@ pub struct ResyncStatusArgs {
 }
 
 #[derive(clap::Args, Debug)]
+pub struct RepairArgs {
+    #[command(subcommand)]
+    pub command: RepairCommands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RepairCommands {
+    /// Create a local-only repair plan and preflight token
+    DryRun(RepairDryRunArgs),
+
+    /// Execute or resume a repair using the exact preflight token and operation ID
+    Execute(RepairExecuteArgs),
+
+    /// Read a durable repair snapshot from a fresh process
+    Status(RepairStatusArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct RepairDryRunArgs {
+    /// Alias name of the server
+    pub alias: String,
+}
+
+#[derive(clap::Args)]
+pub struct RepairExecuteArgs {
+    /// Alias name of the server
+    pub alias: String,
+
+    /// Complete server-issued preflight token from a separate dry-run
+    #[arg(long)]
+    pub preflight_token: String,
+
+    /// Stable UUID retained and reused for retries
+    #[arg(long)]
+    pub operation_id: String,
+
+    /// Confirm the repair mutation
+    #[arg(long)]
+    pub yes: bool,
+}
+
+impl std::fmt::Debug for RepairExecuteArgs {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RepairExecuteArgs")
+            .field("alias", &self.alias)
+            .field("has_preflight_token", &!self.preflight_token.is_empty())
+            .field("operation_id", &self.operation_id)
+            .field("yes", &self.yes)
+            .finish()
+    }
+}
+
+#[derive(clap::Args, Debug)]
+pub struct RepairStatusArgs {
+    /// Alias name of the server
+    pub alias: String,
+
+    /// Durable operation UUID
+    #[arg(long)]
+    pub operation_id: String,
+}
+
+#[derive(clap::Args, Debug)]
 pub struct StatusArgs {
     /// Alias name of the server
     pub alias: String,
@@ -187,6 +256,7 @@ pub async fn execute(cmd: ReplicateCommands, formatter: &Formatter) -> ExitCode 
         ReplicateCommands::Info(args) => execute_info(args, formatter).await,
         ReplicateCommands::Edit(args) => execute_edit(args, formatter).await,
         ReplicateCommands::Resync(args) => execute_resync(args, formatter).await,
+        ReplicateCommands::Repair(args) => execute_repair(args, formatter).await,
         ReplicateCommands::Status(args) => execute_status(args, formatter).await,
         ReplicateCommands::Remove(args) => execute_remove(args, formatter).await,
     }
@@ -575,6 +645,201 @@ async fn execute_resync_request(
         Err(error) => {
             let mutation_attempted = mutation_was_attempted(mutation, &error);
             emit_admin_error(formatter, &error, operation_name, mutation_attempted)
+        }
+    }
+}
+
+async fn execute_repair(args: RepairArgs, formatter: &Formatter) -> ExitCode {
+    match args.command {
+        RepairCommands::DryRun(args) => execute_repair_dry_run(args, formatter).await,
+        RepairCommands::Execute(args) => execute_repair_execute(args, formatter).await,
+        RepairCommands::Status(args) => execute_repair_status(args, formatter).await,
+    }
+}
+
+async fn repair_client(
+    alias: &str,
+    formatter: &Formatter,
+    operation: &'static str,
+) -> Result<AdminClient, ExitCode> {
+    let client = load_admin_client(alias)
+        .map_err(|error| emit_admin_error(formatter, &error, operation, false))?;
+    client
+        .site_replication_repair_capability()
+        .await
+        .map_err(|error| emit_admin_error(formatter, &error, operation, false))?;
+    Ok(client)
+}
+
+async fn execute_repair_dry_run(args: RepairDryRunArgs, formatter: &Formatter) -> ExitCode {
+    const OPERATION: &str = "site_replication_repair_dry_run";
+    let client = match repair_client(&args.alias, formatter, OPERATION).await {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
+    match client.site_replication_repair_dry_run().await {
+        Ok(preflight) => {
+            emit_repair_preflight(formatter, &args.alias, preflight);
+            ExitCode::Success
+        }
+        Err(error) => emit_admin_error(formatter, &error, OPERATION, false),
+    }
+}
+
+async fn execute_repair_execute(args: RepairExecuteArgs, formatter: &Formatter) -> ExitCode {
+    const OPERATION: &str = "site_replication_repair_execute";
+    if !args.yes {
+        return emit_admin_message_error(
+            formatter,
+            ExitCode::UsageError,
+            OPERATION,
+            false,
+            "Site replication repair execute requires --yes confirmation".to_string(),
+        );
+    }
+    if let Err(error) = validate_site_replication_repair_token(&args.preflight_token) {
+        return emit_admin_error(formatter, &error, OPERATION, false);
+    }
+    if let Err(error) = validate_site_replication_repair_operation_id(&args.operation_id) {
+        return emit_admin_error(formatter, &error, OPERATION, false);
+    }
+    let client = match repair_client(&args.alias, formatter, OPERATION).await {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
+    match client
+        .site_replication_repair_execute(&args.preflight_token, &args.operation_id)
+        .await
+    {
+        Ok(status) => emit_repair_operation(formatter, OPERATION, &args.alias, true, status),
+        Err(error) => emit_admin_error(
+            formatter,
+            &error,
+            OPERATION,
+            mutation_was_attempted(true, &error),
+        ),
+    }
+}
+
+async fn execute_repair_status(args: RepairStatusArgs, formatter: &Formatter) -> ExitCode {
+    const OPERATION: &str = "site_replication_repair_status";
+    if let Err(error) = validate_site_replication_repair_operation_id(&args.operation_id) {
+        return emit_admin_error(formatter, &error, OPERATION, false);
+    }
+    let client = match repair_client(&args.alias, formatter, OPERATION).await {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
+    match client
+        .site_replication_repair_status(&args.operation_id)
+        .await
+    {
+        Ok(status) => emit_repair_operation(formatter, OPERATION, &args.alias, false, status),
+        Err(error) => emit_admin_error(formatter, &error, OPERATION, false),
+    }
+}
+
+fn emit_repair_preflight(
+    formatter: &Formatter,
+    alias: &str,
+    preflight: SiteReplicationRepairPreflight,
+) {
+    if formatter.is_json() {
+        formatter.json(&admin_success_output(
+            "site_replication_repair_dry_run",
+            alias.to_string(),
+            false,
+            preflight,
+        ));
+        return;
+    }
+    formatter.println("Site replication repair plan:");
+    formatter.println(&format!(
+        "  Preflight token: {}",
+        formatter.sanitize_text(&preflight.preflight_token)
+    ));
+    formatter.println(&format!("  Retry events: {}", preflight.retry_events));
+    emit_repair_sites_human(formatter, &preflight.sites);
+}
+
+fn emit_repair_operation(
+    formatter: &Formatter,
+    operation: &'static str,
+    alias: &str,
+    changed: bool,
+    status: SiteReplicationRepairOperationStatus,
+) -> ExitCode {
+    let failed = status.has_failure();
+    let state = if failed {
+        "failed"
+    } else if status.status == "success" {
+        "succeeded"
+    } else if status.status == "running" {
+        "running"
+    } else {
+        "unknown"
+    };
+    if formatter.is_json() {
+        formatter.json(&admin_operation_output(
+            operation,
+            alias.to_string(),
+            state,
+            Some(status.operation_id.clone()),
+            changed,
+            status,
+        ));
+    } else {
+        formatter.println(&format!(
+            "Site replication repair: status={}, operation ID={}",
+            formatter.sanitize_text(&status.status),
+            formatter.sanitize_text(&status.operation_id)
+        ));
+        emit_repair_sites_human(formatter, &status.sites);
+        if failed {
+            formatter.error(
+                "Repair is partial or failed; retry execute with the same operation ID and preflight token",
+            );
+        }
+    }
+    if failed {
+        ExitCode::GeneralError
+    } else {
+        ExitCode::Success
+    }
+}
+
+fn emit_repair_sites_human(
+    formatter: &Formatter,
+    sites: &BTreeMap<String, rc_core::admin::SiteReplicationRepairSiteStatus>,
+) {
+    for site in sites.values() {
+        formatter.println(&format!(
+            "  Site {} ({})",
+            formatter.sanitize_text(&site.name),
+            formatter.sanitize_text(&site.deployment_id)
+        ));
+        for (name, family) in &site.families {
+            formatter.println(&format!(
+                "    {}: planned={}, succeeded={}, failed={}, retry-events={}",
+                formatter.sanitize_text(name),
+                family.planned,
+                family.succeeded,
+                family.failed,
+                family.retry_events
+            ));
+            for task in &family.tasks {
+                let error = task
+                    .error
+                    .as_deref()
+                    .map(|value| format!(", error={}", formatter.sanitize_text(value)))
+                    .unwrap_or_default();
+                formatter.println(&format!(
+                    "      {}: {}{}",
+                    formatter.sanitize_text(&task.task_id),
+                    formatter.sanitize_text(&task.status),
+                    error
+                ));
+            }
         }
     }
 }

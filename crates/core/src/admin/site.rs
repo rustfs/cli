@@ -21,6 +21,322 @@ pub const MAX_SITE_REPLICATION_ERROR_RESPONSE_BYTES: usize = 64 * 1024;
 pub const MAX_SITE_REPLICATION_REQUEST_BYTES: usize = 1024 * 1024;
 /// Maximum custom CA bundle accepted by the CLI.
 pub const MAX_SITE_REPLICATION_CA_CERT_BYTES: usize = 256 * 1024;
+/// Stable capability name for the durable site-replication repair lifecycle.
+pub const SITE_REPLICATION_REPAIR_CAPABILITY: &str = "admin.site-replication.repair";
+/// Maximum preflight/operation response accepted from the repair routes.
+pub const MAX_SITE_REPLICATION_REPAIR_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Validate the opaque HMAC-SHA256 v1 preflight token without inspecting its contents.
+pub fn validate_site_replication_repair_token(token: &str) -> Result<()> {
+    if token.len() == 43
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        Ok(())
+    } else {
+        Err(Error::InvalidPath(
+            "Preflight token must be the complete 43-character server-issued token".to_string(),
+        ))
+    }
+}
+
+/// Validate the canonical UUID syntax required for durable operation identifiers.
+pub fn validate_site_replication_repair_operation_id(operation_id: &str) -> Result<()> {
+    let bytes = operation_id.as_bytes();
+    let valid = bytes.len() == 36
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                *byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(Error::InvalidPath(
+            "Operation ID must be a canonical UUID".to_string(),
+        ))
+    }
+}
+
+/// Capability contract advertised by `/rustfs/admin/v4/runtime/capabilities`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SiteReplicationRepairCapabilityContract {
+    pub contract_version: u32,
+    pub status: super::RuntimeCapabilityStatus,
+    pub modes: Vec<String>,
+    pub execute_route: String,
+    pub status_route: String,
+    pub preflight_token_contract: String,
+    pub operation_id_format: String,
+    pub max_retained_successful_operations: usize,
+    pub disabled_by_default: bool,
+}
+
+impl SiteReplicationRepairCapabilityContract {
+    /// Reject incomplete or incompatible server advertisements before using a repair route.
+    pub fn validate(&self) -> Result<()> {
+        let supported = self.status.state == super::RuntimeCapabilityState::Supported;
+        let modes_ok = self.modes.len() == 2
+            && ["dry-run", "execute"]
+                .iter()
+                .all(|required| self.modes.iter().any(|mode| mode == required));
+        if self.contract_version != 1
+            || !supported
+            || !modes_ok
+            || self.execute_route != "/rustfs/admin/v3/site-replication/repair"
+            || self.status_route != "/rustfs/admin/v3/site-replication/repair/status"
+            || self.preflight_token_contract != "hmac-sha256-v1"
+            || self.operation_id_format != "uuid"
+            || self.max_retained_successful_operations == 0
+            || self.disabled_by_default
+        {
+            return Err(Error::UnsupportedFeature(
+                "RustFS did not advertise the supported durable site-replication repair contract"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Request body for dry-run and execute repair operations.
+#[derive(Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SiteReplicationRepairRequest {
+    pub mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preflight_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+}
+
+/// One durable task checkpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SiteReplicationRepairTaskStatus {
+    pub task_id: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Per-family task counts and checkpoints.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SiteReplicationRepairFamilyStatus {
+    pub planned: usize,
+    pub succeeded: usize,
+    pub failed: usize,
+    #[serde(default)]
+    pub retry_events: usize,
+    #[serde(default)]
+    pub tasks: Vec<SiteReplicationRepairTaskStatus>,
+    #[serde(default)]
+    pub errors: Vec<String>,
+}
+
+/// Per-site repair plan or operation status.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SiteReplicationRepairSiteStatus {
+    pub deployment_id: String,
+    pub name: String,
+    pub families: BTreeMap<String, SiteReplicationRepairFamilyStatus>,
+}
+
+/// Dry-run response containing the server-issued preflight token.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SiteReplicationRepairPreflight {
+    pub mode: String,
+    pub status: String,
+    pub preflight_token: String,
+    pub retry_events: usize,
+    pub sites: BTreeMap<String, SiteReplicationRepairSiteStatus>,
+}
+
+impl fmt::Debug for SiteReplicationRepairPreflight {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SiteReplicationRepairPreflight")
+            .field("mode", &self.mode)
+            .field("status", &self.status)
+            .field("has_preflight_token", &!self.preflight_token.is_empty())
+            .field("retry_events", &self.retry_events)
+            .field("site_count", &self.sites.len())
+            .finish()
+    }
+}
+
+impl SiteReplicationRepairPreflight {
+    pub fn validate(&self) -> Result<()> {
+        if self.mode != "dry-run" || self.status != "planned" {
+            return Err(Error::General(
+                "RustFS returned an inconsistent site-replication repair preflight".to_string(),
+            ));
+        }
+        validate_site_replication_repair_token(&self.preflight_token)?;
+        validate_repair_sites(&self.sites)
+    }
+}
+
+/// Durable execute/status snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SiteReplicationRepairOperationStatus {
+    pub mode: String,
+    pub operation_id: String,
+    pub status: String,
+    pub sites: BTreeMap<String, SiteReplicationRepairSiteStatus>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+    #[serde(default)]
+    pub completed_at: Option<String>,
+}
+
+impl SiteReplicationRepairOperationStatus {
+    pub fn validate(&self, expected_operation_id: &str) -> Result<()> {
+        validate_site_replication_repair_operation_id(&self.operation_id)?;
+        if self.mode != "execute"
+            || !self
+                .operation_id
+                .eq_ignore_ascii_case(expected_operation_id)
+            || !matches!(
+                self.status.as_str(),
+                "running" | "success" | "partial" | "failed"
+            )
+        {
+            return Err(Error::General(
+                "RustFS returned an inconsistent site-replication repair operation".to_string(),
+            ));
+        }
+        for timestamp in [&self.created_at, &self.updated_at, &self.completed_at]
+            .into_iter()
+            .flatten()
+        {
+            timestamp.parse::<jiff::Timestamp>().map_err(|_| {
+                Error::General(
+                    "RustFS returned an invalid site-replication repair timestamp".to_string(),
+                )
+            })?;
+        }
+        if self.created_at.is_none() || self.updated_at.is_none() {
+            return Err(Error::General(
+                "RustFS returned an incomplete site-replication repair timestamp".to_string(),
+            ));
+        }
+        validate_repair_sites(&self.sites)
+    }
+
+    /// Terminal snapshots that must cause a non-zero CLI exit.
+    pub fn has_failure(&self) -> bool {
+        matches!(
+            self.status.trim().to_ascii_lowercase().as_str(),
+            "partial" | "failed" | "failure"
+        ) || self
+            .sites
+            .values()
+            .flat_map(|site| site.families.values())
+            .any(|family| {
+                family.failed > 0
+                    || family.tasks.iter().any(|task| {
+                        matches!(
+                            task.status.trim().to_ascii_lowercase().as_str(),
+                            "failed" | "failure"
+                        )
+                    })
+            })
+    }
+}
+
+fn validate_repair_sites(sites: &BTreeMap<String, SiteReplicationRepairSiteStatus>) -> Result<()> {
+    for (deployment_id, site) in sites {
+        if deployment_id.is_empty()
+            || site.deployment_id != *deployment_id
+            || site.name.trim().is_empty()
+            || site.families.is_empty()
+        {
+            return Err(Error::General(
+                "RustFS returned an incomplete site-replication repair site".to_string(),
+            ));
+        }
+        for (family_name, family) in &site.families {
+            let successful = family
+                .tasks
+                .iter()
+                .filter(|task| matches!(task.status.as_str(), "succeeded" | "skipped"))
+                .count();
+            let failed = family
+                .tasks
+                .iter()
+                .filter(|task| task.status == "failed")
+                .count();
+            let mut task_ids = std::collections::BTreeSet::new();
+            if family_name.is_empty()
+                || family.succeeded.saturating_add(family.failed) > family.planned
+                || family.tasks.len() != family.planned
+                || successful != family.succeeded
+                || failed != family.failed
+                || family
+                    .errors
+                    .iter()
+                    .any(|error| !repair_error_is_safe(error))
+                || family.tasks.iter().any(|task| {
+                    validate_site_replication_repair_token(&task.task_id).is_err()
+                        || !task_ids.insert(task.task_id.as_str())
+                        || !matches!(
+                            task.status.as_str(),
+                            "planned" | "running" | "succeeded" | "failed" | "skipped"
+                        )
+                        || task
+                            .error
+                            .as_deref()
+                            .is_some_and(|error| !repair_error_is_safe(error))
+                })
+            {
+                return Err(Error::General(
+                    "RustFS returned inconsistent site-replication repair checkpoints".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn repair_error_is_safe(error: &str) -> bool {
+    matches!(
+        error,
+        "authorization-failed"
+            | "remote-timeout"
+            | "remote-dns-failed"
+            | "remote-tls-failed"
+            | "remote-connect-failed"
+            | "remote-operation-failed"
+    )
+}
+
+/// Durable site-replication repair transport.
+#[async_trait::async_trait]
+pub trait SiteReplicationRepairApi: Send + Sync {
+    async fn site_replication_repair_capability(
+        &self,
+    ) -> Result<SiteReplicationRepairCapabilityContract>;
+    async fn site_replication_repair_dry_run(&self) -> Result<SiteReplicationRepairPreflight>;
+    async fn site_replication_repair_execute(
+        &self,
+        preflight_token: &str,
+        operation_id: &str,
+    ) -> Result<SiteReplicationRepairOperationStatus>;
+    async fn site_replication_repair_status(
+        &self,
+        operation_id: &str,
+    ) -> Result<SiteReplicationRepairOperationStatus>;
+}
 
 /// Validate a bounded certificate-only PEM bundle for site replication edits.
 pub fn validate_site_replication_ca_bundle(pem: &[u8]) -> Result<()> {
@@ -980,5 +1296,86 @@ mod tests {
 
         exact.push(b' ');
         assert!(validate_site_replication_ca_bundle(&exact).is_err());
+    }
+
+    #[test]
+    fn repair_identifiers_are_strictly_validated() {
+        assert!(
+            validate_site_replication_repair_token("abcdefghijklmnopqrstuvwxyzABCDEFGH012345678")
+                .is_ok()
+        );
+        assert!(validate_site_replication_repair_token("short").is_err());
+        assert!(
+            validate_site_replication_repair_token("abcdefghijklmnopqrstuvwxyzABCDEFGH01234567=")
+                .is_err()
+        );
+
+        assert!(
+            validate_site_replication_repair_operation_id("550e8400-e29b-41d4-a716-446655440000")
+                .is_ok()
+        );
+        assert!(
+            validate_site_replication_repair_operation_id("550e8400e29b41d4a716446655440000")
+                .is_err()
+        );
+
+        let preflight: SiteReplicationRepairPreflight = serde_json::from_value(serde_json::json!({
+            "mode": "dry-run",
+            "status": "planned",
+            "preflightToken": "abcdefghijklmnopqrstuvwxyzABCDEFGH012345678",
+            "retryEvents": 0,
+            "sites": {}
+        }))
+        .expect("valid empty preflight");
+        assert!(!format!("{preflight:?}").contains(&preflight.preflight_token));
+    }
+
+    #[test]
+    fn repair_snapshot_rejects_inconsistent_counts_and_detects_partial() {
+        let json = serde_json::json!({
+            "mode": "execute",
+            "operationId": "550e8400-e29b-41d4-a716-446655440000",
+            "status": "partial",
+            "createdAt": "2026-07-25T00:00:00Z",
+            "updatedAt": "2026-07-25T00:01:00Z",
+            "sites": {
+                "dep-2": {
+                    "deploymentId": "dep-2",
+                    "name": "secondary",
+                    "families": {
+                        "iam": {
+                            "planned": 1,
+                            "succeeded": 0,
+                            "failed": 1,
+                            "retryEvents": 1,
+                            "tasks": [{
+                                "taskId": "abcdefghijklmnopqrstuvwxyzABCDEFGH012345678",
+                                "status": "failed",
+                                "error": "remote-operation-failed"
+                            }],
+                            "errors": ["remote-operation-failed"]
+                        }
+                    }
+                }
+            }
+        });
+        let status: SiteReplicationRepairOperationStatus =
+            serde_json::from_value(json.clone()).expect("valid repair response");
+        assert!(
+            status
+                .validate("550e8400-e29b-41d4-a716-446655440000")
+                .is_ok()
+        );
+        assert!(status.has_failure());
+
+        let mut invalid = json;
+        invalid["sites"]["dep-2"]["families"]["iam"]["planned"] = Value::from(0);
+        let status: SiteReplicationRepairOperationStatus =
+            serde_json::from_value(invalid).expect("syntactically valid repair response");
+        assert!(
+            status
+                .validate("550e8400-e29b-41d4-a716-446655440000")
+                .is_err()
+        );
     }
 }
