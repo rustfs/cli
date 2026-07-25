@@ -1640,6 +1640,29 @@ fn replicate_repair_rejects_invalid_token_before_capability_or_mutation() {
 }
 
 #[test]
+fn replicate_repair_status_rejects_invalid_operation_id_before_alias_or_network() {
+    let config_dir = tempfile::tempdir().expect("create config dir");
+    let output = Command::new(rc_binary())
+        .args([
+            "--json",
+            "admin",
+            "replicate",
+            "repair",
+            "status",
+            "missing",
+            "--operation-id",
+            "not-a-uuid",
+        ])
+        .env("RC_CONFIG_DIR", config_dir.path())
+        .output()
+        .expect("run repair status with invalid operation id");
+    assert_eq!(output.status.code(), Some(2));
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stderr).expect("validation error JSON");
+    assert_eq!(payload["error"]["type"], "usage_error");
+}
+
+#[test]
 fn replicate_repair_older_server_stops_after_capability_gate() {
     let config_dir = tempfile::tempdir().expect("create config dir");
     let unsupported = r#"{
