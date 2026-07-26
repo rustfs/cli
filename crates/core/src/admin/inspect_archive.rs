@@ -607,12 +607,25 @@ pub fn validate_inspect_archive_output_directory(directory: &Path) -> Result<()>
             "Diagnostic archive output directory does not exist or is inaccessible".to_string(),
         )
     })?;
-    if metadata.file_type().is_symlink() {
+    let platform_root_alias = directory.is_absolute()
+        && directory
+            .components()
+            .filter(|component| matches!(component, Component::Normal(_)))
+            .count()
+            == 1;
+    if metadata.file_type().is_symlink() && !platform_root_alias {
         return Err(Error::InvalidPath(
             "Diagnostic archive output directory cannot be a symbolic link".to_string(),
         ));
     }
-    if !metadata.is_dir() {
+    let is_directory = if metadata.file_type().is_symlink() {
+        std::fs::metadata(directory)
+            .map(|target| target.is_dir())
+            .unwrap_or(false)
+    } else {
+        metadata.is_dir()
+    };
+    if !is_directory {
         return Err(Error::InvalidPath(
             "Diagnostic archive output directory does not exist".to_string(),
         ));
@@ -942,6 +955,14 @@ mod tests {
     #[test]
     fn output_directory_and_broken_destination_symlinks_are_rejected() {
         use std::os::unix::fs::symlink;
+
+        let tmp = Path::new("/tmp");
+        if std::fs::symlink_metadata(tmp)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            assert!(validate_inspect_archive_output_directory(tmp).is_ok());
+        }
 
         let directory = tempdir().expect("temp directory");
         let real = directory.path().join("real");
