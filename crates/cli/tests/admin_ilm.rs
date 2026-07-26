@@ -686,6 +686,151 @@ fn ilm_transition_wait_polls_until_terminal_state() {
 }
 
 #[test]
+fn ilm_transition_async_job_commands_follow_backend_contract() {
+    let config_dir = tempfile::tempdir().expect("create config dir");
+    let (endpoint, receiver, handle) = start_admin_sequence_test_server(vec![
+        ("202 Accepted", MANUAL_TRANSITION_ASYNC_RESPONSE),
+        ("200 OK", MANUAL_TRANSITION_JOB_RUNNING_RESPONSE),
+        ("200 OK", MANUAL_TRANSITION_JOB_CANCELLED_RESPONSE),
+        ("200 OK", MANUAL_TRANSITION_JOB_COMPLETED_RESPONSE),
+    ]);
+    let job_id = "11111111-1111-4111-8111-111111111111";
+
+    let run_output = Command::new(rc_binary())
+        .args([
+            "--json",
+            "admin",
+            "ilm",
+            "transition",
+            "run",
+            "myalias",
+            "photos",
+            "--prefix",
+            "logs/",
+            "--tier",
+            "COLDTIER",
+            "--async",
+        ])
+        .env("RC_CONFIG_DIR", config_dir.path())
+        .env("RC_HOST_myalias", rc_host_alias(&endpoint))
+        .output()
+        .expect("run async transition command");
+    assert!(
+        run_output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run_output.stderr)
+    );
+    let run_value: Value =
+        serde_json::from_slice(&run_output.stdout).expect("run stdout should be JSON");
+    assert_eq!(run_value["type"], "manual_transition_run");
+    assert_eq!(run_value["data"]["job_id"], job_id);
+
+    let status_output = Command::new(rc_binary())
+        .args([
+            "--json",
+            "admin",
+            "ilm",
+            "transition",
+            "status",
+            "myalias",
+            job_id,
+        ])
+        .env("RC_CONFIG_DIR", config_dir.path())
+        .env("RC_HOST_myalias", rc_host_alias(&endpoint))
+        .output()
+        .expect("run transition status command");
+    assert!(
+        status_output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&status_output.stderr)
+    );
+    let status_value: Value =
+        serde_json::from_slice(&status_output.stdout).expect("status stdout should be JSON");
+    assert_eq!(status_value["type"], "manual_transition_job_status");
+    assert_eq!(status_value["data"]["status"], "running");
+
+    let cancel_output = Command::new(rc_binary())
+        .args([
+            "--json",
+            "admin",
+            "ilm",
+            "transition",
+            "cancel",
+            "myalias",
+            job_id,
+        ])
+        .env("RC_CONFIG_DIR", config_dir.path())
+        .env("RC_HOST_myalias", rc_host_alias(&endpoint))
+        .output()
+        .expect("run transition cancel command");
+    assert!(
+        cancel_output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&cancel_output.stderr)
+    );
+    let cancel_value: Value =
+        serde_json::from_slice(&cancel_output.stdout).expect("cancel stdout should be JSON");
+    assert_eq!(cancel_value["type"], "manual_transition_job_cancel");
+    assert_eq!(cancel_value["data"]["status"], "cancelled");
+
+    let wait_output = Command::new(rc_binary())
+        .args([
+            "--json",
+            "admin",
+            "ilm",
+            "transition",
+            "wait",
+            "myalias",
+            job_id,
+            "--poll-interval-seconds",
+            "1",
+            "--timeout-seconds",
+            "10",
+        ])
+        .env("RC_CONFIG_DIR", config_dir.path())
+        .env("RC_HOST_myalias", rc_host_alias(&endpoint))
+        .output()
+        .expect("run transition wait command");
+    assert!(
+        wait_output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&wait_output.stderr)
+    );
+    let wait_value: Value =
+        serde_json::from_slice(&wait_output.stdout).expect("wait stdout should be JSON");
+    assert_eq!(wait_value["type"], "manual_transition_job_wait");
+    assert_eq!(wait_value["data"]["status"], "completed");
+
+    let expected_job_endpoint =
+        "/rustfs/admin/v3/ilm/transition/jobs/11111111-1111-4111-8111-111111111111";
+    let run_request = receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("captured async run request");
+    let status_request = receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("captured status request");
+    let cancel_request = receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("captured cancel request");
+    let wait_request = receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("captured wait request");
+
+    assert_eq!(run_request.method, "POST");
+    assert_eq!(
+        run_request.target,
+        "/rustfs/admin/v3/ilm/transition/run?bucket=photos&prefix=logs%2F&dryRun=false&maxObjects=10000&tier=COLDTIER&async=true"
+    );
+    assert_eq!(status_request.method, "GET");
+    assert_eq!(status_request.target, expected_job_endpoint);
+    assert_eq!(cancel_request.method, "DELETE");
+    assert_eq!(cancel_request.target, expected_job_endpoint);
+    assert_eq!(wait_request.method, "GET");
+    assert_eq!(wait_request.target, expected_job_endpoint);
+    handle.join().expect("admin test server finished");
+}
+
+#[test]
 fn ilm_transition_job_errors_preserve_exit_classes() {
     for (status, expected_code) in [
         ("403 Forbidden", 4),
