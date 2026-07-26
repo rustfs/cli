@@ -39,20 +39,21 @@ use rc_core::admin::{
     MAX_REPLICATION_DIFF_RESPONSE_BYTES, MAX_REPLICATION_INSPECTION_RESPONSE_BYTES,
     MAX_SITE_REPLICATION_ERROR_RESPONSE_BYTES, MAX_SITE_REPLICATION_REPAIR_RESPONSE_BYTES,
     MAX_SITE_REPLICATION_REQUEST_BYTES, MAX_SITE_REPLICATION_SUCCESS_RESPONSE_BYTES,
-    ManualTransitionRunRequest, ManualTransitionRunResponse, MetricsBatch, MetricsQuery,
-    ModuleSwitches, ObservabilityApi, OidcMutationApi, OidcMutationRequest, OidcMutationResult,
-    OidcProvider, OidcProviderList, OidcReadApi, OidcValidationRequest, OidcValidationResult,
-    PeerSiteSpec, Policy, PolicyDetachEntity, PolicyDetachRequest, PolicyDetachResult,
-    PolicyEntitiesQuery, PolicyEntitiesResult, PolicyEntity, PolicyInfo, PoolStatus, PoolTarget,
-    RealtimeMetrics, RebalanceStartResult, RebalanceStatus, ReplicateEditStatus, ReplicationDiff,
-    ReplicationDiffApi, ReplicationInspectionApi, ReplicationMetricScope, ReplicationMetrics,
-    ReplicationMrf, RuntimeCapabilitiesSnapshot, RuntimeCapabilityStatus, ScannerStatus,
-    ServiceAccount, ServiceAccountCreateResponse, ServiceActionResult, SiteRemoveSpec,
-    SiteReplicationInfo, SiteReplicationPeer, SiteReplicationRepairApi,
-    SiteReplicationRepairCapabilityContract, SiteReplicationRepairOperationStatus,
-    SiteReplicationRepairPreflight, SiteReplicationRepairRequest, SiteReplicationResyncOperation,
-    SiteReplicationResyncStatus, SiteStatusOptions, StorageInfo, UpdateGroupMembersRequest,
-    UpdateServiceAccountRequest, User, UserStatus,
+    ManualTransitionJobResponse, ManualTransitionRunRequest, ManualTransitionRunResponse,
+    MetricsBatch, MetricsQuery, ModuleSwitches, ObservabilityApi, OidcMutationApi,
+    OidcMutationRequest, OidcMutationResult, OidcProvider, OidcProviderList, OidcReadApi,
+    OidcValidationRequest, OidcValidationResult, PeerSiteSpec, Policy, PolicyDetachEntity,
+    PolicyDetachRequest, PolicyDetachResult, PolicyEntitiesQuery, PolicyEntitiesResult,
+    PolicyEntity, PolicyInfo, PoolStatus, PoolTarget, RealtimeMetrics, RebalanceStartResult,
+    RebalanceStatus, ReplicateEditStatus, ReplicationDiff, ReplicationDiffApi,
+    ReplicationInspectionApi, ReplicationMetricScope, ReplicationMetrics, ReplicationMrf,
+    RuntimeCapabilitiesSnapshot, RuntimeCapabilityStatus, ScannerStatus, ServiceAccount,
+    ServiceAccountCreateResponse, ServiceActionResult, SiteRemoveSpec, SiteReplicationInfo,
+    SiteReplicationPeer, SiteReplicationRepairApi, SiteReplicationRepairCapabilityContract,
+    SiteReplicationRepairOperationStatus, SiteReplicationRepairPreflight,
+    SiteReplicationRepairRequest, SiteReplicationResyncOperation, SiteReplicationResyncStatus,
+    SiteStatusOptions, StorageInfo, UpdateGroupMembersRequest, UpdateServiceAccountRequest, User,
+    UserStatus,
 };
 use rc_core::{Alias, Error, Result};
 use reqwest::header::{CACHE_CONTROL, CONTENT_TYPE, HOST, HeaderMap, HeaderName, HeaderValue};
@@ -1653,6 +1654,37 @@ fn site_replication_server_invalid_state(code: Option<&str>, message: &str) -> b
         "site replication state changed" | "site replication refresh state changed"
     );
     state_changed && matches!(code, None | Some("InvalidRequest"))
+}
+
+fn manual_transition_run_query(
+    request: &ManualTransitionRunRequest,
+    async_mode: bool,
+) -> Vec<(&'static str, String)> {
+    let mut query = vec![
+        ("bucket", request.bucket.clone()),
+        ("prefix", request.prefix.clone()),
+        ("dryRun", request.dry_run.to_string()),
+        ("maxObjects", request.max_objects.to_string()),
+    ];
+    if let Some(duration) = request.max_duration_seconds {
+        query.push(("maxDurationSeconds", duration.to_string()));
+    }
+    if let Some(tier) = request.tier.as_deref() {
+        query.push(("tier", tier.to_string()));
+    }
+    if async_mode {
+        query.push(("async", "true".to_string()));
+    }
+    query
+}
+
+fn manual_transition_query_refs<'a>(
+    query: &'a [(&'static str, String)],
+) -> Vec<(&'a str, &'a str)> {
+    query
+        .iter()
+        .map(|(key, value)| (*key, value.as_str()))
+        .collect()
 }
 
 fn parse_admin_error(body: &str) -> Option<AdminErrorResponse> {
@@ -4971,26 +5003,38 @@ impl AdminApi for AdminClient {
         &self,
         request: ManualTransitionRunRequest,
     ) -> Result<ManualTransitionRunResponse> {
-        let dry_run = if request.dry_run { "true" } else { "false" };
-        let max_objects = request.max_objects.to_string();
-        let mut query = vec![
-            ("bucket", request.bucket.as_str()),
-            ("prefix", request.prefix.as_str()),
-            ("dryRun", dry_run),
-            ("maxObjects", max_objects.as_str()),
-        ];
-        let max_duration_seconds = request
-            .max_duration_seconds
-            .map(|duration| duration.to_string());
-        if let Some(max_duration_seconds) = max_duration_seconds.as_deref() {
-            query.push(("maxDurationSeconds", max_duration_seconds));
-        }
-        if let Some(tier) = request.tier.as_deref() {
-            query.push(("tier", tier));
-        }
+        let query = manual_transition_run_query(&request, false);
+        let query = manual_transition_query_refs(&query);
 
         self.request(Method::POST, "/ilm/transition/run", Some(&query), None)
             .await
+    }
+
+    async fn run_manual_transition_async(
+        &self,
+        request: ManualTransitionRunRequest,
+    ) -> Result<ManualTransitionRunResponse> {
+        let query = manual_transition_run_query(&request, true);
+        let query = manual_transition_query_refs(&query);
+
+        self.request(Method::POST, "/ilm/transition/run", Some(&query), None)
+            .await
+    }
+
+    async fn manual_transition_job_status(
+        &self,
+        job_id: &str,
+    ) -> Result<ManualTransitionJobResponse> {
+        let path = format!("/ilm/transition/jobs/{}", urlencoding::encode(job_id));
+        self.request(Method::GET, &path, None, None).await
+    }
+
+    async fn cancel_manual_transition_job(
+        &self,
+        job_id: &str,
+    ) -> Result<ManualTransitionJobResponse> {
+        let path = format!("/ilm/transition/jobs/{}", urlencoding::encode(job_id));
+        self.request(Method::DELETE, &path, None, None).await
     }
 
     // ==================== Replication Target Operations ====================

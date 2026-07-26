@@ -303,9 +303,56 @@ pub struct ManualTransitionRunRequest {
 pub struct ManualTransitionRunResponse {
     pub state: String,
     pub mode: String,
+    #[serde(default)]
     pub job_id: Option<String>,
+    #[serde(default)]
     pub status_endpoint: Option<String>,
+    #[serde(default)]
+    pub cancel_endpoint: Option<String>,
     pub report: ManualTransitionRunReport,
+}
+
+/// Response returned when inspecting or cancelling a durable manual transition job.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManualTransitionJobResponse {
+    pub status: String,
+    pub mode: String,
+    pub job_id: String,
+    pub status_endpoint: String,
+    pub cancel_endpoint: String,
+    pub cancel_requested: bool,
+    pub bucket: String,
+    pub prefix: String,
+    pub tier: Option<String>,
+    pub dry_run: bool,
+    pub created_at_unix_nanos: i128,
+    pub updated_at_unix_nanos: i128,
+    pub completed_at_unix_nanos: Option<i128>,
+    pub report: ManualTransitionRunReport,
+    #[serde(default)]
+    pub queue_snapshot: ManualTransitionQueueSnapshot,
+    pub failure_reason: Option<String>,
+}
+
+/// Snapshot of transition worker pressure reported with manual transition jobs.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManualTransitionQueueSnapshot {
+    #[serde(default)]
+    pub queue_capacity: u64,
+    #[serde(default)]
+    pub queued: u64,
+    #[serde(default)]
+    pub active: u64,
+    #[serde(default)]
+    pub workers: u64,
+    #[serde(default)]
+    pub queue_full: u64,
+    #[serde(default)]
+    pub queue_send_timeout: u64,
+    #[serde(default)]
+    pub compensation_pending: u64,
+    #[serde(default)]
+    pub compensation_running: u64,
 }
 
 /// Aggregate report for a manual lifecycle transition run.
@@ -331,9 +378,19 @@ pub struct ManualTransitionRunReport {
     pub skipped_queue_full: u64,
     pub skipped_queue_closed: u64,
     pub skipped_queue_timeout: u64,
+    #[serde(default)]
+    pub transition_completed: u64,
+    #[serde(default)]
+    pub transition_failed: u64,
+    #[serde(default)]
+    pub tier_failure: u64,
     pub truncated_by_limit: bool,
     #[serde(default)]
     pub truncated_by_duration: bool,
+    #[serde(default)]
+    pub cancelled: bool,
+    #[serde(default)]
+    pub continuation_token: Option<String>,
 }
 
 // ==================== Per-type sub-configs ====================

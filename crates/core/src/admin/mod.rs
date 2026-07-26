@@ -126,9 +126,10 @@ pub use site::{
     validate_site_replication_repair_token,
 };
 pub use tier::{
-    ManualTransitionRunReport, ManualTransitionRunRequest, ManualTransitionRunResponse, TierAliyun,
-    TierAzure, TierConfig, TierCreds, TierGCS, TierHuaweicloud, TierMinIO, TierR2, TierRustFS,
-    TierS3, TierTencent, TierType,
+    ManualTransitionJobResponse, ManualTransitionQueueSnapshot, ManualTransitionRunReport,
+    ManualTransitionRunRequest, ManualTransitionRunResponse, TierAliyun, TierAzure, TierConfig,
+    TierCreds, TierGCS, TierHuaweicloud, TierMinIO, TierR2, TierRustFS, TierS3, TierTencent,
+    TierType,
 };
 pub use types::{
     AccessKeyDetails, AccessKeyInfo, BucketQuota, CreateServiceAccountRequest, Group, GroupStatus,
@@ -325,6 +326,24 @@ pub trait AdminApi: Send + Sync {
         &self,
         request: ManualTransitionRunRequest,
     ) -> Result<ManualTransitionRunResponse>;
+
+    /// Start a durable manual lifecycle transition job for a bucket scope.
+    async fn run_manual_transition_async(
+        &self,
+        request: ManualTransitionRunRequest,
+    ) -> Result<ManualTransitionRunResponse>;
+
+    /// Inspect a durable manual lifecycle transition job.
+    async fn manual_transition_job_status(
+        &self,
+        job_id: &str,
+    ) -> Result<ManualTransitionJobResponse>;
+
+    /// Request cancellation for a durable manual lifecycle transition job.
+    async fn cancel_manual_transition_job(
+        &self,
+        job_id: &str,
+    ) -> Result<ManualTransitionJobResponse>;
 
     // ==================== Replication Target Operations ====================
 

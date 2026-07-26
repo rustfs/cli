@@ -347,6 +347,7 @@ mod tests {
             "--tier",
             "COLDTIER",
             "--dry-run",
+            "--async",
             "--max-objects",
             "25",
             "--max-duration-seconds",
@@ -362,10 +363,74 @@ mod tests {
                 assert_eq!(args.prefix, "logs/");
                 assert_eq!(args.tier.as_deref(), Some("COLDTIER"));
                 assert!(args.dry_run);
+                assert!(args.async_mode);
                 assert_eq!(args.max_objects, 25);
                 assert_eq!(args.max_duration_seconds, Some(30));
             }
             _ => panic!("Unexpected ILM transition run command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_admin_ilm_transition_job_commands() {
+        let status = TestCli::parse_from([
+            "rc",
+            "ilm",
+            "transition",
+            "status",
+            "local",
+            "11111111-1111-4111-8111-111111111111",
+        ]);
+        match status.command {
+            AdminCommands::Ilm(ilm::IlmCommands::Transition(ilm::TransitionCommands::Status(
+                args,
+            ))) => {
+                assert_eq!(args.alias, "local");
+                assert_eq!(args.job_id, "11111111-1111-4111-8111-111111111111");
+            }
+            _ => panic!("Unexpected ILM transition status command"),
+        }
+
+        let cancel = TestCli::parse_from([
+            "rc",
+            "ilm",
+            "transition",
+            "cancel",
+            "local",
+            "11111111-1111-4111-8111-111111111111",
+        ]);
+        match cancel.command {
+            AdminCommands::Ilm(ilm::IlmCommands::Transition(ilm::TransitionCommands::Cancel(
+                args,
+            ))) => {
+                assert_eq!(args.alias, "local");
+                assert_eq!(args.job_id, "11111111-1111-4111-8111-111111111111");
+            }
+            _ => panic!("Unexpected ILM transition cancel command"),
+        }
+
+        let wait = TestCli::parse_from([
+            "rc",
+            "ilm",
+            "transition",
+            "wait",
+            "local",
+            "11111111-1111-4111-8111-111111111111",
+            "--poll-interval-seconds",
+            "1",
+            "--timeout-seconds",
+            "30",
+        ]);
+        match wait.command {
+            AdminCommands::Ilm(ilm::IlmCommands::Transition(ilm::TransitionCommands::Wait(
+                args,
+            ))) => {
+                assert_eq!(args.alias, "local");
+                assert_eq!(args.job_id, "11111111-1111-4111-8111-111111111111");
+                assert_eq!(args.poll_interval_seconds, 1);
+                assert_eq!(args.timeout_seconds, Some(30));
+            }
+            _ => panic!("Unexpected ILM transition wait command"),
         }
     }
 
