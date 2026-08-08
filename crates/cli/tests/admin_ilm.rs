@@ -686,6 +686,63 @@ fn ilm_transition_wait_polls_until_terminal_state() {
 }
 
 #[test]
+fn ilm_transition_wait_times_out_before_terminal_state() {
+    let config_dir = tempfile::tempdir().expect("create config dir");
+    let (endpoint, receiver, handle) = start_admin_sequence_test_server(vec![
+        ("200 OK", MANUAL_TRANSITION_JOB_RUNNING_RESPONSE),
+        ("200 OK", MANUAL_TRANSITION_JOB_RUNNING_RESPONSE),
+    ]);
+
+    let output = Command::new(rc_binary())
+        .args([
+            "--json",
+            "admin",
+            "ilm",
+            "transition",
+            "wait",
+            "myalias",
+            "11111111-1111-4111-8111-111111111111",
+            "--poll-interval-seconds",
+            "1",
+            "--timeout-seconds",
+            "1",
+        ])
+        .env("RC_CONFIG_DIR", config_dir.path())
+        .env("RC_HOST_myalias", rc_host_alias(&endpoint))
+        .output()
+        .expect("run rc command");
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+    let value: Value = serde_json::from_slice(&output.stderr).expect("stderr should be JSON");
+    assert_eq!(value["type"], "manual_transition_job_wait");
+    assert_eq!(value["status"], "error");
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .expect("error should be a string")
+            .contains("Timed out waiting for manual transition job"),
+        "stderr: {value}"
+    );
+
+    let first = receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("captured first status request");
+    let second = receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("captured second status request");
+    assert_eq!(first.method, "GET");
+    assert_eq!(second.method, "GET");
+    assert_eq!(first.target, second.target);
+    handle.join().expect("admin test server finished");
+}
+
+#[test]
 fn ilm_transition_async_job_commands_follow_backend_contract() {
     let config_dir = tempfile::tempdir().expect("create config dir");
     let (endpoint, receiver, handle) = start_admin_sequence_test_server(vec![
