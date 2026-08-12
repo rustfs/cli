@@ -542,10 +542,16 @@ fn print_cluster_info(info: &ClusterInfo, formatter: &Formatter) {
 
     // Object info
     if let Some(ref buckets) = info.buckets {
-        formatter.println(&format!("  Buckets:       {}", buckets.count));
+        formatter.println(&format!(
+            "  Buckets:       {}",
+            count_or_unavailable(buckets.count, buckets.error.as_deref())
+        ));
     }
     if let Some(ref objects) = info.objects {
-        formatter.println(&format!("  Objects:       {}", objects.count));
+        formatter.println(&format!(
+            "  Objects:       {}",
+            count_or_unavailable(objects.count, objects.error.as_deref())
+        ));
     }
 
     // Backend info
@@ -802,6 +808,14 @@ fn value_or_unknown(value: &str) -> &str {
     if value.is_empty() { "unknown" } else { value }
 }
 
+fn count_or_unavailable(count: u64, error: Option<&str>) -> String {
+    if error.is_some_and(|error| !error.trim().is_empty()) {
+        "unavailable".to_string()
+    } else {
+        count.to_string()
+    }
+}
+
 fn cluster_rustfs_version(info: &ClusterInfo) -> String {
     let versions = info
         .servers
@@ -906,6 +920,16 @@ mod tests {
         assert!(value.get("rustfsVersion").is_some());
         assert!(value.get("onlineDisks").is_some());
         assert!(value.get("usedCapacity").is_some());
+    }
+
+    #[test]
+    fn test_count_or_unavailable_distinguishes_unknown_from_zero() {
+        assert_eq!(count_or_unavailable(0, None), "0");
+        assert_eq!(count_or_unavailable(42, Some("")), "42");
+        assert_eq!(
+            count_or_unavailable(0, Some("data usage snapshot unavailable")),
+            "unavailable"
+        );
     }
 
     #[test]
