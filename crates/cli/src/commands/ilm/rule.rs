@@ -225,6 +225,15 @@ pub async fn execute(cmd: RuleCommands, output_config: OutputConfig) -> ExitCode
 async fn execute_add(args: AddRuleArgs, output_config: OutputConfig) -> ExitCode {
     let formatter = Formatter::new(output_config);
 
+    if let Err(error) = validate_expired_delete_marker_inputs(
+        args.expired_object_delete_marker,
+        args.expiry_days.is_some() || args.expiry_date.is_some(),
+        false,
+    ) {
+        formatter.error(&error);
+        return ExitCode::UsageError;
+    }
+
     let (alias_name, bucket) = match parse_bucket_path(&args.path) {
         Ok(parts) => parts,
         Err(error) => {
@@ -476,6 +485,11 @@ async fn execute_edit(args: EditRuleArgs, output_config: OutputConfig) -> ExitCo
         rule.expired_object_delete_marker = Some(val);
     }
 
+    if let Err(error) = validate_expired_delete_marker_rule(rule) {
+        formatter.error(&error);
+        return ExitCode::UsageError;
+    }
+
     match client.set_bucket_lifecycle(&bucket, rules).await {
         Ok(()) => {
             if formatter.is_json() {
@@ -702,6 +716,15 @@ async fn execute_import(args: ImportRuleArgs, output_config: OutputConfig) -> Ex
         }
     };
 
+    if let Some(error) = config
+        .rules
+        .iter()
+        .find_map(|rule| validate_expired_delete_marker_rule(rule).err())
+    {
+        formatter.error(&error);
+        return ExitCode::UsageError;
+    }
+
     let client = match setup_client(&alias_name, &bucket, args.force, &formatter).await {
         Ok(client) => client,
         Err(code) => return code,
@@ -731,6 +754,38 @@ async fn execute_import(args: ImportRuleArgs, output_config: OutputConfig) -> Ex
 }
 
 // ==================== Helpers ====================
+
+fn validate_expired_delete_marker_inputs(
+    cleanup_enabled: bool,
+    has_current_expiration: bool,
+    has_tags: bool,
+) -> std::result::Result<(), String> {
+    if !cleanup_enabled {
+        return Ok(());
+    }
+    if has_current_expiration {
+        return Err(
+            "expired delete-marker cleanup cannot be combined with current expiration days or date"
+                .to_string(),
+        );
+    }
+    if has_tags {
+        return Err(
+            "expired delete-marker cleanup cannot be combined with tag filters".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_expired_delete_marker_rule(rule: &LifecycleRule) -> std::result::Result<(), String> {
+    validate_expired_delete_marker_inputs(
+        rule.expired_object_delete_marker == Some(true),
+        rule.expiration
+            .as_ref()
+            .is_some_and(|expiration| expiration.days.is_some() || expiration.date.is_some()),
+        rule.tags.as_ref().is_some_and(|tags| !tags.is_empty()),
+    )
+}
 
 async fn setup_client(
     alias_name: &str,
@@ -936,6 +991,35 @@ mod tests {
 
         let code = execute_add(args, OutputConfig::default()).await;
         assert_eq!(code, ExitCode::UsageError);
+    }
+
+    #[tokio::test]
+    async fn test_execute_add_rejects_current_expiration_with_marker_cleanup() {
+        let args = AddRuleArgs {
+            path: "local/my-bucket".to_string(),
+            expiry_days: Some(30),
+            expiry_date: None,
+            transition_days: None,
+            transition_date: None,
+            storage_class: None,
+            noncurrent_expiry_days: None,
+            noncurrent_transition_days: None,
+            noncurrent_transition_storage_class: None,
+            prefix: None,
+            expired_object_delete_marker: true,
+            newer_noncurrent_versions: None,
+            disable: false,
+            force: false,
+        };
+
+        let code = execute_add(args, OutputConfig::default()).await;
+        assert_eq!(code, ExitCode::UsageError);
+    }
+
+    #[test]
+    fn test_marker_cleanup_validation_rejects_tags() {
+        assert!(validate_expired_delete_marker_inputs(true, false, true).is_err());
+        assert!(validate_expired_delete_marker_inputs(true, false, false).is_ok());
     }
 
     #[tokio::test]

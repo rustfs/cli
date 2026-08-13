@@ -208,6 +208,9 @@ rc ilm rule add local/my-bucket --expiry-days 30 --prefix "logs/"
 # Add lifecycle rule: transition to remote tier after 90 days
 rc ilm rule add local/my-bucket --transition-days 90 --storage-class WARM
 
+# Expire noncurrent versions after 1 day and clean up the remaining delete marker
+rc ilm rule add local/my-bucket --noncurrent-expiry-days 1 --expired-object-delete-marker
+
 # List lifecycle rules
 rc ilm rule list local/my-bucket
 
