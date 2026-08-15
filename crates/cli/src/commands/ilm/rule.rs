@@ -1023,6 +1023,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_execute_import_rejects_invalid_marker_cleanup_before_alias_lookup() {
+        let temp_dir = tempfile::tempdir().expect("create lifecycle config directory");
+        let config_path = temp_dir.path().join("rules.json");
+        let config = LifecycleConfiguration {
+            rules: vec![LifecycleRule {
+                id: "invalid-marker-cleanup".to_string(),
+                status: LifecycleRuleStatus::Enabled,
+                prefix: None,
+                tags: None,
+                expiration: Some(LifecycleExpiration {
+                    days: Some(30),
+                    date: None,
+                }),
+                transition: None,
+                noncurrent_version_expiration: None,
+                noncurrent_version_transition: None,
+                abort_incomplete_multipart_upload_days: None,
+                expired_object_delete_marker: Some(true),
+            }],
+        };
+        std::fs::write(
+            &config_path,
+            serde_json::to_string(&config).expect("serialize lifecycle configuration"),
+        )
+        .expect("write lifecycle configuration");
+
+        let code = execute_import(
+            ImportRuleArgs {
+                path: "missing-alias/my-bucket".to_string(),
+                file: config_path.to_string_lossy().into_owned(),
+                force: false,
+            },
+            OutputConfig::default(),
+        )
+        .await;
+
+        assert_eq!(code, ExitCode::UsageError);
+    }
+
+    #[tokio::test]
     async fn test_execute_remove_no_id_or_all_returns_usage_error() {
         let args = RemoveRuleArgs {
             path: "local/my-bucket".to_string(),
