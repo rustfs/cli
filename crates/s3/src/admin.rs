@@ -2274,6 +2274,19 @@ impl AdminClient {
             Err(error) => return Err(error),
         };
 
+        // Merge after the direct endpoint probes so a probe result keeps
+        // precedence over a same-named advertisement, but before the pinned
+        // per-version fallbacks so the server's own advertisement wins there.
+        for advertised in &runtime.advertised {
+            push_capability_if_absent(
+                &mut capabilities,
+                CapabilityEntry {
+                    name: advertised.name.clone(),
+                    availability: advertised.status.availability(),
+                    reason: advertised.status.reason.clone(),
+                },
+            );
+        }
         add_known_server_capabilities(server_version.as_deref(), &mut capabilities);
         capabilities.sort_by(|left, right| left.name.cmp(&right.name));
 
@@ -2386,7 +2399,29 @@ fn stubbed_report(server_version: Option<String>, reason: String) -> CapabilityR
 }
 
 fn add_known_server_capabilities(version: Option<&str>, capabilities: &mut Vec<CapabilityEntry>) {
-    if !version.is_some_and(is_rustfs_beta_10) {
+    let is_beta_10 = version.is_some_and(is_rustfs_beta_10);
+    if is_beta_10 || version.is_some_and(is_rustfs_rc_series) {
+        for name in [
+            "admin.data-usage",
+            "listen_notification",
+            IAM_POLICY_ENTITIES_CAPABILITY,
+            IAM_POLICY_DETACH_CAPABILITY,
+            IAM_ACCESS_KEYS_BULK_CAPABILITY,
+            IAM_ACCESS_KEYS_BULK_LDAP_CAPABILITY,
+            IAM_ACCESS_KEYS_BULK_OPENID_CAPABILITY,
+        ] {
+            push_capability_if_absent(
+                capabilities,
+                CapabilityEntry {
+                    name: name.to_string(),
+                    availability: CapabilityAvailability::Available,
+                    reason: None,
+                },
+            );
+        }
+    }
+
+    if !is_beta_10 {
         add_uniform_diagnostic_capabilities(
             capabilities,
             CapabilityAvailability::Unknown,
@@ -2394,38 +2429,6 @@ fn add_known_server_capabilities(version: Option<&str>, capabilities: &mut Vec<C
         );
         mirror_read_only_diagnostic_routes(capabilities);
         return;
-    }
-
-    capabilities.push(CapabilityEntry {
-        name: "admin.data-usage".to_string(),
-        availability: CapabilityAvailability::Available,
-        reason: None,
-    });
-    capabilities.push(CapabilityEntry {
-        name: "listen_notification".to_string(),
-        availability: CapabilityAvailability::Available,
-        reason: None,
-    });
-    capabilities.push(CapabilityEntry {
-        name: IAM_POLICY_ENTITIES_CAPABILITY.to_string(),
-        availability: CapabilityAvailability::Available,
-        reason: None,
-    });
-    capabilities.push(CapabilityEntry {
-        name: IAM_POLICY_DETACH_CAPABILITY.to_string(),
-        availability: CapabilityAvailability::Available,
-        reason: None,
-    });
-    for name in [
-        IAM_ACCESS_KEYS_BULK_CAPABILITY,
-        IAM_ACCESS_KEYS_BULK_LDAP_CAPABILITY,
-        IAM_ACCESS_KEYS_BULK_OPENID_CAPABILITY,
-    ] {
-        capabilities.push(CapabilityEntry {
-            name: name.to_string(),
-            availability: CapabilityAvailability::Available,
-            reason: None,
-        });
     }
 
     for (name, reason) in [
@@ -2589,6 +2592,35 @@ fn is_rustfs_beta_10(version: &str) -> bool {
         .split(|character: char| character.is_ascii_whitespace() || character == '/')
         .map(|component| component.trim_start_matches('v'))
         .any(|component| component.split('+').next() == Some("1.0.0-beta.10"))
+}
+
+/// The 1.0.0-rc series ships the same implemented IAM admin surface that was
+/// pinned for beta.10 (verified against 1.0.0-rc.3, rustfs/backlog#1900), but
+/// predates dynamic capability advertisement, so the pinned IAM contract must
+/// also apply to it.
+fn is_rustfs_rc_series(version: &str) -> bool {
+    version
+        .split(|character: char| character.is_ascii_whitespace() || character == '/')
+        .map(|component| component.trim_start_matches('v'))
+        .any(|component| {
+            component
+                .split('+')
+                .next()
+                .is_some_and(|core| core.starts_with("1.0.0-rc."))
+        })
+}
+
+/// Server-advertised entries are merged before any pinned per-version
+/// fallback, so a pinned fallback must never override an entry the server
+/// itself reported.
+fn push_capability_if_absent(capabilities: &mut Vec<CapabilityEntry>, entry: CapabilityEntry) {
+    if capabilities
+        .iter()
+        .any(|existing| existing.name == entry.name)
+    {
+        return;
+    }
+    capabilities.push(entry);
 }
 
 #[derive(Debug, Deserialize)]
@@ -5723,7 +5755,9 @@ mod tests {
 
     const CAPABILITY_INFO_RESPONSE: &str = r#"{"info":{"mode":"distributed","servers":[{"endpoint":"http://node1:9000","state":"online","version":"1.0.0-beta.10","drives":[]}]}}"#;
     const UNKNOWN_CAPABILITY_INFO_RESPONSE: &str = r#"{"info":{"mode":"distributed","servers":[{"endpoint":"http://node1:9000","state":"online","version":"1.0.0-beta.11","drives":[]}]}}"#;
+    const RC3_CAPABILITY_INFO_RESPONSE: &str = r#"{"info":{"mode":"distributed","servers":[{"endpoint":"http://node1:9000","state":"online","version":"1.0.0-rc.3-preview.2","drives":[]}]}}"#;
     const RUNTIME_CAPABILITIES_RESPONSE: &str = r#"{"summary":{"observability":{"state":"supported"},"userspace_profiling":{"state":"disabled","reason":"disabled by configuration"},"memory_sampling":{"state":"unsupported","reason":"not available on this platform"},"platform":{"state":"supported"},"topology":{"state":"unknown","reason":"storage is initializing"},"cluster_snapshot":{"state":"supported"}},"cluster_snapshot_path":"/rustfs/admin/v4/cluster/snapshot","cluster_snapshot_summary":{"state":"supported"},"observability":{},"workload_admission":{},"topology":null,"topology_status":{"state":"unknown"}}"#;
+    const ADVERTISED_RUNTIME_CAPABILITIES_RESPONSE: &str = r#"{"summary":{"observability":{"state":"supported"},"userspace_profiling":{"state":"disabled","reason":"disabled by configuration"},"memory_sampling":{"state":"unsupported","reason":"not available on this platform"},"platform":{"state":"supported"},"topology":{"state":"unknown","reason":"storage is initializing"},"cluster_snapshot":{"state":"supported"}},"advertised":[{"name":"admin.iam.policy-attach","status":{"state":"supported"}},{"name":"admin.iam.policy-detach","status":{"state":"supported"}},{"name":"admin.iam.policy-entities","status":{"state":"unsupported","reason":"route disabled by operator"}}],"cluster_snapshot_path":"/rustfs/admin/v4/cluster/snapshot","cluster_snapshot_summary":{"state":"supported"},"observability":{},"workload_admission":{},"topology":null,"topology_status":{"state":"unknown"}}"#;
     const EXTENSIONS_RESPONSE: &str = r#"{"extensions":[{"schema_version":"rustfs.extension-schema.v1","extension_id":"ops.diagnostics","display_name":"Operations Diagnostics","provider":"rustfs","version":"1","kind":"ops_diagnostics","runtime":{"api_version":"v1","boundary":"builtin"},"capabilities":[],"disabled_by_default":false}],"runtime_capabilities":{},"cluster_snapshot":{},"external_plugin_flow":{}}"#;
     const CLUSTER_SNAPSHOT_RESPONSE: &str = r#"{"snapshot":{"summary":{"runtime":{"state":"supported"},"topology":{"state":"supported"},"membership":{"state":"supported"},"peer_health":{"state":"supported"},"rpc_boundary":{"state":"supported"},"observability":{"state":"supported"},"workload_admission":{"state":"supported"},"actionable_pressure":{"state":"disabled"}},"runtime_capabilities_path":"/rustfs/admin/v4/runtime/capabilities","extensions_catalog_path":"/rustfs/admin/v4/extensions/catalog"}}"#;
     const CLIENT_DEVNULL_RESPONSE: &str = r#"{"kind":"client-devnull","measured":true,"aggregate_write_throughput_bytes_per_sec":2048.0,"rx_bytes":65536,"duration_secs":0.5}"#;
@@ -5894,6 +5928,117 @@ mod tests {
         assert!(is_rustfs_beta_10("rustfs/v1.0.0-beta.10+build.7"));
         assert!(!is_rustfs_beta_10("1.0.0-beta.100"));
         assert!(!is_rustfs_beta_10("1.0.0-beta.9"));
+    }
+
+    #[test]
+    fn rc_series_capability_gate_matches_only_the_rc_prerelease_family() {
+        assert!(is_rustfs_rc_series("1.0.0-rc.3"));
+        assert!(is_rustfs_rc_series("1.0.0-rc.3-preview.2"));
+        assert!(is_rustfs_rc_series("rustfs/v1.0.0-rc.1+build.2"));
+        assert!(!is_rustfs_rc_series("1.0.0-beta.10"));
+        assert!(!is_rustfs_rc_series("1.0.0"));
+        assert!(!is_rustfs_rc_series("1.0.1-rc.1"));
+        assert!(!is_rustfs_rc_series("1.0.0-rc"));
+    }
+
+    /// rustfs/backlog#1900: the rc.x series predates dynamic capability
+    /// advertisement but implements the beta.10 IAM admin surface, so the
+    /// pinned IAM contract must keep `rc admin policy detach` usable.
+    #[tokio::test]
+    async fn capability_discovery_applies_pinned_iam_contract_to_rc_series() {
+        let (endpoint, _receiver, handle) = start_admin_sequence_server(vec![
+            ("200 OK", RC3_CAPABILITY_INFO_RESPONSE),
+            ("200 OK", RUNTIME_CAPABILITIES_RESPONSE),
+            ("200 OK", EXTENSIONS_RESPONSE),
+            ("200 OK", CLUSTER_SNAPSHOT_RESPONSE),
+        ]);
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let report = client
+            .discover_capabilities(false)
+            .await
+            .expect("capability discovery should succeed");
+
+        for name in [
+            IAM_POLICY_ENTITIES_CAPABILITY,
+            IAM_POLICY_DETACH_CAPABILITY,
+            IAM_ACCESS_KEYS_BULK_CAPABILITY,
+            IAM_ACCESS_KEYS_BULK_LDAP_CAPABILITY,
+            IAM_ACCESS_KEYS_BULK_OPENID_CAPABILITY,
+            "admin.data-usage",
+        ] {
+            assert!(
+                report.capabilities.iter().any(|capability| {
+                    capability.name == name
+                        && capability.availability == CapabilityAvailability::Available
+                }),
+                "{name} must be pinned available for the rc series"
+            );
+        }
+        assert!(
+            report.capabilities.iter().any(|capability| {
+                capability.name == "admin.diagnostics.health-snapshot"
+                    && capability.availability == CapabilityAvailability::Unknown
+            }),
+            "diagnostics must stay unknown because only beta.10 has a pinned diagnostic contract"
+        );
+        assert!(
+            !report
+                .capabilities
+                .iter()
+                .any(|capability| capability.name == "admin.batch"),
+            "beta.10 stub classifications must not be claimed for the rc series"
+        );
+        handle.join().expect("server thread should finish");
+    }
+
+    /// rustfs/backlog#1900: servers that advertise capabilities dynamically
+    /// are authoritative — advertised entries must be honored on unpinned
+    /// versions and must take precedence over pinned fallbacks.
+    #[tokio::test]
+    async fn capability_discovery_prefers_server_advertised_entries() {
+        let (endpoint, _receiver, handle) = start_admin_sequence_server(vec![
+            ("200 OK", RC3_CAPABILITY_INFO_RESPONSE),
+            ("200 OK", ADVERTISED_RUNTIME_CAPABILITIES_RESPONSE),
+            ("200 OK", EXTENSIONS_RESPONSE),
+            ("200 OK", CLUSTER_SNAPSHOT_RESPONSE),
+        ]);
+        let client = admin_client_for_endpoint(&endpoint);
+
+        let report = client
+            .discover_capabilities(false)
+            .await
+            .expect("capability discovery should succeed");
+
+        for name in ["admin.iam.policy-attach", IAM_POLICY_DETACH_CAPABILITY] {
+            assert!(
+                report.capabilities.iter().any(|capability| {
+                    capability.name == name
+                        && capability.availability == CapabilityAvailability::Available
+                }),
+                "{name} must be taken from the server advertisement"
+            );
+        }
+        let entities: Vec<_> = report
+            .capabilities
+            .iter()
+            .filter(|capability| capability.name == IAM_POLICY_ENTITIES_CAPABILITY)
+            .collect();
+        assert_eq!(
+            entities.len(),
+            1,
+            "advertised and pinned entries must not duplicate"
+        );
+        assert_eq!(
+            entities[0].availability,
+            CapabilityAvailability::Unsupported,
+            "the server-advertised state must override the pinned fallback"
+        );
+        assert_eq!(
+            entities[0].reason.as_deref(),
+            Some("route disabled by operator")
+        );
+        handle.join().expect("server thread should finish");
     }
 
     #[tokio::test]
