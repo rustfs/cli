@@ -246,6 +246,7 @@ pub async fn execute(args: MbArgs, output_config: OutputConfig) -> ExitCode {
     }
 }
 
+#[allow(clippy::result_large_err)]
 async fn run_bucket_creation<S: BucketCreationStore>(
     store: &S,
     bucket: &str,
@@ -367,6 +368,7 @@ async fn run_bucket_creation<S: BucketCreationStore>(
     Ok(data)
 }
 
+#[allow(clippy::result_large_err)]
 async fn verify_object_lock<S: BucketCreationStore>(
     store: &S,
     bucket: &str,

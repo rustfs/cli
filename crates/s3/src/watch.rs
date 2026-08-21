@@ -454,7 +454,7 @@ fn safe_error_component(value: String) -> Option<String> {
 mod tests {
     use std::collections::HashMap;
 
-    use futures::{StreamExt as _, stream};
+    use futures::stream;
     use rc_core::{Alias, WatchFrame};
 
     use super::*;

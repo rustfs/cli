@@ -675,7 +675,7 @@ fn build_policy(level: &AccessLevel, bucket: &str, prefix: &str) -> String {
             let sanitized = prefix.trim_end_matches('/');
             condition = serde_json::json!({
                 "StringLike": {
-                    "s3:prefix": [format!("{sanitized}"), format!("{sanitized}/*"), format!("{sanitized}*")]
+                    "s3:prefix": [sanitized.to_string(), format!("{sanitized}/*"), format!("{sanitized}*")]
                 }
             });
         }

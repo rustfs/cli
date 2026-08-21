@@ -417,6 +417,7 @@ fn failure_upload_id(failure: &RmIncompleteFailure) -> &str {
         .unwrap_or_default()
 }
 
+#[allow(clippy::result_large_err)]
 async fn process_incomplete_path(
     path_str: &str,
     args: &RmArgs,

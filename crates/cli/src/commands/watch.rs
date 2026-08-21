@@ -602,7 +602,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
-    use futures::{StreamExt as _, stream};
+    use futures::stream;
     use rc_core::admin::{CapabilityEntry, ClusterSnapshotMetadata};
     use rc_core::{Result as CoreResult, WatchSource, WatchStream};
 
