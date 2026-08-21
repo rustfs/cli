@@ -14,6 +14,10 @@ This document defines the standards and constraints that AI assistants must foll
 - Log messages
 - Variable and function names
 
+## First-Principles Reasoning
+
+Use first-principles thinking. Do not assume the user always has a fully formed understanding of what they want or how to achieve it. Start from the underlying need and problem, and proceed carefully. If the motivation or goal is unclear, stop and discuss it with the user. If the goal is clear but the proposed path is not the shortest or most effective, say so and recommend a better approach.
+
 ## Workflow
 
 ### 0. Branch Base Policy
