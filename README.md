@@ -26,6 +26,11 @@ Download the appropriate binary for your platform from the [Releases](https://gi
 On Linux, use the default `linux-amd64` / `linux-arm64` artifacts for maximum compatibility (`musl` static build).
 If you specifically need glibc-linked builds, use `linux-amd64-gnu` / `linux-arm64-gnu`.
 
+### DEB/RPM Packages
+
+Debian and RPM packages are published as GitHub release assets for each tagged release.
+Download the appropriate `.deb` or `.rpm` package from the [Releases](https://github.com/rustfs/cli/releases) page and install it with your system package manager.
+
 ### Homebrew (macOS/Linux)
 
 ```bash
