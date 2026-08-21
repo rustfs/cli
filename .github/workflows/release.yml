@@ -29,6 +29,7 @@ jobs:
       is_release: ${{ steps.check.outputs.is_release }}
       has_token: ${{ steps.check.outputs.has_token }}
       source_ref: ${{ steps.check.outputs.source_ref }}
+      source_sha: ${{ steps.check.outputs.source_sha }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -76,6 +77,8 @@ jobs:
             fi
           fi
 
+          source_sha=$(git rev-parse "${source_ref}^{commit}")
+
           # Ensure version starts with 'v' for release builds
           if [[ "$is_release" == "true" ]] && [[ ! "$version" =~ ^v ]]; then
             version="v${version}"
@@ -87,10 +90,13 @@ jobs:
             has_token="true"
           fi
 
-          echo "version=$version" >> $GITHUB_OUTPUT
-          echo "is_release=$is_release" >> $GITHUB_OUTPUT
-          echo "has_token=$has_token" >> $GITHUB_OUTPUT
-          echo "source_ref=$source_ref" >> $GITHUB_OUTPUT
+          {
+            echo "version=$version"
+            echo "is_release=$is_release"
+            echo "has_token=$has_token"
+            echo "source_ref=$source_ref"
+            echo "source_sha=$source_sha"
+          } >> "$GITHUB_OUTPUT"
 
           echo "📊 Build Summary:"
           echo "  - Version: $version"
@@ -393,8 +399,10 @@ jobs:
           mkdir -p release-assets
 
           # Copy all artifacts (exclude latest versions for GitHub Release)
-          if [ -d "artifacts" ] && [ "$(ls -A artifacts)" ]; then
-            for file in artifacts/*; do
+          shopt -s nullglob
+          artifact_files=(./artifacts/*)
+          if (( ${#artifact_files[@]} > 0 )); then
+            for file in "${artifact_files[@]}"; do
               filename=$(basename "$file")
               # Skip latest versions - only upload versioned artifacts to GitHub Release
               if [[ "$filename" != *"-latest"* ]]; then
@@ -410,8 +418,9 @@ jobs:
 
           # Generate combined checksums file
           cd release-assets
-          if ls *.tar.gz *.zip 2>/dev/null; then
-            sha256sum *.tar.gz *.zip 2>/dev/null > SHA256SUMS || true
+          release_files=(*.tar.gz *.zip)
+          if (( ${#release_files[@]} > 0 )); then
+            sha256sum -- "${release_files[@]}" > SHA256SUMS
             echo "✅ SHA256SUMS generated"
           fi
 
@@ -419,6 +428,7 @@ jobs:
           ls -la
 
       - name: Upload release assets to Cloudflare R2
+        continue-on-error: true
         env:
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -466,6 +476,21 @@ jobs:
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Build distribution packages from the exact artifacts produced above.
+  package-deb-rpm:
+    name: Package DEB/RPM
+    needs: [build-check, upload-release-assets]
+    if: needs.build-check.outputs.is_release == 'true'
+    uses: ./.github/workflows/package.yml
+    with:
+      tag: ${{ needs.build-check.outputs.version }}
+      build_run_id: ${{ github.run_id }}
+      head_sha: ${{ needs.build-check.outputs.source_sha }}
+    secrets: inherit
+    permissions:
+      contents: write
+      actions: read
 
   # Publish to crates.io
   publish-crates:

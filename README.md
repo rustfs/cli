@@ -29,6 +29,8 @@ If you specifically need glibc-linked builds, use `linux-amd64-gnu` / `linux-arm
 ### DEB/RPM Packages
 
 Debian and RPM packages are published as GitHub release assets for each tagged release.
+They contain the default statically linked Linux binaries, so installation does not
+impose a minimum glibc version.
 Download the appropriate `.deb` or `.rpm` package from the [Releases](https://github.com/rustfs/cli/releases) page and install it with your system package manager.
 
 ### Homebrew (macOS/Linux)

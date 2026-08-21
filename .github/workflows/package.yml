@@ -1,99 +1,141 @@
 name: Package DEB/RPM
 
-permissions:
-  contents: write
-  actions: read
-
 on:
-  workflow_run:
-    workflows: ["Build and Release"]
-    types: [completed]
+  workflow_call:
+    inputs:
+      tag:
+        description: "Release tag to package"
+        required: true
+        type: string
+      build_run_id:
+        description: "Build and Release workflow run ID that produced the artifacts"
+        required: true
+        type: string
+      head_sha:
+        description: "Commit SHA built by the Build and Release workflow"
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       tag:
         description: "Release tag to package (for example v0.1.24 or v0.1.24-rc.1)"
-        required: false
+        required: true
         type: string
       build_run_id:
-        description: "Build and Release workflow run ID to package"
+        description: "Successful Build and Release workflow run ID to package"
+        required: true
+        type: string
+      head_sha:
+        description: "Commit SHA for manually dispatched builds (optional for tag-push runs)"
         required: false
         type: string
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event.workflow_run.head_branch || github.event.inputs.tag || github.run_id }}
-  cancel-in-progress: true
+permissions:
+  contents: write
+  actions: read
 
-env:
-  HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
-  WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
+concurrency:
+  group: package-${{ inputs.tag || github.run_id }}
+  cancel-in-progress: true
 
 jobs:
   resolve:
     name: Resolve Build
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event.workflow_run.conclusion == 'success' &&
-       github.event.workflow_run.event == 'push' &&
-       github.event.workflow_run.head_branch != 'main')
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
     outputs:
       version: ${{ steps.resolve.outputs.version }}
       package_version: ${{ steps.resolve.outputs.package_version }}
       build_run_id: ${{ steps.resolve.outputs.build_run_id }}
       tag: ${{ steps.resolve.outputs.tag }}
+      head_sha: ${{ steps.resolve.outputs.head_sha }}
     steps:
-      - name: Resolve build run
+      - name: Resolve and validate build run
         id: resolve
         env:
           GH_TOKEN: ${{ github.token }}
-          INPUT_TAG: ${{ github.event.inputs.tag }}
-          INPUT_RUN_ID: ${{ github.event.inputs.build_run_id }}
+          INPUT_TAG: ${{ inputs.tag || github.event.inputs.tag }}
+          INPUT_RUN_ID: ${{ inputs.build_run_id || github.event.inputs.build_run_id }}
+          INPUT_HEAD_SHA: ${{ inputs.head_sha || github.event.inputs.head_sha }}
+          REPOSITORY: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
         shell: bash
         run: |
           set -euo pipefail
 
-          if [[ "${{ github.event_name }}" == "workflow_run" ]]; then
-            TAG="${HEAD_BRANCH}"
-          elif [[ -n "${INPUT_TAG}" ]]; then
-            TAG="${INPUT_TAG}"
-          else
-            TAG=""
-          fi
-
-          BUILD_RUN_ID=""
-          if [[ -n "${INPUT_RUN_ID}" ]]; then
-            BUILD_RUN_ID="${INPUT_RUN_ID}"
-            echo "Using explicit build run ID: ${BUILD_RUN_ID}"
-          elif [[ "${{ github.event_name }}" == "workflow_run" ]]; then
-            BUILD_RUN_ID="${WORKFLOW_RUN_ID}"
-            echo "Using triggering workflow run: ${BUILD_RUN_ID}"
-          elif [[ -n "${TAG}" ]]; then
-            echo "Looking for release workflow run for tag: ${TAG}"
-            BUILD_RUN_ID=$(gh api \
-              "repos/${{ github.repository }}/actions/workflows/release.yml/runs?event=push&status=success&per_page=100" \
-              --jq ".workflow_runs[] | select(.head_branch == \"${TAG}\") | .id" 2>/dev/null | head -1 || echo "")
-
-            if [[ -z "${BUILD_RUN_ID}" || "${BUILD_RUN_ID}" == "null" ]]; then
-              echo "No successful release workflow run found for tag: ${TAG}"
-              exit 1
-            fi
-          else
-            echo "A tag or build_run_id is required for manual packaging"
-            exit 1
-          fi
-
-          if [[ -z "${TAG}" ]]; then
-            TAG=$(gh api "repos/${{ github.repository }}/actions/runs/${BUILD_RUN_ID}" --jq '.head_branch' 2>/dev/null || echo "")
-          fi
-
-          if [[ -z "${TAG}" || "${TAG}" == "null" ]]; then
-            echo "Unable to resolve release tag for workflow run ${BUILD_RUN_ID}"
-            exit 1
-          fi
+          TAG="${INPUT_TAG}"
+          BUILD_RUN_ID="${INPUT_RUN_ID}"
+          EXPECTED_SHA="${INPUT_HEAD_SHA,,}"
 
           if [[ ! "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
-            echo "Resolved tag is not a release tag: ${TAG}"
+            echo "Input tag is not a release tag: ${TAG}"
+            exit 1
+          fi
+
+          if [[ ! "${BUILD_RUN_ID}" =~ ^[0-9]+$ ]]; then
+            echo "build_run_id must be a numeric workflow run ID"
+            exit 1
+          fi
+
+          if [[ -n "${EXPECTED_SHA}" && ! "${EXPECTED_SHA}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "head_sha must be a 40-character commit SHA"
+            exit 1
+          fi
+
+          RUN_PATH=$(gh api "repos/${REPOSITORY}/actions/runs/${BUILD_RUN_ID}" --jq '.path')
+          RUN_CONCLUSION=$(gh api "repos/${REPOSITORY}/actions/runs/${BUILD_RUN_ID}" --jq '.conclusion // ""')
+          RUN_EVENT=$(gh api "repos/${REPOSITORY}/actions/runs/${BUILD_RUN_ID}" --jq '.event')
+          RUN_HEAD_SHA=$(gh api "repos/${REPOSITORY}/actions/runs/${BUILD_RUN_ID}" --jq '.head_sha')
+          RUN_HEAD_SHA="${RUN_HEAD_SHA,,}"
+
+          if [[ "${RUN_PATH}" != ".github/workflows/release.yml" ]]; then
+            echo "Workflow run ${BUILD_RUN_ID} is not a Build and Release run"
+            exit 1
+          fi
+
+          if [[ "${RUN_EVENT}" != "push" && "${RUN_EVENT}" != "workflow_dispatch" ]]; then
+            echo "Workflow run ${BUILD_RUN_ID} was triggered by an unsupported event: ${RUN_EVENT}"
+            exit 1
+          fi
+
+          if [[ "${RUN_CONCLUSION}" != "success" ]]; then
+            if [[ "${EVENT_NAME}" != "workflow_call" || "${BUILD_RUN_ID}" != "${CURRENT_RUN_ID}" || -n "${RUN_CONCLUSION}" ]]; then
+              echo "Workflow run ${BUILD_RUN_ID} did not complete successfully: ${RUN_CONCLUSION}"
+              exit 1
+            fi
+          fi
+
+          if [[ ! "${RUN_HEAD_SHA}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "Workflow run ${BUILD_RUN_ID} returned an invalid head SHA"
+            exit 1
+          fi
+
+          TAG_SHA=$(gh api "repos/${REPOSITORY}/commits/${TAG}" --jq '.sha')
+          TAG_SHA="${TAG_SHA,,}"
+          if [[ ! "${TAG_SHA}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "Tag ${TAG} did not resolve to a commit SHA"
+            exit 1
+          fi
+
+          if [[ "${RUN_EVENT}" == "push" && "${RUN_HEAD_SHA}" != "${TAG_SHA}" ]]; then
+            echo "Push workflow run ${BUILD_RUN_ID} (${RUN_HEAD_SHA}) does not build tag ${TAG} (${TAG_SHA})"
+            exit 1
+          fi
+
+          if [[ -n "${EXPECTED_SHA}" ]]; then
+            if [[ "${EXPECTED_SHA}" != "${TAG_SHA}" ]]; then
+              echo "The supplied head SHA does not match tag ${TAG}"
+              exit 1
+            fi
+            SOURCE_SHA="${EXPECTED_SHA}"
+          elif [[ "${RUN_EVENT}" == "push" ]]; then
+            SOURCE_SHA="${RUN_HEAD_SHA}"
+          else
+            echo "head_sha is required when the build run was not triggered by a tag push"
             exit 1
           fi
 
@@ -105,37 +147,43 @@ jobs:
             echo "package_version=${PACKAGE_VERSION}"
             echo "build_run_id=${BUILD_RUN_ID}"
             echo "tag=${TAG}"
+            echo "head_sha=${SOURCE_SHA}"
           } >> "$GITHUB_OUTPUT"
 
-          echo "Resolved version: ${TAG}"
+          echo "Resolved tag: ${TAG}"
           echo "Resolved package version: ${PACKAGE_VERSION}"
-          echo "Resolved workflow run: ${BUILD_RUN_ID}"
+          echo "Validated release workflow run: ${BUILD_RUN_ID}"
+          echo "Validated source SHA: ${SOURCE_SHA}"
 
   package:
     name: Package (${{ matrix.arch }})
     needs: resolve
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: amd64
             rpm_arch: x86_64
-            artifact_name: rustfs-cli-linux-amd64-gnu
+            artifact_name: rustfs-cli-linux-amd64
           - arch: arm64
             rpm_arch: aarch64
-            artifact_name: rustfs-cli-linux-arm64-gnu
+            artifact_name: rustfs-cli-linux-arm64
     steps:
-      - name: Checkout repository
+      - name: Checkout exact build source
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
-          ref: ${{ needs.resolve.outputs.tag }}
+          ref: ${{ needs.resolve.outputs.head_sha }}
+          persist-credentials: false
 
       - name: Download binary artifact from release build
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
-          pattern: ${{ matrix.artifact_name }}*
+          pattern: ${{ matrix.artifact_name }}
           path: ./binary-artifact
           run-id: ${{ needs.resolve.outputs.build_run_id }}
           github-token: ${{ github.token }}
@@ -154,19 +202,30 @@ jobs:
         run: |
           set -euo pipefail
 
-          TAR_FILE=$(find ./binary-artifact -name '*.tar.gz' -type f | head -1)
+          TAR_FILE=$(find ./binary-artifact -type f -name '*.tar.gz' -print -quit)
           if [[ -z "${TAR_FILE}" ]]; then
             echo "No Linux binary archive found"
-            ls -la ./binary-artifact/ || true
+            find ./binary-artifact -maxdepth 2 -type f -print || true
             exit 1
           fi
 
           mkdir -p ./binary-extract
           tar -xzf "${TAR_FILE}" -C ./binary-extract
 
+          if [[ ! -f ./binary-extract/rc ]]; then
+            echo "The release archive does not contain rc"
+            exit 1
+          fi
+
+          BINARY_INFO=$(file ./binary-extract/rc)
+          echo "${BINARY_INFO}"
+          if ! grep -qiE 'static|statically linked' <<< "${BINARY_INFO}"; then
+            echo "Package inputs must use a statically linked Linux binary"
+            exit 1
+          fi
+
           mkdir -p ./pkg-root/usr/bin
           install -m 755 ./binary-extract/rc ./pkg-root/usr/bin/rc
-          chmod 755 ./pkg-root/usr/bin/rc
 
           mkdir -p ./pkg-root/usr/share/doc/rustfs-cli
           cp LICENSE-MIT LICENSE-APACHE README.md ./pkg-root/usr/share/doc/rustfs-cli/
@@ -177,7 +236,7 @@ jobs:
 
           if [[ ! -f ./completions-artifact/completions.tar.gz ]]; then
             echo "No completions archive found"
-            ls -la ./completions-artifact/ || true
+            find ./completions-artifact -maxdepth 2 -type f -print || true
             exit 1
           fi
 
@@ -192,7 +251,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y fakeroot ruby ruby-dev build-essential rpm
-          sudo gem install --no-document fpm
+          sudo gem install --no-document fpm -v 1.15.1
 
       - name: Build DEB package
         id: deb
@@ -212,10 +271,9 @@ jobs:
           Section: utils
           Priority: optional
           Architecture: ${{ matrix.arch }}
-          Depends: libc6 (>= 2.31)
           Maintainer: RustFS Team <support@rustfs.com>
           Description: Rust S3 CLI client for S3-compatible object storage
-           rc is a command-line client for RustFS, MinIO, AWS S3,
+           rc is a statically linked command-line client for RustFS, MinIO, AWS S3,
            and other S3-compatible object storage services.
           Homepage: https://github.com/rustfs/cli
           EOF
@@ -238,7 +296,6 @@ jobs:
             --version "${VERSION}" \
             --iteration 1 \
             --architecture "${{ matrix.rpm_arch }}" \
-            --depends 'glibc >= 2.31' \
             --maintainer 'RustFS Team <support@rustfs.com>' \
             --description 'Rust S3 CLI client for S3-compatible object storage' \
             --url 'https://github.com/rustfs/cli' \
@@ -251,7 +308,7 @@ jobs:
             ./pkg-root/usr/share/zsh/site-functions/_rc=/usr/share/zsh/site-functions/_rc \
             ./pkg-root/usr/share/fish/vendor_completions.d/rc.fish=/usr/share/fish/vendor_completions.d/rc.fish
 
-          RPM_FILE=$(ls -1 rustfs-cli-*.rpm 2>/dev/null | head -1)
+          RPM_FILE=$(find . -maxdepth 1 -type f -name 'rustfs-cli-*.rpm' -print -quit)
           if [[ -z "${RPM_FILE}" ]]; then
             echo "RPM build failed"
             exit 1
@@ -260,6 +317,27 @@ jobs:
           echo "rpm_file=${RPM_FILE}" >> "$GITHUB_OUTPUT"
           ls -lh "${RPM_FILE}"
 
+      - name: Verify package metadata
+        env:
+          DEB_FILE: ${{ steps.deb.outputs.deb_file }}
+          RPM_FILE: ${{ steps.rpm.outputs.rpm_file }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if dpkg-deb -f "${DEB_FILE}" Depends | grep -Eiq '(^|[, ])libc6|glibc'; then
+            echo "DEB unexpectedly declares a glibc dependency"
+            exit 1
+          fi
+
+          if rpm -qp --requires "${RPM_FILE}" | grep -Eiq 'glibc|libc\.so\.6|ld-linux'; then
+            echo "RPM unexpectedly declares a dynamic libc dependency"
+            exit 1
+          fi
+
+          dpkg-deb --contents "${DEB_FILE}" | grep -F '/usr/bin/rc'
+          rpm -qpl "${RPM_FILE}" | grep -F '/usr/bin/rc'
+
       - name: Upload package artifacts
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
@@ -267,15 +345,117 @@ jobs:
           path: |
             *.deb
             *.rpm
+          if-no-files-found: error
           retention-days: 30
 
-      - name: Upload packages to Cloudflare R2
+  publish-github:
+    name: Publish packages to GitHub Release
+    needs: [resolve, package]
+    if: needs.resolve.result == 'success' && needs.package.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Download package artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: packages-*
+          path: ./packages
+          github-token: ${{ github.token }}
+          run-id: ${{ github.run_id }}
+          merge-multiple: true
+
+      - name: Upload packages and merge checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          shopt -s nullglob
+          package_files=(./packages/*.deb ./packages/*.rpm)
+          if (( ${#package_files[@]} != 4 )); then
+            echo "Expected four package files, found ${#package_files[@]}"
+            printf '%s\n' ./packages/* || true
+            exit 1
+          fi
+
+          checksum_dir=$(mktemp -d)
+          checksum_file="${checksum_dir}/SHA256SUMS"
+
+          if ! gh release download "${TAG}" \
+            --repo "${REPOSITORY}" \
+            --pattern 'SHA256SUMS' \
+            --dir "${checksum_dir}" \
+            --clobber; then
+            asset_count=$(gh api \
+              "repos/${REPOSITORY}/releases/tags/${TAG}" \
+              --jq '[.assets[] | select(.name == "SHA256SUMS")] | length')
+            if [[ "${asset_count}" != "0" ]]; then
+              echo "Unable to download the existing SHA256SUMS asset"
+              exit 1
+            fi
+            : > "${checksum_file}"
+          fi
+
+          if [[ ! -f "${checksum_file}" ]]; then
+            echo "SHA256SUMS download did not produce a file"
+            exit 1
+          fi
+
+          for file in "${package_files[@]}"; do
+            base=$(basename -- "${file}")
+            legacy_base="${base//\~/.}"
+            gh release upload "${TAG}" "${file}" --repo "${REPOSITORY}" --clobber
+
+            awk -v name="${base}" -v legacy="${legacy_base}" '
+              NF >= 2 {
+                candidate = $2
+                sub(/^\*/, "", candidate)
+                if (candidate == name || candidate == legacy) next
+              }
+              { print }
+            ' "${checksum_file}" > "${checksum_file}.next"
+            mv "${checksum_file}.next" "${checksum_file}"
+
+            checksum=$(sha256sum -- "${file}" | awk '{print $1}')
+            printf '%s  %s\n' "${checksum}" "${base}" >> "${checksum_file}"
+          done
+
+          sort -k2,2 "${checksum_file}" -o "${checksum_file}"
+          gh release upload "${TAG}" "${checksum_file}" --repo "${REPOSITORY}" --clobber
+
+  publish-r2:
+    name: Publish packages to Cloudflare R2
+    needs: [resolve, package]
+    if: needs.resolve.result == 'success' && needs.package.result == 'success'
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+    steps:
+      - name: Download package artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: packages-*
+          path: ./packages
+          github-token: ${{ github.token }}
+          run-id: ${{ github.run_id }}
+          merge-multiple: true
+
+      - name: Upload packages and checksums
         env:
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
           AWS_EC2_METADATA_DISABLED: true
+          VERSION: ${{ needs.resolve.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail
@@ -296,64 +476,54 @@ jobs:
           export AWS_REQUEST_CHECKSUM_CALCULATION="when_required"
           export AWS_RESPONSE_CHECKSUM_VALIDATION="when_required"
 
-          VERSION="${{ needs.resolve.outputs.version }}"
+          shopt -s nullglob
+          package_files=(./packages/*.deb ./packages/*.rpm)
+          if (( ${#package_files[@]} != 4 )); then
+            echo "Expected four package files, found ${#package_files[@]}"
+            exit 1
+          fi
+
+          checksum_file=./packages/SHA256SUMS
+          (
+            cd ./packages
+            sha256sum -- *.deb *.rpm
+          ) > "${checksum_file}"
+
           VERSION_PATH="s3://${R2_BUCKET}/artifacts/rustfs-cli/packages/release/${VERSION}/"
           LATEST_PATH="s3://${R2_BUCKET}/artifacts/rustfs-cli/packages/latest/"
 
-          for file in "${{ steps.deb.outputs.deb_file }}" "${{ steps.rpm.outputs.rpm_file }}"; do
-            if [[ -n "${file}" && -f "${file}" ]]; then
-              aws s3 cp "${file}" "${VERSION_PATH}" --endpoint-url "${R2_ENDPOINT}" --only-show-errors
-              aws s3 cp "${file}" "${LATEST_PATH}" --endpoint-url "${R2_ENDPOINT}" --only-show-errors
-            fi
+          for file in "${package_files[@]}" "${checksum_file}"; do
+            aws s3 cp "${file}" "${VERSION_PATH}" --endpoint-url "${R2_ENDPOINT}" --only-show-errors
+            aws s3 cp "${file}" "${LATEST_PATH}" --endpoint-url "${R2_ENDPOINT}" --only-show-errors
           done
-
-      - name: Upload packages to GitHub Release
-        if: needs.resolve.outputs.tag != ''
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          TAG="${{ needs.resolve.outputs.tag }}"
-          CHECKSUM_FILE="$(mktemp)"
-          gh release download "${TAG}" -p 'SHA256SUMS' -D "$(dirname "${CHECKSUM_FILE}")" --clobber 2>/dev/null || true
-          if [[ -f "$(dirname "${CHECKSUM_FILE}")/SHA256SUMS" ]]; then
-            mv "$(dirname "${CHECKSUM_FILE}")/SHA256SUMS" "${CHECKSUM_FILE}"
-          else
-            : > "${CHECKSUM_FILE}"
-          fi
-
-          for file in "${{ steps.deb.outputs.deb_file }}" "${{ steps.rpm.outputs.rpm_file }}"; do
-            if [[ -n "${file}" && -f "${file}" ]]; then
-              base=$(basename "${file}")
-              github_base="${base//\~/.}"
-              gh release upload "${TAG}" "${file}" --clobber
-              grep -Fv -- "${base}" "${CHECKSUM_FILE}" > "${CHECKSUM_FILE}.tmp" || true
-              grep -Fv -- "${github_base}" "${CHECKSUM_FILE}.tmp" > "${CHECKSUM_FILE}.next" || true
-              mv "${CHECKSUM_FILE}.next" "${CHECKSUM_FILE}"
-              checksum=$(sha256sum "${file}" | awk '{print $1}')
-              printf '%s  %s\n' "${checksum}" "${github_base}" >> "${CHECKSUM_FILE}"
-            fi
-          done
-
-          mv "${CHECKSUM_FILE}" "$(dirname "${CHECKSUM_FILE}")/SHA256SUMS"
-          gh release upload "${TAG}" "$(dirname "${CHECKSUM_FILE}")/SHA256SUMS" --clobber
 
   summary:
     name: Summary
-    needs: [resolve, package]
+    needs: [resolve, package, publish-github, publish-r2]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
     steps:
       - name: Print summary
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+          BUILD_RUN_ID: ${{ needs.resolve.outputs.build_run_id }}
+          PACKAGE_RESULT: ${{ needs.package.result }}
+          GITHUB_RESULT: ${{ needs.publish-github.result }}
+          R2_RESULT: ${{ needs.publish-r2.result }}
         shell: bash
         run: |
-          echo "## Package Summary" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Item | Value |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|------|-------|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Version | ${{ needs.resolve.outputs.version }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Build Run | #${{ needs.resolve.outputs.build_run_id }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Package Status | ${{ needs.package.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## Package Summary"
+            echo ""
+            echo "| Item | Value |"
+            echo "|------|-------|"
+            echo "| Version | ${VERSION} |"
+            echo "| Build Run | #${BUILD_RUN_ID} |"
+            echo "| Package Status | ${PACKAGE_RESULT} |"
+            echo "| GitHub Release Status | ${GITHUB_RESULT} |"
+            echo "| R2 Status | ${R2_RESULT} |"
+          } >> "$GITHUB_STEP_SUMMARY"
