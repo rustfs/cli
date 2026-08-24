@@ -17,6 +17,7 @@ pub mod encryption;
 pub mod error;
 pub mod lifecycle;
 pub mod multipart_copy;
+pub mod object_key;
 pub mod object_lock;
 pub mod ops;
 pub mod path;
@@ -47,6 +48,7 @@ pub use multipart_copy::{
     S3_MAX_OBJECT_SIZE, S3_MULTIPART_COPY_MAX_PART_SIZE, S3_MULTIPART_COPY_MAX_PARTS,
     S3_MULTIPART_COPY_MIN_PART_SIZE, S3_SINGLE_COPY_MAX_SIZE, requires_multipart_copy,
 };
+pub use object_key::{ObjectKeyPolicy, normalize_relative_key, relative_local_path_from_key};
 pub use object_lock::{
     BucketObjectLockConfiguration, DefaultRetention, LegalHoldStatus, ObjectLockOptions,
     ObjectRetention, RetentionDuration, RetentionDurationUnit, RetentionMode,

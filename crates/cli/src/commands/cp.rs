@@ -7,10 +7,10 @@ use jiff::Timestamp;
 use rc_core::alias::RetryConfig;
 use rc_core::{
     AliasManager, Error, MetadataDirective, MultipartCopyCancellation, MultipartCopyOptions,
-    ObjectEncryptionRequest, ObjectInfo, ObjectStore as _, ObjectWriteOptions, ParsedPath,
-    RemotePath, SseCustomerKey, TransferCancellation, TransferCandidate, TransferControls,
-    TransferCopyOptions, TransferExecutor, TransferOutcomeState, TransferPlan, TransferReadOptions,
-    TransferSelection, parse_path,
+    ObjectEncryptionRequest, ObjectInfo, ObjectKeyPolicy, ObjectStore as _, ObjectWriteOptions,
+    ParsedPath, RemotePath, SseCustomerKey, TransferCancellation, TransferCandidate,
+    TransferControls, TransferCopyOptions, TransferExecutor, TransferOutcomeState, TransferPlan,
+    TransferReadOptions, TransferSelection, parse_path, relative_local_path_from_key,
 };
 use rc_s3::S3Client;
 use serde::Serialize;
@@ -188,6 +188,10 @@ pub struct CpArgs {
     /// Print deterministic aggregate transfer counters (human output)
     #[arg(long)]
     pub summary: bool,
+
+    /// Reject object keys that cannot be created on Windows filesystems
+    #[arg(long)]
+    pub portable_names: bool,
 }
 
 impl fmt::Debug for CpArgs {
@@ -232,7 +236,12 @@ impl CpArgs {
             retry_max_backoff_ms: None,
             fail_empty: false,
             summary: false,
+            portable_names: false,
         }
+    }
+
+    fn local_key_policy(&self) -> ObjectKeyPolicy {
+        ObjectKeyPolicy::for_local_destination(self.portable_names)
     }
 }
 
@@ -825,6 +834,7 @@ async fn execute_transfer_plan(
         encryption,
         args.source_customer_key.as_ref(),
         alias_manager,
+        args.local_key_policy(),
     )
     .await
     {
@@ -1589,6 +1599,7 @@ fn is_container_target(raw: &str, target: &ParsedPath) -> bool {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn build_transfer_candidates(
     sources: &[ParsedPath],
     target: &ParsedPath,
@@ -1597,6 +1608,7 @@ async fn build_transfer_candidates(
     encryption: Option<ObjectEncryptionRequest>,
     source_customer_key: Option<&SseCustomerKey>,
     alias_manager: &AliasManager,
+    key_policy: ObjectKeyPolicy,
 ) -> rc_core::Result<Vec<TransferCandidate<CpOperation>>> {
     let mut candidates = Vec::new();
     let mut planning_clients = HashMap::new();
@@ -1625,6 +1637,7 @@ async fn build_transfer_candidates(
                     alias_manager,
                     &mut planning_clients,
                     &mut candidates,
+                    key_policy,
                 )
                 .await?;
             }
@@ -1844,6 +1857,7 @@ async fn build_remote_candidates(
     alias_manager: &AliasManager,
     planning_clients: &mut HashMap<String, Arc<S3Client>>,
     candidates: &mut Vec<TransferCandidate<CpOperation>>,
+    key_policy: ObjectKeyPolicy,
 ) -> rc_core::Result<()> {
     let is_prefix = source.key.is_empty() || source.key.ends_with('/') || recursive;
     let client = planning_client(planning_clients, alias_manager, &source.alias).await?;
@@ -1896,9 +1910,12 @@ async fn build_remote_candidates(
                     RemotePath::new(&listing_source.alias, &listing_source.bucket, &object.key);
                 match target {
                     ParsedPath::Local(target_root) => {
-                        let relative =
-                            safe_download_relative_path(&object.key, &listing_source.key)
-                                .map_err(Error::InvalidPath)?;
+                        let relative = safe_download_relative_path(
+                            &object.key,
+                            &listing_source.key,
+                            key_policy,
+                        )
+                        .map_err(Error::InvalidPath)?;
                         let relative_string = relative.to_string_lossy().replace('\\', "/");
                         let target_relative = if source_root.is_empty() {
                             relative.clone()
@@ -1984,7 +2001,8 @@ async fn build_remote_candidates(
     match target {
         ParsedPath::Local(target) => {
             let destination = if target_is_container {
-                let relative = safe_download_relative_path(name, "").map_err(Error::InvalidPath)?;
+                let relative = safe_download_relative_path(name, "", key_policy)
+                    .map_err(Error::InvalidPath)?;
                 safe_download_destination(target, &relative)
                     .await
                     .map_err(Error::InvalidPath)?
@@ -2502,7 +2520,7 @@ pub(super) async fn download_file(
     // Determine destination path
     let dst_path = if dst.is_dir() || dst.to_string_lossy().ends_with('/') {
         let filename = src.key.rsplit('/').next().unwrap_or(&src.key);
-        let filename = match safe_download_relative_path(filename, "") {
+        let filename = match safe_download_relative_path(filename, "", args.local_key_policy()) {
             Ok(filename) => filename,
             Err(error) => {
                 return formatter.fail(
@@ -2643,7 +2661,11 @@ async fn download_prefix(
                     }
 
                     // Calculate relative path from prefix
-                    let relative_path = match safe_download_relative_path(&item.key, &src.key) {
+                    let relative_path = match safe_download_relative_path(
+                        &item.key,
+                        &src.key,
+                        args.local_key_policy(),
+                    ) {
                         Ok(path) => path,
                         Err(error) => {
                             error_count += 1;
@@ -2716,43 +2738,12 @@ async fn download_prefix(
     }
 }
 
-pub(super) fn safe_download_relative_path(key: &str, prefix: &str) -> Result<PathBuf, String> {
-    let relative = key
-        .strip_prefix(prefix)
-        .ok_or_else(|| format!("key is outside requested prefix '{prefix}'"))?
-        .trim_start_matches('/');
-
-    let mut path = PathBuf::new();
-    for component in relative.split(['/', '\\']) {
-        if component.is_empty() {
-            continue;
-        }
-        if matches!(component, "." | "..") {
-            return Err("path traversal components are not allowed".to_string());
-        }
-        if component.contains(':') {
-            return Err("colon characters are not allowed in download paths".to_string());
-        }
-        if component.ends_with(['.', ' ']) {
-            return Err("download path components must not end in a dot or space".to_string());
-        }
-        let stem = component.split('.').next().unwrap_or_default();
-        let stem = stem.to_ascii_uppercase();
-        if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-            || (stem.len() == 4
-                && (stem.starts_with("COM") || stem.starts_with("LPT"))
-                && matches!(stem.as_bytes()[3], b'1'..=b'9'))
-        {
-            return Err("reserved Windows device names are not allowed".to_string());
-        }
-        path.push(component);
-    }
-
-    if path.as_os_str().is_empty() {
-        return Err("object key does not contain a file path".to_string());
-    }
-
-    Ok(path)
+pub(super) fn safe_download_relative_path(
+    key: &str,
+    prefix: &str,
+    policy: ObjectKeyPolicy,
+) -> Result<PathBuf, String> {
+    relative_local_path_from_key(key, prefix, policy).map_err(|error| error.to_string())
 }
 
 pub(super) async fn safe_download_destination(
@@ -3185,8 +3176,12 @@ mod tests {
 
     #[test]
     fn download_relative_path_preserves_safe_nested_keys() {
-        let relative = safe_download_relative_path("reports/2026/july/data.csv", "reports/")
-            .expect("safe key should resolve");
+        let relative = safe_download_relative_path(
+            "reports/2026/july/data.csv",
+            "reports/",
+            ObjectKeyPolicy::Logical,
+        )
+        .expect("safe key should resolve");
 
         assert_eq!(
             relative,
@@ -3199,15 +3194,44 @@ mod tests {
         for key in [
             "reports/../../escaped",
             "reports/..\\..\\escaped",
+            "/absolute/path",
+        ] {
+            assert!(
+                safe_download_relative_path(key, "reports/", ObjectKeyPolicy::Logical).is_err(),
+                "unsafe key should be rejected: {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn download_relative_path_accepts_colon_keys_on_logical_destinations() {
+        let relative = safe_download_relative_path(
+            "loki/fake/deadbeef/19f6abd9af4:19f6abe0e77:499628ff",
+            "loki/",
+            ObjectKeyPolicy::Logical,
+        )
+        .expect("colon keys are valid Unix file names");
+
+        assert_eq!(
+            relative,
+            PathBuf::from("fake")
+                .join("deadbeef")
+                .join("19f6abd9af4:19f6abe0e77:499628ff")
+        );
+    }
+
+    #[test]
+    fn download_relative_path_rejects_colon_keys_when_portable_names_requested() {
+        for key in [
             "reports/C:/escaped",
             "reports/safe:stream",
             "reports/CON.txt",
             "reports/trailing.",
-            "/absolute/path",
         ] {
             assert!(
-                safe_download_relative_path(key, "reports/").is_err(),
-                "unsafe key should be rejected: {key}"
+                safe_download_relative_path(key, "reports/", ObjectKeyPolicy::WindowsPortable)
+                    .is_err(),
+                "portable-unsafe key should be rejected: {key}"
             );
         }
     }
@@ -3594,6 +3618,7 @@ mod tests {
             None,
             None,
             &alias_manager,
+            ObjectKeyPolicy::Logical,
         )
         .await
         .expect("sources can be expanded before selection");

@@ -31,6 +31,7 @@ rc [GLOBAL OPTIONS] mirror [OPTIONS] <SOURCE> <TARGET>
 | `--retry-max-backoff-ms <MS>` | Maximum transient retry backoff. Defaults to `10000`. |
 | `--summary` | Print deterministic aggregate counts and transferred bytes in human output. |
 | `--quiet` | Suppress non-error command output. The global `--quiet` option has the same effect. |
+| `--portable-names` | Reject keys that cannot be created on Windows filesystems. Unix destinations accept characters such as `:` by default. |
 
 ## Examples
 
@@ -47,7 +48,7 @@ rc mirror stage/data/ prod/data/ --overwrite --remove --concurrency 8 --rate-lim
 
 Both operands are directory-like roots. Every selected source-relative path is appended to the destination root without flattening. Remote prefixes are normalized to one trailing `/`, so `alias/bucket/prefix` and `alias/bucket/prefix/` map the same tree. Remote listing is paginated and the final plan is sorted by normalized relative path.
 
-Remote keys that are absolute, contain traversal, use backslashes, collide after normalization, or cannot be represented portably on supported local platforms are rejected. A new relative local target should be written explicitly, for example `./restore/`, so it cannot be confused with `ALIAS/BUCKET` syntax.
+Remote keys that are absolute, contain traversal, use backslashes, contain control characters, or collide after normalization are rejected. Windows filename rules (`:`, reserved device names, trailing dots or spaces) apply only when the destination is a local filesystem that needs them: always on Windows, and on other platforms only when `--portable-names` is set. Remote-to-remote copies keep the original object key, including characters such as `:`. A new relative local target should be written explicitly, for example `./restore/`, so it cannot be confused with `ALIAS/BUCKET` syntax.
 
 ### Comparison and restart behavior
 

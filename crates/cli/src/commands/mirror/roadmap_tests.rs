@@ -46,18 +46,48 @@ fn manifest(entries: impl IntoIterator<Item = MirrorEntry>) -> MirrorManifest {
 #[test]
 fn relative_paths_are_normalized_and_traversal_is_rejected() {
     assert_eq!(
-        normalize_relative_path("nested//./report.txt").expect("normal relative path"),
+        normalize_relative_path("nested//./report.txt", ObjectKeyPolicy::Logical)
+            .expect("normal relative path"),
         "nested/report.txt"
     );
     for value in [
         "../secret",
         "nested/../../secret",
         "/absolute",
-        "C:/windows",
-        "nested/bad?.txt",
         "nested/control\u{0007}.txt",
     ] {
-        assert!(normalize_relative_path(value).is_err(), "accepted {value}");
+        assert!(
+            normalize_relative_path(value, ObjectKeyPolicy::Logical).is_err(),
+            "accepted {value}"
+        );
+    }
+}
+
+#[test]
+fn logical_relative_paths_accept_colon_object_keys() {
+    assert_eq!(
+        normalize_relative_path(
+            "fake/deadbeef/19f6abd9af4:19f6abe0e77:499628ff",
+            ObjectKeyPolicy::Logical
+        )
+        .expect("colon keys are valid S3 object names"),
+        "fake/deadbeef/19f6abd9af4:19f6abe0e77:499628ff"
+    );
+}
+
+#[test]
+fn windows_portable_relative_paths_reject_reserved_names() {
+    for value in [
+        "C:/windows",
+        "nested/bad?.txt",
+        "safe:stream",
+        "CON.txt",
+        "trailing.",
+    ] {
+        assert!(
+            normalize_relative_path(value, ObjectKeyPolicy::WindowsPortable).is_err(),
+            "accepted portable-unsafe {value}"
+        );
     }
 }
 
@@ -76,7 +106,7 @@ fn planners_map_all_supported_directions_without_changing_relative_paths() {
                 "nested/report.txt",
                 "etag-1",
             )]),
-            MirrorEndpointSpec::Local(PathBuf::from("/target")),
+            MirrorEndpointSpec::local(PathBuf::from("/target"), ObjectKeyPolicy::Logical),
             MirrorLocation::Local(PathBuf::from("/target").join("nested").join("report.txt")),
         ),
         (
@@ -305,9 +335,11 @@ async fn a_removal_retry_treats_an_already_absent_target_as_complete() {
     let io = LiveMirrorIo {
         source: RuntimeEndpoint::Local {
             root: root.path().to_path_buf(),
+            key_policy: ObjectKeyPolicy::Logical,
         },
         target: RuntimeEndpoint::Local {
             root: root.path().to_path_buf(),
+            key_policy: ObjectKeyPolicy::Logical,
         },
     };
 
@@ -370,7 +402,7 @@ fn empty_manifests_produce_empty_deterministic_plans() {
     let copy = build_copy_plan(
         &MirrorManifest::default(),
         &MirrorManifest::default(),
-        &MirrorEndpointSpec::Local(PathBuf::from("/target")),
+        &MirrorEndpointSpec::local(PathBuf::from("/target"), ObjectKeyPolicy::Logical),
         &TransferSelection::default(),
         true,
     )
@@ -425,9 +457,58 @@ fn filtered_nested_tree_is_stably_sorted() {
 
 #[test]
 fn target_mapping_rejects_non_normal_relative_paths() {
-    let target = MirrorEndpointSpec::Local(PathBuf::from("/target"));
+    let target = MirrorEndpointSpec::local(PathBuf::from("/target"), ObjectKeyPolicy::Logical);
     assert!(target.location_for("../outside").is_err());
     assert!(normalized_remote_root_prefix("/absolute").is_err());
+}
+
+#[test]
+fn local_logical_target_maps_colon_object_keys() {
+    let source = manifest([remote_entry(
+        "src",
+        "loki/fake/deadbeef/19f6abd9af4:19f6abe0e77:499628ff",
+        "fake/deadbeef/19f6abd9af4:19f6abe0e77:499628ff",
+        "etag-1",
+    )]);
+    let plan = build_copy_plan(
+        &source,
+        &MirrorManifest::default(),
+        &MirrorEndpointSpec::local(PathBuf::from("/restore"), ObjectKeyPolicy::Logical),
+        &TransferSelection::default(),
+        false,
+    )
+    .expect("colon keys are planned onto Unix destinations");
+
+    assert_eq!(plan.items.len(), 1);
+    assert_eq!(
+        plan.items[0].payload.target,
+        MirrorLocation::Local(
+            PathBuf::from("/restore")
+                .join("fake")
+                .join("deadbeef")
+                .join("19f6abd9af4:19f6abe0e77:499628ff")
+        )
+    );
+}
+
+#[test]
+fn windows_portable_local_target_rejects_colon_object_keys() {
+    let source = manifest([remote_entry(
+        "src",
+        "loki/fake/deadbeef/19f6abd9af4:19f6abe0e77:499628ff",
+        "fake/deadbeef/19f6abd9af4:19f6abe0e77:499628ff",
+        "etag-1",
+    )]);
+    let error = build_copy_plan(
+        &source,
+        &MirrorManifest::default(),
+        &MirrorEndpointSpec::local(PathBuf::from("/restore"), ObjectKeyPolicy::WindowsPortable),
+        &TransferSelection::default(),
+        false,
+    )
+    .expect_err("Windows-portable destinations reject colon keys");
+
+    assert!(error.to_string().contains("portable"));
 }
 
 #[test]
@@ -845,7 +926,7 @@ async fn missing_multilevel_local_target_root_is_created_one_directory_at_a_time
     std::fs::create_dir(&existing).expect("create existing ancestor");
     let root = existing.join("a/b/new-root");
 
-    let destination = secure_local_path(&root, "nested/file.txt", true)
+    let destination = secure_local_path(&root, "nested/file.txt", true, ObjectKeyPolicy::Logical)
         .await
         .expect("create safe target directories");
 
@@ -873,7 +954,7 @@ async fn plain_relative_multilevel_target_uses_the_current_directory_as_its_ance
     drop(placeholder);
     let root = relative_base.join("foo/bar");
 
-    let result = secure_local_path(&root, "nested/file.txt", true).await;
+    let result = secure_local_path(&root, "nested/file.txt", true, ObjectKeyPolicy::Logical).await;
 
     let destination = result.expect("create plain relative target tree");
     assert_eq!(destination, root.join("nested/file.txt"));
@@ -972,6 +1053,7 @@ fn mirror_arguments_keep_legacy_parallel_alias_and_safe_defaults() {
     assert_eq!(defaults.retry_attempts, 3);
     assert!(!defaults.remove);
     assert!(!defaults.overwrite);
+    assert!(!defaults.portable_names);
 
     let legacy = MirrorArgumentParser::try_parse_from([
         "test",

@@ -8,9 +8,10 @@ use clap::Args;
 use jiff::Timestamp;
 use rc_core::alias::RetryConfig;
 use rc_core::{
-    AliasManager, Error, ListOptions, ObjectInfo, ObjectStore as _, ParsedPath, RemotePath,
-    TransferCandidate, TransferControls, TransferExecutor, TransferOutcomeState, TransferPlan,
-    TransferReport, TransferSelection, TransferSummary, parse_path,
+    AliasManager, Error, ListOptions, ObjectInfo, ObjectKeyPolicy, ObjectStore as _, ParsedPath,
+    RemotePath, TransferCandidate, TransferControls, TransferExecutor, TransferOutcomeState,
+    TransferPlan, TransferReport, TransferSelection, TransferSummary, normalize_relative_key,
+    parse_path,
 };
 use rc_s3::S3Client;
 use serde::Serialize;
@@ -95,6 +96,10 @@ pub struct MirrorArgs {
     /// Suppress non-error mirror output (legacy command-local alias)
     #[arg(long)]
     pub quiet: bool,
+
+    /// Reject object keys that cannot be created on Windows filesystems
+    #[arg(long)]
+    pub portable_names: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -147,15 +152,25 @@ struct MirrorManifest {
 
 #[derive(Debug, Clone)]
 enum MirrorEndpointSpec {
-    Local(PathBuf),
+    Local {
+        root: PathBuf,
+        key_policy: ObjectKeyPolicy,
+    },
     Remote(RemotePath),
 }
 
 impl MirrorEndpointSpec {
+    fn local(root: impl Into<PathBuf>, key_policy: ObjectKeyPolicy) -> Self {
+        Self::Local {
+            root: root.into(),
+            key_policy,
+        }
+    }
+
     fn location_for(&self, relative_path: &str) -> rc_core::Result<MirrorLocation> {
-        let relative_path = normalize_relative_path(relative_path)?;
         match self {
-            Self::Local(root) => {
+            Self::Local { root, key_policy } => {
+                let relative_path = normalize_relative_path(relative_path, *key_policy)?;
                 let mut target = root.clone();
                 for component in relative_path.split('/') {
                     target.push(component);
@@ -163,6 +178,8 @@ impl MirrorEndpointSpec {
                 Ok(MirrorLocation::Local(target))
             }
             Self::Remote(root) => {
+                let relative_path =
+                    normalize_relative_path(relative_path, ObjectKeyPolicy::Logical)?;
                 let prefix = normalized_remote_root_prefix(&root.key)?;
                 Ok(MirrorLocation::Remote(RemotePath::new(
                     &root.alias,
@@ -254,6 +271,7 @@ struct MirrorOperationReports {
 enum RuntimeEndpoint {
     Local {
         root: PathBuf,
+        key_policy: ObjectKeyPolicy,
     },
     Remote {
         root: RemotePath,
@@ -264,7 +282,9 @@ enum RuntimeEndpoint {
 impl RuntimeEndpoint {
     fn spec(&self) -> MirrorEndpointSpec {
         match self {
-            Self::Local { root } => MirrorEndpointSpec::Local(root.clone()),
+            Self::Local { root, key_policy } => {
+                MirrorEndpointSpec::local(root.clone(), *key_policy)
+            }
             Self::Remote { root, .. } => MirrorEndpointSpec::Remote(root.clone()),
         }
     }
@@ -272,8 +292,8 @@ impl RuntimeEndpoint {
     async fn current_entry(&self, relative_path: &str) -> rc_core::Result<Option<MirrorEntry>> {
         let location = self.spec().location_for(relative_path)?;
         match (&location, self) {
-            (MirrorLocation::Local(path), Self::Local { root }) => {
-                inspect_local_entry(root, relative_path, path).await
+            (MirrorLocation::Local(path), Self::Local { root, key_policy }) => {
+                inspect_local_entry(root, relative_path, path, *key_policy).await
             }
             (MirrorLocation::Remote(path), Self::Remote { client, .. }) => {
                 match client.head_object(path).await {
@@ -332,8 +352,9 @@ impl MirrorIo for LiveMirrorIo {
         }
 
         match (&current.location, &self.target) {
-            (MirrorLocation::Local(path), RuntimeEndpoint::Local { root }) => {
-                let safe_path = secure_local_path(root, &operation.relative_path, false).await?;
+            (MirrorLocation::Local(path), RuntimeEndpoint::Local { root, key_policy }) => {
+                let safe_path =
+                    secure_local_path(root, &operation.relative_path, false, *key_policy).await?;
                 if &safe_path != path {
                     return Err(Error::InvalidPath(format!(
                         "Removal target escaped mirror root: {}",
@@ -465,7 +486,7 @@ impl LiveMirrorIo {
                 "Remote mirror source client is unavailable".to_string(),
             ));
         };
-        let RuntimeEndpoint::Local { root } = &self.target else {
+        let RuntimeEndpoint::Local { root, key_policy } = &self.target else {
             return Err(Error::General(
                 "Local mirror target root is unavailable".to_string(),
             ));
@@ -480,7 +501,8 @@ impl LiveMirrorIo {
             TargetDisposition::Ready => {}
         }
 
-        let destination = secure_local_path(root, &operation.relative_path, true).await?;
+        let destination =
+            secure_local_path(root, &operation.relative_path, true, *key_policy).await?;
         if destination != target_path {
             return Err(Error::InvalidPath(format!(
                 "Download target escaped mirror root: {}",
@@ -681,26 +703,42 @@ pub async fn execute(args: MirrorArgs, mut output_config: OutputConfig) -> ExitC
         return formatter.fail(exit_code_for_error(&error), &error.to_string());
     }
 
-    let (source_runtime, source_manifest) =
-        match prepare_endpoint(&source, MissingRootPolicy::Error, &alias_manager).await {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                return formatter.fail(
-                    exit_code_for_error(&error),
-                    &format!("Failed to enumerate mirror source: {error}"),
-                );
-            }
-        };
-    let (target_runtime, target_manifest) =
-        match prepare_endpoint(&target, MissingRootPolicy::Empty, &alias_manager).await {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                return formatter.fail(
-                    exit_code_for_error(&error),
-                    &format!("Failed to enumerate mirror destination: {error}"),
-                );
-            }
-        };
+    let dest_key_policy = match &target {
+        ParsedPath::Local(_) => ObjectKeyPolicy::for_local_destination(args.portable_names),
+        ParsedPath::Remote(_) => ObjectKeyPolicy::Logical,
+    };
+    let (source_runtime, source_manifest) = match prepare_endpoint(
+        &source,
+        MissingRootPolicy::Error,
+        &alias_manager,
+        ObjectKeyPolicy::Logical,
+    )
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            return formatter.fail(
+                exit_code_for_error(&error),
+                &format!("Failed to enumerate mirror source: {error}"),
+            );
+        }
+    };
+    let (target_runtime, target_manifest) = match prepare_endpoint(
+        &target,
+        MissingRootPolicy::Empty,
+        &alias_manager,
+        dest_key_policy,
+    )
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            return formatter.fail(
+                exit_code_for_error(&error),
+                &format!("Failed to enumerate mirror destination: {error}"),
+            );
+        }
+    };
     let copy_plan = match build_copy_plan(
         &source_manifest,
         &target_manifest,
@@ -834,11 +872,18 @@ async fn prepare_endpoint(
     parsed: &ParsedPath,
     missing_root: MissingRootPolicy,
     alias_manager: &AliasManager,
+    key_policy: ObjectKeyPolicy,
 ) -> rc_core::Result<(RuntimeEndpoint, MirrorManifest)> {
     match parsed {
         ParsedPath::Local(root) => {
             let manifest = enumerate_local_manifest(root, missing_root)?;
-            Ok((RuntimeEndpoint::Local { root: root.clone() }, manifest))
+            Ok((
+                RuntimeEndpoint::Local {
+                    root: root.clone(),
+                    key_policy,
+                },
+                manifest,
+            ))
         }
         ParsedPath::Remote(root) => {
             let alias = alias_manager
@@ -982,7 +1027,7 @@ async fn enumerate_remote_manifest(
             if raw_relative.is_empty() {
                 continue;
             }
-            let relative_path = normalize_relative_path(raw_relative)?;
+            let relative_path = normalize_relative_path(raw_relative, ObjectKeyPolicy::Logical)?;
             let snapshot = snapshot_from_object(&object)?;
             insert_manifest_entry(
                 &mut manifest.entries,
@@ -1320,54 +1365,8 @@ fn output_outcomes<T>(formatter: &Formatter, marker: &str, report: &TransferRepo
     }
 }
 
-fn normalize_relative_path(value: &str) -> rc_core::Result<String> {
-    if value.starts_with(['/', '\\']) || value.contains('\\') {
-        return Err(Error::InvalidPath(format!(
-            "Mirror path must be relative and use '/' separators: {value}"
-        )));
-    }
-    let mut normalized = Vec::new();
-    for component in value.split('/') {
-        if component.is_empty() || component == "." {
-            continue;
-        }
-        if component == ".." {
-            return Err(Error::InvalidPath(
-                "Mirror paths must not contain traversal components".to_string(),
-            ));
-        }
-        validate_portable_component(component)?;
-        normalized.push(component);
-    }
-    if normalized.is_empty() {
-        return Err(Error::InvalidPath(
-            "Mirror path does not contain a file name".to_string(),
-        ));
-    }
-    Ok(normalized.join("/"))
-}
-
-fn validate_portable_component(component: &str) -> rc_core::Result<()> {
-    if component.chars().any(|character| {
-        character.is_control() || matches!(character, ':' | '<' | '>' | '"' | '|' | '?' | '*')
-    }) || component.ends_with(['.', ' '])
-    {
-        return Err(Error::InvalidPath(format!(
-            "Mirror path component is not portable: {component}"
-        )));
-    }
-    let stem = component.split('.').next().unwrap_or_default();
-    let stem = stem.to_ascii_uppercase();
-    if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || (stem.len() == 4
-            && (stem.starts_with("COM") || stem.starts_with("LPT"))
-            && matches!(stem.as_bytes()[3], b'1'..=b'9'))
-    {
-        return Err(Error::InvalidPath(format!(
-            "Mirror path uses a reserved device name: {component}"
-        )));
-    }
-    Ok(())
+fn normalize_relative_path(value: &str, policy: ObjectKeyPolicy) -> rc_core::Result<String> {
+    normalize_relative_key(value, policy)
 }
 
 fn local_relative_path(root: &Path, path: &Path) -> rc_core::Result<String> {
@@ -1390,7 +1389,7 @@ fn local_relative_path(root: &Path, path: &Path) -> rc_core::Result<String> {
         })?;
         components.push(component);
     }
-    normalize_relative_path(&components.join("/"))
+    normalize_relative_path(&components.join("/"), ObjectKeyPolicy::Logical)
 }
 
 fn normalized_remote_root_prefix(key: &str) -> rc_core::Result<String> {
@@ -1403,7 +1402,10 @@ fn normalized_remote_root_prefix(key: &str) -> rc_core::Result<String> {
     if key.is_empty() {
         return Ok(String::new());
     }
-    Ok(format!("{}/", normalize_relative_path(key)?))
+    Ok(format!(
+        "{}/",
+        normalize_relative_path(key, ObjectKeyPolicy::Logical)?
+    ))
 }
 
 fn snapshot_from_metadata(metadata: &std::fs::Metadata) -> MirrorSnapshot {
@@ -1603,8 +1605,9 @@ async fn inspect_local_entry(
     root: &Path,
     relative_path: &str,
     expected_path: &Path,
+    key_policy: ObjectKeyPolicy,
 ) -> rc_core::Result<Option<MirrorEntry>> {
-    let path = secure_local_path(root, relative_path, false).await?;
+    let path = secure_local_path(root, relative_path, false, key_policy).await?;
     if path != expected_path {
         return Err(Error::InvalidPath(format!(
             "Local mirror target escaped its root: {}",
@@ -1634,8 +1637,9 @@ async fn secure_local_path(
     root: &Path,
     relative_path: &str,
     create_parents: bool,
+    key_policy: ObjectKeyPolicy,
 ) -> rc_core::Result<PathBuf> {
-    let relative_path = normalize_relative_path(relative_path)?;
+    let relative_path = normalize_relative_path(relative_path, key_policy)?;
     match tokio::fs::symlink_metadata(root).await {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             return Err(Error::InvalidPath(format!(

@@ -37,6 +37,7 @@ rc [GLOBAL OPTIONS] cp [OPTIONS] <SOURCE>... <TARGET>
 | `--continue-on-error` | Continue eligible work after an item fails; the final exit code remains non-zero. |
 | `--fail-empty` | Return the not-found exit code when no source passes selection. |
 | `--summary` | Print deterministic aggregate counters in human output; bulk and recursive copies summarize automatically. |
+| `--portable-names` | When downloading to a local filesystem, reject keys that cannot be created on Windows. Unix destinations accept characters such as `:` by default. |
 
 ## Examples
 
