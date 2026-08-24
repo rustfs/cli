@@ -1124,6 +1124,7 @@ fn nested_subcommand_help_contract() {
                 "--policy",
                 "--policy-json",
                 "--expiry",
+                "--user",
             ],
         },
         HelpCase {

@@ -76,6 +76,11 @@ pub struct CreateArgs {
     /// Optional expiration time (ISO 8601 format)
     #[arg(long)]
     pub expiry: Option<String>,
+
+    /// Parent IAM user. Owner credentials may create a service account for
+    /// another user; omitted requests stay parented to the alias identity.
+    #[arg(long)]
+    pub user: Option<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -300,6 +305,11 @@ fn build_create_service_account_request(
         description: args.description.clone(),
         access_key: args.access_key.clone(),
         secret_key: args.secret_key.clone(),
+        target_user: args
+            .user
+            .as_ref()
+            .filter(|value| !value.is_empty())
+            .cloned(),
     }
 }
 
@@ -512,11 +522,13 @@ mod tests {
             policy: None,
             policy_json: None,
             expiry: None,
+            user: None,
         };
 
         let request = build_create_service_account_request(&args, None);
         assert_eq!(request.name.as_deref(), Some("AKIAIOSFODNN7EXAMPLE"));
         assert!(request.expiry.is_none());
+        assert!(request.target_user.is_none());
     }
 
     #[test]
@@ -530,6 +542,7 @@ mod tests {
             policy: None,
             policy_json: None,
             expiry: Some("2030-01-01T00:00:00Z".to_string()),
+            user: None,
         };
 
         let request = build_create_service_account_request(&args, Some("{\"x\":1}".to_string()));
@@ -537,6 +550,43 @@ mod tests {
         assert_eq!(request.description.as_deref(), Some("demo"));
         assert_eq!(request.expiry.as_deref(), Some("2030-01-01T00:00:00Z"));
         assert_eq!(request.policy.as_deref(), Some("{\"x\":1}"));
+        assert!(request.target_user.is_none());
+    }
+
+    #[test]
+    fn test_build_create_request_forwards_target_user() {
+        let args = CreateArgs {
+            alias: "local".to_string(),
+            access_key: "SA_ACCESS_KEY".to_string(),
+            secret_key: "SA_SECRET_KEY".to_string(),
+            name: None,
+            description: None,
+            policy: None,
+            policy_json: None,
+            expiry: None,
+            user: Some("test-user".to_string()),
+        };
+
+        let request = build_create_service_account_request(&args, None);
+        assert_eq!(request.target_user.as_deref(), Some("test-user"));
+    }
+
+    #[test]
+    fn test_build_create_request_omits_empty_target_user() {
+        let args = CreateArgs {
+            alias: "local".to_string(),
+            access_key: "SA_ACCESS_KEY".to_string(),
+            secret_key: "SA_SECRET_KEY".to_string(),
+            name: None,
+            description: None,
+            policy: None,
+            policy_json: None,
+            expiry: None,
+            user: Some(String::new()),
+        };
+
+        let request = build_create_service_account_request(&args, None);
+        assert!(request.target_user.is_none());
     }
 
     #[test]
@@ -617,6 +667,7 @@ mod tests {
             policy: None,
             policy_json: None,
             expiry: None,
+            user: None,
         };
         let error = rc_core::Error::InvalidPath("missing field `expiration`".to_string());
         assert!(should_retry_with_default_expiry(&args, &error));
@@ -633,6 +684,7 @@ mod tests {
             policy: None,
             policy_json: None,
             expiry: Some("2030-01-01T00:00:00Z".to_string()),
+            user: None,
         };
         let error = rc_core::Error::InvalidPath("missing field `expiration`".to_string());
         assert!(!should_retry_with_default_expiry(&args, &error));

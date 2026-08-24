@@ -426,6 +426,11 @@ pub struct CreateServiceAccountRequest {
     /// Secret key (required)
     #[serde(rename = "secretKey")]
     pub secret_key: String,
+
+    /// Optional parent IAM user. Owner credentials may create a service
+    /// account for another user; omitted requests stay parented to the caller.
+    #[serde(rename = "targetUser", skip_serializing_if = "Option::is_none")]
+    pub target_user: Option<String>,
 }
 
 /// Request to update an existing service account
@@ -628,6 +633,7 @@ mod tests {
             description: None,
             access_key: "myaccesskey".to_string(),
             secret_key: "mysecretkey".to_string(),
+            target_user: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -640,6 +646,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(parsed.get("expiration").is_some());
         assert!(parsed["expiration"].is_null());
+        assert!(parsed.get("targetUser").is_none());
     }
 
     #[test]
@@ -651,6 +658,7 @@ mod tests {
             description: None,
             access_key: "myaccesskey".to_string(),
             secret_key: "mysecretkey".to_string(),
+            target_user: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -659,6 +667,23 @@ mod tests {
             parsed.get("expiration").and_then(|v| v.as_str()),
             Some("2025-12-31T23:59:59Z")
         );
+    }
+
+    #[test]
+    fn test_create_service_account_request_serializes_target_user() {
+        let request = CreateServiceAccountRequest {
+            policy: None,
+            expiry: None,
+            name: None,
+            description: None,
+            access_key: "myaccesskey".to_string(),
+            secret_key: "mysecretkey".to_string(),
+            target_user: Some("test-user".to_string()),
+        };
+
+        let parsed: serde_json::Value = serde_json::to_value(&request).unwrap();
+        assert_eq!(parsed["targetUser"], "test-user");
+        assert_eq!(parsed["accessKey"], "myaccesskey");
     }
 
     #[test]

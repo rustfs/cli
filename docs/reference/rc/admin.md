@@ -256,7 +256,10 @@ Create a service account with a policy file:
 
 ```bash
 rc admin service-account create local SA_ACCESS_KEY SA_SECRET_KEY --policy ./policy.json
+rc admin service-account create local SA_ACCESS_KEY SA_SECRET_KEY --user test-user
 ```
+
+`--user` on create sends `targetUser` so an owner alias can parent the key to another IAM user. Omit it to keep the existing parent-is-the-caller behavior. `rc admin service-account ls --user` already lists another user's keys.
 
 Link two sites for site replication and check the result:
 
