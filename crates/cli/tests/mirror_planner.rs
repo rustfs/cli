@@ -299,6 +299,180 @@ fn remote_pagination_is_consumed_before_the_deterministic_plan_is_emitted() {
     assert!(requests.iter().all(|request| request.starts_with("GET ")));
 }
 
+fn destination_list_response(etag: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>target-bucket</Name>
+  <Prefix>backup/</Prefix>
+  <KeyCount>1</KeyCount>
+  <MaxKeys>1000</MaxKeys>
+  <IsTruncated>false</IsTruncated>
+  <Contents>
+    <Key>backup/nested/file.txt</Key>
+    <LastModified>2026-07-21T04:00:00.000Z</LastModified>
+    <ETag>&quot;{etag}&quot;</ETag>
+    <Size>4</Size>
+    <StorageClass>STANDARD</StorageClass>
+  </Contents>
+</ListBucketResult>"#
+    )
+}
+
+fn start_identity_server(
+    expected_requests: usize,
+    destination_etag: &'static str,
+    identity_etag: Option<&'static str>,
+) -> (String, thread::JoinHandle<Vec<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock S3 endpoint");
+    listener
+        .set_nonblocking(true)
+        .expect("configure nonblocking listener");
+    let endpoint = format!("http://{}", listener.local_addr().expect("mock endpoint"));
+    let handle = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut requests = Vec::new();
+        while requests.len() < expected_requests && Instant::now() < deadline {
+            let (mut stream, _) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(error) => panic!("accept mock S3 request: {error}"),
+            };
+            stream
+                .set_nonblocking(false)
+                .expect("configure blocking mock connection");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("set request timeout");
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 2048];
+            loop {
+                let read = stream.read(&mut chunk).expect("read mock S3 request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request = String::from_utf8_lossy(&request).into_owned();
+            let request_line = request.lines().next().unwrap_or_default().to_string();
+            let response = if request_line.starts_with("HEAD ") {
+                let mut headers = vec![
+                    "HTTP/1.1 200 OK".to_string(),
+                    "content-length: 4".to_string(),
+                    format!("etag: \"{destination_etag}\""),
+                    "last-modified: Tue, 21 Jul 2026 04:00:00 GMT".to_string(),
+                    "connection: close".to_string(),
+                ];
+                if let Some(identity_etag) = identity_etag {
+                    headers.push(format!("x-amz-meta-rc-source-etag: {identity_etag}"));
+                }
+                format!("{}\r\n\r\n", headers.join("\r\n"))
+            } else {
+                let body = if request_line.contains("/source-bucket") {
+                    source_list_response().to_string()
+                } else {
+                    destination_list_response(destination_etag)
+                };
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/xml\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+            };
+            stream
+                .write_all(response.as_bytes())
+                .expect("write mock S3 response");
+            requests.push(request_line);
+        }
+        requests
+    });
+    (endpoint, handle)
+}
+
+fn assert_read_only_identity_requests(
+    handle: thread::JoinHandle<Vec<String>>,
+    expected_requests: usize,
+) {
+    let requests = handle.join().expect("join mock S3 endpoint");
+    assert_eq!(requests.len(), expected_requests, "{requests:?}");
+    assert!(
+        requests
+            .iter()
+            .all(|request| { request.starts_with("GET ") || request.starts_with("HEAD ") }),
+        "identity planning sent a mutating request: {requests:?}"
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.starts_with("HEAD ") && request.contains("target-bucket")),
+        "auto compare should HeadObject the destination: {requests:?}"
+    );
+}
+
+#[test]
+fn remote_to_remote_auto_compare_skips_when_destination_preserves_source_etag() {
+    let config_dir = tempfile::tempdir().expect("create config dir");
+    let (endpoint, handle) = start_identity_server(3, "multipart-etag-1", Some("source-etag"));
+
+    let output = run_rc(
+        &[
+            "--json",
+            "mirror",
+            "test/source-bucket/source/",
+            "test/target-bucket/backup/",
+            "--overwrite",
+            "--dry-run",
+            "--compare",
+            "auto",
+        ],
+        config_dir.path(),
+        Some(&endpoint),
+    );
+
+    let payload = parse_success(&output);
+    assert_eq!(payload["copied"], 0);
+    assert_eq!(payload["skipped"], 1);
+    assert_eq!(payload["dry_run"], true);
+    assert_read_only_identity_requests(handle, 3);
+}
+
+#[test]
+fn remote_to_remote_etag_compare_recopies_when_stored_etags_differ() {
+    let config_dir = tempfile::tempdir().expect("create config dir");
+    let (endpoint, handle) = start_identity_server(2, "multipart-etag-1", Some("source-etag"));
+
+    let output = run_rc(
+        &[
+            "--json",
+            "mirror",
+            "test/source-bucket/source/",
+            "test/target-bucket/backup/",
+            "--overwrite",
+            "--dry-run",
+            "--compare",
+            "etag",
+        ],
+        config_dir.path(),
+        Some(&endpoint),
+    );
+
+    let payload = parse_success(&output);
+    assert_eq!(payload["copied"], 1);
+    assert_eq!(payload["dry_run"], true);
+    let requests = handle.join().expect("join mock S3 endpoint");
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    assert!(
+        requests.iter().all(|request| request.starts_with("GET ")),
+        "etag compare should not HeadObject destinations: {requests:?}"
+    );
+}
+
 #[test]
 fn local_to_local_is_rejected_with_the_unsupported_exit_code() {
     let config_dir = tempfile::tempdir().expect("create config dir");
