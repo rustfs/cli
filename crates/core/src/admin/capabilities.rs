@@ -86,10 +86,22 @@ pub struct RuntimeCapabilitiesSummary {
     pub cluster_snapshot: RuntimeCapabilityStatus,
 }
 
+/// One named admin capability advertised by the server itself
+/// (rustfs/backlog#1900). Servers after 1.0.0-rc.3 include this list in
+/// `/v4/runtime/capabilities`; older servers omit it, in which case the
+/// client falls back to its pinned per-version contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdvertisedAdminCapability {
+    pub name: String,
+    pub status: RuntimeCapabilityStatus,
+}
+
 /// Typed subset of the RustFS runtime capability response.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeCapabilitiesSnapshot {
     pub summary: RuntimeCapabilitiesSummary,
+    #[serde(default)]
+    pub advertised: Vec<AdvertisedAdminCapability>,
     #[serde(default)]
     pub inspect_archive: Option<super::InspectArchiveCapabilityContract>,
     #[serde(default)]

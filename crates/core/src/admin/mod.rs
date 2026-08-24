@@ -32,10 +32,11 @@ pub use bucket_metadata::{
     MAX_BUCKET_METADATA_ARCHIVE_BYTES,
 };
 pub use capabilities::{
-    CapabilityAvailability, CapabilityEntry, CapabilityReport, ClusterSnapshotMetadata,
-    ClusterSnapshotSummary, DiagnosticCapability, DiagnosticCapabilityGuardError,
-    ExtensionMetadata, ExtensionsCatalog, RuntimeCapabilitiesSnapshot, RuntimeCapabilitiesSummary,
-    RuntimeCapabilityState, RuntimeCapabilityStatus,
+    AdvertisedAdminCapability, CapabilityAvailability, CapabilityEntry, CapabilityReport,
+    ClusterSnapshotMetadata, ClusterSnapshotSummary, DiagnosticCapability,
+    DiagnosticCapabilityGuardError, ExtensionMetadata, ExtensionsCatalog,
+    RuntimeCapabilitiesSnapshot, RuntimeCapabilitiesSummary, RuntimeCapabilityState,
+    RuntimeCapabilityStatus,
 };
 pub use cluster::{
     BackendInfo, BackendType, BucketsInfo, ClusterInfo, DecommissionPoolStatus, DecommissionStatus,
