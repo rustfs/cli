@@ -125,6 +125,44 @@ fn service_account_create_omits_target_user_when_parent_is_the_caller() {
 }
 
 #[test]
+fn service_account_create_omits_empty_user_flag_from_request_body() {
+    let config_dir = tempfile::tempdir().expect("create config dir");
+    let (endpoint, receiver, handle) = start_admin_test_server(
+        r#"{"credentials":{"accessKey":"service-key","secretKey":"service-secret"}}"#,
+    );
+
+    let output = Command::new(rc_binary())
+        .args([
+            "--json",
+            "admin",
+            "service-account",
+            "create",
+            "myalias",
+            "service-key",
+            "service-secret",
+            "--user",
+            "",
+        ])
+        .env("RC_CONFIG_DIR", config_dir.path())
+        .env("RC_HOST_myalias", rc_host_alias(&endpoint))
+        .output()
+        .expect("run rc command");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let request = receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("captured admin request");
+    let body: serde_json::Value =
+        serde_json::from_slice(&request.body).expect("create body should be JSON");
+    assert!(body.get("targetUser").is_none());
+    handle.join().expect("admin test server finished");
+}
+
+#[test]
 fn service_account_create_rejects_invalid_inline_policy_json() {
     let config_dir = tempfile::tempdir().expect("create config dir");
     let output = Command::new(rc_binary())

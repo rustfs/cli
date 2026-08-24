@@ -44,7 +44,8 @@ log_info "Service-account targetUser regression suite"
 run_tests "core request serialization" \
     cargo test -p rc-core --lib -- \
     test_create_service_account_request_includes_expiration \
-    test_create_service_account_request_serializes_target_user
+    test_create_service_account_request_serializes_target_user \
+    test_create_service_account_request_deserializes_target_user
 
 run_tests "CLI request mapping" \
     cargo test -p rustfs-cli --lib -- \
@@ -57,6 +58,7 @@ run_tests "admin create integration" \
     cargo test -p rustfs-cli --test admin_service_account -- \
     service_account_create_sends_target_user_for_another_parent \
     service_account_create_omits_target_user_when_parent_is_the_caller \
+    service_account_create_omits_empty_user_flag_from_request_body \
     service_account_create_accepts_inline_policy_json
 
 run_tests "CLI help contract includes create --user" \

@@ -687,6 +687,28 @@ mod tests {
     }
 
     #[test]
+    fn test_create_service_account_request_deserializes_target_user() {
+        let parsed: CreateServiceAccountRequest = serde_json::from_value(serde_json::json!({
+            "expiration": null,
+            "accessKey": "myaccesskey",
+            "secretKey": "mysecretkey",
+            "targetUser": "test-user"
+        }))
+        .expect("deserialize create request");
+
+        assert_eq!(parsed.target_user.as_deref(), Some("test-user"));
+
+        let omitted: CreateServiceAccountRequest = serde_json::from_value(serde_json::json!({
+            "expiration": null,
+            "accessKey": "myaccesskey",
+            "secretKey": "mysecretkey"
+        }))
+        .expect("deserialize create request without targetUser");
+
+        assert!(omitted.target_user.is_none());
+    }
+
+    #[test]
     fn test_update_service_account_request_serializes_provided_fields() {
         let request = UpdateServiceAccountRequest {
             new_policy: Some(r#"{"Version":"2012-10-17"}"#.to_string()),

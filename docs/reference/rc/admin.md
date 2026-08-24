@@ -261,6 +261,10 @@ rc admin service-account create local SA_ACCESS_KEY SA_SECRET_KEY --user test-us
 
 `--user` on create sends `targetUser` so an owner alias can parent the key to another IAM user. Omit it to keep the existing parent-is-the-caller behavior. `rc admin service-account ls --user` already lists another user's keys.
 
+### BREAKING service-account targetUser contract migration
+
+`--user` on `rc admin service-account create` is additive and omitted from the request body when unset or empty. Existing creates without `--user` serialize the same body as before. This PR must be marked `BREAKING` because `docs/reference/rc/admin.md` is a protected CLI behavior contract. No JSON schema or config `schema_version` bump applies.
+
 Link two sites for site replication and check the result:
 
 ```bash
