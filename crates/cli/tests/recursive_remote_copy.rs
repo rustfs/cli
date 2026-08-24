@@ -198,10 +198,14 @@ fn write_response(stream: &mut TcpStream, response: Response) {
         .headers
         .iter()
         .any(|(name, _)| name.eq_ignore_ascii_case("content-length"));
-    let mut head = format!(
-        "HTTP/1.1 {}\r\ncontent-type: application/xml\r\nconnection: keep-alive\r\n",
-        response.status
-    );
+    let has_content_type = response
+        .headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("content-type"));
+    let mut head = format!("HTTP/1.1 {}\r\nconnection: keep-alive\r\n", response.status);
+    if !has_content_type {
+        head.push_str("content-type: application/xml\r\n");
+    }
     if !has_content_length {
         head.push_str(&format!("content-length: {}\r\n", response.body.len()));
     }
@@ -251,6 +255,29 @@ fn run_rc(mock: &S3Mock, args: &[&str]) -> Output {
         .env("AWS_EC2_METADATA_DISABLED", "true")
         .output()
         .expect("run rc command")
+}
+
+fn run_rc_with_hosts(mock: &S3Mock, hosts: &[(&str, &str)], args: &[&str]) -> Output {
+    let config_dir = tempfile::tempdir().expect("create config directory");
+    let authority = mock
+        .endpoint
+        .strip_prefix("http://")
+        .expect("mock endpoint has scheme");
+    let alias = format!("http://ACCESS_KEY:SECRET_KEY@{authority}");
+    let mut command = Command::new(rc_binary());
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("RC_HOST_") {
+            command.env_remove(key);
+        }
+    }
+    command
+        .args(args)
+        .env("RC_CONFIG_DIR", config_dir.path())
+        .env("AWS_EC2_METADATA_DISABLED", "true");
+    for (name, _) in hosts {
+        command.env(format!("RC_HOST_{name}"), &alias);
+    }
+    command.output().expect("run rc command")
 }
 
 fn run_rc_with_stdin(mock: &S3Mock, args: &[&str], input: &[u8]) -> Output {
@@ -335,6 +362,32 @@ fn is_list_request(request: &Request) -> bool {
 
 fn is_copy_request(request: &Request) -> bool {
     request.method == "PUT" && request.headers.contains_key("x-amz-copy-source")
+}
+
+fn is_upload_request(request: &Request) -> bool {
+    request.method == "PUT"
+        && !request.headers.contains_key("x-amz-copy-source")
+        && !request.target.contains("uploads")
+}
+
+fn object_get_result(body: &str) -> Response {
+    Response {
+        status: "200 OK",
+        headers: vec![
+            ("content-length", body.len().to_string()),
+            ("etag", "\"source-etag\"".to_string()),
+            ("content-type", "text/plain".to_string()),
+        ],
+        body: body.to_string(),
+    }
+}
+
+fn missing_object() -> Response {
+    Response {
+        status: "404 Not Found",
+        headers: Vec::new(),
+        body: "<Error><Code>NoSuchKey</Code><Message>missing</Message></Error>".to_string(),
+    }
 }
 
 #[test]
@@ -1515,5 +1568,112 @@ fn recursive_multipart_sigint_aborts_once_and_reports_cancelled_cleanup() {
             })
             .count(),
         1
+    );
+}
+
+#[test]
+fn cross_alias_recursive_dry_run_plans_without_server_side_copy() {
+    let mock = S3Mock::start(|request| {
+        if is_list_request(request) {
+            return one_object_list();
+        }
+        Response {
+            status: "500 Internal Server Error",
+            headers: Vec::new(),
+            body: "<Error><Code>UnexpectedRequest</Code></Error>".to_string(),
+        }
+    });
+
+    let output = run_rc_with_hosts(
+        &mock,
+        &[("alpha", ""), ("beta", "")],
+        &[
+            "cp",
+            "--recursive",
+            "--overwrite=true",
+            "--dry-run",
+            "--concurrency",
+            "1",
+            "alpha/source/src/",
+            "beta/destination/dst/",
+        ],
+    );
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}\nrequests: {:#?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        mock.requests()
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Would copy: alpha/source/src/a.txt -> beta/destination/dst/a.txt"));
+    assert!(
+        mock.requests()
+            .iter()
+            .all(|request| request.method == "GET" && request.target.contains("list-type=2")),
+        "dry-run must only list the source: {:#?}",
+        mock.requests()
+    );
+}
+
+#[test]
+fn cross_alias_copy_downloads_then_uploads_without_copy_source() {
+    let mock = S3Mock::start(|request| {
+        if request.method == "HEAD" && request.target == "/source/a.txt" {
+            return Response::head_with_etag(5, "source-etag");
+        }
+        if request.method == "GET" && request.target.starts_with("/source/a.txt") {
+            return object_get_result("hello");
+        }
+        if is_upload_request(request) && request.target.starts_with("/destination/b.txt") {
+            return Response {
+                status: "200 OK",
+                headers: vec![("etag", "\"dest-etag\"".to_string())],
+                body: String::new(),
+            };
+        }
+        if request.method == "HEAD" && request.target.starts_with("/destination/") {
+            return missing_object();
+        }
+        Response {
+            status: "500 Internal Server Error",
+            headers: Vec::new(),
+            body: "<Error><Code>UnexpectedRequest</Code></Error>".to_string(),
+        }
+    });
+
+    let output = run_rc_with_hosts(
+        &mock,
+        &[("alpha", ""), ("beta", "")],
+        &[
+            "cp",
+            "--overwrite=true",
+            "alpha/source/a.txt",
+            "beta/destination/b.txt",
+        ],
+    );
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}\nrequests: {:#?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        mock.requests()
+    );
+    let requests = mock.requests();
+    assert!(
+        requests.iter().any(|request| {
+            request.method == "GET" && request.target.starts_with("/source/a.txt")
+        }),
+        "cross-alias copy should download the source: {requests:#?}"
+    );
+    assert!(
+        requests.iter().any(is_upload_request),
+        "cross-alias copy should upload to the destination: {requests:#?}"
+    );
+    assert!(
+        requests.iter().all(|request| !is_copy_request(request)),
+        "cross-alias copy must not use CopyObject: {requests:#?}"
     );
 }
