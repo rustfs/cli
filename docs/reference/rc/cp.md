@@ -106,6 +106,10 @@ The current implementation supports `SSE-S3` and `SSE-KMS`. It does not support 
 
 When the server returns a source or destination object version ID, JSON copy output uses the output v3 `versioned_objects` envelope with `data.operation` set to `copy`. `data.source_version_id` identifies the copied source version and `data.version_id` identifies the created destination version. Copies for which the backend reports no version information retain the legacy JSON shape.
 
+### BREAKING cross-alias copy contract migration
+
+Cross-alias `rc cp` is additive and does not change same-alias CopyObject behavior. Destinations on a different alias are copied by download then upload instead of failing as `unsupported_feature`. Source content type and user metadata are preserved unless `--metadata-directive replace` is set. This PR must be marked `BREAKING` because `docs/reference/rc/cp.md` is a protected CLI behavior contract. No JSON schema or config `schema_version` bump applies.
+
 Global options shown in command syntax use the same meaning everywhere:
 
 | Option | Description |

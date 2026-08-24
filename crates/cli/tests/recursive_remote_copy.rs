@@ -1677,3 +1677,143 @@ fn cross_alias_copy_downloads_then_uploads_without_copy_source() {
         "cross-alias copy must not use CopyObject: {requests:#?}"
     );
 }
+
+#[test]
+fn cross_alias_recursive_copy_downloads_then_uploads_without_copy_source() {
+    let mock = S3Mock::start(|request| {
+        if is_list_request(request) {
+            return one_object_list();
+        }
+        if request.method == "HEAD" && request.target.starts_with("/source/src/a.txt") {
+            return Response::head_with_etag(1, "source-etag");
+        }
+        if request.method == "GET" && request.target.starts_with("/source/src/a.txt") {
+            return object_get_result("h");
+        }
+        if is_upload_request(request) && request.target.starts_with("/destination/dst/a.txt") {
+            return Response {
+                status: "200 OK",
+                headers: vec![("etag", "\"dest-etag\"".to_string())],
+                body: String::new(),
+            };
+        }
+        if request.method == "HEAD" && request.target.starts_with("/destination/") {
+            return missing_object();
+        }
+        Response {
+            status: "500 Internal Server Error",
+            headers: Vec::new(),
+            body: "<Error><Code>UnexpectedRequest</Code></Error>".to_string(),
+        }
+    });
+
+    let output = run_rc_with_hosts(
+        &mock,
+        &[("alpha", ""), ("beta", "")],
+        &[
+            "cp",
+            "--recursive",
+            "--overwrite=true",
+            "--concurrency",
+            "1",
+            "alpha/source/src/",
+            "beta/destination/dst/",
+        ],
+    );
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}\nrequests: {:#?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        mock.requests()
+    );
+    let requests = mock.requests();
+    assert!(
+        requests.iter().any(is_list_request),
+        "recursive copy should list the source: {requests:#?}"
+    );
+    assert!(
+        requests.iter().any(|request| {
+            request.method == "GET" && request.target.starts_with("/source/src/a.txt")
+        }),
+        "recursive cross-alias copy should download the source: {requests:#?}"
+    );
+    assert!(
+        requests.iter().any(is_upload_request),
+        "recursive cross-alias copy should upload to the destination: {requests:#?}"
+    );
+    assert!(
+        requests.iter().all(|request| !is_copy_request(request)),
+        "recursive cross-alias copy must not use CopyObject: {requests:#?}"
+    );
+}
+
+#[test]
+fn cross_alias_copy_forwards_source_user_metadata_on_upload() {
+    let mock = S3Mock::start(|request| {
+        if request.method == "HEAD" && request.target.starts_with("/source/a.txt") {
+            return Response {
+                status: "200 OK",
+                headers: vec![
+                    ("content-length", "5".to_string()),
+                    ("etag", "\"source-etag\"".to_string()),
+                    ("content-type", "text/plain".to_string()),
+                    ("x-amz-meta-owner", "storage".to_string()),
+                ],
+                body: String::new(),
+            };
+        }
+        if request.method == "GET" && request.target.starts_with("/source/a.txt") {
+            return object_get_result("hello");
+        }
+        if is_upload_request(request) && request.target.starts_with("/destination/b.txt") {
+            return Response {
+                status: "200 OK",
+                headers: vec![("etag", "\"dest-etag\"".to_string())],
+                body: String::new(),
+            };
+        }
+        if request.method == "HEAD" && request.target.starts_with("/destination/") {
+            return missing_object();
+        }
+        Response {
+            status: "500 Internal Server Error",
+            headers: Vec::new(),
+            body: "<Error><Code>UnexpectedRequest</Code></Error>".to_string(),
+        }
+    });
+
+    let output = run_rc_with_hosts(
+        &mock,
+        &[("alpha", ""), ("beta", "")],
+        &[
+            "cp",
+            "--overwrite=true",
+            "alpha/source/a.txt",
+            "beta/destination/b.txt",
+        ],
+    );
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}\nrequests: {:#?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        mock.requests()
+    );
+    let requests = mock.requests();
+    let upload = requests
+        .iter()
+        .find(|request| is_upload_request(request))
+        .expect("cross-alias copy should upload");
+    assert_eq!(
+        upload.headers.get("x-amz-meta-owner").map(String::as_str),
+        Some("storage"),
+        "upload should preserve source user metadata: {requests:#?}"
+    );
+    assert!(
+        requests.iter().all(|request| !is_copy_request(request)),
+        "cross-alias copy must not use CopyObject: {requests:#?}"
+    );
+}

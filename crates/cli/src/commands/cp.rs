@@ -3598,6 +3598,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn planned_client_aliases_keep_same_alias_remote_copy_on_one_alias() {
+        let candidate = TransferCandidate {
+            payload: CpOperation::RemoteToRemote {
+                source: RemotePath::new("shared", "source", "file.txt"),
+                target: RemotePath::new("shared", "target", "file.txt"),
+                source_info: Box::new(ObjectInfo::file("file.txt", 4)),
+                encryption: None,
+            },
+            source: "shared/source/file.txt".to_string(),
+            target: "shared/target/file.txt".to_string(),
+            relative_path: "file.txt".to_string(),
+            modified: None,
+            size_bytes: Some(4),
+        };
+
+        assert_eq!(
+            planned_client_aliases(&[candidate])
+                .into_iter()
+                .collect::<Vec<_>>(),
+            ["shared"]
+        );
+    }
+
     #[tokio::test]
     async fn planning_client_reuses_one_connection_pool_per_alias() {
         let (alias_manager, _temp_dir) = temp_alias_manager();
@@ -4054,6 +4078,36 @@ mod tests {
                 .attributes
                 .as_ref()
                 .is_none_or(|value| value.content_type.is_none())
+        );
+    }
+
+    #[test]
+    fn piped_copy_preserves_source_user_metadata_unless_replaced() {
+        let mut source = ObjectInfo::file("file.txt", 4);
+        source.metadata = Some(HashMap::from([(
+            "owner".to_string(),
+            "storage".to_string(),
+        )]));
+        let args = CpArgs::single("alpha/source/file.txt", "beta/target/file.txt");
+
+        let copied = piped_copy_write_options(&args, &source, None).expect("copy metadata");
+        assert_eq!(
+            copied
+                .attributes
+                .as_ref()
+                .and_then(|value| value.user_metadata.get("owner"))
+                .map(String::as_str),
+            Some("storage")
+        );
+
+        let mut replace = args;
+        replace.metadata_directive = Some(MetadataDirectiveArg::Replace);
+        let replaced = piped_copy_write_options(&replace, &source, None).expect("replace metadata");
+        assert!(
+            replaced
+                .attributes
+                .as_ref()
+                .is_none_or(|value| value.user_metadata.is_empty())
         );
     }
 
