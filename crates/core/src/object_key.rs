@@ -236,6 +236,30 @@ mod tests {
     }
 
     #[test]
+    fn relative_local_path_rejects_colon_keys_when_portable() {
+        assert!(
+            relative_local_path_from_key(
+                "loki/fake/deadbeef/19f6abd9af4:19f6abe0e77:499628ff",
+                "loki/",
+                ObjectKeyPolicy::WindowsPortable
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn normalize_relative_key_rejects_empty_or_dot_only_keys() {
+        for policy in [ObjectKeyPolicy::Logical, ObjectKeyPolicy::WindowsPortable] {
+            for value in ["", ".", "./", "//"] {
+                assert!(
+                    normalize_relative_key(value, policy).is_err(),
+                    "policy {policy:?} accepted {value:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn relative_local_path_rejects_traversal_after_prefix() {
         assert!(
             relative_local_path_from_key(

@@ -100,6 +100,12 @@ The current implementation supports `SSE-S3` and `SSE-KMS`. It does not support 
 
 When the server returns a source or destination object version ID, JSON copy output uses the output v3 `versioned_objects` envelope with `data.operation` set to `copy`. `data.source_version_id` identifies the copied source version and `data.version_id` identifies the created destination version. Copies for which the backend reports no version information retain the legacy JSON shape.
 
+Recursive downloads map object keys onto the local filesystem using `/` separators. Traversal, absolute keys, backslashes, and control characters are always rejected. Characters such as `:` are accepted on Unix destinations unless `--portable-names` is set.
+
+### BREAKING object-key portability contract migration
+
+`--portable-names` is additive. Unix destinations no longer apply Windows filename rules by default, so keys containing `:` are accepted. Remote-to-remote copies keep the original key. This PR must be marked `BREAKING` because `docs/reference/rc/cp.md` is a protected CLI behavior contract. No JSON schema or config `schema_version` bump applies.
+
 Global options shown in command syntax use the same meaning everywhere:
 
 | Option | Description |
