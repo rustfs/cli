@@ -45,6 +45,9 @@ log_info "Mirror identity regression suite"
 run_tests "mirror identity unit tests" \
     cargo test -p rustfs-cli --lib -- \
     auto_compare_skips_when_source_etag_is_preserved_in_destination_metadata \
+    auto_compare_copies_when_identity_metadata_is_missing \
+    auto_compare_copies_when_identity_metadata_does_not_match \
+    size_mismatch_never_skips_regardless_of_compare_mode \
     etag_compare_still_copies_when_only_identity_metadata_matches \
     size_compare_skips_when_sizes_match_even_if_etags_differ \
     identity_metadata_is_read_case_insensitively \
@@ -59,6 +62,9 @@ run_tests "mirror identity planner integration tests" \
     cargo test -p rustfs-cli --test mirror_planner -- \
     remote_to_remote_auto_compare_skips_when_destination_preserves_source_etag \
     remote_to_remote_etag_compare_recopies_when_stored_etags_differ \
+    remote_to_remote_auto_compare_recopies_when_destination_identity_is_missing \
+    remote_to_remote_auto_compare_recopies_when_destination_identity_mismatches \
+    remote_to_remote_auto_compare_recopies_when_sizes_differ_without_head \
     remote_to_remote_dry_run_reads_both_manifests_without_mutation
 
 run_tests "CLI help contract includes --compare" \

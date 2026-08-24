@@ -83,6 +83,10 @@ Copy and removal phases use the shared transfer controls for filtering, concurre
 
 Existing remote-to-remote commands continue to work. `--parallel` is retained as an alias of the shared `--concurrency` option. Mirror no longer falls back to an unconditional byte copy when source metadata lookup fails, and missing remote ETags are no longer treated as proof of equality. Automation that depended on either unsafe fallback must handle explicit network or conflict exits and retry after re-planning.
 
+### BREAKING incremental identity contract migration
+
+`--compare auto|etag|size` and destination metadata `x-amz-meta-rc-source-etag` are additive. Default skip-on-matching-ETag behavior is unchanged. Objects copied before this change still recopy once under `auto`, then skip. This PR must be marked `BREAKING` because `docs/reference/rc/mirror.md` is a protected CLI behavior contract. No JSON schema or config `schema_version` bump applies.
+
 Global options shown in command syntax use the same meaning everywhere:
 
 | Option | Description |

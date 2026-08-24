@@ -905,6 +905,102 @@ fn auto_compare_skips_when_source_etag_is_preserved_in_destination_metadata() {
 }
 
 #[test]
+fn auto_compare_copies_when_identity_metadata_is_missing() {
+    let source = manifest([remote_entry(
+        "src",
+        "source/report.txt",
+        "report.txt",
+        "source-etag",
+    )]);
+    let target = manifest([remote_entry(
+        "dst",
+        "backup/report.txt",
+        "report.txt",
+        "multipart-etag-1",
+    )]);
+
+    let plan = build_copy_plan(
+        &source,
+        &target,
+        &MirrorEndpointSpec::Remote(RemotePath::new("dst", "bucket", "backup")),
+        &TransferSelection::default(),
+        true,
+        CompareMode::Auto,
+    )
+    .expect("build plan without identity metadata");
+
+    assert_eq!(plan.items.len(), 1);
+    assert_eq!(plan.summary.skipped, 0);
+}
+
+#[test]
+fn auto_compare_copies_when_identity_metadata_does_not_match() {
+    let source = manifest([remote_entry(
+        "src",
+        "source/report.txt",
+        "report.txt",
+        "source-etag",
+    )]);
+    let target = manifest([remote_entry_with_identity(
+        "dst",
+        "backup/report.txt",
+        "report.txt",
+        "multipart-etag-1",
+        "other-etag",
+    )]);
+
+    let plan = build_copy_plan(
+        &source,
+        &target,
+        &MirrorEndpointSpec::Remote(RemotePath::new("dst", "bucket", "backup")),
+        &TransferSelection::default(),
+        true,
+        CompareMode::Auto,
+    )
+    .expect("build plan with mismatched identity");
+
+    assert_eq!(plan.items.len(), 1);
+    assert_eq!(plan.summary.skipped, 0);
+}
+
+#[test]
+fn size_mismatch_never_skips_regardless_of_compare_mode() {
+    let source = remote_entry("src", "source/report.txt", "report.txt", "source-etag");
+    let mut target = remote_entry_with_identity(
+        "dst",
+        "backup/report.txt",
+        "report.txt",
+        "source-etag",
+        "source-etag",
+    );
+    target.snapshot.size_bytes = Some(8);
+
+    for compare in [CompareMode::Auto, CompareMode::Etag, CompareMode::Size] {
+        assert!(
+            !source_matches_target(&source, &target, compare),
+            "{compare:?} must copy when sizes differ"
+        );
+        assert!(
+            !destination_needs_identity_lookup(&source, &target, compare),
+            "{compare:?} must not HeadObject when sizes differ"
+        );
+    }
+
+    let plan = build_copy_plan(
+        &manifest([source]),
+        &manifest([target]),
+        &MirrorEndpointSpec::Remote(RemotePath::new("dst", "bucket", "backup")),
+        &TransferSelection::default(),
+        true,
+        CompareMode::Auto,
+    )
+    .expect("build plan for size mismatch");
+
+    assert_eq!(plan.items.len(), 1);
+    assert_eq!(plan.summary.skipped, 0);
+}
+
+#[test]
 fn etag_compare_still_copies_when_only_identity_metadata_matches() {
     let source = manifest([remote_entry(
         "src",

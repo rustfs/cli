@@ -299,7 +299,7 @@ fn remote_pagination_is_consumed_before_the_deterministic_plan_is_emitted() {
     assert!(requests.iter().all(|request| request.starts_with("GET ")));
 }
 
-fn destination_list_response(etag: &str) -> String {
+fn destination_list_response_with(etag: &str, size: u64) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
@@ -312,7 +312,7 @@ fn destination_list_response(etag: &str) -> String {
     <Key>backup/nested/file.txt</Key>
     <LastModified>2026-07-21T04:00:00.000Z</LastModified>
     <ETag>&quot;{etag}&quot;</ETag>
-    <Size>4</Size>
+    <Size>{size}</Size>
     <StorageClass>STANDARD</StorageClass>
   </Contents>
 </ListBucketResult>"#
@@ -323,6 +323,15 @@ fn start_identity_server(
     expected_requests: usize,
     destination_etag: &'static str,
     identity_etag: Option<&'static str>,
+) -> (String, thread::JoinHandle<Vec<String>>) {
+    start_identity_server_with(expected_requests, destination_etag, identity_etag, 4)
+}
+
+fn start_identity_server_with(
+    expected_requests: usize,
+    destination_etag: &'static str,
+    identity_etag: Option<&'static str>,
+    destination_size: u64,
 ) -> (String, thread::JoinHandle<Vec<String>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock S3 endpoint");
     listener
@@ -377,7 +386,7 @@ fn start_identity_server(
                 let body = if request_line.contains("/source-bucket") {
                     source_list_response().to_string()
                 } else {
-                    destination_list_response(destination_etag)
+                    destination_list_response_with(destination_etag, destination_size)
                 };
                 format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: application/xml\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
@@ -470,6 +479,92 @@ fn remote_to_remote_etag_compare_recopies_when_stored_etags_differ() {
     assert!(
         requests.iter().all(|request| request.starts_with("GET ")),
         "etag compare should not HeadObject destinations: {requests:?}"
+    );
+}
+
+#[test]
+fn remote_to_remote_auto_compare_recopies_when_destination_identity_is_missing() {
+    let config_dir = tempfile::tempdir().expect("create config dir");
+    let (endpoint, handle) = start_identity_server(3, "multipart-etag-1", None);
+
+    let output = run_rc(
+        &[
+            "--json",
+            "mirror",
+            "test/source-bucket/source/",
+            "test/target-bucket/backup/",
+            "--overwrite",
+            "--dry-run",
+            "--compare",
+            "auto",
+        ],
+        config_dir.path(),
+        Some(&endpoint),
+    );
+
+    let payload = parse_success(&output);
+    assert_eq!(payload["copied"], 1);
+    assert_eq!(payload["skipped"], 0);
+    assert_eq!(payload["dry_run"], true);
+    assert_read_only_identity_requests(handle, 3);
+}
+
+#[test]
+fn remote_to_remote_auto_compare_recopies_when_destination_identity_mismatches() {
+    let config_dir = tempfile::tempdir().expect("create config dir");
+    let (endpoint, handle) = start_identity_server(3, "multipart-etag-1", Some("other-etag"));
+
+    let output = run_rc(
+        &[
+            "--json",
+            "mirror",
+            "test/source-bucket/source/",
+            "test/target-bucket/backup/",
+            "--overwrite",
+            "--dry-run",
+            "--compare",
+            "auto",
+        ],
+        config_dir.path(),
+        Some(&endpoint),
+    );
+
+    let payload = parse_success(&output);
+    assert_eq!(payload["copied"], 1);
+    assert_eq!(payload["skipped"], 0);
+    assert_eq!(payload["dry_run"], true);
+    assert_read_only_identity_requests(handle, 3);
+}
+
+#[test]
+fn remote_to_remote_auto_compare_recopies_when_sizes_differ_without_head() {
+    let config_dir = tempfile::tempdir().expect("create config dir");
+    let (endpoint, handle) = start_identity_server_with(2, "multipart-etag-1", None, 8);
+
+    let output = run_rc(
+        &[
+            "--json",
+            "mirror",
+            "test/source-bucket/source/",
+            "test/target-bucket/backup/",
+            "--overwrite",
+            "--dry-run",
+            "--compare",
+            "auto",
+        ],
+        config_dir.path(),
+        Some(&endpoint),
+    );
+
+    let payload = parse_success(&output);
+    assert_eq!(payload["copied"], 1);
+    assert_eq!(payload["skipped"], 0);
+    assert_eq!(payload["dry_run"], true);
+    let requests = handle.join().expect("join mock S3 endpoint");
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    assert!(
+        requests.iter().all(|request| request.starts_with("GET ")),
+        "size mismatch should not HeadObject destinations: {requests:?}"
     );
 }
 
