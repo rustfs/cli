@@ -848,6 +848,26 @@ async fn remote_source_change_after_download_blocks_upload_and_cleans_staging() 
 }
 
 #[tokio::test]
+async fn remote_source_preflight_runs_before_target_identity_check() {
+    let (mut source, operation) = remote_transfer_fixture(4, None);
+    source.info.etag = Some("replacement-etag".to_string());
+    let MirrorLocation::Remote(source_path) = &operation.source.location else {
+        panic!("expected remote source")
+    };
+    let target_checked = Arc::new(Mutex::new(false));
+    let target_checked_for_check = Arc::clone(&target_checked);
+
+    let result = source_preflight_then_target(&source, source_path, &operation, || async move {
+        *target_checked_for_check.lock().expect("target check lock") = true;
+        Ok::<(), Error>(())
+    })
+    .await;
+
+    assert!(matches!(result, Err(Error::Conflict(_))));
+    assert!(!*target_checked.lock().expect("target check lock"));
+}
+
+#[tokio::test]
 async fn truncated_remote_download_is_rejected_and_cleaned_before_upload() {
     let (mut source, operation) = remote_transfer_fixture(4, None);
     source.download_size = 3;
@@ -874,26 +894,6 @@ async fn truncated_remote_download_is_rejected_and_cleaned_before_upload() {
     let downloads = source.download_calls.lock().expect("download calls lock");
     assert_eq!(downloads.len(), 1);
     assert!(!downloads[0].exists());
-}
-
-#[tokio::test]
-async fn remote_source_preflight_runs_before_target_identity_check() {
-    let (mut source, operation) = remote_transfer_fixture(4, None);
-    source.info.etag = Some("replacement-etag".to_string());
-    let MirrorLocation::Remote(source_path) = &operation.source.location else {
-        panic!("expected remote source")
-    };
-    let target_checked = Arc::new(Mutex::new(false));
-    let target_checked_for_check = Arc::clone(&target_checked);
-
-    let result = source_preflight_then_target(&source, source_path, &operation, || async move {
-        *target_checked_for_check.lock().expect("target check lock") = true;
-        Ok::<(), Error>(())
-    })
-    .await;
-
-    assert!(matches!(result, Err(Error::Conflict(_))));
-    assert!(!*target_checked.lock().expect("target check lock"));
 }
 
 #[tokio::test]

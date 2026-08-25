@@ -390,6 +390,494 @@ fn missing_object() -> Response {
     }
 }
 
+/// A ListObjects page for an arbitrary bucket, prefix, and ETag.
+///
+/// `list_result` hardcodes the source bucket, which cannot describe the
+/// destination side of a `diff`.
+fn bucket_list_result(bucket: &str, prefix: &str, key: &str, size: u64, etag: &str) -> Response {
+    Response::xml(format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+         <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <Name>{bucket}</Name><Prefix>{prefix}</Prefix>\
+         <Contents><Key>{key}</Key><Size>{size}</Size><ETag>&quot;{etag}&quot;</ETag></Contents>\
+         <IsTruncated>false</IsTruncated></ListBucketResult>"
+    ))
+}
+
+fn is_bucket_list_request(request: &Request, bucket: &str) -> bool {
+    request.method == "GET"
+        && (request.target.starts_with(&format!("/{bucket}?"))
+            || request.target.starts_with(&format!("/{bucket}/?")))
+        && request.target.contains("list-type=2")
+}
+
+/// HeadObject reply carrying the source-identity metadata a client copy records.
+fn head_with_identity(size: usize, etag: &str, identity_etag: &str) -> Response {
+    Response {
+        status: "200 OK",
+        headers: vec![
+            ("content-length", size.to_string()),
+            ("etag", format!("\"{etag}\"")),
+            ("x-amz-meta-rc-source-etag", identity_etag.to_string()),
+        ],
+        body: String::new(),
+    }
+}
+
+#[test]
+fn cross_alias_copy_records_the_source_etag_for_later_incremental_runs() {
+    let mock = S3Mock::start(|request| {
+        if request.method == "HEAD" && request.target.starts_with("/source/a.txt") {
+            return Response::head_with_etag(5, "source-etag");
+        }
+        if request.method == "GET" && request.target.starts_with("/source/a.txt") {
+            return object_get_result("hello");
+        }
+        if is_upload_request(request) && request.target.starts_with("/destination/b.txt") {
+            return Response {
+                status: "200 OK",
+                headers: vec![("etag", "\"multipart-etag-1\"".to_string())],
+                body: String::new(),
+            };
+        }
+        if request.method == "HEAD" && request.target.starts_with("/destination/") {
+            return missing_object();
+        }
+        Response {
+            status: "500 Internal Server Error",
+            headers: Vec::new(),
+            body: "<Error><Code>UnexpectedRequest</Code></Error>".to_string(),
+        }
+    });
+
+    let output = run_rc_with_hosts(
+        &mock,
+        &[("alpha", ""), ("beta", "")],
+        &[
+            "cp",
+            "--overwrite=true",
+            "alpha/source/a.txt",
+            "beta/destination/b.txt",
+        ],
+    );
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}\nrequests: {:#?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        mock.requests()
+    );
+    let requests = mock.requests();
+    let upload = requests
+        .iter()
+        .find(|request| is_upload_request(request))
+        .expect("cross-alias copy should upload");
+    assert_eq!(
+        upload
+            .headers
+            .get("x-amz-meta-rc-source-etag")
+            .map(String::as_str),
+        Some("source-etag"),
+        "cp must record the source ETag so mirror --compare auto can skip it: {requests:#?}"
+    );
+}
+
+#[test]
+fn cross_alias_move_uploads_then_deletes_the_source() {
+    let mock = S3Mock::start(|request| {
+        if request.method == "HEAD" && request.target.starts_with("/source/a.txt") {
+            return Response::head_with_etag(5, "source-etag");
+        }
+        if request.method == "GET" && request.target.starts_with("/source/a.txt") {
+            return object_get_result("hello");
+        }
+        if is_upload_request(request) && request.target.starts_with("/destination/b.txt") {
+            return Response {
+                status: "200 OK",
+                headers: vec![("etag", "\"multipart-etag-1\"".to_string())],
+                body: String::new(),
+            };
+        }
+        if request.method == "DELETE" && request.target.starts_with("/source/a.txt") {
+            return Response {
+                status: "204 No Content",
+                headers: vec![("content-length", "0".to_string())],
+                body: String::new(),
+            };
+        }
+        if request.method == "HEAD" && request.target.starts_with("/destination/") {
+            return missing_object();
+        }
+        Response {
+            status: "500 Internal Server Error",
+            headers: Vec::new(),
+            body: "<Error><Code>UnexpectedRequest</Code></Error>".to_string(),
+        }
+    });
+
+    let output = run_rc_with_hosts(
+        &mock,
+        &[("alpha", ""), ("beta", "")],
+        &["mv", "alpha/source/a.txt", "beta/destination/b.txt"],
+    );
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}\nrequests: {:#?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        mock.requests()
+    );
+    let requests = mock.requests();
+    assert!(
+        requests.iter().any(|request| {
+            request.method == "GET" && request.target.starts_with("/source/a.txt")
+        }),
+        "cross-alias move should download the source: {requests:#?}"
+    );
+    assert!(
+        requests.iter().any(is_upload_request),
+        "cross-alias move should upload to the destination: {requests:#?}"
+    );
+    assert!(
+        requests.iter().all(|request| !is_copy_request(request)),
+        "cross-alias move must not use CopyObject: {requests:#?}"
+    );
+    assert!(
+        requests.iter().any(|request| {
+            request.method == "DELETE" && request.target.starts_with("/source/a.txt")
+        }),
+        "a move must delete the source after a successful copy: {requests:#?}"
+    );
+    let delete = requests
+        .iter()
+        .find(|request| request.method == "DELETE" && request.target.starts_with("/source/a.txt"))
+        .expect("cross-alias move should issue one conditional source delete");
+    assert_eq!(
+        delete.headers.get("if-match").map(String::as_str),
+        Some("source-etag"),
+        "move must delete only the source version that was copied: {requests:#?}"
+    );
+}
+
+#[test]
+fn cross_alias_move_keeps_the_source_when_conditional_delete_fails() {
+    let mock = S3Mock::start(|request| {
+        if request.method == "HEAD" && request.target.starts_with("/source/a.txt") {
+            return Response::head_with_etag(5, "source-etag");
+        }
+        if request.method == "GET" && request.target.starts_with("/source/a.txt") {
+            return object_get_result("hello");
+        }
+        if is_upload_request(request) && request.target.starts_with("/destination/b.txt") {
+            return Response {
+                status: "200 OK",
+                headers: vec![("etag", "\"multipart-etag-1\"".to_string())],
+                body: String::new(),
+            };
+        }
+        if request.method == "DELETE" && request.target.starts_with("/source/a.txt") {
+            return Response {
+                status: "412 Precondition Failed",
+                headers: Vec::new(),
+                body: "<Error><Code>PreconditionFailed</Code></Error>".to_string(),
+            };
+        }
+        if request.method == "HEAD" && request.target.starts_with("/destination/") {
+            return missing_object();
+        }
+        Response {
+            status: "500 Internal Server Error",
+            headers: Vec::new(),
+            body: "<Error><Code>UnexpectedRequest</Code></Error>".to_string(),
+        }
+    });
+
+    let output = run_rc_with_hosts(
+        &mock,
+        &[("alpha", ""), ("beta", "")],
+        &["mv", "alpha/source/a.txt", "beta/destination/b.txt"],
+    );
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Copied but failed to delete source"),
+        "stderr: {stderr}\nrequests: {:?}",
+        mock.requests()
+    );
+    let delete = mock
+        .requests()
+        .into_iter()
+        .find(|request| request.method == "DELETE")
+        .expect("move should attempt the conditional delete");
+    assert_eq!(
+        delete.headers.get("if-match").map(String::as_str),
+        Some("source-etag")
+    );
+}
+
+#[test]
+fn cross_alias_move_keeps_the_source_when_the_upload_fails() {
+    let mock = S3Mock::start(|request| {
+        if request.method == "HEAD" && request.target.starts_with("/source/a.txt") {
+            return Response::head_with_etag(5, "source-etag");
+        }
+        if request.method == "GET" && request.target.starts_with("/source/a.txt") {
+            return object_get_result("hello");
+        }
+        if is_upload_request(request) {
+            return Response::access_denied();
+        }
+        if request.method == "HEAD" && request.target.starts_with("/destination/") {
+            return missing_object();
+        }
+        Response {
+            status: "500 Internal Server Error",
+            headers: Vec::new(),
+            body: "<Error><Code>UnexpectedRequest</Code></Error>".to_string(),
+        }
+    });
+
+    let output = run_rc_with_hosts(
+        &mock,
+        &[("alpha", ""), ("beta", "")],
+        &["mv", "alpha/source/a.txt", "beta/destination/b.txt"],
+    );
+
+    assert!(
+        !output.status.success(),
+        "a failed upload must not report success: {:#?}",
+        mock.requests()
+    );
+    let requests = mock.requests();
+    assert!(
+        requests.iter().any(|request| {
+            request.method == "GET" && request.target.starts_with("/source/a.txt")
+        }),
+        "the move should have taken the cross-alias download path: {requests:#?}"
+    );
+    assert!(
+        requests.iter().all(|request| request.method != "DELETE"),
+        "a failed cross-alias move must never delete the source: {requests:#?}"
+    );
+}
+
+/// The migration path this change exists for: a first pass with `cp --recursive`
+/// across aliases, then incremental `mirror --compare auto`. The second command
+/// must recognize what the first wrote, or the whole tree is copied twice.
+#[test]
+fn mirror_auto_compare_skips_objects_a_cross_alias_copy_already_migrated() {
+    let recorded_identity: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let mock = {
+        let recorded_identity = Arc::clone(&recorded_identity);
+        S3Mock::start(move |request| {
+            if is_bucket_list_request(request, "source") {
+                return bucket_list_result("source", "src/", "src/a.txt", 5, "source-etag");
+            }
+            if is_bucket_list_request(request, "destination") {
+                // The destination computed its own ETag during the upload.
+                return bucket_list_result(
+                    "destination",
+                    "dst/",
+                    "dst/a.txt",
+                    5,
+                    "multipart-etag-1",
+                );
+            }
+            if request.method == "HEAD" && request.target.starts_with("/source/src/a.txt") {
+                return Response::head_with_etag(5, "source-etag");
+            }
+            if request.method == "GET" && request.target.starts_with("/source/src/a.txt") {
+                return object_get_result("hello");
+            }
+            if is_upload_request(request) && request.target.starts_with("/destination/dst/a.txt") {
+                *recorded_identity.lock().expect("record identity") =
+                    request.headers.get("x-amz-meta-rc-source-etag").cloned();
+                return Response {
+                    status: "200 OK",
+                    headers: vec![("etag", "\"multipart-etag-1\"".to_string())],
+                    body: String::new(),
+                };
+            }
+            if request.method == "HEAD" && request.target.starts_with("/destination/dst/a.txt") {
+                // Serve back whatever the upload persisted, as a real backend would.
+                return match recorded_identity.lock().expect("read identity").as_deref() {
+                    Some(identity) => head_with_identity(5, "multipart-etag-1", identity),
+                    None => Response::head_with_etag(5, "multipart-etag-1"),
+                };
+            }
+            if request.method == "HEAD" && request.target.starts_with("/destination/") {
+                return missing_object();
+            }
+            Response {
+                status: "500 Internal Server Error",
+                headers: Vec::new(),
+                body: "<Error><Code>UnexpectedRequest</Code></Error>".to_string(),
+            }
+        })
+    };
+
+    let copy = run_rc_with_hosts(
+        &mock,
+        &[("alpha", ""), ("beta", "")],
+        &[
+            "cp",
+            "--recursive",
+            "--overwrite=true",
+            "--concurrency",
+            "1",
+            "alpha/source/src/",
+            "beta/destination/dst/",
+        ],
+    );
+    assert!(
+        copy.status.success(),
+        "cross-alias copy failed\nstdout: {}\nstderr: {}\nrequests: {:#?}",
+        String::from_utf8_lossy(&copy.stdout),
+        String::from_utf8_lossy(&copy.stderr),
+        mock.requests()
+    );
+    assert_eq!(
+        recorded_identity
+            .lock()
+            .expect("identity recorded")
+            .as_deref(),
+        Some("source-etag"),
+        "the copy must persist the source ETag: {:#?}",
+        mock.requests()
+    );
+
+    let mirror = run_rc_with_hosts(
+        &mock,
+        &[("alpha", ""), ("beta", "")],
+        &[
+            "--json",
+            "mirror",
+            "alpha/source/src/",
+            "beta/destination/dst/",
+            "--overwrite",
+            "--dry-run",
+            "--compare",
+            "auto",
+        ],
+    );
+    assert!(
+        mirror.status.success(),
+        "mirror failed\nstdout: {}\nstderr: {}\nrequests: {:#?}",
+        String::from_utf8_lossy(&mirror.stdout),
+        String::from_utf8_lossy(&mirror.stderr),
+        mock.requests()
+    );
+    let payload: serde_json::Value =
+        serde_json::from_slice(&mirror.stdout).expect("mirror JSON output");
+    assert_eq!(
+        payload["copied"], 0,
+        "mirror must not recopy what cp already migrated: {payload}"
+    );
+    assert_eq!(payload["skipped"], 1, "{payload}");
+}
+
+#[test]
+fn diff_auto_compare_treats_a_recorded_source_identity_as_same() {
+    let mock = S3Mock::start(|request| {
+        if is_bucket_list_request(request, "source") {
+            return bucket_list_result("source", "src/", "src/a.txt", 1, "source-etag");
+        }
+        if is_bucket_list_request(request, "destination") {
+            return bucket_list_result("destination", "dst/", "dst/a.txt", 1, "multipart-etag-1");
+        }
+        if request.method == "HEAD" && request.target.starts_with("/destination/dst/a.txt") {
+            return head_with_identity(1, "multipart-etag-1", "source-etag");
+        }
+        Response {
+            status: "500 Internal Server Error",
+            headers: Vec::new(),
+            body: "<Error><Code>UnexpectedRequest</Code></Error>".to_string(),
+        }
+    });
+
+    let output = run_rc_with_hosts(
+        &mock,
+        &[("alpha", ""), ("beta", "")],
+        &[
+            "diff",
+            "--recursive",
+            "alpha/source/src/",
+            "beta/destination/dst/",
+        ],
+    );
+
+    assert!(
+        output.status.success(),
+        "auto compare should report no differences\nstdout: {}\nstderr: {}\nrequests: {:#?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        mock.requests()
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("1 same, 0 different"),
+        "expected one matching object: {stdout}"
+    );
+    assert!(
+        mock.requests()
+            .iter()
+            .any(|request| request.method == "HEAD"),
+        "auto compare must HeadObject to read the recorded identity: {:#?}",
+        mock.requests()
+    );
+}
+
+#[test]
+fn diff_etag_compare_ignores_the_recorded_identity_without_head() {
+    let mock = S3Mock::start(|request| {
+        if is_bucket_list_request(request, "source") {
+            return bucket_list_result("source", "src/", "src/a.txt", 1, "source-etag");
+        }
+        if is_bucket_list_request(request, "destination") {
+            return bucket_list_result("destination", "dst/", "dst/a.txt", 1, "multipart-etag-1");
+        }
+        Response {
+            status: "500 Internal Server Error",
+            headers: Vec::new(),
+            body: "<Error><Code>UnexpectedRequest</Code></Error>".to_string(),
+        }
+    });
+
+    let output = run_rc_with_hosts(
+        &mock,
+        &[("alpha", ""), ("beta", "")],
+        &[
+            "diff",
+            "--recursive",
+            "--compare",
+            "etag",
+            "alpha/source/src/",
+            "beta/destination/dst/",
+        ],
+    );
+
+    assert!(
+        !output.status.success(),
+        "etag compare should still report a difference: {:#?}",
+        mock.requests()
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("0 same, 1 different"),
+        "expected one differing object: {stdout}"
+    );
+    assert!(
+        mock.requests()
+            .iter()
+            .all(|request| request.method != "HEAD"),
+        "etag compare must not spend HeadObject requests: {:#?}",
+        mock.requests()
+    );
+}
+
 #[test]
 fn single_copy_and_pipe_send_supported_storage_classes() {
     let mock = S3Mock::start(|request| {
@@ -1679,7 +2167,7 @@ fn cross_alias_copy_downloads_then_uploads_without_copy_source() {
 }
 
 #[test]
-fn cross_alias_copy_allows_metadata_replace() {
+fn cross_alias_copy_allows_metadata_replace_and_records_source_identity() {
     let mock = S3Mock::start(|request| {
         if request.method == "HEAD" && request.target == "/source/a.txt" {
             return Response::head_with_etag(5, "source-etag");
@@ -1736,6 +2224,10 @@ fn cross_alias_copy_allows_metadata_replace() {
     assert_eq!(
         upload.headers.get("x-amz-meta-owner"),
         Some(&"analytics".to_string())
+    );
+    assert_eq!(
+        upload.headers.get("x-amz-meta-rc-source-etag"),
+        Some(&"source-etag".to_string())
     );
     assert!(
         requests.iter().all(|request| !is_copy_request(request)),

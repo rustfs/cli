@@ -3,11 +3,15 @@
 //! Moves objects between locations (copy + delete).
 
 use clap::Args;
-use rc_core::{AliasManager, ListOptions, ObjectStore as _, ParsedPath, RemotePath, parse_path};
+use rc_core::{
+    AliasManager, CopyObjectOptions, DeleteRequestOptions, ListOptions, ObjectEncryptionRequest,
+    ObjectInfo, ObjectStore as _, ParsedPath, RemotePath, parse_path,
+};
 use rc_s3::S3Client;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
+use super::cp;
 use crate::exit_code::ExitCode;
 use crate::output::{Formatter, OutputConfig};
 
@@ -366,6 +370,98 @@ async fn move_s3_prefix_to_local(
     }
 }
 
+/// Copy one object for a move, picking the transfer that the alias pair allows.
+///
+/// `target_client` is `Some` only for a cross-alias move, where server-side
+/// CopyObject is not available and the object must stream through the client.
+#[derive(Debug)]
+struct MoveCopyResult {
+    object: ObjectInfo,
+    source_version_id: Option<String>,
+    source_etag: Option<String>,
+}
+
+async fn copy_for_move(
+    source_client: &S3Client,
+    target_client: Option<&S3Client>,
+    source: &RemotePath,
+    target: &RemotePath,
+    encryption: Option<&ObjectEncryptionRequest>,
+) -> rc_core::Result<MoveCopyResult> {
+    match target_client {
+        Some(target_client) => {
+            let result = cp::copy_object_across_aliases(
+                source_client,
+                target_client,
+                source,
+                target,
+                encryption,
+            )
+            .await?;
+            Ok(MoveCopyResult {
+                object: result.object,
+                source_version_id: result.source_version_id,
+                source_etag: result.source_etag,
+            })
+        }
+        None => {
+            let source_info = source_client.head_object(source).await?;
+            let copy_options =
+                CopyObjectOptions::for_source_version(source_info.version_id.clone())?;
+            let object = source_client
+                .copy_object_with_options(source, target, &copy_options, encryption)
+                .await?;
+            Ok(MoveCopyResult {
+                object,
+                source_version_id: source_info.version_id,
+                source_etag: source_info.etag,
+            })
+        }
+    }
+}
+
+async fn delete_moved_source(
+    client: &S3Client,
+    source: &RemotePath,
+    copied: &MoveCopyResult,
+) -> rc_core::Result<()> {
+    match move_delete_condition(copied)? {
+        MoveDeleteCondition::Version(version_id) => {
+            rc_core::ObjectStore::delete_object_with_options(
+                client,
+                source,
+                DeleteRequestOptions {
+                    version_id: Some(version_id),
+                    ..DeleteRequestOptions::default()
+                },
+            )
+            .await?;
+            Ok(())
+        }
+        MoveDeleteCondition::Etag(etag) => client.delete_object_if_match(source, &etag).await,
+    }
+}
+
+enum MoveDeleteCondition {
+    Version(String),
+    Etag(String),
+}
+
+fn move_delete_condition(copied: &MoveCopyResult) -> rc_core::Result<MoveDeleteCondition> {
+    if let Some(version_id) = copied.source_version_id.clone() {
+        return Ok(MoveDeleteCondition::Version(version_id));
+    }
+    copied
+        .source_etag
+        .clone()
+        .map(MoveDeleteCondition::Etag)
+        .ok_or_else(|| {
+            rc_core::Error::Conflict(
+                "Refusing to delete moved source because its ETag is unavailable".to_string(),
+            )
+        })
+}
+
 async fn move_s3_to_s3(
     src: &RemotePath,
     dst: &RemotePath,
@@ -381,12 +477,6 @@ async fn move_s3_to_s3(
         Ok(encryption) => encryption,
         Err(error) => return formatter.fail(ExitCode::UsageError, &error),
     };
-
-    // For S3-to-S3, we need same alias for server-side copy
-    if src.alias != dst.alias {
-        formatter.error("Cross-alias S3-to-S3 move not yet supported.");
-        return ExitCode::UnsupportedFeature;
-    }
 
     if args.recursive && remote_prefixes_overlap(src, dst) {
         formatter.error("Recursive move source and destination prefixes must not overlap.");
@@ -414,6 +504,27 @@ async fn move_s3_to_s3(
         Err(e) => {
             formatter.error(&format!("Failed to create S3 client: {e}"));
             return ExitCode::NetworkError;
+        }
+    };
+
+    // A different alias means a different endpoint or credentials, so server-side
+    // CopyObject cannot be used. Build a destination client and stream through it.
+    let target_client = if src.alias == dst.alias {
+        None
+    } else {
+        let target_alias = match alias_manager.get(&dst.alias) {
+            Ok(a) => a,
+            Err(_) => {
+                formatter.error(&format!("Alias '{}' not found", dst.alias));
+                return ExitCode::NotFound;
+            }
+        };
+        match S3Client::new(target_alias).await {
+            Ok(c) => Some(c),
+            Err(e) => {
+                formatter.error(&format!("Failed to create destination S3 client: {e}"));
+                return ExitCode::NetworkError;
+            }
         }
     };
 
@@ -506,11 +617,16 @@ async fn move_s3_to_s3(
             let src_obj_display = src_obj.to_string();
             let dst_obj_display = dst_obj.to_string();
 
-            match client
-                .copy_object(&src_obj, &dst_obj, encryption.as_ref())
-                .await
+            match copy_for_move(
+                &client,
+                target_client.as_ref(),
+                &src_obj,
+                &dst_obj,
+                encryption.as_ref(),
+            )
+            .await
             {
-                Ok(_) => match client.delete_object(&src_obj).await {
+                Ok(copied) => match delete_moved_source(&client, &src_obj, &copied).await {
                     Ok(()) => {
                         moved_count += 1;
                         if !formatter.is_json() {
@@ -575,10 +691,18 @@ async fn move_s3_to_s3(
         }
     } else {
         // Copy
-        match client.copy_object(src, dst, encryption.as_ref()).await {
-            Ok(info) => {
+        match copy_for_move(
+            &client,
+            target_client.as_ref(),
+            src,
+            dst,
+            encryption.as_ref(),
+        )
+        .await
+        {
+            Ok(copied) => {
                 // Delete source
-                if let Err(e) = client.delete_object(src).await {
+                if let Err(e) = delete_moved_source(&client, src, &copied).await {
                     formatter.error(&format!("Copied but failed to delete source: {e}"));
                     return ExitCode::GeneralError;
                 }
@@ -588,13 +712,13 @@ async fn move_s3_to_s3(
                         status: "success",
                         source: src_display,
                         target: dst_display,
-                        size_bytes: info.size_bytes,
+                        size_bytes: copied.object.size_bytes,
                     };
                     formatter.json(&output);
                 } else {
                     formatter.println(&format!(
                         "{src_display} -> {dst_display} ({})",
-                        info.size_human.unwrap_or_default()
+                        copied.object.size_human.unwrap_or_default()
                     ));
                 }
                 ExitCode::Success
@@ -761,6 +885,39 @@ mod tests {
         assert!(remote_prefixes_overlap(&source, &nested_target));
         assert!(remote_prefixes_overlap(&source, &parent_target));
         assert!(!remote_prefixes_overlap(&source, &separate_target));
+    }
+
+    #[test]
+    fn moved_source_deletion_prefers_exact_version_then_etag_condition() {
+        let versioned = MoveCopyResult {
+            object: ObjectInfo::file("target", 1),
+            source_version_id: Some("source-v1".to_string()),
+            source_etag: Some("source-etag".to_string()),
+        };
+        assert!(matches!(
+            move_delete_condition(&versioned),
+            Ok(MoveDeleteCondition::Version(version)) if version == "source-v1"
+        ));
+
+        let unversioned = MoveCopyResult {
+            object: ObjectInfo::file("target", 1),
+            source_version_id: None,
+            source_etag: Some("source-etag".to_string()),
+        };
+        assert!(matches!(
+            move_delete_condition(&unversioned),
+            Ok(MoveDeleteCondition::Etag(etag)) if etag == "source-etag"
+        ));
+
+        let without_identity = MoveCopyResult {
+            object: ObjectInfo::file("target", 1),
+            source_version_id: None,
+            source_etag: None,
+        };
+        assert!(matches!(
+            move_delete_condition(&without_identity),
+            Err(rc_core::Error::Conflict(_))
+        ));
     }
 
     #[test]

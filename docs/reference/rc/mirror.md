@@ -64,6 +64,8 @@ Entries are compared by size and the strongest stable metadata available. `--com
 
 Remote-to-remote copies download through a temporary file and upload to the destination. Multipart completion often stores a different ETag than the source, so a second `auto` run would recopy every object if it compared ListObjects ETags alone. `rc mirror` therefore writes `x-amz-meta-rc-source-etag` on remote uploads that have a source ETag. ListObjects does not return user metadata, so `auto` issues HeadObject for same-size destinations whose listed ETags differ.
 
+Cross-alias `rc cp` writes the same metadata key, and `rc diff --compare auto` reads it. A tree migrated with `rc cp --recursive` across aliases is therefore recognized by a later incremental `rc mirror` run instead of being copied again.
+
 Downloads preserve the source modification time, and local-to-remote restart checks accept a same-size destination written no earlier than the source. A completed entry is skipped on a restarted command.
 
 `--overwrite` authorizes replacing a changed destination; it does not disable concurrency checks. Mirror revalidates sources and compares local destination metadata again before persistence, so changes observed by those checks fail with the conflict exit code. New remote objects use `If-None-Match: *`, while existing remote objects and remote removals use the planned ETag as a condition; these service-side conditions also reject remote races after the final client-side check. Local replacement is atomic but is not a filesystem compare-and-swap, so a local writer racing after the final metadata check may be replaced.

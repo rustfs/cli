@@ -1,6 +1,6 @@
 //! mirror command - Synchronize trees between local filesystems and S3-compatible storage.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -19,10 +19,9 @@ use serde::Serialize;
 use tokio::io::AsyncWriteExt as _;
 
 use super::cp::{parse_age_cutoff, parse_byte_rate};
+use super::object_identity::{identity_etag_from_metadata, set_source_identity};
 use crate::exit_code::ExitCode;
 use crate::output::{Formatter, OutputConfig};
-
-const SOURCE_IDENTITY_METADATA_KEY: &str = "rc-source-etag";
 
 /// How `rc mirror` decides that a destination object already matches the source.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, ValueEnum)]
@@ -282,19 +281,15 @@ impl MirrorRemoteTransfer for S3Client {
         condition: RemoteWriteCondition,
         identity_etag: Option<&str>,
     ) -> rc_core::Result<ObjectInfo> {
-        let mut user_metadata = HashMap::new();
+        let mut attributes = ObjectAttributes {
+            content_type: content_type.map(ToString::to_string),
+            ..ObjectAttributes::default()
+        };
         if let Some(identity_etag) = identity_etag {
-            user_metadata.insert(
-                SOURCE_IDENTITY_METADATA_KEY.to_string(),
-                identity_etag.to_string(),
-            );
+            set_source_identity(&mut attributes, identity_etag);
         }
         let options = ObjectWriteOptions {
-            attributes: Some(ObjectAttributes {
-                content_type: content_type.map(ToString::to_string),
-                user_metadata,
-                ..ObjectAttributes::default()
-            }),
+            attributes: Some(attributes),
             ..ObjectWriteOptions::default()
         };
         match condition {
@@ -1556,18 +1551,6 @@ fn snapshot_from_object(object: &ObjectInfo) -> rc_core::Result<MirrorSnapshot> 
         modified: object.last_modified,
         etag: object.etag.clone(),
         identity_etag: identity_etag_from_metadata(object.metadata.as_ref()),
-    })
-}
-
-fn identity_etag_from_metadata(metadata: Option<&HashMap<String, String>>) -> Option<String> {
-    metadata.and_then(|metadata| {
-        metadata.iter().find_map(|(key, value)| {
-            let normalized = key.to_ascii_lowercase();
-            let key = normalized
-                .strip_prefix("x-amz-meta-")
-                .unwrap_or(normalized.as_str());
-            (key == SOURCE_IDENTITY_METADATA_KEY && !value.is_empty()).then(|| value.clone())
-        })
     })
 }
 

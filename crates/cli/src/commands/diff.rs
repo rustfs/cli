@@ -2,15 +2,34 @@
 //!
 //! Shows differences between two S3 paths or between local and remote.
 
-use clap::Args;
-use rc_core::{AliasManager, ListOptions, ObjectStore as _, ParsedPath, RemotePath, parse_path};
+use clap::{Args, ValueEnum};
+use rc_core::{
+    AliasManager, ListOptions, ObjectInfo, ObjectStore as _, ParsedPath, RemotePath, parse_path,
+};
 use rc_s3::S3Client;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::Path;
 
+use super::object_identity::identity_etag_from_metadata;
 use crate::exit_code::ExitCode;
 use crate::output::{Formatter, OutputConfig};
+
+/// How `rc diff` decides that two objects hold the same data.
+///
+/// These mirror `rc mirror --compare` so the two commands cannot disagree about
+/// whether a pair of objects is already in sync.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum CompareMode {
+    /// Same when ETags match, or when sizes match and the second object records
+    /// the first object's ETag in `x-amz-meta-rc-source-etag`.
+    #[default]
+    Auto,
+    /// Same only when both ETags are present and identical.
+    Etag,
+    /// Same when sizes match, ignoring ETag differences.
+    Size,
+}
 
 /// Compare objects between two locations
 #[derive(Args, Debug)]
@@ -28,6 +47,10 @@ pub struct DiffArgs {
     /// Show only differences (default: show all)
     #[arg(long)]
     pub diff_only: bool,
+
+    /// How to decide that two objects hold the same data
+    #[arg(long, value_enum, default_value_t = CompareMode::Auto)]
+    pub compare: CompareMode,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -72,9 +95,16 @@ struct DiffSummary {
 
 #[derive(Debug, Clone)]
 struct FileInfo {
+    /// Full object key, retained so `auto` compare can HeadObject this entry.
+    key: String,
     size: Option<i64>,
     modified: Option<String>,
     etag: Option<String>,
+    /// Source ETag recorded by a previous `rc mirror` or cross-alias `rc cp`.
+    /// ListObjects never returns user metadata, so this is filled by HeadObject.
+    identity_etag: Option<String>,
+    /// The object changed between LIST and the identity HEAD request.
+    snapshot_conflict: bool,
 }
 
 /// Execute the diff command
@@ -153,17 +183,31 @@ pub async fn execute(args: DiffArgs, output_config: OutputConfig) -> ExitCode {
         }
     };
 
-    let second_objects = match list_objects_map(&second_client, &second_path, args.recursive).await
-    {
-        Ok(o) => o,
-        Err(e) => {
-            formatter.error(&format!("Failed to list second path: {e}"));
-            return ExitCode::NetworkError;
-        }
-    };
+    let mut second_objects =
+        match list_objects_map(&second_client, &second_path, args.recursive).await {
+            Ok(o) => o,
+            Err(e) => {
+                formatter.error(&format!("Failed to list second path: {e}"));
+                return ExitCode::NetworkError;
+            }
+        };
+
+    enrich_second_identity(
+        &second_client,
+        &second_path,
+        &first_objects,
+        &mut second_objects,
+        args.compare,
+    )
+    .await;
 
     // Compare objects
-    let entries = compare_objects(&first_objects, &second_objects, args.diff_only);
+    let entries = compare_objects(
+        &first_objects,
+        &second_objects,
+        args.diff_only,
+        args.compare,
+    );
 
     // Calculate summary
     let mut summary = DiffSummary {
@@ -266,30 +310,26 @@ async fn list_objects_map(
             let relative_key = item.key.strip_prefix(base_prefix).unwrap_or(&item.key);
             let relative_key = relative_key.trim_start_matches('/').to_string();
 
-            if relative_key.is_empty() {
+            let map_key = if relative_key.is_empty() {
                 // Single object case
-                let filename = Path::new(&item.key)
+                Path::new(&item.key)
                     .file_name()
                     .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or(item.key.clone());
-                objects.insert(
-                    filename,
-                    FileInfo {
-                        size: item.size_bytes,
-                        modified: item.last_modified.map(|t| t.to_string()),
-                        etag: item.etag,
-                    },
-                );
+                    .unwrap_or_else(|| item.key.clone())
             } else {
-                objects.insert(
-                    relative_key,
-                    FileInfo {
-                        size: item.size_bytes,
-                        modified: item.last_modified.map(|t| t.to_string()),
-                        etag: item.etag,
-                    },
-                );
-            }
+                relative_key
+            };
+            objects.insert(
+                map_key,
+                FileInfo {
+                    key: item.key,
+                    size: item.size_bytes,
+                    modified: item.last_modified.map(|t| t.to_string()),
+                    etag: item.etag,
+                    identity_etag: None,
+                    snapshot_conflict: false,
+                },
+            );
         }
 
         if result.truncated {
@@ -302,10 +342,112 @@ async fn list_objects_map(
     Ok(objects)
 }
 
+/// Decide whether the second object already holds the first object's data.
+///
+/// A client-streamed copy cannot preserve the source ETag, so `auto` also
+/// accepts a recorded source identity. This is the same rule `rc mirror` uses to
+/// skip a copy, which keeps `diff` from reporting a difference for a pair that
+/// `mirror` considers synchronized.
+fn objects_match(first: &FileInfo, second: &FileInfo, compare: CompareMode) -> bool {
+    if first.snapshot_conflict || second.snapshot_conflict {
+        return false;
+    }
+    let (Some(first_size), Some(second_size)) = (first.size, second.size) else {
+        return false;
+    };
+    if first_size != second_size {
+        return false;
+    }
+    match compare {
+        CompareMode::Size => true,
+        CompareMode::Etag => first.etag.is_some() && first.etag == second.etag,
+        CompareMode::Auto => {
+            if first.etag.is_some() && first.etag == second.etag {
+                return true;
+            }
+            first
+                .etag
+                .as_ref()
+                .zip(second.identity_etag.as_ref())
+                .is_some_and(|(first_etag, identity_etag)| first_etag == identity_etag)
+        }
+    }
+}
+
+/// Whether HeadObject on the second entry could still prove the pair identical.
+///
+/// Restricted to same-size pairs whose listed ETags differ, so an unchanged tree
+/// costs no extra requests.
+fn second_needs_identity_lookup(first: &FileInfo, second: &FileInfo, compare: CompareMode) -> bool {
+    if !matches!(compare, CompareMode::Auto) {
+        return false;
+    }
+    if first.size.is_none() || first.size != second.size {
+        return false;
+    }
+    let Some(first_etag) = first.etag.as_ref() else {
+        return false;
+    };
+    if second.etag.as_ref() == Some(first_etag) {
+        return false;
+    }
+    second.identity_etag.is_none()
+}
+
+/// Fill recorded source identities for entries that could still match.
+///
+/// ListObjects omits user metadata, so the identity has to come from HeadObject.
+/// A failed lookup leaves the entry unenriched and it is reported as different.
+async fn enrich_second_identity(
+    client: &S3Client,
+    path: &RemotePath,
+    first: &HashMap<String, FileInfo>,
+    second: &mut HashMap<String, FileInfo>,
+    compare: CompareMode,
+) {
+    let pending: Vec<String> = second
+        .iter()
+        .filter(|(key, second_info)| {
+            first.get(*key).is_some_and(|first_info| {
+                second_needs_identity_lookup(first_info, second_info, compare)
+            })
+        })
+        .map(|(key, _)| key.clone())
+        .collect();
+
+    for map_key in pending {
+        let Some(second_info) = second.get(&map_key) else {
+            continue;
+        };
+        let object_path = RemotePath::new(&path.alias, &path.bucket, &second_info.key);
+        match client.head_object(&object_path).await {
+            Ok(info) => {
+                let listed_matches = second_snapshot_matches_head(second_info, &info);
+                if let Some(entry) = second.get_mut(&map_key) {
+                    entry.snapshot_conflict = !listed_matches;
+                    if listed_matches {
+                        entry.identity_etag = identity_etag_from_metadata(info.metadata.as_ref());
+                    }
+                }
+            }
+            Err(_) => {
+                if let Some(entry) = second.get_mut(&map_key) {
+                    entry.snapshot_conflict = true;
+                }
+            }
+        }
+    }
+}
+
+fn second_snapshot_matches_head(listed: &FileInfo, head: &ObjectInfo) -> bool {
+    listed.size == head.size_bytes && listed.etag == head.etag
+}
+
 fn compare_objects(
     first: &HashMap<String, FileInfo>,
     second: &HashMap<String, FileInfo>,
     diff_only: bool,
+    compare: CompareMode,
 ) -> Vec<DiffEntry> {
     let mut entries = Vec::new();
 
@@ -313,13 +455,7 @@ fn compare_objects(
     for (key, first_info) in first {
         if let Some(second_info) = second.get(key) {
             // Object exists in both
-            let is_same = first_info.size == second_info.size
-                && matches!(
-                    (&first_info.etag, &second_info.etag),
-                    (Some(first_etag), Some(second_etag)) if first_etag == second_etag
-                );
-
-            let status = if is_same {
+            let status = if objects_match(first_info, second_info, compare) {
                 DiffStatus::Same
             } else {
                 DiffStatus::Different
@@ -375,99 +511,86 @@ fn format_size(size: i64) -> String {
 mod tests {
     use super::*;
 
+    fn entry(size: i64, etag: Option<&str>) -> FileInfo {
+        FileInfo {
+            key: "prefix/file.txt".to_string(),
+            size: Some(size),
+            modified: None,
+            etag: etag.map(ToOwned::to_owned),
+            identity_etag: None,
+            snapshot_conflict: false,
+        }
+    }
+
+    fn entry_with_identity(size: i64, etag: &str, identity_etag: &str) -> FileInfo {
+        FileInfo {
+            identity_etag: Some(identity_etag.to_string()),
+            ..entry(size, Some(etag))
+        }
+    }
+
+    fn one(key: &str, info: FileInfo) -> HashMap<String, FileInfo> {
+        HashMap::from([(key.to_string(), info)])
+    }
+
     #[test]
     fn test_compare_objects_same() {
-        let mut first = HashMap::new();
-        first.insert(
-            "file.txt".to_string(),
-            FileInfo {
-                size: Some(100),
-                modified: None,
-                etag: Some("abc123".to_string()),
-            },
-        );
+        let first = one("file.txt", entry(100, Some("abc123")));
+        let second = one("file.txt", entry(100, Some("abc123")));
 
-        let mut second = HashMap::new();
-        second.insert(
-            "file.txt".to_string(),
-            FileInfo {
-                size: Some(100),
-                modified: None,
-                etag: Some("abc123".to_string()),
-            },
-        );
-
-        let entries = compare_objects(&first, &second, false);
+        let entries = compare_objects(&first, &second, false, CompareMode::Auto);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].status, DiffStatus::Same);
     }
 
     #[test]
     fn test_compare_objects_different() {
-        let mut first = HashMap::new();
-        first.insert(
-            "file.txt".to_string(),
-            FileInfo {
-                size: Some(100),
-                modified: None,
-                etag: Some("abc123".to_string()),
-            },
-        );
+        let first = one("file.txt", entry(100, Some("abc123")));
+        let second = one("file.txt", entry(200, Some("def456")));
 
-        let mut second = HashMap::new();
-        second.insert(
-            "file.txt".to_string(),
-            FileInfo {
-                size: Some(200),
-                modified: None,
-                etag: Some("def456".to_string()),
-            },
-        );
-
-        let entries = compare_objects(&first, &second, false);
+        let entries = compare_objects(&first, &second, false, CompareMode::Auto);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].status, DiffStatus::Different);
     }
 
     #[test]
-    fn test_compare_objects_missing_etag_is_different() {
-        let first = HashMap::from([(
-            "file.txt".to_string(),
-            FileInfo {
-                size: Some(100),
-                modified: None,
-                etag: None,
-            },
-        )]);
-        let second = HashMap::from([(
-            "file.txt".to_string(),
-            FileInfo {
-                size: Some(100),
-                modified: None,
-                etag: Some("second-etag".to_string()),
-            },
-        )]);
+    fn identity_head_must_match_the_listed_size_and_etag() {
+        let listed = entry(100, Some("listed-etag"));
+        let mut head = ObjectInfo::file("prefix/file.txt", 100);
+        head.etag = Some("listed-etag".to_string());
+        assert!(second_snapshot_matches_head(&listed, &head));
 
-        let entries = compare_objects(&first, &second, false);
+        head.size_bytes = Some(101);
+        assert!(!second_snapshot_matches_head(&listed, &head));
+        head.size_bytes = Some(100);
+        head.etag = Some("changed-etag".to_string());
+        assert!(!second_snapshot_matches_head(&listed, &head));
+
+        let mut conflicted = listed.clone();
+        conflicted.snapshot_conflict = true;
+        assert!(!objects_match(
+            &entry(100, Some("listed-etag")),
+            &conflicted,
+            CompareMode::Auto
+        ));
+    }
+
+    #[test]
+    fn test_compare_objects_missing_etag_is_different() {
+        let first = one("file.txt", entry(100, None));
+        let second = one("file.txt", entry(100, Some("second-etag")));
+
+        let entries = compare_objects(&first, &second, false, CompareMode::Auto);
 
         assert_eq!(entries[0].status, DiffStatus::Different);
     }
 
     #[test]
     fn test_compare_objects_only_first() {
-        let mut first = HashMap::new();
-        first.insert(
-            "file.txt".to_string(),
-            FileInfo {
-                size: Some(100),
-                modified: None,
-                etag: None,
-            },
-        );
-
+        let first = one("file.txt", entry(100, None));
         let second = HashMap::new();
 
-        let entries = compare_objects(&first, &second, false);
+        let entries = compare_objects(&first, &second, false, CompareMode::Auto);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].status, DiffStatus::OnlyFirst);
     }
@@ -475,19 +598,180 @@ mod tests {
     #[test]
     fn test_compare_objects_only_second() {
         let first = HashMap::new();
+        let second = one("file.txt", entry(100, None));
 
-        let mut second = HashMap::new();
-        second.insert(
-            "file.txt".to_string(),
-            FileInfo {
-                size: Some(100),
-                modified: None,
-                etag: None,
-            },
-        );
-
-        let entries = compare_objects(&first, &second, false);
+        let entries = compare_objects(&first, &second, false, CompareMode::Auto);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].status, DiffStatus::OnlySecond);
+    }
+
+    #[test]
+    fn auto_compare_treats_a_recorded_source_identity_as_same() {
+        let first = one("file.txt", entry(100, Some("source-etag")));
+        let second = one(
+            "file.txt",
+            entry_with_identity(100, "multipart-etag-1", "source-etag"),
+        );
+
+        let entries = compare_objects(&first, &second, false, CompareMode::Auto);
+
+        assert_eq!(
+            entries[0].status,
+            DiffStatus::Same,
+            "auto must agree with mirror --compare auto"
+        );
+    }
+
+    #[test]
+    fn etag_compare_ignores_a_recorded_source_identity() {
+        let first = one("file.txt", entry(100, Some("source-etag")));
+        let second = one(
+            "file.txt",
+            entry_with_identity(100, "multipart-etag-1", "source-etag"),
+        );
+
+        let entries = compare_objects(&first, &second, false, CompareMode::Etag);
+
+        assert_eq!(entries[0].status, DiffStatus::Different);
+    }
+
+    #[test]
+    fn size_compare_ignores_etag_differences() {
+        let first = one("file.txt", entry(100, Some("source-etag")));
+        let second = one("file.txt", entry(100, Some("other-etag")));
+
+        let entries = compare_objects(&first, &second, false, CompareMode::Size);
+
+        assert_eq!(entries[0].status, DiffStatus::Same);
+    }
+
+    #[test]
+    fn auto_compare_reports_a_mismatched_identity_as_different() {
+        let first = one("file.txt", entry(100, Some("source-etag")));
+        let second = one(
+            "file.txt",
+            entry_with_identity(100, "multipart-etag-1", "other-etag"),
+        );
+
+        let entries = compare_objects(&first, &second, false, CompareMode::Auto);
+
+        assert_eq!(entries[0].status, DiffStatus::Different);
+    }
+
+    #[test]
+    fn size_mismatch_is_different_in_every_compare_mode() {
+        let first = one("file.txt", entry(100, Some("source-etag")));
+        let second = one(
+            "file.txt",
+            entry_with_identity(200, "source-etag", "source-etag"),
+        );
+
+        for compare in [CompareMode::Auto, CompareMode::Etag, CompareMode::Size] {
+            let entries = compare_objects(&first, &second, false, compare);
+            assert_eq!(
+                entries[0].status,
+                DiffStatus::Different,
+                "{compare:?} must not call different sizes the same"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_sizes_are_never_assumed_equal() {
+        let mut missing = entry(100, Some("source-etag"));
+        missing.size = None;
+        let first = one("file.txt", missing.clone());
+        let second = one("file.txt", missing);
+
+        for compare in [CompareMode::Auto, CompareMode::Etag, CompareMode::Size] {
+            let entries = compare_objects(&first, &second, false, compare);
+            assert_eq!(
+                entries[0].status,
+                DiffStatus::Different,
+                "{compare:?} must not assume equality without sizes"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_lookup_is_limited_to_auto_same_size_etag_mismatches() {
+        let source = entry(100, Some("source-etag"));
+        let mismatched = entry(100, Some("other-etag"));
+
+        assert!(second_needs_identity_lookup(
+            &source,
+            &mismatched,
+            CompareMode::Auto
+        ));
+
+        assert!(
+            !second_needs_identity_lookup(
+                &source,
+                &entry(100, Some("source-etag")),
+                CompareMode::Auto
+            ),
+            "matching ETags already prove equality"
+        );
+        assert!(
+            !second_needs_identity_lookup(
+                &source,
+                &entry_with_identity(100, "other-etag", "source-etag"),
+                CompareMode::Auto
+            ),
+            "an entry that already has an identity needs no lookup"
+        );
+        assert!(
+            !second_needs_identity_lookup(
+                &source,
+                &entry(200, Some("other-etag")),
+                CompareMode::Auto
+            ),
+            "different sizes can never match"
+        );
+        assert!(!second_needs_identity_lookup(
+            &source,
+            &mismatched,
+            CompareMode::Etag
+        ));
+        assert!(!second_needs_identity_lookup(
+            &source,
+            &mismatched,
+            CompareMode::Size
+        ));
+
+        let mut unknown_size = source.clone();
+        unknown_size.size = None;
+        assert!(
+            !second_needs_identity_lookup(&unknown_size, &mismatched, CompareMode::Auto),
+            "an unknown source size cannot be reconciled by metadata"
+        );
+
+        let mut no_etag = source.clone();
+        no_etag.etag = None;
+        assert!(
+            !second_needs_identity_lookup(&no_etag, &mismatched, CompareMode::Auto),
+            "without a source ETag there is nothing to match an identity against"
+        );
+    }
+
+    #[test]
+    fn diff_only_hides_matching_entries_in_auto_mode() {
+        let first = HashMap::from([
+            ("same.txt".to_string(), entry(100, Some("source-etag"))),
+            ("changed.txt".to_string(), entry(100, Some("source-etag"))),
+        ]);
+        let second = HashMap::from([
+            (
+                "same.txt".to_string(),
+                entry_with_identity(100, "multipart-etag-1", "source-etag"),
+            ),
+            ("changed.txt".to_string(), entry(100, Some("other-etag"))),
+        ]);
+
+        let entries = compare_objects(&first, &second, true, CompareMode::Auto);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].key, "changed.txt");
+        assert_eq!(entries[0].status, DiffStatus::Different);
     }
 }

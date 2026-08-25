@@ -5677,7 +5677,8 @@ impl ObjectStore for S3Client {
         let plan = multipart
             .plan()
             .map_err(|error| self.redact_sensitive_error(error))?;
-        let attributes = if matches!(transfer.metadata_directive, Some(MetadataDirective::Copy)) {
+        let mut attributes = if matches!(transfer.metadata_directive, Some(MetadataDirective::Copy))
+        {
             let mut source_options = transfer.source.clone();
             if source_options.version_id.is_none() {
                 source_options.version_id = multipart.source_version_id.clone();
@@ -5692,6 +5693,15 @@ impl ObjectStore for S3Client {
                 ..ObjectAttributes::default()
             }
         };
+        // Multipart callers may carry the rc source identity, which is
+        // bookkeeping rather than source metadata and is not exposed by HEAD.
+        // Preserve that identity even when the user requested metadata COPY,
+        // without overriding user metadata returned by the source.
+        if let Some(identity) = multipart.metadata.get("rc-source-etag") {
+            attributes
+                .user_metadata
+                .insert("rc-source-etag".to_string(), identity.clone());
+        }
         if cancellation.is_cancelled() {
             return Err(self.redact_sensitive_error(Error::Interrupted(
                 "Multipart copy cancelled after metadata preflight".to_string(),
@@ -11894,7 +11904,10 @@ mod tests {
         ]);
         let src = RemotePath::new("test", "source-bucket", "src.bin");
         let dst = RemotePath::new("test", "destination-bucket", "dst.bin");
-        let multipart = multipart_copy_options(S3_MULTIPART_COPY_MIN_PART_SIZE);
+        let mut multipart = multipart_copy_options(S3_MULTIPART_COPY_MIN_PART_SIZE);
+        multipart
+            .metadata
+            .insert("rc-source-etag".to_string(), "source-etag".to_string());
         let transfer = TransferCopyOptions {
             metadata_directive: Some(MetadataDirective::Copy),
             ..TransferCopyOptions::default()
@@ -11931,6 +11944,10 @@ mod tests {
         assert_eq!(create.headers().get("content-language"), Some("en"));
         assert!(create.headers().get("expires").is_some());
         assert_eq!(create.headers().get("x-amz-meta-owner"), Some("source"));
+        assert_eq!(
+            create.headers().get("x-amz-meta-rc-source-etag"),
+            Some("source-etag")
+        );
     }
 
     #[tokio::test]
