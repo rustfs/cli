@@ -307,7 +307,11 @@ async fn move_s3_prefix_to_local(
     let mut errors = 0usize;
 
     for item in objects {
-        let relative = match cp::safe_download_relative_path(&item.key, &src.key) {
+        let relative = match cp::safe_download_relative_path(
+            &item.key,
+            &src.key,
+            rc_core::ObjectKeyPolicy::for_local_destination(false),
+        ) {
             Ok(relative) => relative,
             Err(error) => {
                 errors += 1;

@@ -32,6 +32,7 @@ rc [GLOBAL OPTIONS] mirror [OPTIONS] <SOURCE> <TARGET>
 | `--summary` | Print deterministic aggregate counts and transferred bytes in human output. |
 | `--compare <auto\|etag\|size>` | Choose how existing destination objects are compared before a copy is skipped. Defaults to `auto`. |
 | `--quiet` | Suppress non-error command output. The global `--quiet` option has the same effect. |
+| `--portable-names` | Reject keys that cannot be created on Windows filesystems. Unix destinations accept characters such as `:` by default. |
 
 ## Examples
 
@@ -49,7 +50,7 @@ rc mirror stage/data/ prod/data/ --overwrite --compare auto
 
 Both operands are directory-like roots. Every selected source-relative path is appended to the destination root without flattening. Remote prefixes are normalized to one trailing `/`, so `alias/bucket/prefix` and `alias/bucket/prefix/` map the same tree. Remote listing is paginated and the final plan is sorted by normalized relative path.
 
-Remote keys that are absolute, contain traversal, use backslashes, collide after normalization, or cannot be represented portably on supported local platforms are rejected. A new relative local target should be written explicitly, for example `./restore/`, so it cannot be confused with `ALIAS/BUCKET` syntax.
+Remote keys that are absolute, contain traversal, use backslashes, contain control characters, or collide after normalization are rejected. Windows filename rules (`:`, reserved device names, trailing dots or spaces) apply only when the destination is a local filesystem that needs them: always on Windows, and on other platforms only when `--portable-names` is set. Remote-to-remote copies keep the original object key, including characters such as `:`. A new relative local target should be written explicitly, for example `./restore/`, so it cannot be confused with `ALIAS/BUCKET` syntax.
 
 ### Comparison and restart behavior
 
@@ -84,6 +85,10 @@ Copy and removal phases use the shared transfer controls for filtering, concurre
 ### Compatibility and migration
 
 Existing remote-to-remote commands continue to work. `--parallel` is retained as an alias of the shared `--concurrency` option. Mirror no longer falls back to an unconditional byte copy when source metadata lookup fails, and missing remote ETags are no longer treated as proof of equality. Automation that depended on either unsafe fallback must handle explicit network or conflict exits and retry after re-planning.
+
+### BREAKING object-key portability contract migration
+
+`--portable-names` is additive. Unix destinations no longer apply Windows filename rules by default, so Loki-style keys containing `:` can be mirrored locally. Remote-to-remote copies keep the original object key. This PR must be marked `BREAKING` because `docs/reference/rc/mirror.md` is a protected CLI behavior contract. No JSON schema or config `schema_version` bump applies.
 
 ### BREAKING incremental identity contract migration
 

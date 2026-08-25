@@ -6,6 +6,7 @@
 
 pub mod admin;
 pub mod client;
+mod lifecycle_xml;
 pub mod multipart;
 mod ops;
 mod select;

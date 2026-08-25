@@ -270,6 +270,7 @@ async fn execute_add(args: AddRuleArgs, output_config: OutputConfig) -> ExitCode
         Some(LifecycleExpiration {
             days: args.expiry_days,
             date: args.expiry_date,
+            expired_object_all_versions: None,
         })
     } else {
         None
@@ -311,6 +312,7 @@ async fn execute_add(args: AddRuleArgs, output_config: OutputConfig) -> ExitCode
         (Some(days), Some(sc)) => Some(NoncurrentVersionTransition {
             noncurrent_days: days,
             storage_class: sc.clone(),
+            newer_noncurrent_versions: None,
         }),
         (Some(_), None) => {
             formatter.error("--noncurrent-transition-storage-class is required when using --noncurrent-transition-days");
@@ -330,10 +332,15 @@ async fn execute_add(args: AddRuleArgs, output_config: OutputConfig) -> ExitCode
         status,
         prefix: args.prefix,
         tags: None,
+        object_size_greater_than: None,
+        object_size_less_than: None,
         expiration,
+        del_marker_expiration: None,
         transition,
+        transitions: Vec::new(),
         noncurrent_version_expiration,
         noncurrent_version_transition,
+        noncurrent_version_transitions: Vec::new(),
         abort_incomplete_multipart_upload_days: None,
         expired_object_delete_marker,
     };
@@ -415,6 +422,10 @@ async fn execute_edit(args: EditRuleArgs, output_config: OutputConfig) -> ExitCo
             date: args
                 .expiry_date
                 .or_else(|| rule.expiration.as_ref().and_then(|e| e.date.clone())),
+            expired_object_all_versions: rule
+                .expiration
+                .as_ref()
+                .and_then(|expiration| expiration.expired_object_all_versions),
         });
     }
 
@@ -477,6 +488,8 @@ async fn execute_edit(args: EditRuleArgs, output_config: OutputConfig) -> ExitCo
                 .noncurrent_transition_days
                 .unwrap_or_else(|| current.map(|c| c.noncurrent_days).unwrap_or(0)),
             storage_class: sc,
+            newer_noncurrent_versions: current
+                .and_then(|transition| transition.newer_noncurrent_versions),
         });
     }
 
@@ -526,10 +539,13 @@ async fn execute_list(args: BucketArg, output_config: OutputConfig) -> ExitCode 
         Err(code) => return code,
     };
 
-    let rules = client
-        .get_bucket_lifecycle(&bucket)
-        .await
-        .unwrap_or_default();
+    let rules = match client.get_bucket_lifecycle(&bucket).await {
+        Ok(rules) => rules,
+        Err(error) => {
+            formatter.error(&format!("Failed to get lifecycle rules: {error}"));
+            return ExitCode::GeneralError;
+        }
+    };
 
     if formatter.is_json() {
         formatter.json(&RuleListOutput { bucket, rules });
@@ -679,10 +695,13 @@ async fn execute_export(args: BucketArg, output_config: OutputConfig) -> ExitCod
         Err(code) => return code,
     };
 
-    let rules = client
-        .get_bucket_lifecycle(&bucket)
-        .await
-        .unwrap_or_default();
+    let rules = match client.get_bucket_lifecycle(&bucket).await {
+        Ok(rules) => rules,
+        Err(error) => {
+            formatter.error(&format!("Failed to get lifecycle rules: {error}"));
+            return ExitCode::GeneralError;
+        }
+    };
 
     let config = LifecycleConfiguration { rules };
     formatter.json(&config);
@@ -784,7 +803,30 @@ fn validate_expired_delete_marker_rule(rule: &LifecycleRule) -> std::result::Res
             .as_ref()
             .is_some_and(|expiration| expiration.days.is_some() || expiration.date.is_some()),
         rule.tags.as_ref().is_some_and(|tags| !tags.is_empty()),
-    )
+    )?;
+
+    if let Some(expiration) = rule.expiration.as_ref()
+        && expiration.expired_object_all_versions.is_some()
+        && (expiration.days.is_none_or(|days| days < 1) || expiration.date.is_some())
+    {
+        return Err(
+            "ExpiredObjectAllVersions requires positive expiration days and no date".to_string(),
+        );
+    }
+
+    if let Some(expiration) = rule.del_marker_expiration.as_ref()
+        && expiration.days.is_none_or(|days| days < 1)
+    {
+        return Err("delete-marker expiration days must be at least 1".to_string());
+    }
+
+    if rule.del_marker_expiration.is_some()
+        && rule.tags.as_ref().is_some_and(|tags| !tags.is_empty())
+    {
+        return Err("delete-marker expiration cannot be combined with tag filters".to_string());
+    }
+
+    Ok(())
 }
 
 async fn setup_client(
@@ -940,13 +982,19 @@ mod tests {
             status: LifecycleRuleStatus::Enabled,
             prefix: None,
             tags: None,
+            object_size_greater_than: None,
+            object_size_less_than: None,
             expiration: Some(LifecycleExpiration {
                 days: Some(30),
                 date: None,
+                expired_object_all_versions: None,
             }),
+            del_marker_expiration: None,
             transition: None,
+            transitions: Vec::new(),
             noncurrent_version_expiration: None,
             noncurrent_version_transition: None,
+            noncurrent_version_transitions: Vec::new(),
             abort_incomplete_multipart_upload_days: None,
             expired_object_delete_marker: None,
         };
@@ -960,10 +1008,15 @@ mod tests {
             status: LifecycleRuleStatus::Enabled,
             prefix: None,
             tags: None,
+            object_size_greater_than: None,
+            object_size_less_than: None,
             expiration: None,
+            del_marker_expiration: None,
             transition: None,
+            transitions: Vec::new(),
             noncurrent_version_expiration: None,
             noncurrent_version_transition: None,
+            noncurrent_version_transitions: Vec::new(),
             abort_incomplete_multipart_upload_days: None,
             expired_object_delete_marker: None,
         };
@@ -1022,6 +1075,103 @@ mod tests {
         assert!(validate_expired_delete_marker_inputs(true, false, false).is_ok());
     }
 
+    #[test]
+    fn test_lifecycle_extension_validation_rejects_invalid_values() {
+        let invalid_all_versions = LifecycleRule {
+            id: "invalid-all-versions".to_string(),
+            status: LifecycleRuleStatus::Enabled,
+            prefix: None,
+            tags: None,
+            object_size_greater_than: None,
+            object_size_less_than: None,
+            expiration: Some(LifecycleExpiration {
+                days: Some(0),
+                date: None,
+                expired_object_all_versions: Some(true),
+            }),
+            del_marker_expiration: None,
+            transition: None,
+            transitions: Vec::new(),
+            noncurrent_version_expiration: None,
+            noncurrent_version_transition: None,
+            noncurrent_version_transitions: Vec::new(),
+            abort_incomplete_multipart_upload_days: None,
+            expired_object_delete_marker: None,
+        };
+        assert!(validate_expired_delete_marker_rule(&invalid_all_versions).is_err());
+
+        let all_versions_with_date = LifecycleRule {
+            id: "all-versions-date".to_string(),
+            status: LifecycleRuleStatus::Enabled,
+            prefix: None,
+            tags: None,
+            object_size_greater_than: None,
+            object_size_less_than: None,
+            expiration: Some(LifecycleExpiration {
+                days: Some(1),
+                date: Some("2026-01-01T00:00:00Z".to_string()),
+                expired_object_all_versions: Some(false),
+            }),
+            del_marker_expiration: None,
+            transition: None,
+            transitions: Vec::new(),
+            noncurrent_version_expiration: None,
+            noncurrent_version_transition: None,
+            noncurrent_version_transitions: Vec::new(),
+            abort_incomplete_multipart_upload_days: None,
+            expired_object_delete_marker: None,
+        };
+        assert!(validate_expired_delete_marker_rule(&all_versions_with_date).is_err());
+
+        let invalid_delete_marker = LifecycleRule {
+            id: "invalid-delete-marker".to_string(),
+            status: LifecycleRuleStatus::Enabled,
+            prefix: None,
+            tags: None,
+            object_size_greater_than: None,
+            object_size_less_than: None,
+            expiration: None,
+            del_marker_expiration: Some(rc_core::LifecycleDelMarkerExpiration { days: None }),
+            transition: None,
+            transitions: Vec::new(),
+            noncurrent_version_expiration: None,
+            noncurrent_version_transition: None,
+            noncurrent_version_transitions: Vec::new(),
+            abort_incomplete_multipart_upload_days: None,
+            expired_object_delete_marker: None,
+        };
+        assert!(validate_expired_delete_marker_rule(&invalid_delete_marker).is_err());
+    }
+
+    #[test]
+    fn test_lifecycle_import_accepts_issue_6334_shape() {
+        let input = r#"
+        {
+          "rules": [{
+            "id": "rule-delayed-deletion",
+            "status": "Enabled",
+            "prefix": "test/",
+            "expiration": {
+              "ExpiredObjectAllVersions": true,
+              "DelMarkerExpiration": true,
+              "days": 1
+            }
+          }]
+        }
+        "#;
+
+        let config: LifecycleConfiguration =
+            serde_json::from_str(input).expect("issue lifecycle import should parse");
+        assert_eq!(config.rules.len(), 1);
+        assert_eq!(
+            config.rules[0]
+                .del_marker_expiration
+                .as_ref()
+                .and_then(|expiration| expiration.days),
+            Some(1)
+        );
+    }
+
     #[tokio::test]
     async fn test_execute_import_rejects_invalid_marker_cleanup_before_alias_lookup() {
         let temp_dir = tempfile::tempdir().expect("create lifecycle config directory");
@@ -1032,13 +1182,19 @@ mod tests {
                 status: LifecycleRuleStatus::Enabled,
                 prefix: None,
                 tags: None,
+                object_size_greater_than: None,
+                object_size_less_than: None,
                 expiration: Some(LifecycleExpiration {
                     days: Some(30),
                     date: None,
+                    expired_object_all_versions: None,
                 }),
+                del_marker_expiration: None,
                 transition: None,
+                transitions: Vec::new(),
                 noncurrent_version_expiration: None,
                 noncurrent_version_transition: None,
+                noncurrent_version_transitions: Vec::new(),
                 abort_incomplete_multipart_upload_days: None,
                 expired_object_delete_marker: Some(true),
             }],

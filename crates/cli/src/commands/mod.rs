@@ -1693,6 +1693,40 @@ mod tests {
     }
 
     #[test]
+    fn cli_accepts_portable_names_on_mirror_and_copy() {
+        let mirror = Cli::try_parse_from([
+            "rc",
+            "mirror",
+            "local/loki/",
+            "./restore/",
+            "--portable-names",
+        ])
+        .expect("parse mirror portable-names");
+        match mirror.command {
+            Commands::Mirror(args) => assert!(args.portable_names),
+            other => panic!("expected mirror command, got {other:?}"),
+        }
+
+        let copy = Cli::try_parse_from([
+            "rc",
+            "object",
+            "copy",
+            "local/loki/",
+            "./restore/",
+            "--recursive",
+            "--portable-names",
+        ])
+        .expect("parse object copy portable-names");
+        match copy.command {
+            Commands::Object(args) => match args.command {
+                object::ObjectCommands::Copy(args) => assert!(args.portable_names),
+                other => panic!("expected object copy command, got {other:?}"),
+            },
+            other => panic!("expected object command, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn version_selector_rejects_ambiguous_or_empty_values() {
         assert!(validate_version_selector(Some("v1"), None).is_ok());
         assert!(validate_version_selector(None, Some("1h")).is_ok());
