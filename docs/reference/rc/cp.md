@@ -37,6 +37,7 @@ rc [GLOBAL OPTIONS] cp [OPTIONS] <SOURCE>... <TARGET>
 | `--continue-on-error` | Continue eligible work after an item fails; the final exit code remains non-zero. |
 | `--fail-empty` | Return the not-found exit code when no source passes selection. |
 | `--summary` | Print deterministic aggregate counters in human output; bulk and recursive copies summarize automatically. |
+| `--portable-names` | When downloading to a local filesystem, reject keys that cannot be created on Windows. Unix destinations accept characters such as `:` by default. |
 
 ## Examples
 
@@ -105,6 +106,12 @@ Destination encryption flags apply only to remote writes. On `rc cp`, the select
 The current implementation supports `SSE-S3` and `SSE-KMS`. It does not support `SSE-C`, repeated encryption selectors, or MinIO `mc`-style prefix fan-out matching beyond the exact destination argument for the current command. For shared encryption rules across commands, see [Encryption workflows](encryption.md).
 
 When the server returns a source or destination object version ID, JSON copy output uses the output v3 `versioned_objects` envelope with `data.operation` set to `copy`. `data.source_version_id` identifies the copied source version and `data.version_id` identifies the created destination version. Copies for which the backend reports no version information retain the legacy JSON shape.
+
+Recursive downloads map object keys onto the local filesystem using `/` separators. Traversal, absolute keys, backslashes, and control characters are always rejected. Characters such as `:` are accepted on Unix destinations unless `--portable-names` is set.
+
+### BREAKING object-key portability contract migration
+
+`--portable-names` is additive. Unix destinations no longer apply Windows filename rules by default, so keys containing `:` are accepted. Remote-to-remote copies keep the original key. This PR must be marked `BREAKING` because `docs/reference/rc/cp.md` is a protected CLI behavior contract. No JSON schema or config `schema_version` bump applies.
 
 ### BREAKING cross-alias copy contract migration
 
