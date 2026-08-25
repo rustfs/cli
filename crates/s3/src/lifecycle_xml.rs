@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 
+use quick_xml::Reader;
 use quick_xml::de::from_str as from_xml_str;
+use quick_xml::events::Event;
 use rc_core::{
     Error, LifecycleDelMarkerExpiration, LifecycleExpiration, LifecycleRule, LifecycleRuleStatus,
     LifecycleTransition, NoncurrentVersionExpiration, NoncurrentVersionTransition, Result,
@@ -40,6 +42,8 @@ struct LifecycleRuleXml {
 struct LifecycleFilterXml {
     prefix: Option<String>,
     tag: Option<LifecycleTagXml>,
+    object_size_greater_than: Option<i64>,
+    object_size_less_than: Option<i64>,
     and: Option<LifecycleAndXml>,
 }
 
@@ -49,6 +53,8 @@ struct LifecycleAndXml {
     prefix: Option<String>,
     #[serde(rename = "Tag", default)]
     tags: Vec<LifecycleTagXml>,
+    object_size_greater_than: Option<i64>,
+    object_size_less_than: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -87,6 +93,7 @@ struct NoncurrentVersionExpirationXml {
 struct NoncurrentVersionTransitionXml {
     noncurrent_days: Option<i32>,
     storage_class: Option<String>,
+    newer_noncurrent_versions: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -102,6 +109,7 @@ struct LifecycleDelMarkerExpirationXml {
 }
 
 pub(crate) fn parse_lifecycle_configuration_xml(body: &str) -> Result<Vec<LifecycleRule>> {
+    validate_lifecycle_root(body)?;
     let config: LifecycleConfigurationXml = from_xml_str(body)
         .map_err(|error| Error::General(format!("parse bucket lifecycle xml: {error}")))?;
 
@@ -112,6 +120,16 @@ pub(crate) fn parse_lifecycle_configuration_xml(body: &str) -> Result<Vec<Lifecy
         .collect()
 }
 
+pub(crate) fn validate_lifecycle_configuration_xml_response(body: &str) -> Result<()> {
+    if body.trim().is_empty() {
+        return Ok(());
+    }
+    validate_lifecycle_root(body)?;
+    from_xml_str::<LifecycleConfigurationXml>(body)
+        .map(|_| ())
+        .map_err(|error| Error::General(format!("parse bucket lifecycle xml: {error}")))
+}
+
 fn convert_lifecycle_rule(rule: LifecycleRuleXml) -> Result<LifecycleRule> {
     let prefix = rule
         .filter
@@ -119,6 +137,11 @@ fn convert_lifecycle_rule(rule: LifecycleRuleXml) -> Result<LifecycleRule> {
         .and_then(parse_filter_prefix)
         .or(rule.legacy_prefix);
     let tags = rule.filter.as_ref().and_then(parse_filter_tags);
+    let (object_size_greater_than, object_size_less_than) = rule
+        .filter
+        .as_ref()
+        .map(parse_filter_object_sizes)
+        .unwrap_or((None, None));
 
     let (expiration, expired_object_delete_marker) = match rule.expiration {
         Some(expiration) => (
@@ -134,15 +157,17 @@ fn convert_lifecycle_rule(rule: LifecycleRuleXml) -> Result<LifecycleRule> {
         None => (None, None),
     };
 
-    let transition = rule
+    let transitions = rule
         .transitions
         .into_iter()
-        .next()
         .map(|transition| LifecycleTransition {
             days: transition.days,
             date: transition.date,
             storage_class: transition.storage_class.unwrap_or_default(),
-        });
+        })
+        .collect::<Vec<_>>();
+    let transition = transitions.first().cloned();
+    let additional_transitions = transitions.into_iter().skip(1).collect();
 
     let noncurrent_version_expiration =
         rule.noncurrent_version_expiration
@@ -151,20 +176,26 @@ fn convert_lifecycle_rule(rule: LifecycleRuleXml) -> Result<LifecycleRule> {
                 newer_noncurrent_versions: expiration.newer_noncurrent_versions,
             });
 
-    let noncurrent_version_transition =
-        rule.noncurrent_version_transitions
-            .into_iter()
-            .next()
-            .map(|transition| NoncurrentVersionTransition {
-                noncurrent_days: transition.noncurrent_days.unwrap_or_default(),
-                storage_class: transition.storage_class.unwrap_or_default(),
-            });
+    let noncurrent_version_transitions = rule
+        .noncurrent_version_transitions
+        .into_iter()
+        .map(|transition| NoncurrentVersionTransition {
+            noncurrent_days: transition.noncurrent_days.unwrap_or_default(),
+            storage_class: transition.storage_class.unwrap_or_default(),
+            newer_noncurrent_versions: transition.newer_noncurrent_versions,
+        })
+        .collect::<Vec<_>>();
+    let noncurrent_version_transition = noncurrent_version_transitions.first().cloned();
+    let additional_noncurrent_version_transitions =
+        noncurrent_version_transitions.into_iter().skip(1).collect();
 
     Ok(LifecycleRule {
         id: rule.id.unwrap_or_default(),
         status: parse_rule_status(rule.status.as_deref()),
         prefix,
         tags,
+        object_size_greater_than,
+        object_size_less_than,
         expiration,
         del_marker_expiration: rule.del_marker_expiration.map(|expiration| {
             LifecycleDelMarkerExpiration {
@@ -172,13 +203,46 @@ fn convert_lifecycle_rule(rule: LifecycleRuleXml) -> Result<LifecycleRule> {
             }
         }),
         transition,
+        transitions: additional_transitions,
         noncurrent_version_expiration,
         noncurrent_version_transition,
+        noncurrent_version_transitions: additional_noncurrent_version_transitions,
         abort_incomplete_multipart_upload_days: rule
             .abort_incomplete_multipart_upload
             .and_then(|upload| upload.days_after_initiation),
         expired_object_delete_marker,
     })
+}
+
+fn validate_lifecycle_root(body: &str) -> Result<()> {
+    let mut reader = Reader::from_str(body);
+    reader.config_mut().trim_text(true);
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(element)) | Ok(Event::Empty(element)) => {
+                let root = element.local_name();
+                if root.as_ref() == b"LifecycleConfiguration" {
+                    return Ok(());
+                }
+                return Err(Error::General(format!(
+                    "unexpected lifecycle root '{}', expected 'LifecycleConfiguration'",
+                    String::from_utf8_lossy(root.as_ref())
+                )));
+            }
+            Ok(Event::Eof) => {
+                return Err(Error::General(
+                    "parse bucket lifecycle xml: missing root element".to_string(),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) => {
+                return Err(Error::General(format!(
+                    "parse bucket lifecycle xml: {error}"
+                )));
+            }
+        }
+    }
 }
 
 fn parse_rule_status(status: Option<&str>) -> LifecycleRuleStatus {
@@ -212,6 +276,23 @@ fn parse_filter_tags(filter: &LifecycleFilterXml) -> Option<HashMap<String, Stri
     (!tags.is_empty()).then_some(tags)
 }
 
+fn parse_filter_object_sizes(filter: &LifecycleFilterXml) -> (Option<i64>, Option<i64>) {
+    (
+        filter.object_size_greater_than.or_else(|| {
+            filter
+                .and
+                .as_ref()
+                .and_then(|and| and.object_size_greater_than)
+        }),
+        filter.object_size_less_than.or_else(|| {
+            filter
+                .and
+                .as_ref()
+                .and_then(|and| and.object_size_less_than)
+        }),
+    )
+}
+
 pub(crate) fn build_lifecycle_configuration_xml(rules: &[LifecycleRule]) -> String {
     let mut xml =
         String::from(r#"<?xml version="1.0" encoding="UTF-8"?><LifecycleConfiguration xmlns=""#);
@@ -232,19 +313,22 @@ pub(crate) fn build_lifecycle_configuration_xml(rules: &[LifecycleRule]) -> Stri
                 LifecycleRuleStatus::Disabled => "Disabled",
             },
         );
-        append_filter_xml(&mut xml, rule.prefix.as_deref(), rule.tags.as_ref());
+        append_filter_xml(
+            &mut xml,
+            rule.prefix.as_deref(),
+            rule.tags.as_ref(),
+            rule.object_size_greater_than,
+            rule.object_size_less_than,
+        );
         append_expiration_xml(
             &mut xml,
             rule.expiration.as_ref(),
             rule.expired_object_delete_marker,
         );
 
-        if let Some(transition) = &rule.transition {
-            xml.push_str("<Transition>");
-            append_optional_i32(&mut xml, "Days", transition.days);
-            append_optional_string(&mut xml, "Date", transition.date.as_deref());
-            append_xml_element(&mut xml, "StorageClass", &transition.storage_class);
-            xml.push_str("</Transition>");
+        append_transition_xml(&mut xml, rule.transition.as_ref());
+        for transition in &rule.transitions {
+            append_transition_xml(&mut xml, Some(transition));
         }
 
         if let Some(expiration) = &rule.noncurrent_version_expiration {
@@ -262,15 +346,12 @@ pub(crate) fn build_lifecycle_configuration_xml(rules: &[LifecycleRule]) -> Stri
             xml.push_str("</NoncurrentVersionExpiration>");
         }
 
-        if let Some(transition) = &rule.noncurrent_version_transition {
-            xml.push_str("<NoncurrentVersionTransition>");
-            append_xml_element(
-                &mut xml,
-                "NoncurrentDays",
-                &transition.noncurrent_days.to_string(),
-            );
-            append_xml_element(&mut xml, "StorageClass", &transition.storage_class);
-            xml.push_str("</NoncurrentVersionTransition>");
+        append_noncurrent_version_transition_xml(
+            &mut xml,
+            rule.noncurrent_version_transition.as_ref(),
+        );
+        for transition in &rule.noncurrent_version_transitions {
+            append_noncurrent_version_transition_xml(&mut xml, Some(transition));
         }
 
         if let Some(days) = rule.abort_incomplete_multipart_upload_days {
@@ -296,33 +377,84 @@ fn append_filter_xml(
     xml: &mut String,
     prefix: Option<&str>,
     tags: Option<&HashMap<String, String>>,
+    object_size_greater_than: Option<i64>,
+    object_size_less_than: Option<i64>,
 ) {
     let tags = tags.filter(|tags| !tags.is_empty());
-    match (prefix, tags) {
-        (None, None) => {}
-        (Some(prefix), None) => {
-            xml.push_str("<Filter>");
+    let tag_count = tags.map_or(0, HashMap::len);
+    let predicate_count = usize::from(prefix.is_some())
+        + tag_count
+        + usize::from(object_size_greater_than.is_some())
+        + usize::from(object_size_less_than.is_some());
+    if predicate_count == 0 {
+        return;
+    }
+
+    xml.push_str("<Filter>");
+    if predicate_count == 1 {
+        if let Some(prefix) = prefix {
             append_xml_element(xml, "Prefix", prefix);
-            xml.push_str("</Filter>");
-        }
-        (None, Some(tags)) if tags.len() == 1 => {
-            xml.push_str("<Filter>");
+        } else if let Some(tags) = tags {
             if let Some((key, value)) = sorted_tags(tags).into_iter().next() {
                 append_tag_xml(xml, key, value);
             }
-            xml.push_str("</Filter>");
+        } else if let Some(value) = object_size_greater_than {
+            append_xml_element(xml, "ObjectSizeGreaterThan", &value.to_string());
+        } else if let Some(value) = object_size_less_than {
+            append_xml_element(xml, "ObjectSizeLessThan", &value.to_string());
         }
-        (prefix, Some(tags)) => {
-            xml.push_str("<Filter><And>");
-            if let Some(prefix) = prefix {
-                append_xml_element(xml, "Prefix", prefix);
-            }
+    } else {
+        xml.push_str("<And>");
+        if let Some(prefix) = prefix {
+            append_xml_element(xml, "Prefix", prefix);
+        }
+        if let Some(tags) = tags {
             for (key, value) in sorted_tags(tags) {
                 append_tag_xml(xml, key, value);
             }
-            xml.push_str("</And></Filter>");
         }
+        if let Some(value) = object_size_greater_than {
+            append_xml_element(xml, "ObjectSizeGreaterThan", &value.to_string());
+        }
+        if let Some(value) = object_size_less_than {
+            append_xml_element(xml, "ObjectSizeLessThan", &value.to_string());
+        }
+        xml.push_str("</And>");
     }
+    xml.push_str("</Filter>");
+}
+
+fn append_transition_xml(xml: &mut String, transition: Option<&LifecycleTransition>) {
+    let Some(transition) = transition else {
+        return;
+    };
+    xml.push_str("<Transition>");
+    append_optional_i32(xml, "Days", transition.days);
+    append_optional_string(xml, "Date", transition.date.as_deref());
+    append_xml_element(xml, "StorageClass", &transition.storage_class);
+    xml.push_str("</Transition>");
+}
+
+fn append_noncurrent_version_transition_xml(
+    xml: &mut String,
+    transition: Option<&NoncurrentVersionTransition>,
+) {
+    let Some(transition) = transition else {
+        return;
+    };
+    xml.push_str("<NoncurrentVersionTransition>");
+    append_xml_element(
+        xml,
+        "NoncurrentDays",
+        &transition.noncurrent_days.to_string(),
+    );
+    append_xml_element(xml, "StorageClass", &transition.storage_class);
+    append_optional_i32(
+        xml,
+        "NewerNoncurrentVersions",
+        transition.newer_noncurrent_versions,
+    );
+    xml.push_str("</NoncurrentVersionTransition>");
 }
 
 fn append_expiration_xml(
@@ -420,6 +552,8 @@ mod tests {
             status: LifecycleRuleStatus::Enabled,
             prefix: Some("logs/".to_string()),
             tags: Some(tags),
+            object_size_greater_than: None,
+            object_size_less_than: None,
             expiration: Some(LifecycleExpiration {
                 days: Some(1),
                 date: None,
@@ -436,6 +570,8 @@ mod tests {
                 newer_noncurrent_versions: Some(1),
             }),
             noncurrent_version_transition: None,
+            transitions: Vec::new(),
+            noncurrent_version_transitions: Vec::new(),
             abort_incomplete_multipart_upload_days: Some(4),
             expired_object_delete_marker: None,
         }];
@@ -488,5 +624,112 @@ mod tests {
         let rules = parse_lifecycle_configuration_xml(xml).expect("parse legacy lifecycle XML");
         assert_eq!(rules[0].prefix.as_deref(), Some("logs/"));
         assert_eq!(rules[0].expired_object_delete_marker, Some(true));
+    }
+
+    #[test]
+    fn lifecycle_xml_parser_rejects_error_and_unexpected_roots() {
+        for xml in [
+            "<Error><Code>InternalError</Code></Error>",
+            "<Unexpected><Rule /></Unexpected>",
+        ] {
+            let result = parse_lifecycle_configuration_xml(xml);
+            assert!(
+                matches!(result, Err(Error::General(message)) if message.contains("unexpected lifecycle root")),
+                "unexpected root should fail with a root-validation error: {xml}"
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_xml_response_validator_rejects_malformed_success_body() {
+        assert!(
+            validate_lifecycle_configuration_xml_response("<LifecycleConfiguration><Rule>")
+                .is_err()
+        );
+        assert!(
+            validate_lifecycle_configuration_xml_response("<LifecycleConfiguration />").is_ok()
+        );
+        assert!(validate_lifecycle_configuration_xml_response(" ").is_ok());
+    }
+
+    #[test]
+    fn lifecycle_xml_roundtrip_preserves_size_filters_and_all_actions() {
+        let rules = vec![LifecycleRule {
+            id: "full-rule".to_string(),
+            status: LifecycleRuleStatus::Enabled,
+            prefix: Some("logs/".to_string()),
+            tags: None,
+            object_size_greater_than: Some(500),
+            object_size_less_than: Some(64000),
+            expiration: None,
+            del_marker_expiration: None,
+            transition: Some(LifecycleTransition {
+                days: Some(30),
+                date: None,
+                storage_class: "WARM".to_string(),
+            }),
+            transitions: vec![LifecycleTransition {
+                days: Some(60),
+                date: None,
+                storage_class: "COLD".to_string(),
+            }],
+            noncurrent_version_expiration: Some(NoncurrentVersionExpiration {
+                noncurrent_days: 90,
+                newer_noncurrent_versions: Some(2),
+            }),
+            noncurrent_version_transition: Some(NoncurrentVersionTransition {
+                noncurrent_days: 90,
+                storage_class: "WARM".to_string(),
+                newer_noncurrent_versions: Some(2),
+            }),
+            noncurrent_version_transitions: vec![NoncurrentVersionTransition {
+                noncurrent_days: 180,
+                storage_class: "COLD".to_string(),
+                newer_noncurrent_versions: Some(1),
+            }],
+            abort_incomplete_multipart_upload_days: None,
+            expired_object_delete_marker: None,
+        }];
+
+        let xml = build_lifecycle_configuration_xml(&rules);
+        assert!(xml.contains("<ObjectSizeGreaterThan>500</ObjectSizeGreaterThan>"));
+        assert!(xml.contains("<ObjectSizeLessThan>64000</ObjectSizeLessThan>"));
+        assert_eq!(xml.matches("<Transition>").count(), 2);
+        assert_eq!(xml.matches("<NoncurrentVersionTransition>").count(), 2);
+        assert!(xml.contains("<NewerNoncurrentVersions>2</NewerNoncurrentVersions>"));
+        assert!(xml.contains("<NewerNoncurrentVersions>1</NewerNoncurrentVersions>"));
+
+        let parsed = parse_lifecycle_configuration_xml(&xml).expect("parse full lifecycle XML");
+        let rule = &parsed[0];
+        assert_eq!(rule.object_size_greater_than, Some(500));
+        assert_eq!(rule.object_size_less_than, Some(64000));
+        assert_eq!(rule.transitions.len(), 1);
+        assert_eq!(rule.noncurrent_version_transitions.len(), 1);
+        assert_eq!(
+            rule.noncurrent_version_transition
+                .as_ref()
+                .and_then(|transition| transition.newer_noncurrent_versions),
+            Some(2)
+        );
+        assert_eq!(
+            rule.noncurrent_version_transitions[0].newer_noncurrent_versions,
+            Some(1)
+        );
+
+        let mut direct_filter = String::new();
+        append_filter_xml(&mut direct_filter, None, None, Some(7), None);
+        assert_eq!(
+            direct_filter,
+            "<Filter><ObjectSizeGreaterThan>7</ObjectSizeGreaterThan></Filter>"
+        );
+        let direct_xml = format!(
+            "<LifecycleConfiguration><Rule><ID>direct-size</ID><Status>Enabled</Status>{direct_filter}</Rule></LifecycleConfiguration>"
+        );
+        let direct_rule = parse_lifecycle_configuration_xml(&direct_xml)
+            .expect("direct size filter should parse")
+            .into_iter()
+            .next()
+            .expect("direct size rule should be present");
+        assert_eq!(direct_rule.object_size_greater_than, Some(7));
     }
 }

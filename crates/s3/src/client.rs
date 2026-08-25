@@ -49,10 +49,10 @@ use rc_core::{
     ReplicationResyncStartResult, ReplicationResyncState, ReplicationResyncStatus,
     ReplicationResyncTargetStatus, RequestHeader, Result, RetentionDuration, RetentionDurationUnit,
     RetentionMode, SelectOptions, SseCustomerKey, TransferCopyOptions, TransferReadOptions,
-    global_request_headers,
+    global_request_headers, is_retryable_error, retry_with_backoff,
 };
 use reqwest::Method;
-use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, LOCATION};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -63,7 +63,10 @@ use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use zeroize::Zeroizing;
 
-use crate::lifecycle_xml::{build_lifecycle_configuration_xml, parse_lifecycle_configuration_xml};
+use crate::lifecycle_xml::{
+    build_lifecycle_configuration_xml, parse_lifecycle_configuration_xml,
+    validate_lifecycle_configuration_xml_response,
+};
 
 /// Keep single-part uploads small to avoid backend incompatibilities with
 /// streaming aws-chunked payloads.
@@ -75,6 +78,7 @@ const REPLICATION_EXTENSION_BODY_LIMIT: u64 = 1024 * 1024;
 const REPLICATION_CHECK_PROBE_NAMESPACE: &str = ".rustfs.sys/replication-check/";
 const REPLICATION_CHECK_ERROR_LIMIT: usize = 512;
 const REPLICATION_CHECK_DESCRIPTION_LIMIT: usize = 1024;
+const MAX_LIFECYCLE_REDIRECTS: u32 = 5;
 
 fn contains_control_characters(value: &str) -> bool {
     value.chars().any(char::is_control)
@@ -163,6 +167,19 @@ enum BucketPolicyErrorKind {
     MissingPolicy,
     MissingBucket,
     Other,
+}
+
+#[derive(Debug)]
+struct XmlResponse {
+    status: reqwest::StatusCode,
+    headers: HeaderMap,
+    body: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct XmlRequestOptions {
+    include_content_md5: bool,
+    include_custom_headers: bool,
 }
 
 /// Custom HTTP connector using reqwest, supporting insecure TLS (skip cert verification)
@@ -270,6 +287,93 @@ fn sdk_retry_config(
         .initial_backoff(Duration::from_millis(config.initial_backoff_ms))
         .max_backoff(Duration::from_millis(config.max_backoff_ms))
         .build())
+}
+
+fn is_lifecycle_redirect(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::MOVED_PERMANENTLY
+            | reqwest::StatusCode::TEMPORARY_REDIRECT
+            | reqwest::StatusCode::PERMANENT_REDIRECT
+    )
+}
+
+fn is_lifecycle_retryable_error(error: &Error) -> bool {
+    let Error::Network(message) = error else {
+        return is_retryable_error(error);
+    };
+    if message.starts_with("Request failed:") || message.starts_with("Failed to read response:") {
+        return true;
+    }
+    if let Some(status) = message
+        .strip_prefix("HTTP ")
+        .and_then(|message| message.split(':').next())
+        .and_then(|status| status.parse::<u16>().ok())
+    {
+        return (500..600).contains(&status)
+            || status == reqwest::StatusCode::TOO_MANY_REQUESTS.as_u16();
+    }
+    is_retryable_error(error)
+}
+
+fn recognized_s3_provider(host: &str) -> Option<&'static str> {
+    let host = host.to_ascii_lowercase();
+    [
+        ("amazonaws.com.cn", "s3"),
+        ("amazonaws.com", "s3"),
+        ("aliyuncs.com", "oss"),
+    ]
+    .into_iter()
+    .find_map(|(suffix, service)| {
+        let belongs_to_provider = host == suffix || host.ends_with(&format!(".{suffix}"));
+        let is_service_host = host
+            .split('.')
+            .any(|label| label == service || label.starts_with(&format!("{service}-")));
+        (belongs_to_provider && is_service_host).then_some(suffix)
+    })
+}
+
+fn lifecycle_redirect_host_is_trusted(current: &str, next: &str) -> bool {
+    current.eq_ignore_ascii_case(next)
+        || recognized_s3_provider(current)
+            .zip(recognized_s3_provider(next))
+            .is_some_and(|(current, next)| current == next)
+}
+
+fn resolve_lifecycle_redirect(
+    current_url: &reqwest::Url,
+    headers: &HeaderMap,
+) -> Result<reqwest::Url> {
+    let location = headers
+        .get(LOCATION)
+        .ok_or_else(|| Error::Network("lifecycle redirect missing Location header".to_string()))?
+        .to_str()
+        .map_err(|_| {
+            Error::Network("lifecycle redirect has an invalid Location header".to_string())
+        })?;
+    let next_url = current_url
+        .join(location)
+        .map_err(|error| Error::Network(format!("invalid lifecycle redirect Location: {error}")))?;
+    if !matches!(next_url.scheme(), "http" | "https")
+        || !next_url.username().is_empty()
+        || next_url.password().is_some()
+    {
+        return Err(Error::Network(
+            "lifecycle redirect must target an HTTP(S) URL without credentials".to_string(),
+        ));
+    }
+    let trusted_host = current_url
+        .host_str()
+        .zip(next_url.host_str())
+        .is_some_and(|(current, next)| lifecycle_redirect_host_is_trusted(current, next));
+    let same_port = current_url.port_or_known_default() == next_url.port_or_known_default();
+    let downgraded = current_url.scheme() == "https" && next_url.scheme() != "https";
+    if !trusted_host || !same_port || downgraded {
+        return Err(Error::Network(
+            "lifecycle redirect must stay on the configured endpoint host or a recognized S3 provider, and must not downgrade HTTPS".to_string(),
+        ));
+    }
+    Ok(next_url)
 }
 
 fn sdk_timeout_config(
@@ -3171,6 +3275,18 @@ impl S3Client {
         headers: &HeaderMap,
         body: &[u8],
     ) -> Result<HeaderMap> {
+        self.sign_xml_request_for_region(method, url, headers, body, &self.alias.region)
+            .await
+    }
+
+    async fn sign_xml_request_for_region(
+        &self,
+        method: &Method,
+        url: &str,
+        headers: &HeaderMap,
+        body: &[u8],
+        region: &str,
+    ) -> Result<HeaderMap> {
         if self.alias.anonymous {
             return Ok(headers.clone());
         }
@@ -3189,7 +3305,7 @@ impl S3Client {
 
         let signing_params = v4::SigningParams::builder()
             .identity(&identity)
-            .region(&self.alias.region)
+            .region(region)
             .name(S3_SERVICE_NAME)
             .time(std::time::SystemTime::now())
             .settings(signing_settings)
@@ -3236,17 +3352,6 @@ impl S3Client {
             .await
     }
 
-    async fn xml_request_with_content_md5(
-        &self,
-        method: Method,
-        url: reqwest::Url,
-        content_type: Option<&str>,
-        body: Option<Vec<u8>>,
-    ) -> Result<String> {
-        self.xml_request_inner(method, url, content_type, body, true)
-            .await
-    }
-
     async fn xml_request_inner(
         &self,
         method: Method,
@@ -3256,15 +3361,125 @@ impl S3Client {
         include_content_md5: bool,
     ) -> Result<String> {
         let body = body.unwrap_or_default();
+        let response = self
+            .xml_request_once(
+                &method,
+                &url,
+                content_type,
+                &body,
+                &self.alias.region,
+                XmlRequestOptions {
+                    include_content_md5,
+                    include_custom_headers: true,
+                },
+            )
+            .await?;
+
+        if !response.status.is_success() {
+            return Err(self.xml_response_error(&response));
+        }
+
+        Ok(response.body)
+    }
+
+    async fn lifecycle_xml_request(
+        &self,
+        method: Method,
+        url: reqwest::Url,
+        content_type: Option<&str>,
+        body: Option<Vec<u8>>,
+        include_content_md5: bool,
+    ) -> Result<String> {
+        let body = body.unwrap_or_default();
+        let retry = self.alias.retry_config();
+        // Reuse the same validation as the SDK transport so malformed alias retry
+        // settings cannot silently disable lifecycle retries.
+        sdk_retry_config(&retry)?;
+
+        let initial_region = self.alias.region.clone();
+        let initial_host = url.host_str().map(str::to_owned);
+        retry_with_backoff(
+            &retry,
+            || {
+                let method = method.clone();
+                let body = body.clone();
+                let mut current_url = url.clone();
+                let mut signing_region = initial_region.clone();
+                let initial_host = initial_host.clone();
+                async move {
+                    let mut redirects = 0;
+                    loop {
+                        let response = self
+                            .xml_request_once(
+                                &method,
+                                &current_url,
+                                content_type,
+                                &body,
+                                &signing_region,
+                                XmlRequestOptions {
+                                    include_content_md5,
+                                    include_custom_headers: current_url
+                                        .host_str()
+                                        .zip(initial_host.as_deref())
+                                        .is_some_and(|(current, initial)| {
+                                            current.eq_ignore_ascii_case(initial)
+                                        }),
+                                },
+                            )
+                            .await?;
+
+                        if is_lifecycle_redirect(response.status) {
+                            if redirects >= MAX_LIFECYCLE_REDIRECTS {
+                                return Err(self.xml_response_error(&response));
+                            }
+                            if let Some(region) = response
+                                .headers
+                                .get("x-amz-bucket-region")
+                                .and_then(|value| value.to_str().ok())
+                                .map(str::trim)
+                                .filter(|value| {
+                                    !value.is_empty() && !contains_control_characters(value)
+                                })
+                            {
+                                signing_region = region.to_string();
+                            }
+                            current_url =
+                                resolve_lifecycle_redirect(&current_url, &response.headers)?;
+                            redirects += 1;
+                            continue;
+                        }
+
+                        if response.status.is_success() {
+                            return Ok(response.body);
+                        }
+
+                        return Err(self.xml_response_error(&response));
+                    }
+                }
+            },
+            is_lifecycle_retryable_error,
+        )
+        .await
+    }
+
+    async fn xml_request_once(
+        &self,
+        method: &Method,
+        url: &reqwest::Url,
+        content_type: Option<&str>,
+        body: &[u8],
+        signing_region: &str,
+        options: XmlRequestOptions,
+    ) -> Result<XmlResponse> {
         let mut headers = HeaderMap::new();
         headers.insert(
             "x-amz-content-sha256",
-            HeaderValue::from_str(&Self::sha256_hash(&body))
+            HeaderValue::from_str(&Self::sha256_hash(body))
                 .map_err(|e| Error::Auth(format!("Invalid content hash header: {e}")))?,
         );
         headers.insert(
             "host",
-            HeaderValue::from_str(&self.request_host(&url)?)
+            HeaderValue::from_str(&self.request_host(url)?)
                 .map_err(|e| Error::Auth(format!("Invalid host header: {e}")))?,
         );
 
@@ -3276,32 +3491,36 @@ impl S3Client {
             );
         }
 
-        for header in &self.request_headers {
-            let name = HeaderName::from_bytes(header.name.as_bytes())
-                .map_err(|e| Error::Auth(format!("Invalid custom header name: {e}")))?;
-            let value = HeaderValue::from_str(&header.value)
-                .map_err(|e| Error::Auth(format!("Invalid custom header value: {e}")))?;
-            headers.insert(name, value);
+        // Caller-supplied x-amz headers can contain credentials; keep them on the
+        // configured host when a provider redirect changes the authority.
+        if options.include_custom_headers {
+            for header in &self.request_headers {
+                let name = HeaderName::from_bytes(header.name.as_bytes())
+                    .map_err(|e| Error::Auth(format!("Invalid custom header name: {e}")))?;
+                let value = HeaderValue::from_str(&header.value)
+                    .map_err(|e| Error::Auth(format!("Invalid custom header value: {e}")))?;
+                headers.insert(name, value);
+            }
         }
 
-        if include_content_md5 {
+        if options.include_content_md5 {
             headers.insert(
                 HeaderName::from_static("content-md5"),
-                HeaderValue::from_str(&BASE64_STANDARD.encode(Md5::digest(&body)))
+                HeaderValue::from_str(&BASE64_STANDARD.encode(Md5::digest(body)))
                     .map_err(|e| Error::Auth(format!("Invalid content MD5 header: {e}")))?,
             );
         }
 
         let signed_headers = self
-            .sign_xml_request(&method, url.as_str(), &headers, &body)
+            .sign_xml_request_for_region(method, url.as_str(), &headers, body, signing_region)
             .await?;
 
-        let mut request_builder = self.xml_http_client.request(method, url);
+        let mut request_builder = self.xml_http_client.request(method.clone(), url.clone());
         for (name, value) in &signed_headers {
             request_builder = request_builder.header(name, value);
         }
         if !body.is_empty() {
-            request_builder = request_builder.body(body);
+            request_builder = request_builder.body(body.to_vec());
         }
 
         let response = request_builder
@@ -3310,20 +3529,25 @@ impl S3Client {
             .map_err(|e| Error::Network(format!("Request failed: {e}")))?;
 
         let status = response.status();
+        let response_headers = response.headers().clone();
         let text = response
             .text()
             .await
             .map_err(|e| Error::Network(format!("Failed to read response: {e}")))?;
 
-        if !status.is_success() {
-            return Err(Error::Network(format!(
-                "HTTP {}: {}",
-                status.as_u16(),
-                text
-            )));
-        }
+        Ok(XmlResponse {
+            status,
+            headers: response_headers,
+            body: text,
+        })
+    }
 
-        Ok(text)
+    fn xml_response_error(&self, response: &XmlResponse) -> Error {
+        Error::Network(self.redact_sensitive_text(format!(
+            "HTTP {}: {}",
+            response.status.as_u16(),
+            response.body
+        )))
     }
 
     fn bucket_policy_error_kind(
@@ -6317,7 +6541,10 @@ impl ObjectStore for S3Client {
 
     async fn get_bucket_lifecycle(&self, bucket: &str) -> Result<Vec<LifecycleRule>> {
         let url = self.lifecycle_url(bucket)?;
-        let body = match self.xml_request(Method::GET, url, None, None).await {
+        let body = match self
+            .lifecycle_xml_request(Method::GET, url, None, None, false)
+            .await
+        {
             Ok(body) => body,
             Err(Error::Network(error_text))
                 if is_missing_lifecycle_configuration_error(&error_text) =>
@@ -6339,8 +6566,11 @@ impl ObjectStore for S3Client {
 
         let url = self.lifecycle_url(bucket)?;
         let body = build_lifecycle_configuration_xml(&rules).into_bytes();
-        self.xml_request_with_content_md5(Method::PUT, url, Some("application/xml"), Some(body))
+        let response = self
+            .lifecycle_xml_request(Method::PUT, url, Some("application/xml"), Some(body), true)
             .await
+            .map_err(|error| Error::General(format!("set_bucket_lifecycle: {error}")))?;
+        validate_lifecycle_configuration_xml_response(&response)
             .map_err(|error| Error::General(format!("set_bucket_lifecycle: {error}")))?;
 
         Ok(())
@@ -6939,6 +7169,34 @@ mod tests {
         (endpoint, receiver, handle)
     }
 
+    fn start_lifecycle_sequence_test_server(
+        responses: Vec<Vec<u8>>,
+    ) -> (
+        String,
+        mpsc::Receiver<CapturedXmlRequest>,
+        thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind lifecycle test server");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        let (sender, receiver) = mpsc::channel();
+
+        let handle = thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener.accept().expect("accept lifecycle request");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .expect("set lifecycle request timeout");
+                let request = read_xml_request(&mut stream);
+                sender.send(request).expect("send lifecycle request");
+                stream
+                    .write_all(&response)
+                    .expect("write lifecycle response");
+            }
+        });
+
+        (endpoint, receiver, handle)
+    }
+
     fn start_repeated_replication_extension_test_server(
         response: Vec<u8>,
         request_count: usize,
@@ -7349,6 +7607,196 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_bucket_lifecycle_rejects_success_error_envelope() {
+        let body = b"<Error><Code>InternalError</Code><Message>unexpected</Message></Error>";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        let mut response = response;
+        response.extend_from_slice(body);
+        let (endpoint, receiver, server) = start_replication_extension_test_server(response);
+        let (client, _) = test_s3_client_with_endpoint(&endpoint, None);
+
+        let result = ObjectStore::get_bucket_lifecycle(&client, "bucket").await;
+        assert!(
+            matches!(result, Err(Error::General(ref message)) if message.contains("unexpected lifecycle root")),
+            "success Error envelope must not be treated as an empty lifecycle: {result:?}"
+        );
+        receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("error response request should be captured");
+        server.join().expect("error response server should finish");
+    }
+
+    #[tokio::test]
+    async fn set_bucket_lifecycle_rejects_success_error_envelope() {
+        let body = b"<Error><Code>InternalError</Code><Message>unexpected</Message></Error>";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        let mut response = response;
+        response.extend_from_slice(body);
+        let (endpoint, receiver, server) = start_replication_extension_test_server(response);
+        let (client, _) = test_s3_client_with_endpoint(&endpoint, None);
+        let rule = LifecycleRule {
+            id: "error-response".to_string(),
+            status: rc_core::LifecycleRuleStatus::Enabled,
+            prefix: None,
+            tags: None,
+            object_size_greater_than: None,
+            object_size_less_than: None,
+            expiration: None,
+            del_marker_expiration: None,
+            transition: None,
+            transitions: Vec::new(),
+            noncurrent_version_expiration: None,
+            noncurrent_version_transition: None,
+            noncurrent_version_transitions: Vec::new(),
+            abort_incomplete_multipart_upload_days: None,
+            expired_object_delete_marker: None,
+        };
+
+        let result = ObjectStore::set_bucket_lifecycle(&client, "bucket", vec![rule]).await;
+        assert!(
+            matches!(result, Err(Error::General(ref message)) if message.contains("unexpected lifecycle root")),
+            "success Error envelope must not be treated as a successful PUT: {result:?}"
+        );
+        receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("error response request should be captured");
+        server.join().expect("error response server should finish");
+    }
+
+    #[tokio::test]
+    async fn lifecycle_get_retries_transient_failure() {
+        let success_body = br#"<LifecycleConfiguration><Rule><ID>retry</ID><Status>Enabled</Status></Rule></LifecycleConfiguration>"#;
+        let first = b"<Error><Code>InternalError</Code></Error>";
+        let first_response = format!(
+            "HTTP/1.1 500 Internal Server Error\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            first.len()
+        )
+        .into_bytes();
+        let mut first_response = first_response;
+        first_response.extend_from_slice(first);
+        let second_response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            success_body.len()
+        )
+        .into_bytes();
+        let mut second_response = second_response;
+        second_response.extend_from_slice(success_body);
+        let (endpoint, receiver, server) =
+            start_lifecycle_sequence_test_server(vec![first_response, second_response]);
+        let (mut client, _) = test_s3_client_with_endpoint(&endpoint, None);
+        client.alias.retry = Some(rc_core::alias::RetryConfig {
+            max_attempts: 2,
+            initial_backoff_ms: 1,
+            max_backoff_ms: 1,
+        });
+
+        let rules = ObjectStore::get_bucket_lifecycle(&client, "bucket")
+            .await
+            .expect("transient lifecycle failure should be retried");
+        assert_eq!(rules[0].id, "retry");
+        let first_request = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first lifecycle request should be captured");
+        let second_request = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("retry lifecycle request should be captured");
+        assert_eq!(first_request.method, "GET");
+        assert_eq!(second_request.method, "GET");
+        server.join().expect("retry server should finish");
+    }
+
+    #[tokio::test]
+    async fn lifecycle_get_retries_dropped_connection() {
+        let success_body = br#"<LifecycleConfiguration><Rule><ID>network-retry</ID><Status>Enabled</Status></Rule></LifecycleConfiguration>"#;
+        let success_response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            success_body.len()
+        )
+        .into_bytes();
+        let mut success_response = success_response;
+        success_response.extend_from_slice(success_body);
+        let (endpoint, receiver, server) =
+            start_lifecycle_sequence_test_server(vec![Vec::new(), success_response]);
+        let (mut client, _) = test_s3_client_with_endpoint(&endpoint, None);
+        client.alias.retry = Some(rc_core::alias::RetryConfig {
+            max_attempts: 2,
+            initial_backoff_ms: 1,
+            max_backoff_ms: 1,
+        });
+
+        let rules = ObjectStore::get_bucket_lifecycle(&client, "bucket")
+            .await
+            .expect("dropped lifecycle connection should be retried");
+        assert_eq!(rules[0].id, "network-retry");
+        for _ in 0..2 {
+            let request = receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("lifecycle request should be captured");
+            assert_eq!(request.method, "GET");
+        }
+        server.join().expect("network retry server should finish");
+    }
+
+    #[tokio::test]
+    async fn lifecycle_put_follows_redirect_and_resigns_request() {
+        let redirect = b"HTTP/1.1 307 Temporary Redirect\r\nlocation: /redirected?lifecycle=\r\nx-amz-bucket-region: eu-west-1\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_vec();
+        let success = b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_vec();
+        let (endpoint, receiver, server) =
+            start_lifecycle_sequence_test_server(vec![redirect, success]);
+        let (mut client, _) = test_s3_client_with_endpoint(&endpoint, None);
+        client.alias.retry = Some(rc_core::alias::RetryConfig {
+            max_attempts: 1,
+            initial_backoff_ms: 1,
+            max_backoff_ms: 1,
+        });
+        let rule = LifecycleRule {
+            id: "redirect".to_string(),
+            status: rc_core::LifecycleRuleStatus::Enabled,
+            prefix: None,
+            tags: None,
+            object_size_greater_than: None,
+            object_size_less_than: None,
+            expiration: None,
+            del_marker_expiration: None,
+            transition: None,
+            transitions: Vec::new(),
+            noncurrent_version_expiration: None,
+            noncurrent_version_transition: None,
+            noncurrent_version_transitions: Vec::new(),
+            abort_incomplete_multipart_upload_days: None,
+            expired_object_delete_marker: None,
+        };
+
+        ObjectStore::set_bucket_lifecycle(&client, "bucket", vec![rule])
+            .await
+            .expect("lifecycle PUT should follow endpoint redirect");
+        let first_request = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("redirect request should be captured");
+        let second_request = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("redirect follow-up should be captured");
+        assert_eq!(first_request.method, "PUT");
+        assert_eq!(second_request.method, "PUT");
+        assert_eq!(second_request.target, "/redirected?lifecycle=");
+        let first_signature = header_value(&first_request.headers, "authorization")
+            .expect("redirect request should be signed");
+        let second_signature = header_value(&second_request.headers, "authorization")
+            .expect("redirect follow-up should be signed");
+        assert_ne!(first_signature, second_signature);
+        assert!(second_signature.contains("/eu-west-1/s3/aws4_request"));
+        server.join().expect("redirect server should finish");
+    }
+
+    #[tokio::test]
     async fn set_bucket_lifecycle_serializes_marker_only_expiration() {
         let (endpoint, request_receiver, server_handle) = start_replication_extension_test_server(
             b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_vec(),
@@ -7359,11 +7807,15 @@ mod tests {
             status: rc_core::LifecycleRuleStatus::Enabled,
             prefix: Some(String::new()),
             tags: None,
+            object_size_greater_than: None,
+            object_size_less_than: None,
             expiration: None,
             del_marker_expiration: None,
             transition: None,
+            transitions: Vec::new(),
             noncurrent_version_expiration: None,
             noncurrent_version_transition: None,
+            noncurrent_version_transitions: Vec::new(),
             abort_incomplete_multipart_upload_days: None,
             expired_object_delete_marker: Some(true),
         };
@@ -7395,14 +7847,18 @@ mod tests {
             status: rc_core::LifecycleRuleStatus::Enabled,
             prefix: Some(String::new()),
             tags: None,
+            object_size_greater_than: None,
+            object_size_less_than: None,
             expiration: None,
             del_marker_expiration: None,
             transition: None,
+            transitions: Vec::new(),
             noncurrent_version_expiration: Some(rc_core::NoncurrentVersionExpiration {
                 noncurrent_days: 1,
                 newer_noncurrent_versions: None,
             }),
             noncurrent_version_transition: None,
+            noncurrent_version_transitions: Vec::new(),
             abort_incomplete_multipart_upload_days: None,
             expired_object_delete_marker: Some(true),
         };
@@ -7437,6 +7893,8 @@ mod tests {
             status: rc_core::LifecycleRuleStatus::Enabled,
             prefix: Some("test/".to_string()),
             tags: None,
+            object_size_greater_than: None,
+            object_size_less_than: None,
             expiration: Some(rc_core::LifecycleExpiration {
                 days: Some(1),
                 date: None,
@@ -7444,8 +7902,10 @@ mod tests {
             }),
             del_marker_expiration: Some(rc_core::LifecycleDelMarkerExpiration { days: Some(1) }),
             transition: None,
+            transitions: Vec::new(),
             noncurrent_version_expiration: None,
             noncurrent_version_transition: None,
+            noncurrent_version_transitions: Vec::new(),
             abort_incomplete_multipart_upload_days: None,
             expired_object_delete_marker: None,
         };
@@ -7538,6 +7998,8 @@ mod tests {
                 status: rc_core::LifecycleRuleStatus::Enabled,
                 prefix: None,
                 tags: None,
+                object_size_greater_than: None,
+                object_size_less_than: None,
                 expiration: Some(rc_core::LifecycleExpiration {
                     days: Some(30),
                     date: None,
@@ -7545,8 +8007,10 @@ mod tests {
                 }),
                 del_marker_expiration: None,
                 transition: None,
+                transitions: Vec::new(),
                 noncurrent_version_expiration: None,
                 noncurrent_version_transition: None,
+                noncurrent_version_transitions: Vec::new(),
                 abort_incomplete_multipart_upload_days: None,
                 expired_object_delete_marker: Some(true),
             },
@@ -7555,11 +8019,15 @@ mod tests {
                 status: rc_core::LifecycleRuleStatus::Enabled,
                 prefix: None,
                 tags: Some(tags),
+                object_size_greater_than: None,
+                object_size_less_than: None,
                 expiration: None,
                 del_marker_expiration: None,
                 transition: None,
+                transitions: Vec::new(),
                 noncurrent_version_expiration: None,
                 noncurrent_version_transition: None,
+                noncurrent_version_transitions: Vec::new(),
                 abort_incomplete_multipart_upload_days: None,
                 expired_object_delete_marker: Some(true),
             },
@@ -7581,6 +8049,8 @@ mod tests {
                 status: rc_core::LifecycleRuleStatus::Enabled,
                 prefix: None,
                 tags: None,
+                object_size_greater_than: None,
+                object_size_less_than: None,
                 expiration: Some(rc_core::LifecycleExpiration {
                     days: None,
                     date: None,
@@ -7588,8 +8058,10 @@ mod tests {
                 }),
                 del_marker_expiration: None,
                 transition: None,
+                transitions: Vec::new(),
                 noncurrent_version_expiration: None,
                 noncurrent_version_transition: None,
+                noncurrent_version_transitions: Vec::new(),
                 abort_incomplete_multipart_upload_days: None,
                 expired_object_delete_marker: None,
             },
@@ -7598,6 +8070,8 @@ mod tests {
                 status: rc_core::LifecycleRuleStatus::Enabled,
                 prefix: None,
                 tags: None,
+                object_size_greater_than: None,
+                object_size_less_than: None,
                 expiration: Some(rc_core::LifecycleExpiration {
                     days: Some(1),
                     date: Some("2026-01-01T00:00:00Z".to_string()),
@@ -7605,8 +8079,10 @@ mod tests {
                 }),
                 del_marker_expiration: None,
                 transition: None,
+                transitions: Vec::new(),
                 noncurrent_version_expiration: None,
                 noncurrent_version_transition: None,
+                noncurrent_version_transitions: Vec::new(),
                 abort_incomplete_multipart_upload_days: None,
                 expired_object_delete_marker: None,
             },
@@ -7615,11 +8091,15 @@ mod tests {
                 status: rc_core::LifecycleRuleStatus::Enabled,
                 prefix: None,
                 tags: None,
+                object_size_greater_than: None,
+                object_size_less_than: None,
                 expiration: None,
                 del_marker_expiration: Some(rc_core::LifecycleDelMarkerExpiration { days: None }),
                 transition: None,
+                transitions: Vec::new(),
                 noncurrent_version_expiration: None,
                 noncurrent_version_transition: None,
+                noncurrent_version_transitions: Vec::new(),
                 abort_incomplete_multipart_upload_days: None,
                 expired_object_delete_marker: None,
             },
@@ -8158,6 +8638,65 @@ mod tests {
         assert_eq!(url.host_str(), Some("bucket-name.example.com"));
         assert_eq!(url.path(), "/");
         assert_eq!(url.query(), Some("lifecycle="));
+    }
+
+    #[test]
+    fn lifecycle_redirect_rejects_cross_host_locations() {
+        let current = reqwest::Url::parse("https://s3.example.com/bucket?lifecycle=")
+            .expect("valid current lifecycle URL");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            LOCATION,
+            HeaderValue::from_static("https://attacker.example/collect"),
+        );
+
+        let result = resolve_lifecycle_redirect(&current, &headers);
+        assert!(
+            matches!(result, Err(Error::Network(message)) if message.contains("configured endpoint host"))
+        );
+    }
+
+    #[test]
+    fn lifecycle_redirect_allows_recognized_s3_provider_hosts() {
+        let current = reqwest::Url::parse("https://s3.amazonaws.com/bucket?lifecycle=")
+            .expect("valid current lifecycle URL");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            LOCATION,
+            HeaderValue::from_static("https://bucket.s3.eu-west-1.amazonaws.com/?lifecycle="),
+        );
+
+        let result = resolve_lifecycle_redirect(&current, &headers)
+            .expect("AWS S3 endpoint redirects should be supported");
+        assert_eq!(result.host_str(), Some("bucket.s3.eu-west-1.amazonaws.com"));
+    }
+
+    #[test]
+    fn lifecycle_redirect_statuses_are_limited_to_s3_endpoint_redirects() {
+        assert!(is_lifecycle_redirect(
+            reqwest::StatusCode::MOVED_PERMANENTLY
+        ));
+        assert!(is_lifecycle_redirect(
+            reqwest::StatusCode::TEMPORARY_REDIRECT
+        ));
+        assert!(is_lifecycle_redirect(
+            reqwest::StatusCode::PERMANENT_REDIRECT
+        ));
+        assert!(!is_lifecycle_redirect(reqwest::StatusCode::FOUND));
+        assert!(!is_lifecycle_redirect(reqwest::StatusCode::SEE_OTHER));
+    }
+
+    #[test]
+    fn lifecycle_retry_classification_uses_http_status_before_error_text() {
+        assert!(is_lifecycle_retryable_error(&Error::Network(
+            "HTTP 500: InternalError".to_string(),
+        )));
+        assert!(is_lifecycle_retryable_error(&Error::Network(
+            "HTTP 429: throttled".to_string(),
+        )));
+        assert!(!is_lifecycle_retryable_error(&Error::Network(
+            "HTTP 404: SlowDown".to_string(),
+        )));
     }
 
     #[test]
