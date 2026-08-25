@@ -63,6 +63,8 @@ use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use zeroize::Zeroizing;
 
+use crate::lifecycle_xml::{build_lifecycle_configuration_xml, parse_lifecycle_configuration_xml};
+
 /// Keep single-part uploads small to avoid backend incompatibilities with
 /// streaming aws-chunked payloads.
 const SINGLE_PUT_OBJECT_MAX_SIZE: u64 = crate::multipart::DEFAULT_PART_SIZE;
@@ -1387,106 +1389,64 @@ fn build_replication_configuration_xml(config: &ReplicationConfiguration) -> Str
     xml
 }
 
-fn parse_lifecycle_filter_prefix(
-    filter: Option<&aws_sdk_s3::types::LifecycleRuleFilter>,
-) -> Option<String> {
-    filter
-        .and_then(|filter| filter.prefix().map(str::to_string))
-        .or_else(|| filter.and_then(|filter| filter.and()?.prefix().map(str::to_string)))
-}
-
-fn parse_lifecycle_filter_tags(
-    filter: Option<&aws_sdk_s3::types::LifecycleRuleFilter>,
-) -> Option<HashMap<String, String>> {
-    filter
-        .and_then(|filter| collect_tag_map(filter.tag().map(|tag| (tag.key(), tag.value()))))
-        .or_else(|| {
-            filter.and_then(|filter| {
-                collect_tag_map(
-                    filter
-                        .and()?
-                        .tags()
-                        .iter()
-                        .map(|tag| (tag.key(), tag.value())),
-                )
-            })
-        })
-}
-
-fn build_s3_tag(key: &str, value: &str) -> Result<aws_sdk_s3::types::Tag> {
-    aws_sdk_s3::types::Tag::builder()
-        .key(key)
-        .value(value)
-        .build()
-        .map_err(|error| Error::General(format!("build filter tag: {error}")))
-}
-
-fn build_lifecycle_rule_filter(
-    prefix: Option<&str>,
-    tags: Option<&HashMap<String, String>>,
-) -> Result<Option<aws_sdk_s3::types::LifecycleRuleFilter>> {
-    let Some(tags) = tags.filter(|tags| !tags.is_empty()) else {
-        return Ok(prefix.map(|prefix| {
-            aws_sdk_s3::types::LifecycleRuleFilter::builder()
-                .prefix(prefix)
-                .build()
-        }));
-    };
-
-    let tag_values = sorted_tags(tags)
-        .into_iter()
-        .map(|(key, value)| build_s3_tag(key, value))
-        .collect::<Result<Vec<_>>>()?;
-
-    let filter = if prefix.is_some() || tag_values.len() > 1 {
-        let mut and_builder = aws_sdk_s3::types::LifecycleRuleAndOperator::builder();
-        if let Some(prefix) = prefix {
-            and_builder = and_builder.prefix(prefix);
-        }
-        for tag in tag_values {
-            and_builder = and_builder.tags(tag);
-        }
-        aws_sdk_s3::types::LifecycleRuleFilter::builder()
-            .and(and_builder.build())
-            .build()
-    } else {
-        aws_sdk_s3::types::LifecycleRuleFilter::builder()
-            .tag(
-                tag_values
-                    .into_iter()
-                    .next()
-                    .expect("non-empty tags required to build lifecycle filter"),
-            )
-            .build()
-    };
-
-    Ok(Some(filter))
-}
-
 fn validate_lifecycle_rule(rule: &LifecycleRule) -> Result<()> {
-    if rule.expired_object_delete_marker != Some(true) {
-        return Ok(());
-    }
-
-    if rule
-        .expiration
-        .as_ref()
-        .is_some_and(|expiration| expiration.days.is_some() || expiration.date.is_some())
+    if let Some(expiration) = rule.expiration.as_ref()
+        && expiration.expired_object_all_versions.is_some()
+        && (expiration.days.is_none_or(|days| days < 1) || expiration.date.is_some())
     {
         return Err(Error::InvalidPath(format!(
-            "lifecycle rule '{}' cannot combine current expiration days or date with expired delete-marker cleanup",
+            "lifecycle rule '{}' requires positive expiration days without a date when ExpiredObjectAllVersions is specified",
             rule.id
         )));
     }
 
-    if rule.tags.as_ref().is_some_and(|tags| !tags.is_empty()) {
+    if let Some(expiration) = rule.del_marker_expiration.as_ref()
+        && expiration.days.is_none_or(|days| days < 1)
+    {
         return Err(Error::InvalidPath(format!(
-            "lifecycle rule '{}' cannot combine tag filters with expired delete-marker cleanup",
+            "lifecycle rule '{}' requires positive days for delete-marker expiration",
             rule.id
         )));
+    }
+
+    if rule.del_marker_expiration.is_some()
+        && rule.tags.as_ref().is_some_and(|tags| !tags.is_empty())
+    {
+        return Err(Error::InvalidPath(format!(
+            "lifecycle rule '{}' cannot combine delete-marker expiration with tag filters",
+            rule.id
+        )));
+    }
+
+    if rule.expired_object_delete_marker == Some(true) {
+        if rule
+            .expiration
+            .as_ref()
+            .is_some_and(|expiration| expiration.days.is_some() || expiration.date.is_some())
+        {
+            return Err(Error::InvalidPath(format!(
+                "lifecycle rule '{}' cannot combine current expiration days or date with expired delete-marker cleanup",
+                rule.id
+            )));
+        }
+
+        if rule.tags.as_ref().is_some_and(|tags| !tags.is_empty()) {
+            return Err(Error::InvalidPath(format!(
+                "lifecycle rule '{}' cannot combine tag filters with expired delete-marker cleanup",
+                rule.id
+            )));
+        }
     }
 
     Ok(())
+}
+
+fn is_missing_lifecycle_configuration_error(error_text: &str) -> bool {
+    let normalized = error_text.to_ascii_lowercase();
+    normalized.contains("nosuchlifecycleconfiguration")
+        || normalized.contains("lifecycle configuration is not found")
+        || normalized.contains("lifecycle configuration was not found")
+        || normalized.contains("lifecycle configuration does not exist")
 }
 
 impl HttpConnector for ReqwestConnector {
@@ -2845,6 +2805,37 @@ impl S3Client {
         Ok(url)
     }
 
+    fn lifecycle_url(&self, bucket: &str) -> Result<reqwest::Url> {
+        let mut url =
+            reqwest::Url::parse(self.alias.endpoint.trim_end_matches('/')).map_err(|e| {
+                Error::Network(format!("Invalid endpoint '{}': {e}", self.alias.endpoint))
+            })?;
+
+        if force_path_style_for_alias(&self.alias) {
+            let mut segments = url.path_segments_mut().map_err(|_| {
+                Error::Network(format!(
+                    "Endpoint '{}' does not support path-style bucket operations",
+                    self.alias.endpoint
+                ))
+            })?;
+            segments.pop_if_empty();
+            segments.push(bucket);
+        } else {
+            let host = url
+                .host_str()
+                .ok_or_else(|| Error::Network("Missing host in lifecycle endpoint".to_string()))?;
+            let bucket_host = format!("{bucket}.{host}");
+            url.set_host(Some(&bucket_host)).map_err(|_| {
+                Error::Network(format!(
+                    "Bucket '{bucket}' cannot be used with DNS-style lifecycle requests"
+                ))
+            })?;
+        }
+
+        url.set_query(Some("lifecycle="));
+        Ok(url)
+    }
+
     fn replication_extension_url(
         &self,
         bucket: &str,
@@ -3241,6 +3232,29 @@ impl S3Client {
         content_type: Option<&str>,
         body: Option<Vec<u8>>,
     ) -> Result<String> {
+        self.xml_request_inner(method, url, content_type, body, false)
+            .await
+    }
+
+    async fn xml_request_with_content_md5(
+        &self,
+        method: Method,
+        url: reqwest::Url,
+        content_type: Option<&str>,
+        body: Option<Vec<u8>>,
+    ) -> Result<String> {
+        self.xml_request_inner(method, url, content_type, body, true)
+            .await
+    }
+
+    async fn xml_request_inner(
+        &self,
+        method: Method,
+        url: reqwest::Url,
+        content_type: Option<&str>,
+        body: Option<Vec<u8>>,
+        include_content_md5: bool,
+    ) -> Result<String> {
         let body = body.unwrap_or_default();
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -3268,6 +3282,14 @@ impl S3Client {
             let value = HeaderValue::from_str(&header.value)
                 .map_err(|e| Error::Auth(format!("Invalid custom header value: {e}")))?;
             headers.insert(name, value);
+        }
+
+        if include_content_md5 {
+            headers.insert(
+                HeaderName::from_static("content-md5"),
+                HeaderValue::from_str(&BASE64_STANDARD.encode(Md5::digest(&body)))
+                    .map_err(|e| Error::Auth(format!("Invalid content MD5 header: {e}")))?,
+            );
         }
 
         let signed_headers = self
@@ -6294,232 +6316,32 @@ impl ObjectStore for S3Client {
     }
 
     async fn get_bucket_lifecycle(&self, bucket: &str) -> Result<Vec<LifecycleRule>> {
-        let response = match self
-            .inner
-            .get_bucket_lifecycle_configuration()
-            .bucket(bucket)
-            .send()
-            .await
-        {
-            Ok(resp) => resp,
+        let url = self.lifecycle_url(bucket)?;
+        let body = match self.xml_request(Method::GET, url, None, None).await {
+            Ok(body) => body,
+            Err(Error::Network(error_text))
+                if is_missing_lifecycle_configuration_error(&error_text) =>
+            {
+                return Ok(Vec::new());
+            }
             Err(error) => {
-                let error_text = Self::format_sdk_error(&error);
-                if error_text.contains("NoSuchLifecycleConfiguration")
-                    || error_text.contains("lifecycle configuration is not found")
-                {
-                    return Ok(Vec::new());
-                }
-                return Err(Error::General(format!(
-                    "get_bucket_lifecycle: {error_text}"
-                )));
+                return Err(Error::General(format!("get_bucket_lifecycle: {error}")));
             }
         };
 
-        let mut rules = Vec::new();
-        for sdk_rule in response.rules() {
-            let id = sdk_rule.id().unwrap_or("").to_string();
-            let status = match sdk_rule.status().as_str() {
-                "Enabled" => rc_core::LifecycleRuleStatus::Enabled,
-                _ => rc_core::LifecycleRuleStatus::Disabled,
-            };
-
-            let prefix = parse_lifecycle_filter_prefix(sdk_rule.filter());
-            let tags = parse_lifecycle_filter_tags(sdk_rule.filter());
-
-            let expiration = sdk_rule
-                .expiration()
-                .map(|exp| rc_core::LifecycleExpiration {
-                    days: exp.days(),
-                    date: exp.date().map(|d| d.to_string()),
-                });
-
-            let transition = sdk_rule
-                .transitions()
-                .first()
-                .map(|t| rc_core::LifecycleTransition {
-                    days: t.days(),
-                    date: t.date().map(|d| d.to_string()),
-                    storage_class: t
-                        .storage_class()
-                        .map(|sc| sc.as_str().to_string())
-                        .unwrap_or_default(),
-                });
-
-            let noncurrent_version_expiration =
-                sdk_rule.noncurrent_version_expiration().map(|nve| {
-                    rc_core::NoncurrentVersionExpiration {
-                        noncurrent_days: nve.noncurrent_days().unwrap_or(0),
-                        newer_noncurrent_versions: nve.newer_noncurrent_versions(),
-                    }
-                });
-
-            let noncurrent_version_transition = sdk_rule
-                .noncurrent_version_transitions()
-                .first()
-                .map(|nvt| rc_core::NoncurrentVersionTransition {
-                    noncurrent_days: nvt.noncurrent_days().unwrap_or(0),
-                    storage_class: nvt
-                        .storage_class()
-                        .map(|sc| sc.as_str().to_string())
-                        .unwrap_or_default(),
-                });
-
-            let abort_incomplete_multipart_upload_days = sdk_rule
-                .abort_incomplete_multipart_upload()
-                .and_then(|a| a.days_after_initiation());
-
-            let expired_object_delete_marker = sdk_rule
-                .expiration()
-                .and_then(|e| e.expired_object_delete_marker())
-                .filter(|v| *v);
-
-            rules.push(LifecycleRule {
-                id,
-                status,
-                prefix,
-                tags,
-                expiration,
-                transition,
-                noncurrent_version_expiration,
-                noncurrent_version_transition,
-                abort_incomplete_multipart_upload_days,
-                expired_object_delete_marker,
-            });
-        }
-
-        Ok(rules)
+        parse_lifecycle_configuration_xml(&body)
     }
 
     async fn set_bucket_lifecycle(&self, bucket: &str, rules: Vec<LifecycleRule>) -> Result<()> {
-        use aws_sdk_s3::types::{
-            AbortIncompleteMultipartUpload, BucketLifecycleConfiguration, ExpirationStatus,
-            LifecycleExpiration as SdkExpiration, LifecycleRule as SdkRule,
-            NoncurrentVersionExpiration as SdkNve, NoncurrentVersionTransition as SdkNvt,
-            Transition, TransitionStorageClass,
-        };
-
-        let mut sdk_rules = Vec::new();
-        for rule in rules {
-            validate_lifecycle_rule(&rule)?;
-            let status = match rule.status {
-                rc_core::LifecycleRuleStatus::Enabled => ExpirationStatus::Enabled,
-                rc_core::LifecycleRuleStatus::Disabled => ExpirationStatus::Disabled,
-            };
-
-            let filter = build_lifecycle_rule_filter(rule.prefix.as_deref(), rule.tags.as_ref())?;
-
-            let expiration =
-                if rule.expiration.is_some() || rule.expired_object_delete_marker == Some(true) {
-                    let mut builder = SdkExpiration::builder();
-                    if let Some(days) = rule
-                        .expiration
-                        .as_ref()
-                        .and_then(|expiration| expiration.days)
-                    {
-                        builder = builder.days(days);
-                    }
-                    if let Some(date_str) = rule
-                        .expiration
-                        .as_ref()
-                        .and_then(|expiration| expiration.date.as_deref())
-                        && let Ok(dt) = aws_smithy_types::DateTime::from_str(
-                            date_str,
-                            aws_smithy_types::date_time::Format::DateTime,
-                        )
-                    {
-                        builder = builder.date(dt);
-                    }
-                    if let Some(true) = rule.expired_object_delete_marker {
-                        builder = builder.expired_object_delete_marker(true);
-                    }
-                    Some(builder.build())
-                } else {
-                    None
-                };
-
-            let transitions = rule.transition.map(|t| {
-                #[allow(deprecated)]
-                let sc = TransitionStorageClass::from(t.storage_class.as_str());
-                let mut builder = Transition::builder().storage_class(sc);
-                if let Some(days) = t.days {
-                    builder = builder.days(days);
-                }
-                if let Some(ref date_str) = t.date
-                    && let Ok(dt) = aws_smithy_types::DateTime::from_str(
-                        date_str,
-                        aws_smithy_types::date_time::Format::DateTime,
-                    )
-                {
-                    builder = builder.date(dt);
-                }
-                vec![builder.build()]
-            });
-
-            let nve = rule.noncurrent_version_expiration.map(|nve| {
-                let mut builder = SdkNve::builder().noncurrent_days(nve.noncurrent_days);
-                if let Some(newer) = nve.newer_noncurrent_versions {
-                    builder = builder.newer_noncurrent_versions(newer);
-                }
-                builder.build()
-            });
-
-            let nvt = rule.noncurrent_version_transition.map(|nvt| {
-                let sc = TransitionStorageClass::from(nvt.storage_class.as_str());
-                let builder = SdkNvt::builder()
-                    .noncurrent_days(nvt.noncurrent_days)
-                    .storage_class(sc);
-                vec![builder.build()]
-            });
-
-            let abort = rule.abort_incomplete_multipart_upload_days.map(|days| {
-                AbortIncompleteMultipartUpload::builder()
-                    .days_after_initiation(days)
-                    .build()
-            });
-
-            let mut builder = SdkRule::builder().id(&rule.id).status(status);
-            if let Some(filter) = filter {
-                builder = builder.filter(filter);
-            }
-            if let Some(expiration) = expiration {
-                builder = builder.expiration(expiration);
-            }
-            if let Some(transitions) = transitions {
-                builder = builder.set_transitions(Some(transitions));
-            }
-            if let Some(nve) = nve {
-                builder = builder.noncurrent_version_expiration(nve);
-            }
-            if let Some(nvt) = nvt {
-                builder = builder.set_noncurrent_version_transitions(Some(nvt));
-            }
-            if let Some(abort) = abort {
-                builder = builder.abort_incomplete_multipart_upload(abort);
-            }
-
-            let sdk_rule = builder
-                .build()
-                .map_err(|e| Error::General(format!("build lifecycle rule: {e}")))?;
-            sdk_rules.push(sdk_rule);
+        for rule in &rules {
+            validate_lifecycle_rule(rule)?;
         }
 
-        let config = BucketLifecycleConfiguration::builder()
-            .set_rules(Some(sdk_rules))
-            .build()
-            .map_err(|e| Error::General(format!("build lifecycle config: {e}")))?;
-
-        self.inner
-            .put_bucket_lifecycle_configuration()
-            .bucket(bucket)
-            .lifecycle_configuration(config)
-            .send()
+        let url = self.lifecycle_url(bucket)?;
+        let body = build_lifecycle_configuration_xml(&rules).into_bytes();
+        self.xml_request_with_content_md5(Method::PUT, url, Some("application/xml"), Some(body))
             .await
-            .map_err(|e| {
-                Error::General(format!(
-                    "set_bucket_lifecycle: {}",
-                    Self::format_sdk_error(&e)
-                ))
-            })?;
+            .map_err(|error| Error::General(format!("set_bucket_lifecycle: {error}")))?;
 
         Ok(())
     }
@@ -6737,6 +6559,7 @@ mod tests {
         method: String,
         target: String,
         headers: Vec<(String, String)>,
+        body: Vec<u8>,
     }
 
     fn test_s3_client(
@@ -7046,6 +6869,7 @@ mod tests {
             method,
             target,
             headers,
+            body: buffer[header_end..header_end + content_length].to_vec(),
         }
     }
 
@@ -7435,37 +7259,108 @@ mod tests {
     }
 
     #[test]
-    fn build_lifecycle_rule_filter_preserves_prefix_and_tags() {
-        let mut tags = HashMap::new();
-        tags.insert("env".to_string(), "prod".to_string());
-        tags.insert("team".to_string(), "core".to_string());
+    fn missing_lifecycle_configuration_detection_does_not_hide_missing_bucket() {
+        assert!(is_missing_lifecycle_configuration_error(
+            "HTTP 404: <Code>NoSuchLifecycleConfiguration</Code>"
+        ));
+        assert!(is_missing_lifecycle_configuration_error(
+            "lifecycle configuration is not found"
+        ));
+        assert!(is_missing_lifecycle_configuration_error(
+            "The lifecycle configuration was not found"
+        ));
+        assert!(is_missing_lifecycle_configuration_error(
+            "HTTP 404: The lifecycle configuration does not exist"
+        ));
+        assert!(!is_missing_lifecycle_configuration_error(
+            "HTTP 404: <Code>NoSuchBucket</Code>"
+        ));
+        assert!(!is_missing_lifecycle_configuration_error("HTTP 404"));
+    }
 
-        let filter = build_lifecycle_rule_filter(Some("logs/"), Some(&tags))
-            .expect("build lifecycle filter")
-            .expect("lifecycle filter");
+    #[tokio::test]
+    async fn get_bucket_lifecycle_maps_only_missing_configuration_to_empty_rules() {
+        let missing_config_body = b"<Error><Code>NoSuchLifecycleConfiguration</Code></Error>";
+        let mut missing_config_response = format!(
+            "HTTP/1.1 404 Not Found\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            missing_config_body.len()
+        )
+        .into_bytes();
+        missing_config_response.extend_from_slice(missing_config_body);
+        let (missing_config_endpoint, missing_config_receiver, missing_config_server) =
+            start_replication_extension_test_server(missing_config_response);
+        let (missing_config_client, _) =
+            test_s3_client_with_endpoint(&missing_config_endpoint, None);
+        let rules = ObjectStore::get_bucket_lifecycle(&missing_config_client, "bucket")
+            .await
+            .expect("missing lifecycle configuration should be empty");
+        assert!(rules.is_empty());
+        missing_config_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("missing configuration request should be captured");
+        missing_config_server
+            .join()
+            .expect("missing configuration server should finish");
 
-        assert_eq!(
-            parse_lifecycle_filter_prefix(Some(&filter)).as_deref(),
-            Some("logs/")
+        let missing_bucket_body = b"<Error><Code>NoSuchBucket</Code></Error>";
+        let mut missing_bucket_response = format!(
+            "HTTP/1.1 404 Not Found\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            missing_bucket_body.len()
+        )
+        .into_bytes();
+        missing_bucket_response.extend_from_slice(missing_bucket_body);
+        let (missing_bucket_endpoint, missing_bucket_receiver, missing_bucket_server) =
+            start_replication_extension_test_server(missing_bucket_response);
+        let (missing_bucket_client, _) =
+            test_s3_client_with_endpoint(&missing_bucket_endpoint, None);
+        let result = ObjectStore::get_bucket_lifecycle(&missing_bucket_client, "bucket").await;
+        assert!(
+            matches!(result, Err(Error::General(ref message)) if message.contains("NoSuchBucket")),
+            "missing bucket must not be reported as an empty lifecycle configuration: {result:?}"
         );
-        let parsed_tags = parse_lifecycle_filter_tags(Some(&filter)).expect("parsed tags");
-        assert_eq!(parsed_tags.get("env").map(String::as_str), Some("prod"));
-        assert_eq!(parsed_tags.get("team").map(String::as_str), Some("core"));
+        missing_bucket_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("missing bucket request should be captured");
+        missing_bucket_server
+            .join()
+            .expect("missing bucket server should finish");
+
+        let malformed_body = b"<LifecycleConfiguration><Rule>";
+        let mut malformed_response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            malformed_body.len()
+        )
+        .into_bytes();
+        malformed_response.extend_from_slice(malformed_body);
+        let (malformed_endpoint, malformed_receiver, malformed_server) =
+            start_replication_extension_test_server(malformed_response);
+        let (malformed_client, _) = test_s3_client_with_endpoint(&malformed_endpoint, None);
+        let result = ObjectStore::get_bucket_lifecycle(&malformed_client, "bucket").await;
+        assert!(
+            matches!(result, Err(Error::General(ref message)) if message.contains("parse bucket lifecycle xml")),
+            "malformed lifecycle XML must not become an empty configuration: {result:?}"
+        );
+        malformed_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("malformed lifecycle request should be captured");
+        malformed_server
+            .join()
+            .expect("malformed lifecycle server should finish");
     }
 
     #[tokio::test]
     async fn set_bucket_lifecycle_serializes_marker_only_expiration() {
-        let response = http::Response::builder()
-            .status(200)
-            .body(SdkBody::empty())
-            .expect("build lifecycle response");
-        let (client, request_receiver) = test_s3_client(Some(response));
+        let (endpoint, request_receiver, server_handle) = start_replication_extension_test_server(
+            b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_vec(),
+        );
+        let (client, _) = test_s3_client_with_endpoint(&endpoint, None);
         let rule = LifecycleRule {
             id: "marker-only".to_string(),
             status: rc_core::LifecycleRuleStatus::Enabled,
             prefix: Some(String::new()),
             tags: None,
             expiration: None,
+            del_marker_expiration: None,
             transition: None,
             noncurrent_version_expiration: None,
             noncurrent_version_transition: None,
@@ -7477,27 +7372,31 @@ mod tests {
             .await
             .expect("set marker-only lifecycle rule");
 
-        let request = request_receiver.expect_request();
-        let body = request.body().bytes().expect("request body bytes");
-        let body = std::str::from_utf8(body).expect("request body is utf8");
+        let request = request_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("server should capture lifecycle request");
+        let body = std::str::from_utf8(&request.body).expect("request body is utf8");
+        assert_eq!(request.method, "PUT");
+        assert_eq!(request.target, "/bucket?lifecycle=");
         assert!(body.contains(
             "<Expiration><ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker></Expiration>"
         ));
+        server_handle.join().expect("server thread should finish");
     }
 
     #[tokio::test]
     async fn set_bucket_lifecycle_serializes_noncurrent_expiration_with_marker_cleanup() {
-        let response = http::Response::builder()
-            .status(200)
-            .body(SdkBody::empty())
-            .expect("build lifecycle response");
-        let (client, request_receiver) = test_s3_client(Some(response));
+        let (endpoint, request_receiver, server_handle) = start_replication_extension_test_server(
+            b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_vec(),
+        );
+        let (client, _) = test_s3_client_with_endpoint(&endpoint, None);
         let rule = LifecycleRule {
             id: "noncurrent-marker".to_string(),
             status: rc_core::LifecycleRuleStatus::Enabled,
             prefix: Some(String::new()),
             tags: None,
             expiration: None,
+            del_marker_expiration: None,
             transition: None,
             noncurrent_version_expiration: Some(rc_core::NoncurrentVersionExpiration {
                 noncurrent_days: 1,
@@ -7512,9 +7411,10 @@ mod tests {
             .await
             .expect("set noncurrent lifecycle rule with marker cleanup");
 
-        let request = request_receiver.expect_request();
-        let body = request.body().bytes().expect("request body bytes");
-        let body = std::str::from_utf8(body).expect("request body is utf8");
+        let request = request_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("server should capture lifecycle request");
+        let body = std::str::from_utf8(&request.body).expect("request body is utf8");
         assert!(body.contains(
             "<NoncurrentVersionExpiration><NoncurrentDays>1</NoncurrentDays></NoncurrentVersionExpiration>"
         ));
@@ -7523,14 +7423,54 @@ mod tests {
         ));
         assert!(!body.contains("<Expiration><Days>"));
         assert!(!body.contains("<Expiration><Date>"));
+        server_handle.join().expect("server thread should finish");
+    }
+
+    #[tokio::test]
+    async fn set_bucket_lifecycle_serializes_extension_expirations_and_content_md5() {
+        let (endpoint, request_receiver, server_handle) = start_replication_extension_test_server(
+            b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_vec(),
+        );
+        let (client, _) = test_s3_client_with_endpoint(&endpoint, None);
+        let rule = LifecycleRule {
+            id: "extensions".to_string(),
+            status: rc_core::LifecycleRuleStatus::Enabled,
+            prefix: Some("test/".to_string()),
+            tags: None,
+            expiration: Some(rc_core::LifecycleExpiration {
+                days: Some(1),
+                date: None,
+                expired_object_all_versions: Some(true),
+            }),
+            del_marker_expiration: Some(rc_core::LifecycleDelMarkerExpiration { days: Some(1) }),
+            transition: None,
+            noncurrent_version_expiration: None,
+            noncurrent_version_transition: None,
+            abort_incomplete_multipart_upload_days: None,
+            expired_object_delete_marker: None,
+        };
+
+        ObjectStore::set_bucket_lifecycle(&client, "bucket", vec![rule])
+            .await
+            .expect("set extension lifecycle rule");
+
+        let request = request_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("server should capture lifecycle request");
+        let body = std::str::from_utf8(&request.body).expect("request body is utf8");
+        assert!(body.contains("<ExpiredObjectAllVersions>true</ExpiredObjectAllVersions>"));
+        assert!(body.contains("<DelMarkerExpiration><Days>1</Days></DelMarkerExpiration>"));
+        let expected_md5 = BASE64_STANDARD.encode(Md5::digest(&request.body));
+        assert_eq!(
+            header_value(&request.headers, "content-md5"),
+            Some(expected_md5.as_str())
+        );
+        server_handle.join().expect("server thread should finish");
     }
 
     #[tokio::test]
     async fn get_then_set_bucket_lifecycle_preserves_marker_cleanup() {
-        let get_response = http::Response::builder()
-            .status(200)
-            .body(SdkBody::from(
-                r#"<?xml version="1.0" encoding="UTF-8"?>
+        let get_body = br#"<?xml version="1.0" encoding="UTF-8"?>
 <LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
   <Rule>
     <ID>noncurrent-marker</ID>
@@ -7538,31 +7478,53 @@ mod tests {
     <Filter><Prefix></Prefix></Filter>
     <NoncurrentVersionExpiration><NoncurrentDays>1</NoncurrentDays></NoncurrentVersionExpiration>
     <Expiration><ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker></Expiration>
+    <DelMarkerExpiration><Days>2</Days></DelMarkerExpiration>
   </Rule>
-</LifecycleConfiguration>"#,
-            ))
-            .expect("build get lifecycle response");
-        let (read_client, _read_request_receiver) = test_s3_client(Some(get_response));
+</LifecycleConfiguration>"#;
+        let mut get_response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/xml\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            get_body.len()
+        )
+        .into_bytes();
+        get_response.extend_from_slice(get_body);
+        let (get_endpoint, _get_request_receiver, get_server_handle) =
+            start_replication_extension_test_server(get_response);
+        let (read_client, _) = test_s3_client_with_endpoint(&get_endpoint, None);
         let rules = ObjectStore::get_bucket_lifecycle(&read_client, "bucket")
             .await
             .expect("get lifecycle rules");
         assert_eq!(rules[0].expired_object_delete_marker, Some(true));
+        assert_eq!(
+            rules[0]
+                .del_marker_expiration
+                .as_ref()
+                .and_then(|expiration| expiration.days),
+            Some(2)
+        );
+        get_server_handle
+            .join()
+            .expect("get server thread should finish");
 
-        let set_response = http::Response::builder()
-            .status(200)
-            .body(SdkBody::empty())
-            .expect("build set lifecycle response");
-        let (write_client, write_request_receiver) = test_s3_client(Some(set_response));
+        let (put_endpoint, put_request_receiver, put_server_handle) =
+            start_replication_extension_test_server(
+                b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_vec(),
+            );
+        let (write_client, _) = test_s3_client_with_endpoint(&put_endpoint, None);
         ObjectStore::set_bucket_lifecycle(&write_client, "bucket", rules)
             .await
             .expect("write lifecycle rules back");
 
-        let request = write_request_receiver.expect_request();
-        let body = request.body().bytes().expect("request body bytes");
-        let body = std::str::from_utf8(body).expect("request body is utf8");
+        let request = put_request_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("put server should capture lifecycle request");
+        let body = std::str::from_utf8(&request.body).expect("request body is utf8");
         assert!(body.contains(
             "<Expiration><ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker></Expiration>"
         ));
+        assert!(body.contains("<DelMarkerExpiration><Days>2</Days></DelMarkerExpiration>"));
+        put_server_handle
+            .join()
+            .expect("put server thread should finish");
     }
 
     #[tokio::test]
@@ -7579,7 +7541,9 @@ mod tests {
                 expiration: Some(rc_core::LifecycleExpiration {
                     days: Some(30),
                     date: None,
+                    expired_object_all_versions: None,
                 }),
+                del_marker_expiration: None,
                 transition: None,
                 noncurrent_version_expiration: None,
                 noncurrent_version_transition: None,
@@ -7592,6 +7556,7 @@ mod tests {
                 prefix: None,
                 tags: Some(tags),
                 expiration: None,
+                del_marker_expiration: None,
                 transition: None,
                 noncurrent_version_expiration: None,
                 noncurrent_version_transition: None,
@@ -7603,6 +7568,68 @@ mod tests {
         for rule in rules {
             let result = ObjectStore::set_bucket_lifecycle(&client, "bucket", vec![rule]).await;
             assert!(matches!(result, Err(Error::InvalidPath(_))));
+        }
+        request_receiver.expect_no_request();
+    }
+
+    #[tokio::test]
+    async fn set_bucket_lifecycle_rejects_invalid_extension_values() {
+        let (client, request_receiver) = test_s3_client(None);
+        let rules = [
+            LifecycleRule {
+                id: "all-versions-without-days".to_string(),
+                status: rc_core::LifecycleRuleStatus::Enabled,
+                prefix: None,
+                tags: None,
+                expiration: Some(rc_core::LifecycleExpiration {
+                    days: None,
+                    date: None,
+                    expired_object_all_versions: Some(true),
+                }),
+                del_marker_expiration: None,
+                transition: None,
+                noncurrent_version_expiration: None,
+                noncurrent_version_transition: None,
+                abort_incomplete_multipart_upload_days: None,
+                expired_object_delete_marker: None,
+            },
+            LifecycleRule {
+                id: "all-versions-with-date".to_string(),
+                status: rc_core::LifecycleRuleStatus::Enabled,
+                prefix: None,
+                tags: None,
+                expiration: Some(rc_core::LifecycleExpiration {
+                    days: Some(1),
+                    date: Some("2026-01-01T00:00:00Z".to_string()),
+                    expired_object_all_versions: Some(false),
+                }),
+                del_marker_expiration: None,
+                transition: None,
+                noncurrent_version_expiration: None,
+                noncurrent_version_transition: None,
+                abort_incomplete_multipart_upload_days: None,
+                expired_object_delete_marker: None,
+            },
+            LifecycleRule {
+                id: "delete-marker-without-days".to_string(),
+                status: rc_core::LifecycleRuleStatus::Enabled,
+                prefix: None,
+                tags: None,
+                expiration: None,
+                del_marker_expiration: Some(rc_core::LifecycleDelMarkerExpiration { days: None }),
+                transition: None,
+                noncurrent_version_expiration: None,
+                noncurrent_version_transition: None,
+                abort_incomplete_multipart_upload_days: None,
+                expired_object_delete_marker: None,
+            },
+        ];
+
+        for rule in rules {
+            assert!(matches!(
+                ObjectStore::set_bucket_lifecycle(&client, "bucket", vec![rule]).await,
+                Err(Error::InvalidPath(_))
+            ));
         }
         request_receiver.expect_no_request();
     }
@@ -8117,6 +8144,20 @@ mod tests {
         let url = client.cors_url("bucket-name").expect("build cors url");
 
         assert_eq!(url.as_str(), "https://example.com/bucket-name?cors=");
+    }
+
+    #[test]
+    fn lifecycle_url_uses_dns_style_when_alias_requests_dns() {
+        let (mut client, _) = test_s3_client(None);
+        client.alias.bucket_lookup = "dns".to_string();
+
+        let url = client
+            .lifecycle_url("bucket-name")
+            .expect("build lifecycle url");
+
+        assert_eq!(url.host_str(), Some("bucket-name.example.com"));
+        assert_eq!(url.path(), "/");
+        assert_eq!(url.query(), Some("lifecycle="));
     }
 
     #[test]
