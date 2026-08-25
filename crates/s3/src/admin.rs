@@ -14,12 +14,12 @@ use aws_sigv4::sign::v4;
 use bytes::Bytes;
 use futures::StreamExt;
 use rc_core::admin::{
-    AccessKeyInfo, AccessKeyKind, AccessKeyProvider, AccessKeyRecord, AdminApi, BucketMetadataApi,
-    BucketMetadataArchive, BucketQuota, BulkAccessKeyApi, BulkAccessKeyQuery, CapabilityApi,
-    CapabilityAvailability, CapabilityEntry, CapabilityReport, ClusterInfo,
-    ClusterSnapshotDocument, ClusterSnapshotMetadata, ClusterSnapshotSummary, ConfigApi,
-    ConfigDocument, ConfigHelp, ConfigHistoryEntry, ConfigMutationResult,
-    CreateServiceAccountRequest, DecommissionPoolStatus, DecommissionStatus,
+    AccessKeyInfo, AccessKeyKind, AccessKeyProvider, AccessKeyRecord, AccountApi, AccountInfo,
+    AccountMfaApi, AdminApi, BucketMetadataApi, BucketMetadataArchive, BucketQuota,
+    BulkAccessKeyApi, BulkAccessKeyQuery, CapabilityApi, CapabilityAvailability, CapabilityEntry,
+    CapabilityReport, ClusterInfo, ClusterSnapshotDocument, ClusterSnapshotMetadata,
+    ClusterSnapshotSummary, ConfigApi, ConfigDocument, ConfigHelp, ConfigHistoryEntry,
+    ConfigMutationResult, CreateServiceAccountRequest, DecommissionPoolStatus, DecommissionStatus,
     DetailedHealthSnapshot, DiagnosticCapability, DiagnosticReadApi, EncryptedInspectArchive,
     ExtensionsCatalog, Group, GroupStatus, HealRuntimeState, HealScanMode, HealStartRequest,
     HealStatus, HealTaskRequest, IAM_ACCESS_KEYS_BULK_CAPABILITY,
@@ -30,7 +30,7 @@ use rc_core::admin::{
     InspectArchiveCapabilityContract, InspectArchiveTransportRequest, KmsApi, KmsBackendKind,
     KmsCacheSummary, KmsCancelKeyDeletionResult, KmsConfigSummary, KmsConfigureRequest,
     KmsCreateKeyRequest, KmsCreateKeyResult, KmsDeleteKeyRequest, KmsDeleteKeyResult, KmsKey,
-    KmsKeyPage, KmsKeyState, KmsKeyUsage, KmsServiceState, KmsStatus,
+    KmsKeyPage, KmsKeyState, KmsKeyUsage, KmsServiceState, KmsStatus, MAX_ACCOUNT_RESPONSE_BYTES,
     MAX_BUCKET_METADATA_ARCHIVE_BYTES, MAX_DIAGNOSTIC_RESPONSE_BYTES, MAX_IAM_ACCESS_KEY_RESULTS,
     MAX_IAM_ACCESS_KEYS_RESPONSE_BYTES, MAX_IAM_ARCHIVE_BYTES, MAX_IAM_IMPORT_RESPONSE_BYTES,
     MAX_IAM_POLICY_DETACH_REQUEST_BYTES, MAX_IAM_POLICY_DETACH_RESPONSE_BYTES,
@@ -40,20 +40,20 @@ use rc_core::admin::{
     MAX_SITE_REPLICATION_ERROR_RESPONSE_BYTES, MAX_SITE_REPLICATION_REPAIR_RESPONSE_BYTES,
     MAX_SITE_REPLICATION_REQUEST_BYTES, MAX_SITE_REPLICATION_SUCCESS_RESPONSE_BYTES,
     ManualTransitionJobResponse, ManualTransitionRunRequest, ManualTransitionRunResponse,
-    MetricsBatch, MetricsQuery, ModuleSwitches, ObservabilityApi, OidcMutationApi,
-    OidcMutationRequest, OidcMutationResult, OidcProvider, OidcProviderList, OidcReadApi,
-    OidcValidationRequest, OidcValidationResult, PeerSiteSpec, Policy, PolicyDetachEntity,
-    PolicyDetachRequest, PolicyDetachResult, PolicyEntitiesQuery, PolicyEntitiesResult,
-    PolicyEntity, PolicyInfo, PoolStatus, PoolTarget, RealtimeMetrics, RebalanceStartResult,
-    RebalanceStatus, ReplicateEditStatus, ReplicationDiff, ReplicationDiffApi,
-    ReplicationInspectionApi, ReplicationMetricScope, ReplicationMetrics, ReplicationMrf,
-    RuntimeCapabilitiesSnapshot, RuntimeCapabilityStatus, ScannerStatus, ServiceAccount,
-    ServiceAccountCreateResponse, ServiceActionResult, SiteRemoveSpec, SiteReplicationInfo,
-    SiteReplicationPeer, SiteReplicationRepairApi, SiteReplicationRepairCapabilityContract,
-    SiteReplicationRepairOperationStatus, SiteReplicationRepairPreflight,
-    SiteReplicationRepairRequest, SiteReplicationResyncOperation, SiteReplicationResyncStatus,
-    SiteStatusOptions, StorageInfo, UpdateGroupMembersRequest, UpdateServiceAccountRequest, User,
-    UserStatus,
+    MetricsBatch, MetricsQuery, MfaEnrollment, MfaStatus, ModuleSwitches, ObservabilityApi,
+    OidcMutationApi, OidcMutationRequest, OidcMutationResult, OidcProvider, OidcProviderList,
+    OidcReadApi, OidcValidationRequest, OidcValidationResult, PasswordChangeResult, PeerSiteSpec,
+    Policy, PolicyDetachEntity, PolicyDetachRequest, PolicyDetachResult, PolicyEntitiesQuery,
+    PolicyEntitiesResult, PolicyEntity, PolicyInfo, PoolStatus, PoolTarget, RealtimeMetrics,
+    RebalanceStartResult, RebalanceStatus, RecoveryCodes, ReplicateEditStatus, ReplicationDiff,
+    ReplicationDiffApi, ReplicationInspectionApi, ReplicationMetricScope, ReplicationMetrics,
+    ReplicationMrf, RuntimeCapabilitiesSnapshot, RuntimeCapabilityStatus, ScannerStatus,
+    SecretValue, ServiceAccount, ServiceAccountCreateResponse, ServiceActionResult, SiteRemoveSpec,
+    SiteReplicationInfo, SiteReplicationPeer, SiteReplicationRepairApi,
+    SiteReplicationRepairCapabilityContract, SiteReplicationRepairOperationStatus,
+    SiteReplicationRepairPreflight, SiteReplicationRepairRequest, SiteReplicationResyncOperation,
+    SiteReplicationResyncStatus, SiteStatusOptions, StorageInfo, UpdateGroupMembersRequest,
+    UpdateServiceAccountRequest, User, UserCredentialApi, UserMfaStatus, UserStatus,
 };
 use rc_core::{Alias, Error, Result};
 use reqwest::header::{CACHE_CONTROL, CONTENT_TYPE, HOST, HeaderMap, HeaderName, HeaderValue};
@@ -718,6 +718,81 @@ impl AdminClient {
         }
 
         serde_json::from_slice(&response_body).map_err(Error::Json)
+    }
+
+    /// One bounded, signed admin request for the account/MFA family, returning
+    /// the raw response body.
+    ///
+    /// Bounded because an MFA response carries a rendered QR and a recovery-code
+    /// set: generous, but never unbounded.
+    async fn request_account_bytes(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&[u8]>,
+    ) -> Result<Vec<u8>> {
+        let url = self.admin_url(path);
+        let body_bytes = body.unwrap_or_default();
+        let headers = self.request_headers(body_bytes)?;
+        let signed_headers = self
+            .sign_request(&method, &url, &headers, body_bytes)
+            .await?;
+        let mut request = self.http_client.request(method, &url);
+        for (name, value) in &signed_headers {
+            request = request.header(name, value);
+        }
+        if !body_bytes.is_empty() {
+            request = request.body(body_bytes.to_vec());
+        }
+
+        let response = request
+            .send()
+            .await
+            .map_err(|_| Error::Network("Account administration request failed".to_string()))?;
+        let status = response.status();
+        let response_body = read_bounded_response_body(
+            response,
+            MAX_ACCOUNT_RESPONSE_BYTES,
+            "Account administration response",
+        )
+        .await?;
+
+        if !status.is_success() {
+            return Err(self.map_error(status, &String::from_utf8_lossy(&response_body)));
+        }
+
+        Ok(response_body)
+    }
+
+    /// A request whose response is a JSON document.
+    ///
+    /// An empty body is an error rather than a default value: silently returning
+    /// an empty struct would report "two-factor authentication is off" for a
+    /// response that never arrived.
+    async fn request_account_json<T: for<'de> Deserialize<'de>>(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&[u8]>,
+    ) -> Result<T> {
+        let response_body = self.request_account_bytes(method, path, body).await?;
+        if response_body.is_empty() {
+            return Err(Error::General(
+                "RustFS returned an empty account administration response".to_string(),
+            ));
+        }
+        serde_json::from_slice(&response_body).map_err(Error::Json)
+    }
+
+    /// A request whose success carries no body.
+    async fn request_account_empty(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&[u8]>,
+    ) -> Result<()> {
+        self.request_account_bytes(method, path, body).await?;
+        Ok(())
     }
 
     async fn request_oidc<T: for<'de> Deserialize<'de>>(
@@ -3319,6 +3394,145 @@ impl OidcReadApi for AdminClient {
         })?;
         Ok(response)
     }
+}
+
+#[async_trait]
+impl AccountApi for AdminClient {
+    async fn account_info(&self) -> Result<AccountInfo> {
+        self.request_account_json(Method::GET, "/account/info", None)
+            .await
+    }
+
+    async fn account_change_password(
+        &self,
+        current_secret_key: &SecretValue,
+        new_secret_key: &SecretValue,
+    ) -> Result<PasswordChangeResult> {
+        if current_secret_key.is_empty() || new_secret_key.is_empty() {
+            return Err(Error::InvalidPath(
+                "Both the current and the new secret key are required".to_string(),
+            ));
+        }
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "current_secret_key": current_secret_key.expose(),
+            "new_secret_key": new_secret_key.expose(),
+        }))
+        .map_err(|_| Error::General("Failed to encode the password change request".to_string()))?;
+
+        self.request_account_json(Method::POST, "/account/password", Some(&body))
+            .await
+    }
+}
+
+#[async_trait]
+impl AccountMfaApi for AdminClient {
+    async fn account_mfa_status(&self) -> Result<MfaStatus> {
+        self.request_account_json(Method::GET, "/account/mfa", None)
+            .await
+    }
+
+    async fn account_mfa_enroll(&self) -> Result<MfaEnrollment> {
+        // An empty JSON object rather than no body: the endpoint is a POST and
+        // some proxies drop a bodyless one.
+        self.request_account_json(Method::POST, "/account/mfa/enroll", Some(b"{}"))
+            .await
+    }
+
+    async fn account_mfa_activate(&self, code: &SecretValue) -> Result<RecoveryCodes> {
+        let body = encode_code_request(code)?;
+        self.request_account_json(Method::POST, "/account/mfa/activate", Some(&body))
+            .await
+    }
+
+    async fn account_mfa_disable(
+        &self,
+        code: &SecretValue,
+        current_secret_key: &SecretValue,
+    ) -> Result<()> {
+        if code.is_empty() || current_secret_key.is_empty() {
+            return Err(Error::InvalidPath(
+                "Turning off two-factor authentication needs both a code and the account password"
+                    .to_string(),
+            ));
+        }
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "code": code.expose(),
+            "current_secret_key": current_secret_key.expose(),
+        }))
+        .map_err(|_| Error::General("Failed to encode the disable request".to_string()))?;
+
+        self.request_account_empty(Method::POST, "/account/mfa/disable", Some(&body))
+            .await
+    }
+
+    async fn account_mfa_recovery_codes(&self, code: &SecretValue) -> Result<RecoveryCodes> {
+        let body = encode_code_request(code)?;
+        self.request_account_json(Method::POST, "/account/mfa/recovery-codes", Some(&body))
+            .await
+    }
+}
+
+#[async_trait]
+impl UserCredentialApi for AdminClient {
+    async fn set_user_secret_key(
+        &self,
+        access_key: &str,
+        secret_key: &SecretValue,
+    ) -> Result<PasswordChangeResult> {
+        if access_key.is_empty() {
+            return Err(Error::InvalidPath(
+                "Access key must not be empty".to_string(),
+            ));
+        }
+        if secret_key.is_empty() {
+            return Err(Error::InvalidPath(
+                "Secret key must not be empty".to_string(),
+            ));
+        }
+
+        let body = serde_json::to_vec(&serde_json::json!({ "secret_key": secret_key.expose() }))
+            .map_err(|_| Error::General("Failed to encode the secret key request".to_string()))?;
+        let path = format!(
+            "/set-user-secret-key?accessKey={}",
+            urlencoding::encode(access_key)
+        );
+
+        self.request_account_json(Method::PUT, &path, Some(&body))
+            .await
+    }
+
+    async fn user_mfa_status(&self, access_key: &str) -> Result<UserMfaStatus> {
+        if access_key.is_empty() {
+            return Err(Error::InvalidPath(
+                "Access key must not be empty".to_string(),
+            ));
+        }
+        let path = format!("/user/mfa?accessKey={}", urlencoding::encode(access_key));
+        self.request_account_json(Method::GET, &path, None).await
+    }
+
+    async fn user_mfa_reset(&self, access_key: &str) -> Result<()> {
+        if access_key.is_empty() {
+            return Err(Error::InvalidPath(
+                "Access key must not be empty".to_string(),
+            ));
+        }
+        let path = format!("/user/mfa?accessKey={}", urlencoding::encode(access_key));
+        self.request_account_empty(Method::DELETE, &path, None)
+            .await
+    }
+}
+
+fn encode_code_request(code: &SecretValue) -> Result<Vec<u8>> {
+    if code.is_empty() {
+        return Err(Error::InvalidPath(
+            "A verification code is required".to_string(),
+        ));
+    }
+    serde_json::to_vec(&serde_json::json!({ "code": code.expose() }))
+        .map_err(|_| Error::General("Failed to encode the verification request".to_string()))
 }
 
 #[async_trait]
