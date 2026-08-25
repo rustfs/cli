@@ -1,6 +1,7 @@
 //! mirror command - Synchronize trees between local filesystems and S3-compatible storage.
 
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -495,7 +496,12 @@ impl LiveMirrorIo {
             ));
         };
 
-        match self.target_disposition(operation).await? {
+        let disposition =
+            source_preflight_then_target(source_client.as_ref(), source_path, operation, || {
+                self.target_disposition(operation)
+            })
+            .await?;
+        match disposition {
             TargetDisposition::AlreadyComplete => {
                 return Ok(operation.source.snapshot.size_bytes.unwrap_or_default());
             }
@@ -603,24 +609,50 @@ impl LiveMirrorIo {
         operation: &MirrorCopyOperation,
     ) -> rc_core::Result<TargetDisposition> {
         let current = self.target.current_entry(&operation.relative_path).await?;
-        if let Some(current) = &current
-            && source_matches_target(&operation.source, current, self.compare)
-        {
-            return Ok(TargetDisposition::AlreadyComplete);
-        }
+        target_disposition_for_current(operation, current.as_ref(), self.compare)
+    }
+}
 
-        match (&operation.target_before, current) {
-            (None, None) => Ok(TargetDisposition::Ready),
-            (Some(expected), Some(current))
-                if expected.snapshot.content_matches(&current.snapshot) =>
-            {
-                Ok(TargetDisposition::Ready)
-            }
-            _ => Err(Error::Conflict(format!(
-                "Destination changed after mirror planning: {}",
-                operation.relative_path
-            ))),
+async fn source_preflight_then_target<S, F, Fut, T>(
+    source_client: &S,
+    source_path: &RemotePath,
+    operation: &MirrorCopyOperation,
+    target_check: F,
+) -> rc_core::Result<T>
+where
+    S: MirrorRemoteTransfer + ?Sized,
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = rc_core::Result<T>>,
+{
+    let before = source_client.mirror_head(source_path).await?;
+    ensure_snapshot_matches(&operation.source, &before)?;
+    target_check().await
+}
+
+fn target_disposition_for_current(
+    operation: &MirrorCopyOperation,
+    current: Option<&MirrorEntry>,
+    compare: CompareMode,
+) -> rc_core::Result<TargetDisposition> {
+    if let Some(current) = current
+        && operation
+            .target_before
+            .as_ref()
+            .is_some_and(|expected| expected.snapshot.content_matches(&current.snapshot))
+        && source_matches_target(&operation.source, current, compare)
+    {
+        return Ok(TargetDisposition::AlreadyComplete);
+    }
+
+    match (&operation.target_before, current) {
+        (None, None) => Ok(TargetDisposition::Ready),
+        (Some(expected), Some(current)) if expected.snapshot.content_matches(&current.snapshot) => {
+            Ok(TargetDisposition::Ready)
         }
+        _ => Err(Error::Conflict(format!(
+            "Destination changed after mirror planning: {}",
+            operation.relative_path
+        ))),
     }
 }
 

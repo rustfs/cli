@@ -794,6 +794,26 @@ async fn truncated_remote_download_is_rejected_and_cleaned_before_upload() {
 }
 
 #[tokio::test]
+async fn remote_source_preflight_runs_before_target_identity_check() {
+    let (mut source, operation) = remote_transfer_fixture(4, None);
+    source.info.etag = Some("replacement-etag".to_string());
+    let MirrorLocation::Remote(source_path) = &operation.source.location else {
+        panic!("expected remote source")
+    };
+    let target_checked = Arc::new(Mutex::new(false));
+    let target_checked_for_check = Arc::clone(&target_checked);
+
+    let result = source_preflight_then_target(&source, source_path, &operation, || async move {
+        *target_checked_for_check.lock().expect("target check lock") = true;
+        Ok::<(), Error>(())
+    })
+    .await;
+
+    assert!(matches!(result, Err(Error::Conflict(_))));
+    assert!(!*target_checked.lock().expect("target check lock"));
+}
+
+#[tokio::test]
 async fn cancelling_a_remote_transfer_drops_and_removes_its_staging_file() {
     let (mut source, operation) = remote_transfer_fixture(4, None);
     let started = Arc::new(tokio::sync::Notify::new());
@@ -902,6 +922,57 @@ fn auto_compare_skips_when_source_etag_is_preserved_in_destination_metadata() {
 
     assert!(plan.items.is_empty());
     assert_eq!(plan.summary.skipped, 1);
+}
+
+#[test]
+fn runtime_identity_shortcut_requires_the_planned_destination_snapshot() {
+    let source = remote_entry("src", "source/report.txt", "report.txt", "source-etag");
+    let current = remote_entry_with_identity(
+        "dst",
+        "backup/report.txt",
+        "report.txt",
+        "multipart-etag-1",
+        "source-etag",
+    );
+    let mut operation = MirrorCopyOperation {
+        relative_path: "report.txt".to_string(),
+        source: source.clone(),
+        target: current.location.clone(),
+        target_before: Some(current.clone()),
+    };
+
+    assert!(matches!(
+        target_disposition_for_current(&operation, Some(&current), CompareMode::Auto),
+        Ok(TargetDisposition::AlreadyComplete)
+    ));
+
+    let mut replaced = current.clone();
+    replaced.snapshot.etag = Some("multipart-etag-2".to_string());
+    assert!(matches!(
+        target_disposition_for_current(&operation, Some(&replaced), CompareMode::Auto),
+        Err(Error::Conflict(_))
+    ));
+
+    operation.target_before = None;
+    assert!(matches!(
+        target_disposition_for_current(&operation, Some(&current), CompareMode::Auto),
+        Err(Error::Conflict(_))
+    ));
+}
+
+#[test]
+fn runtime_identity_shortcut_requires_the_current_source_snapshot() {
+    let source = remote_entry("src", "source/report.txt", "report.txt", "source-etag");
+    let mut current = ObjectInfo::file("source/report.txt", 4);
+    current.last_modified = source.snapshot.modified;
+    current.etag = source.snapshot.etag.clone();
+    assert!(ensure_snapshot_matches(&source, &current).is_ok());
+
+    current.etag = Some("replacement-etag".to_string());
+    assert!(matches!(
+        ensure_snapshot_matches(&source, &current),
+        Err(Error::Conflict(_))
+    ));
 }
 
 #[test]
