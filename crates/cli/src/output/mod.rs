@@ -5,6 +5,7 @@
 
 mod formatter;
 mod progress;
+pub mod qr;
 mod v3;
 
 // These exports will be used in Phase 2+ when commands are implemented

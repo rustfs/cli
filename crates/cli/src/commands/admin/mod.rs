@@ -4,6 +4,7 @@
 //! service accounts, and cluster operations through the RustFS Admin API.
 
 mod access_key;
+mod account;
 mod bucket_metadata;
 mod capabilities;
 mod config;
@@ -39,6 +40,10 @@ use rc_s3::AdminClient;
 /// Admin subcommands for IAM and cluster management
 #[derive(Subcommand, Debug)]
 pub enum AdminCommands {
+    /// Manage the identity this alias authenticates as
+    #[command(subcommand)]
+    Account(account::AccountCommands),
+
     /// Discover effective RustFS runtime capabilities
     Capabilities(capabilities::CapabilitiesArgs),
 
@@ -135,6 +140,7 @@ pub async fn execute(cmd: AdminCommands, output_config: OutputConfig) -> ExitCod
     let formatter = Formatter::new(output_config);
 
     match cmd {
+        AdminCommands::Account(account_cmd) => account::execute(account_cmd, &formatter).await,
         AdminCommands::Capabilities(args) => capabilities::execute(args, &formatter).await,
         AdminCommands::Diagnostics(command) => diagnostics::execute(command, &formatter).await,
         AdminCommands::Config(config_cmd) => config::execute(config_cmd, &formatter).await,

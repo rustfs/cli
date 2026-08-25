@@ -257,3 +257,137 @@ mod tests {
         assert!(matches!(symlink_error, Error::InvalidPath(_)));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Account credentials and second-factor codes
+// ---------------------------------------------------------------------------
+
+/// Where a password or verification code comes from.
+///
+/// Every source except an interactive prompt is explicit, because a command that
+/// silently prompts is a command that hangs in CI. `--*-from-env` and `--*-file`
+/// exist so automation never has to put a secret on the command line, where it
+/// would land in the shell history and in `ps` output.
+#[derive(Debug, Clone)]
+pub(crate) enum SecretSource {
+    /// Read from a named environment variable.
+    Environment(String),
+    /// Read from the first line of a file.
+    File(PathBuf),
+    /// Prompt on the terminal, with echo off.
+    Prompt,
+}
+
+impl SecretSource {
+    /// Pick a source from the mutually exclusive flags.
+    ///
+    /// Interactive prompting is only offered when there is a terminal to prompt
+    /// on and the output is human-readable; otherwise the caller is told which
+    /// flag to pass instead of being left to hang.
+    pub(crate) fn resolve(
+        from_env: Option<String>,
+        from_file: Option<PathBuf>,
+        interactive_allowed: bool,
+        what: &str,
+    ) -> Result<Self> {
+        match (from_env, from_file) {
+            (Some(_), Some(_)) => Err(Error::InvalidPath(format!(
+                "Select either an environment variable or a file for the {what}, not both"
+            ))),
+            (Some(name), None) => {
+                if !valid_environment_name(&name) {
+                    return Err(Error::InvalidPath(format!(
+                        "Environment variable name for the {what} is invalid"
+                    )));
+                }
+                Ok(Self::Environment(name))
+            }
+            (None, Some(path)) => {
+                if path.as_os_str().is_empty() {
+                    return Err(Error::InvalidPath(format!(
+                        "File path for the {what} cannot be empty"
+                    )));
+                }
+                Ok(Self::File(path))
+            }
+            (None, None) => {
+                if interactive_allowed {
+                    Ok(Self::Prompt)
+                } else {
+                    Err(Error::InvalidPath(format!(
+                        "Provide the {what} with --{what}-from-env or --{what}-file when running non-interactively or with --json"
+                    )))
+                }
+            }
+        }
+    }
+
+    /// Load the value, prompting with `prompt` when this is [`Self::Prompt`].
+    pub(crate) fn load(&self, prompt: &str) -> Result<Zeroizing<String>> {
+        match self {
+            Self::Environment(name) => {
+                let value = std::env::var(name).map_err(|_| {
+                    Error::InvalidPath(format!("Environment variable '{name}' is not set"))
+                })?;
+                let value = Zeroizing::new(value.trim_end_matches(['\r', '\n']).to_string());
+                if value.is_empty() {
+                    return Err(Error::InvalidPath(format!(
+                        "Environment variable '{name}' is empty"
+                    )));
+                }
+                Ok(value)
+            }
+            Self::File(path) => {
+                let bytes = read_protected_key_file(path)?;
+                let text = String::from_utf8(bytes.to_vec())
+                    .map_err(|_| Error::InvalidPath("Secret file must be UTF-8".to_string()))?;
+                // First line only: an editor-written file usually has a trailing
+                // newline, and a stray second line is more likely a mistake than
+                // part of the secret.
+                let value = Zeroizing::new(
+                    text.lines()
+                        .next()
+                        .unwrap_or_default()
+                        .trim_end_matches(['\r', ' ', '\t'])
+                        .to_string(),
+                );
+                if value.is_empty() {
+                    return Err(Error::InvalidPath("Secret file is empty".to_string()));
+                }
+                Ok(value)
+            }
+            Self::Prompt => {
+                let term = console::Term::stderr();
+                // Prompt on stderr so stdout stays clean for piping.
+                term.write_str(prompt).map_err(Error::Io)?;
+                let value = term.read_secure_line().map_err(Error::Io)?;
+                let value = Zeroizing::new(value);
+                if value.is_empty() {
+                    return Err(Error::Interrupted("No value was entered".to_string()));
+                }
+                Ok(value)
+            }
+        }
+    }
+}
+
+/// Read a verification code, which is not secret enough to hide but is still
+/// kept out of the command line by default.
+pub(crate) fn read_code_interactive(prompt: &str) -> Result<Zeroizing<String>> {
+    let term = console::Term::stderr();
+    term.write_str(prompt).map_err(Error::Io)?;
+    // Echoed, unlike a password: a TOTP code is short-lived, and hiding it only
+    // makes transcription errors harder to spot.
+    let value = term.read_line().map_err(Error::Io)?;
+    let value = Zeroizing::new(value.trim().to_string());
+    if value.is_empty() {
+        return Err(Error::Interrupted("No code was entered".to_string()));
+    }
+    Ok(value)
+}
+
+/// Whether prompting is possible and appropriate.
+pub(crate) fn can_prompt(is_json: bool) -> bool {
+    use std::io::IsTerminal;
+    !is_json && std::io::stdin().is_terminal()
+}

@@ -10,6 +10,13 @@ The `rc admin` operation manages the RustFS Admin API, including scanner and sto
 
 ```bash
 rc [GLOBAL OPTIONS] admin <COMMAND>
+rc admin account info <ALIAS>
+rc admin account passwd <ALIAS> [--current-password-from-env NAME|--current-password-file PATH] [--new-password-from-env NAME|--new-password-file PATH]
+rc admin account mfa status <ALIAS>
+rc admin account mfa enroll <ALIAS> [--no-qr]
+rc admin account mfa activate <ALIAS> [--code CODE|--code-from-env NAME] [--output-file PATH]
+rc admin account mfa disable <ALIAS> [--code CODE|--code-from-env NAME] [--password-from-env NAME|--password-file PATH]
+rc admin account mfa recovery-codes <ALIAS> [--code CODE|--code-from-env NAME] [--output-file PATH]
 rc admin diagnostics <health|cluster|extensions> <ALIAS>
 rc admin info <cluster|server|disk|storage> <ALIAS> [OPTIONS]
 rc admin scanner status <ALIAS>
@@ -40,6 +47,9 @@ rc admin decommission <start|cancel|clear> <ALIAS> <POOL> [OPTIONS]
 rc admin decommission status <ALIAS> [POOL] [OPTIONS]
 rc admin rebalance <start|status|stop> <ALIAS>
 rc admin user <ls|add|info|rm|enable|disable> ...
+rc admin user passwd <ALIAS> <ACCESS_KEY> [--password-from-env NAME|--password-file PATH]
+rc admin user mfa status <ALIAS> <ACCESS_KEY>
+rc admin user mfa reset <ALIAS> <ACCESS_KEY> [--yes]
 rc admin policy <ls|create|info|rm|attach|detach|entities> ...
 rc admin policy detach <ALIAS> <POLICY>... (--user USER | --group GROUP)
 rc admin policy entities <ALIAS> [--user USER]... [--group GROUP]... [--policy POLICY]...
@@ -64,6 +74,7 @@ rc admin replicate remove <ALIAS> <--all|--site <NAME>>
 
 | Command | Description |
 | --- | --- |
+| `account` | Inspect and manage the identity the alias authenticates as: password and two-factor authentication. |
 | `diagnostics` | Read bounded authenticated snapshots or run explicitly confirmed bounded probes. |
 | `info` | Display cluster, server, or disk information. |
 | `scanner` | Inspect scanner health, freshness, and cycle state. |
@@ -75,7 +86,7 @@ rc admin replicate remove <ALIAS> <--all|--site <NAME>>
 | `expand` | Manage post-expansion data rebalancing. Alias: `scale`. |
 | `decommission` | Manage server pool decommissioning. Alias: `decom`. |
 | `rebalance` | Manage post-expansion rebalancing. |
-| `user` | Manage IAM users. |
+| `user` | Manage IAM users, including password resets and break-glass two-factor clearing. |
 | `policy` | Manage IAM policies and attachments. |
 | `access-key` | Inspect individual or bounded pages of secret-free access-key metadata. |
 | `group` | Manage IAM groups and group membership. |
@@ -85,6 +96,96 @@ rc admin replicate remove <ALIAS> <--all|--site <NAME>>
 | `config` | Inspect, plan, export, and mutate RustFS server configuration. |
 | `bucket-metadata` | Export or import validated per-bucket configuration archives. |
 | `replicate` | Manage site replication across clusters. |
+
+## Account and Two-Factor Workflow
+
+`rc admin account` acts on the identity the alias authenticates as. It never
+takes a target access key, so it cannot modify another account; managing someone
+else's credentials is `rc admin user passwd` and `rc admin user mfa`.
+
+```
+rc admin account info <alias>
+rc admin account passwd <alias> [secret sources]
+rc admin account mfa status <alias>
+rc admin account mfa enroll <alias> [--no-qr]
+rc admin account mfa activate <alias> [--code CODE | --code-from-env NAME] [--output-file PATH]
+rc admin account mfa disable <alias> [--code ...] [password sources]
+rc admin account mfa recovery-codes <alias> [--code ...] [--output-file PATH]
+
+rc admin user passwd <alias> <access-key> [password sources]
+rc admin user mfa status <alias> <access-key>
+rc admin user mfa reset <alias> <access-key> [--yes]
+```
+
+### Two-factor authentication does not gate `rc`
+
+`rc` signs every request with the alias access key. That path is deliberately not
+gated by two-factor authentication: gating it would break every script the moment
+a human enabled the second factor on their own account, and it would add no
+protection, because whoever holds the secret key already has full access without
+presenting a code. The second factor guards session minting — the interactive
+console login (`AssumeRole`) — which `rc` does not use.
+
+Enabling two-factor authentication therefore never breaks an existing alias or
+automation. Scripts that do call `AssumeRole` can pass the factor through STS's
+own `SerialNumber` and `TokenCode` parameters.
+
+### Secret and code sources
+
+No command accepts a password on the command line, where it would be captured by
+shell history and visible in `ps`. Each password is read from one of:
+
+- `--*-from-env NAME` — a named environment variable.
+- `--*-file PATH` — the first line of a file, which must not be group- or
+  world-readable.
+- an interactive prompt with echo off, offered only when stdin is a terminal and
+  the output is human-readable.
+
+Verification codes additionally accept `--code CODE` because a TOTP code is
+valid for at most 90 seconds. `--code` and `--code-from-env` are mutually
+exclusive.
+
+In `--json` mode, or when stdin is not a terminal, a command that would need to
+prompt exits with `USAGE_ERROR` naming the flag to pass instead. No command
+blocks waiting for input it cannot receive.
+
+### QR rendering
+
+The server renders the QR code; `rc` prints the Unicode block art it returns.
+There is no QR encoder in the CLI, and the console shows the same symbol from
+the same source. `--no-qr` prints only the setup key and the `otpauth://` URI,
+and the QR is skipped automatically when the terminal is narrower than 33
+columns, since a wrapped symbol cannot be scanned.
+
+`--json` output omits the QR entirely — both the SVG and the block art — and
+carries `secret_base32` and `otpauth_uri` instead.
+
+### Recovery codes
+
+Recovery codes are returned in plaintext exactly once, by `mfa activate` and
+`mfa recovery-codes`; the server stores only their hashes and cannot show them
+again. `--output-file PATH` writes them with mode `0600` and refuses to
+overwrite an existing file, because that file may hold the only copy of a
+previous set. Without `--output-file` they are printed to stdout.
+
+Each code works once. Generating a new set invalidates the previous one.
+
+### Break-glass reset
+
+`rc admin user mfa reset` clears another identity's second factor, for a user who
+lost both their authenticator and their recovery codes. It names the target and
+asks for confirmation; `--yes` is required in `--json` mode or when stdin is not
+a terminal. The account is left protected by its password alone until the user
+enrols again.
+
+### Root identities
+
+A root identity provisioned from `RUSTFS_ACCESS_KEY` cannot have its password or
+username changed at runtime: the value is fixed for the life of the process and
+also derives the internode RPC secret. `rc admin account info` reports
+`credentials_source: env` and `password_mutable: false` for such an identity, and
+the mutation commands fail with a message naming the environment variable. Use a
+built-in IAM user with the `consoleAdmin` policy for day-to-day administration.
 
 ## IAM archive migration
 
