@@ -58,6 +58,13 @@ Copy between buckets on the same alias:
 rc cp local/reports/summary.json local/archive/summary.json
 ```
 
+Copy between aliases:
+
+```bash
+rc cp --overwrite stage/data/report.json prod/archive/report.json
+rc cp --recursive --overwrite stage/data/ prod/archive/
+```
+
 Copy multiple files with command-wide controls:
 
 ```bash
@@ -84,7 +91,7 @@ rc cp ./reports/ local/archive/ --recursive --enc-kms local/archive/=alias/archi
 
 ## Behavior
 
-The last path is always the target. Multiple sources require a local directory or remote prefix target, and ambiguous targets fail before any transfer starts. Sources can mix local and remote paths only where the command can infer a valid copy direction. S3-to-S3 copies are limited to paths under the same alias in the current implementation; use `rc mirror` for remote-to-remote synchronization across aliases. Recursive S3-to-S3 copy remains unsupported. Use trailing slashes consistently when copying directory-like prefixes.
+The last path is always the target. Multiple sources require a local directory or remote prefix target, and ambiguous targets fail before any transfer starts. Sources can mix local and remote paths only where the command can infer a valid copy direction. Same-alias S3-to-S3 copies use server-side CopyObject, including recursive prefix copies. Cross-alias copies download through a temporary file and upload with the destination alias credentials. Use trailing slashes consistently when copying directory-like prefixes.
 
 Include rules restrict the candidate set when present. Exclude rules are evaluated afterwards and always win, regardless of flag order. `--newer-than` and `--older-than` use strict UTC comparisons; `--rewind` includes its boundary. Candidates without required source timestamps are skipped. Empty selections succeed unless `--fail-empty` is passed.
 
@@ -98,6 +105,10 @@ Destination encryption flags apply only to remote writes. On `rc cp`, the select
 The current implementation supports `SSE-S3` and `SSE-KMS`. It does not support `SSE-C`, repeated encryption selectors, or MinIO `mc`-style prefix fan-out matching beyond the exact destination argument for the current command. For shared encryption rules across commands, see [Encryption workflows](encryption.md).
 
 When the server returns a source or destination object version ID, JSON copy output uses the output v3 `versioned_objects` envelope with `data.operation` set to `copy`. `data.source_version_id` identifies the copied source version and `data.version_id` identifies the created destination version. Copies for which the backend reports no version information retain the legacy JSON shape.
+
+### BREAKING cross-alias copy contract migration
+
+Cross-alias `rc cp` is additive and does not change same-alias CopyObject behavior. Destinations on a different alias are copied by download then upload instead of failing as `unsupported_feature`. Source content type and user metadata are preserved unless `--metadata-directive replace` is set. This PR must be marked `BREAKING` because `docs/reference/rc/cp.md` is a protected CLI behavior contract. No JSON schema or config `schema_version` bump applies.
 
 Global options shown in command syntax use the same meaning everywhere:
 
