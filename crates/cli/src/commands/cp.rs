@@ -10,7 +10,8 @@ use rc_core::{
     ObjectEncryptionRequest, ObjectInfo, ObjectKeyPolicy, ObjectStore as _, ObjectWriteOptions,
     ParsedPath, RemotePath, SseCustomerKey, TransferCancellation, TransferCandidate,
     TransferControls, TransferCopyOptions, TransferExecutor, TransferOutcomeState, TransferPlan,
-    TransferReadOptions, TransferSelection, parse_path, relative_local_path_from_key,
+    TransferReadOptions, TransferSelection, normalize_relative_key, parse_path,
+    relative_local_path_from_key,
 };
 use rc_s3::S3Client;
 use serde::Serialize;
@@ -1735,9 +1736,9 @@ fn build_local_candidates(
     if metadata.is_file() {
         let name = local_file_name(source)?;
         let destination = if target_is_container {
-            remote_child(target, &name)
+            remote_child(target, &name, ObjectKeyPolicy::for_remote_destination())?
         } else {
-            target.clone()
+            normalize_remote_target(target, ObjectKeyPolicy::for_remote_destination())?
         };
         candidates.push(local_transfer_candidate(
             source.to_path_buf(),
@@ -1774,7 +1775,11 @@ fn build_local_candidates(
             .map_or_else(|| relative.clone(), |root| format!("{root}/{relative}"));
         candidates.push(local_transfer_candidate(
             path,
-            remote_child(target, &target_relative),
+            remote_child(
+                target,
+                &target_relative,
+                ObjectKeyPolicy::for_remote_destination(),
+            )?,
             relative,
             metadata,
             encryption.clone(),
@@ -1943,6 +1948,7 @@ async fn build_remote_candidates(
                             target,
                             &object.key,
                             multiple_sources,
+                            ObjectKeyPolicy::for_remote_destination(),
                         )?;
                         let size_bytes =
                             object.size_bytes.and_then(|size| u64::try_from(size).ok());
@@ -2028,9 +2034,9 @@ async fn build_remote_candidates(
                 ));
             }
             let destination = if target_is_container {
-                remote_child(target, name)
+                remote_child(target, name, ObjectKeyPolicy::for_remote_destination())?
             } else {
-                target.clone()
+                normalize_remote_target(target, ObjectKeyPolicy::for_remote_destination())?
             };
             candidates.push(TransferCandidate {
                 payload: CpOperation::RemoteToRemote {
@@ -2066,15 +2072,42 @@ async fn planning_client(
     Ok(client)
 }
 
-fn remote_child(parent: &RemotePath, relative: &str) -> RemotePath {
-    let key = if parent.key.is_empty() {
-        relative.to_string()
-    } else if parent.key.ends_with('/') {
-        format!("{}{}", parent.key, relative)
+fn remote_child(
+    parent: &RemotePath,
+    relative: &str,
+    policy: ObjectKeyPolicy,
+) -> rc_core::Result<RemotePath> {
+    let parent_key = normalize_remote_prefix(&parent.key, policy)?;
+    let relative = normalize_relative_key(relative, policy)?;
+    let key = if parent_key.is_empty() {
+        relative
     } else {
-        format!("{}/{}", parent.key, relative)
+        format!("{parent_key}/{relative}")
     };
-    RemotePath::new(&parent.alias, &parent.bucket, key)
+    Ok(RemotePath::new(&parent.alias, &parent.bucket, key))
+}
+
+fn normalize_remote_target(
+    target: &RemotePath,
+    policy: ObjectKeyPolicy,
+) -> rc_core::Result<RemotePath> {
+    let key = normalize_remote_prefix(&target.key, policy)?;
+    if target.key.ends_with('/') && !key.is_empty() {
+        Ok(RemotePath::new(
+            &target.alias,
+            &target.bucket,
+            format!("{key}/"),
+        ))
+    } else {
+        Ok(RemotePath::new(&target.alias, &target.bucket, key))
+    }
+}
+
+fn normalize_remote_prefix(key: &str, policy: ObjectKeyPolicy) -> rc_core::Result<String> {
+    if key.is_empty() {
+        return Ok(String::new());
+    }
+    normalize_relative_key(key, policy)
 }
 
 fn recursive_listing_source(source: &RemotePath) -> RemotePath {
@@ -2105,6 +2138,7 @@ fn recursive_remote_target(
     target: &RemotePath,
     object_key: &str,
     multiple_sources: bool,
+    policy: ObjectKeyPolicy,
 ) -> rc_core::Result<(RemotePath, String)> {
     let relative = object_key.strip_prefix(&source.key).ok_or_else(|| {
         Error::InvalidPath(format!(
@@ -2122,9 +2156,11 @@ fn recursive_remote_target(
         root if root.is_empty() => relative.to_string(),
         root => format!("{root}/{relative}"),
     };
+    let normalized_relative = normalize_relative_key(relative, policy)?;
+    let normalized_destination_relative = normalize_relative_key(&destination_relative, policy)?;
     Ok((
-        remote_child(target, &destination_relative),
-        relative.to_string(),
+        remote_child(target, &normalized_destination_relative, policy)?,
+        normalized_relative,
     ))
 }
 
@@ -3514,9 +3550,14 @@ mod tests {
         let source = RemotePath::new("shared", "source", "src/");
         let target = RemotePath::new("shared", "destination", "archive/");
 
-        let (destination, relative) =
-            recursive_remote_target(&source, &target, "src/nested/report.csv", false)
-                .expect("map recursive object");
+        let (destination, relative) = recursive_remote_target(
+            &source,
+            &target,
+            "src/nested/report.csv",
+            false,
+            ObjectKeyPolicy::for_remote_destination(),
+        )
+        .expect("map recursive object");
 
         assert_eq!(relative, "nested/report.csv");
         assert_eq!(destination.key, "archive/nested/report.csv");
@@ -3527,12 +3568,68 @@ mod tests {
         let source = RemotePath::new("shared", "source", "");
         let target = RemotePath::new("shared", "destination", "archive/");
 
-        let (destination, relative) =
-            recursive_remote_target(&source, &target, "nested/report.csv", false)
-                .expect("map bucket object");
+        let (destination, relative) = recursive_remote_target(
+            &source,
+            &target,
+            "nested/report.csv",
+            false,
+            ObjectKeyPolicy::for_remote_destination(),
+        )
+        .expect("map bucket object");
 
         assert_eq!(relative, "nested/report.csv");
         assert_eq!(destination.key, "archive/nested/report.csv");
+    }
+
+    #[test]
+    fn recursive_remote_mapping_rejects_unsafe_listed_keys() {
+        let source = RemotePath::new("shared", "source", "src/");
+        let target = RemotePath::new("shared", "destination", "archive/");
+
+        for object_key in [
+            "/absolute.txt",
+            "src/../escape.txt",
+            "src\\escape.txt",
+            "src/control\u{0007}.txt",
+        ] {
+            assert!(
+                recursive_remote_target(
+                    &source,
+                    &target,
+                    object_key,
+                    false,
+                    ObjectKeyPolicy::for_remote_destination(),
+                )
+                .is_err(),
+                "unsafe listed key should be rejected: {object_key:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_child_rejects_unsafe_relative_keys() {
+        let target = RemotePath::new("shared", "destination", "archive/");
+
+        for relative in [
+            "../escape.txt",
+            "nested\\escape.txt",
+            "nested/control\u{0007}.txt",
+        ] {
+            assert!(
+                remote_child(&target, relative, ObjectKeyPolicy::for_remote_destination(),)
+                    .is_err(),
+                "unsafe relative key should be rejected: {relative:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_target_rejects_absolute_prefixes() {
+        let target = RemotePath::new("shared", "destination", "/archive/");
+
+        assert!(
+            normalize_remote_target(&target, ObjectKeyPolicy::for_remote_destination()).is_err()
+        );
     }
 
     #[test]
