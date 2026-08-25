@@ -38,8 +38,9 @@ pub use cors::{CorsConfiguration, CorsRule};
 pub use encryption::{BucketEncryption, ObjectEncryptionRequest};
 pub use error::{Error, MultipartAbortStatus, Result};
 pub use lifecycle::{
-    LifecycleConfiguration, LifecycleExpiration, LifecycleRule, LifecycleRuleStatus,
-    LifecycleTransition, NoncurrentVersionExpiration, NoncurrentVersionTransition,
+    LifecycleConfiguration, LifecycleDelMarkerExpiration, LifecycleExpiration, LifecycleRule,
+    LifecycleRuleStatus, LifecycleTransition, NoncurrentVersionExpiration,
+    NoncurrentVersionTransition,
 };
 pub use multipart_copy::{
     DEFAULT_MULTIPART_COPY_PART_SIZE, MultipartCopyCancellation, MultipartCopyOptions,
