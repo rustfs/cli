@@ -3,11 +3,15 @@
 //! Moves objects between locations (copy + delete).
 
 use clap::Args;
-use rc_core::{AliasManager, ListOptions, ObjectStore as _, ParsedPath, RemotePath, parse_path};
+use rc_core::{
+    AliasManager, ListOptions, ObjectEncryptionRequest, ObjectInfo, ObjectStore as _, ParsedPath,
+    RemotePath, parse_path,
+};
 use rc_s3::S3Client;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
+use super::cp;
 use crate::exit_code::ExitCode;
 use crate::output::{Formatter, OutputConfig};
 
@@ -362,6 +366,26 @@ async fn move_s3_prefix_to_local(
     }
 }
 
+/// Copy one object for a move, picking the transfer that the alias pair allows.
+///
+/// `target_client` is `Some` only for a cross-alias move, where server-side
+/// CopyObject is not available and the object must stream through the client.
+async fn copy_for_move(
+    source_client: &S3Client,
+    target_client: Option<&S3Client>,
+    source: &RemotePath,
+    target: &RemotePath,
+    encryption: Option<&ObjectEncryptionRequest>,
+) -> rc_core::Result<ObjectInfo> {
+    match target_client {
+        Some(target_client) => {
+            cp::copy_object_across_aliases(source_client, target_client, source, target, encryption)
+                .await
+        }
+        None => source_client.copy_object(source, target, encryption).await,
+    }
+}
+
 async fn move_s3_to_s3(
     src: &RemotePath,
     dst: &RemotePath,
@@ -377,12 +401,6 @@ async fn move_s3_to_s3(
         Ok(encryption) => encryption,
         Err(error) => return formatter.fail(ExitCode::UsageError, &error),
     };
-
-    // For S3-to-S3, we need same alias for server-side copy
-    if src.alias != dst.alias {
-        formatter.error("Cross-alias S3-to-S3 move not yet supported.");
-        return ExitCode::UnsupportedFeature;
-    }
 
     if args.recursive && remote_prefixes_overlap(src, dst) {
         formatter.error("Recursive move source and destination prefixes must not overlap.");
@@ -410,6 +428,27 @@ async fn move_s3_to_s3(
         Err(e) => {
             formatter.error(&format!("Failed to create S3 client: {e}"));
             return ExitCode::NetworkError;
+        }
+    };
+
+    // A different alias means a different endpoint or credentials, so server-side
+    // CopyObject cannot be used. Build a destination client and stream through it.
+    let target_client = if src.alias == dst.alias {
+        None
+    } else {
+        let target_alias = match alias_manager.get(&dst.alias) {
+            Ok(a) => a,
+            Err(_) => {
+                formatter.error(&format!("Alias '{}' not found", dst.alias));
+                return ExitCode::NotFound;
+            }
+        };
+        match S3Client::new(target_alias).await {
+            Ok(c) => Some(c),
+            Err(e) => {
+                formatter.error(&format!("Failed to create destination S3 client: {e}"));
+                return ExitCode::NetworkError;
+            }
         }
     };
 
@@ -502,9 +541,14 @@ async fn move_s3_to_s3(
             let src_obj_display = src_obj.to_string();
             let dst_obj_display = dst_obj.to_string();
 
-            match client
-                .copy_object(&src_obj, &dst_obj, encryption.as_ref())
-                .await
+            match copy_for_move(
+                &client,
+                target_client.as_ref(),
+                &src_obj,
+                &dst_obj,
+                encryption.as_ref(),
+            )
+            .await
             {
                 Ok(_) => match client.delete_object(&src_obj).await {
                     Ok(()) => {
@@ -571,7 +615,15 @@ async fn move_s3_to_s3(
         }
     } else {
         // Copy
-        match client.copy_object(src, dst, encryption.as_ref()).await {
+        match copy_for_move(
+            &client,
+            target_client.as_ref(),
+            src,
+            dst,
+            encryption.as_ref(),
+        )
+        .await
+        {
             Ok(info) => {
                 // Delete source
                 if let Err(e) = client.delete_object(src).await {

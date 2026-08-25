@@ -24,6 +24,7 @@ use crate::exit_code::ExitCode;
 use crate::output::{Formatter, OutputConfig, ProgressBar, V3SuccessEnvelope};
 use crate::secret_input::{SecretLocator, resolve_secret_locator};
 
+use super::object_identity::set_source_identity;
 use super::transfer_fidelity::{MetadataDirectiveArg, TaggingDirectiveArg, TransferFidelityArgs};
 
 const CP_AFTER_HELP: &str = "\
@@ -1412,6 +1413,35 @@ async fn perform_cross_alias_remote_copy(
     .await
 }
 
+/// Copy one object between two aliases by streaming through the client.
+///
+/// `rc mv` shares this path so a cross-alias move behaves exactly like a
+/// cross-alias copy followed by a source delete, rather than reimplementing the
+/// download/upload streaming and its source-change checks.
+pub(super) async fn copy_object_across_aliases(
+    source_client: &S3Client,
+    target_client: &S3Client,
+    source: &RemotePath,
+    target: &RemotePath,
+    encryption: Option<&ObjectEncryptionRequest>,
+) -> rc_core::Result<ObjectInfo> {
+    let source_info = source_client.head_object(source).await?;
+    let args = CpArgs::single(source.to_string(), target.to_string());
+    let ignore_progress = |_: u64| {};
+    let result = perform_cross_alias_remote_copy(
+        source_client,
+        target_client,
+        source,
+        target,
+        &source_info,
+        encryption,
+        &ignore_progress,
+        &args,
+    )
+    .await?;
+    Ok(result.object)
+}
+
 fn piped_copy_write_options(
     args: &CpArgs,
     source: &ObjectInfo,
@@ -1424,20 +1454,27 @@ fn piped_copy_write_options(
         args.destination_customer_key.as_ref(),
         args.storage_class.clone(),
     )?;
-    if matches!(
+    let replace_metadata = matches!(
         requested_metadata_directive(args),
         Some(MetadataDirective::Replace)
-    ) {
-        return Ok(options);
-    }
+    );
     let mut attributes = options.attributes.take().unwrap_or_default();
-    if attributes.content_type.is_none() {
-        attributes.content_type = source.content_type.clone();
+    if !replace_metadata {
+        if attributes.content_type.is_none() {
+            attributes.content_type = source.content_type.clone();
+        }
+        if attributes.user_metadata.is_empty()
+            && let Some(metadata) = &source.metadata
+        {
+            attributes.user_metadata.clone_from(metadata);
+        }
     }
-    if attributes.user_metadata.is_empty()
-        && let Some(metadata) = &source.metadata
-    {
-        attributes.user_metadata.clone_from(metadata);
+    // The destination computes its own ETag, so record the source ETag the same
+    // way `rc mirror` does. Without this a later `mirror --compare auto` cannot
+    // tell a faithful cross-alias copy from a changed object and recopies it.
+    // This is `rc` bookkeeping rather than user data, so it survives --metadata-directive replace.
+    if let Some(source_etag) = source.etag.as_deref() {
+        set_source_identity(&mut attributes, source_etag);
     }
     if attributes != ObjectAttributes::default() {
         options.attributes = Some(attributes);
@@ -4078,6 +4115,69 @@ mod tests {
                 .attributes
                 .as_ref()
                 .is_none_or(|value| value.content_type.is_none())
+        );
+    }
+
+    #[test]
+    fn piped_copy_records_the_source_etag_as_identity_metadata() {
+        let mut source = ObjectInfo::file("file.txt", 4);
+        source.etag = Some("source-etag".to_string());
+        let args = CpArgs::single("alpha/source/file.txt", "beta/target/file.txt");
+
+        let options = piped_copy_write_options(&args, &source, None).expect("copy metadata");
+
+        let attributes = options.attributes.as_ref().expect("identity attributes");
+        assert_eq!(
+            super::super::object_identity::identity_etag_from_metadata(Some(
+                &attributes.user_metadata
+            ))
+            .as_deref(),
+            Some("source-etag"),
+            "a later mirror --compare auto must be able to skip this object"
+        );
+    }
+
+    #[test]
+    fn piped_copy_records_identity_even_when_metadata_is_replaced() {
+        let mut source = ObjectInfo::file("file.txt", 4);
+        source.etag = Some("source-etag".to_string());
+        source.metadata = Some(HashMap::from([(
+            "owner".to_string(),
+            "storage".to_string(),
+        )]));
+        let mut args = CpArgs::single("alpha/source/file.txt", "beta/target/file.txt");
+        args.metadata_directive = Some(MetadataDirectiveArg::Replace);
+
+        let options = piped_copy_write_options(&args, &source, None).expect("replace metadata");
+
+        let attributes = options.attributes.as_ref().expect("identity attributes");
+        assert_eq!(
+            super::super::object_identity::identity_etag_from_metadata(Some(
+                &attributes.user_metadata
+            ))
+            .as_deref(),
+            Some("source-etag"),
+            "identity is rc bookkeeping, not user metadata"
+        );
+        assert!(
+            !attributes.user_metadata.contains_key("owner"),
+            "replace must still drop source user metadata"
+        );
+    }
+
+    #[test]
+    fn piped_copy_omits_identity_when_the_source_has_no_etag() {
+        let source = ObjectInfo::file("file.txt", 4);
+        let args = CpArgs::single("alpha/source/file.txt", "beta/target/file.txt");
+
+        let options = piped_copy_write_options(&args, &source, None).expect("copy metadata");
+
+        assert!(
+            options
+                .attributes
+                .as_ref()
+                .is_none_or(|attributes| attributes.user_metadata.is_empty()),
+            "without a source ETag there is no identity to record"
         );
     }
 
