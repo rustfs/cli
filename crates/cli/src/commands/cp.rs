@@ -675,12 +675,21 @@ fn validate_fidelity_directions(
             "Destination transfer policies require a remote destination".to_string(),
         ));
     }
+    let same_alias_remote_copy = target_remote
+        && sources.iter().any(|source| {
+            matches!(
+                source,
+                ParsedPath::Remote(source) if target.as_remote().is_some_and(|target| source.alias == target.alias)
+            )
+        });
     if any_remote && target_remote {
         let copy_options = transfer_copy_options(args, None, None)?;
-        if matches!(
-            copy_options.metadata_directive,
-            Some(MetadataDirective::Replace)
-        ) {
+        if same_alias_remote_copy
+            && matches!(
+                copy_options.metadata_directive,
+                Some(MetadataDirective::Replace)
+            )
+        {
             return Err(Error::UnsupportedFeature(
                 "RustFS beta.10 does not preserve complete metadata REPLACE semantics; tracked by rustfs/backlog#1463"
                     .to_string(),
@@ -1272,13 +1281,7 @@ async fn perform_planned_remote_copy(
             ));
         }
         let current = source_client.head_object(source).await?;
-        if current.size_bytes != source_info.size_bytes
-            || source_info
-                .etag
-                .as_ref()
-                .zip(current.etag.as_ref())
-                .is_some_and(|(planned, current)| planned != current)
-        {
+        if !source_identity_matches(source_info, &current) {
             return Err(Error::Conflict(format!(
                 "Source changed after copy planning: {source}"
             )));
@@ -1355,13 +1358,7 @@ async fn perform_cross_alias_remote_copy(
     }
 
     let current = source_client.head_object(source).await?;
-    if current.size_bytes != source_info.size_bytes
-        || source_info
-            .etag
-            .as_ref()
-            .zip(current.etag.as_ref())
-            .is_some_and(|(planned, current)| planned != current)
-    {
+    if !source_identity_matches(source_info, &current) {
         return Err(Error::Conflict(format!(
             "Source changed after copy planning: {source}"
         )));
@@ -1390,6 +1387,21 @@ async fn perform_cross_alias_remote_copy(
                 "Source changed after copy planning: {source}"
             )));
         }
+        let after = source_client
+            .head_object_with_transfer_options(
+                source,
+                &TransferReadOptions {
+                    version_id: current.version_id.clone(),
+                    customer_key: args.source_customer_key.clone(),
+                    ..TransferReadOptions::default()
+                },
+            )
+            .await?;
+        if !source_identity_matches(&current, &after) {
+            return Err(Error::Conflict(format!(
+                "Source changed after copy planning: {source}"
+            )));
+        }
         let options = piped_copy_write_options(args, &current, encryption)?;
         let object = target_client
             .put_object_from_path_with_options(target, &staging, &options, |copied| {
@@ -1410,6 +1422,22 @@ async fn perform_cross_alias_remote_copy(
         })
     }
     .await
+}
+
+fn source_identity_matches(planned: &ObjectInfo, current: &ObjectInfo) -> bool {
+    if planned.size_bytes != current.size_bytes {
+        return false;
+    }
+    match (&planned.etag, &current.etag) {
+        (Some(planned), Some(current)) => planned == current,
+        // Without an ETag an unversioned object has no stable read identity;
+        // only an identical explicit version can prove that it is unchanged.
+        (None, None) => {
+            planned.version_id.is_some()
+                && planned.version_id.as_ref() == current.version_id.as_ref()
+        }
+        _ => false,
+    }
 }
 
 fn piped_copy_write_options(
@@ -3963,6 +3991,20 @@ mod tests {
             Err(Error::UnsupportedFeature(_))
         ));
 
+        let cross_alias_source =
+            ParsedPath::Remote(RemotePath::new("source", "source", "report.json"));
+        let cross_alias_target =
+            ParsedPath::Remote(RemotePath::new("destination", "target", "report.json"));
+        assert!(
+            validate_fidelity_directions(
+                &replace,
+                std::slice::from_ref(&cross_alias_source),
+                &cross_alias_target,
+            )
+            .is_ok(),
+            "metadata REPLACE is implemented by the cross-alias upload path"
+        );
+
         let mut tags = CpArgs::single("test/source/report.json", "test/target/report.json");
         tags.tagging_directive = Some(TaggingDirectiveArg::Replace);
         tags.fidelity.tags = vec!["env=prod".to_string()];
@@ -3977,6 +4019,23 @@ mod tests {
             validate_fidelity_directions(&checksum, std::slice::from_ref(&source), &target),
             Err(Error::UnsupportedFeature(_))
         ));
+    }
+
+    #[test]
+    fn source_identity_validation_detects_same_size_etag_changes() {
+        let mut planned = ObjectInfo::file("report.json", 4);
+        planned.etag = Some("planned".to_string());
+        let mut current = planned.clone();
+        assert!(source_identity_matches(&planned, &current));
+
+        current.etag = Some("changed".to_string());
+        assert!(!source_identity_matches(&planned, &current));
+
+        current.etag = None;
+        assert!(!source_identity_matches(&planned, &current));
+
+        planned.etag = None;
+        assert!(!source_identity_matches(&planned, &current));
     }
 
     #[test]
