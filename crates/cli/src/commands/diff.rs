@@ -3,7 +3,9 @@
 //! Shows differences between two S3 paths or between local and remote.
 
 use clap::{Args, ValueEnum};
-use rc_core::{AliasManager, ListOptions, ObjectStore as _, ParsedPath, RemotePath, parse_path};
+use rc_core::{
+    AliasManager, ListOptions, ObjectInfo, ObjectStore as _, ParsedPath, RemotePath, parse_path,
+};
 use rc_s3::S3Client;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -101,6 +103,8 @@ struct FileInfo {
     /// Source ETag recorded by a previous `rc mirror` or cross-alias `rc cp`.
     /// ListObjects never returns user metadata, so this is filled by HeadObject.
     identity_etag: Option<String>,
+    /// The object changed between LIST and the identity HEAD request.
+    snapshot_conflict: bool,
 }
 
 /// Execute the diff command
@@ -323,6 +327,7 @@ async fn list_objects_map(
                     modified: item.last_modified.map(|t| t.to_string()),
                     etag: item.etag,
                     identity_etag: None,
+                    snapshot_conflict: false,
                 },
             );
         }
@@ -344,6 +349,9 @@ async fn list_objects_map(
 /// skip a copy, which keeps `diff` from reporting a difference for a pair that
 /// `mirror` considers synchronized.
 fn objects_match(first: &FileInfo, second: &FileInfo, compare: CompareMode) -> bool {
+    if first.snapshot_conflict || second.snapshot_conflict {
+        return false;
+    }
     let (Some(first_size), Some(second_size)) = (first.size, second.size) else {
         return false;
     };
@@ -412,13 +420,27 @@ async fn enrich_second_identity(
             continue;
         };
         let object_path = RemotePath::new(&path.alias, &path.bucket, &second_info.key);
-        if let Ok(info) = client.head_object(&object_path).await
-            && let Some(identity_etag) = identity_etag_from_metadata(info.metadata.as_ref())
-            && let Some(entry) = second.get_mut(&map_key)
-        {
-            entry.identity_etag = Some(identity_etag);
+        match client.head_object(&object_path).await {
+            Ok(info) => {
+                let listed_matches = second_snapshot_matches_head(second_info, &info);
+                if let Some(entry) = second.get_mut(&map_key) {
+                    entry.snapshot_conflict = !listed_matches;
+                    if listed_matches {
+                        entry.identity_etag = identity_etag_from_metadata(info.metadata.as_ref());
+                    }
+                }
+            }
+            Err(_) => {
+                if let Some(entry) = second.get_mut(&map_key) {
+                    entry.snapshot_conflict = true;
+                }
+            }
         }
     }
+}
+
+fn second_snapshot_matches_head(listed: &FileInfo, head: &ObjectInfo) -> bool {
+    listed.size == head.size_bytes && listed.etag == head.etag
 }
 
 fn compare_objects(
@@ -496,6 +518,7 @@ mod tests {
             modified: None,
             etag: etag.map(ToOwned::to_owned),
             identity_etag: None,
+            snapshot_conflict: false,
         }
     }
 
@@ -528,6 +551,28 @@ mod tests {
         let entries = compare_objects(&first, &second, false, CompareMode::Auto);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].status, DiffStatus::Different);
+    }
+
+    #[test]
+    fn identity_head_must_match_the_listed_size_and_etag() {
+        let listed = entry(100, Some("listed-etag"));
+        let mut head = ObjectInfo::file("prefix/file.txt", 100);
+        head.etag = Some("listed-etag".to_string());
+        assert!(second_snapshot_matches_head(&listed, &head));
+
+        head.size_bytes = Some(101);
+        assert!(!second_snapshot_matches_head(&listed, &head));
+        head.size_bytes = Some(100);
+        head.etag = Some("changed-etag".to_string());
+        assert!(!second_snapshot_matches_head(&listed, &head));
+
+        let mut conflicted = listed.clone();
+        conflicted.snapshot_conflict = true;
+        assert!(!objects_match(
+            &entry(100, Some("listed-etag")),
+            &conflicted,
+            CompareMode::Auto
+        ));
     }
 
     #[test]

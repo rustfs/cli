@@ -5,7 +5,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -549,6 +549,72 @@ fn cross_alias_move_uploads_then_deletes_the_source() {
             request.method == "DELETE" && request.target.starts_with("/source/a.txt")
         }),
         "a move must delete the source after a successful copy: {requests:#?}"
+    );
+    let delete = requests
+        .iter()
+        .find(|request| request.method == "DELETE" && request.target.starts_with("/source/a.txt"))
+        .expect("cross-alias move should issue one conditional source delete");
+    assert_eq!(
+        delete.headers.get("if-match").map(String::as_str),
+        Some("source-etag"),
+        "move must delete only the source version that was copied: {requests:#?}"
+    );
+}
+
+#[test]
+fn cross_alias_move_keeps_the_source_when_conditional_delete_fails() {
+    let mock = S3Mock::start(|request| {
+        if request.method == "HEAD" && request.target.starts_with("/source/a.txt") {
+            return Response::head_with_etag(5, "source-etag");
+        }
+        if request.method == "GET" && request.target.starts_with("/source/a.txt") {
+            return object_get_result("hello");
+        }
+        if is_upload_request(request) && request.target.starts_with("/destination/b.txt") {
+            return Response {
+                status: "200 OK",
+                headers: vec![("etag", "\"multipart-etag-1\"".to_string())],
+                body: String::new(),
+            };
+        }
+        if request.method == "DELETE" && request.target.starts_with("/source/a.txt") {
+            return Response {
+                status: "412 Precondition Failed",
+                headers: Vec::new(),
+                body: "<Error><Code>PreconditionFailed</Code></Error>".to_string(),
+            };
+        }
+        if request.method == "HEAD" && request.target.starts_with("/destination/") {
+            return missing_object();
+        }
+        Response {
+            status: "500 Internal Server Error",
+            headers: Vec::new(),
+            body: "<Error><Code>UnexpectedRequest</Code></Error>".to_string(),
+        }
+    });
+
+    let output = run_rc_with_hosts(
+        &mock,
+        &[("alpha", ""), ("beta", "")],
+        &["mv", "alpha/source/a.txt", "beta/destination/b.txt"],
+    );
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Copied but failed to delete source"),
+        "stderr: {stderr}\nrequests: {:?}",
+        mock.requests()
+    );
+    let delete = mock
+        .requests()
+        .into_iter()
+        .find(|request| request.method == "DELETE")
+        .expect("move should attempt the conditional delete");
+    assert_eq!(
+        delete.headers.get("if-match").map(String::as_str),
+        Some("source-etag")
     );
 }
 
@@ -2097,6 +2163,129 @@ fn cross_alias_copy_downloads_then_uploads_without_copy_source() {
     assert!(
         requests.iter().all(|request| !is_copy_request(request)),
         "cross-alias copy must not use CopyObject: {requests:#?}"
+    );
+}
+
+#[test]
+fn cross_alias_copy_allows_metadata_replace_and_records_source_identity() {
+    let mock = S3Mock::start(|request| {
+        if request.method == "HEAD" && request.target == "/source/a.txt" {
+            return Response::head_with_etag(5, "source-etag");
+        }
+        if request.method == "GET" && request.target.starts_with("/source/a.txt") {
+            return object_get_result("hello");
+        }
+        if is_upload_request(request) && request.target.starts_with("/destination/b.txt") {
+            return Response {
+                status: "200 OK",
+                headers: vec![("etag", "\"dest-etag\"".to_string())],
+                body: String::new(),
+            };
+        }
+        if request.method == "HEAD" && request.target.starts_with("/destination/") {
+            return missing_object();
+        }
+        Response {
+            status: "500 Internal Server Error",
+            headers: Vec::new(),
+            body: "<Error><Code>UnexpectedRequest</Code></Error>".to_string(),
+        }
+    });
+
+    let output = run_rc_with_hosts(
+        &mock,
+        &[("alpha", ""), ("beta", "")],
+        &[
+            "cp",
+            "--overwrite=true",
+            "--metadata-directive",
+            "replace",
+            "--metadata",
+            "owner=analytics",
+            "alpha/source/a.txt",
+            "beta/destination/b.txt",
+        ],
+    );
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}\nrequests: {:#?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        mock.requests()
+    );
+    let requests = mock.requests();
+    let upload = requests
+        .iter()
+        .find(|request| {
+            is_upload_request(request) && request.target.starts_with("/destination/b.txt")
+        })
+        .expect("cross-alias replace should upload the destination");
+    assert_eq!(
+        upload.headers.get("x-amz-meta-owner"),
+        Some(&"analytics".to_string())
+    );
+    assert_eq!(
+        upload.headers.get("x-amz-meta-rc-source-etag"),
+        Some(&"source-etag".to_string())
+    );
+    assert!(
+        requests.iter().all(|request| !is_copy_request(request)),
+        "cross-alias replace must not use CopyObject: {requests:#?}"
+    );
+}
+
+#[test]
+fn cross_alias_copy_rejects_same_size_source_replacement_after_download() {
+    let source_head_calls = Arc::new(AtomicUsize::new(0));
+    let source_head_calls_for_handler = Arc::clone(&source_head_calls);
+    let mock = S3Mock::start(move |request| {
+        if request.method == "HEAD" && request.target == "/source/a.txt" {
+            let call = source_head_calls_for_handler.fetch_add(1, Ordering::SeqCst);
+            return if call < 2 {
+                Response::head_with_etag(5, "source-etag")
+            } else {
+                Response::head_with_etag(5, "replacement-etag")
+            };
+        }
+        if request.method == "GET" && request.target.starts_with("/source/a.txt") {
+            return object_get_result("hello");
+        }
+        if request.method == "HEAD" && request.target.starts_with("/destination/") {
+            return missing_object();
+        }
+        Response {
+            status: "500 Internal Server Error",
+            headers: Vec::new(),
+            body: "<Error><Code>UnexpectedRequest</Code></Error>".to_string(),
+        }
+    });
+
+    let output = run_rc_with_hosts(
+        &mock,
+        &[("alpha", ""), ("beta", "")],
+        &[
+            "cp",
+            "--overwrite=true",
+            "alpha/source/a.txt",
+            "beta/destination/b.txt",
+        ],
+    );
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Source changed after copy planning"),
+        "stderr: {stderr}\nrequests: {:?}",
+        mock.requests()
+    );
+    assert_eq!(source_head_calls.load(Ordering::SeqCst), 3);
+    assert!(
+        mock.requests()
+            .iter()
+            .all(|request| !is_upload_request(request)),
+        "source replacement must be detected before upload: {:?}",
+        mock.requests()
     );
 }
 
