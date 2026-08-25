@@ -45,6 +45,7 @@ mod mirror;
 mod multipart;
 mod mv;
 mod object;
+mod object_identity;
 mod ops_output;
 mod ping;
 mod pipe;
