@@ -3979,10 +3979,47 @@ impl S3Client {
             encryption: encryption.cloned().map(ObjectWriteEncryption::Managed),
             ..ObjectWriteOptions::default()
         };
-        self.put_object_from_path_with_condition(
+        self.put_object_from_path_if_match_with_options(
             path,
             file_path,
             &options,
+            etag,
+            on_progress,
+        )
+        .await
+    }
+
+    /// Upload a local file with explicit write options only when the object is absent.
+    pub async fn put_object_from_path_if_absent_with_options(
+        &self,
+        path: &RemotePath,
+        file_path: &std::path::Path,
+        options: &ObjectWriteOptions,
+        on_progress: impl Fn(u64) + Send,
+    ) -> Result<ObjectInfo> {
+        self.put_object_from_path_with_condition(
+            path,
+            file_path,
+            options,
+            ObjectWritePrecondition::IfAbsent,
+            on_progress,
+        )
+        .await
+    }
+
+    /// Upload a local file with explicit write options only when `etag` still matches.
+    pub async fn put_object_from_path_if_match_with_options(
+        &self,
+        path: &RemotePath,
+        file_path: &std::path::Path,
+        options: &ObjectWriteOptions,
+        etag: &str,
+        on_progress: impl Fn(u64) + Send,
+    ) -> Result<ObjectInfo> {
+        self.put_object_from_path_with_condition(
+            path,
+            file_path,
+            options,
             ObjectWritePrecondition::IfMatch(etag),
             on_progress,
         )

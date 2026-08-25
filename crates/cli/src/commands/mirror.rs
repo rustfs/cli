@@ -1,16 +1,18 @@
 //! mirror command - Synchronize trees between local filesystems and S3-compatible storage.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use clap::Args;
+use clap::{Args, ValueEnum};
 use jiff::Timestamp;
 use rc_core::alias::RetryConfig;
 use rc_core::{
-    AliasManager, Error, ListOptions, ObjectInfo, ObjectStore as _, ParsedPath, RemotePath,
-    TransferCandidate, TransferControls, TransferExecutor, TransferOutcomeState, TransferPlan,
-    TransferReport, TransferSelection, TransferSummary, parse_path,
+    AliasManager, Error, ListOptions, ObjectAttributes, ObjectInfo, ObjectStore as _,
+    ObjectWriteOptions, ParsedPath, RemotePath, TransferCandidate, TransferControls,
+    TransferExecutor, TransferOutcomeState, TransferPlan, TransferReport, TransferSelection,
+    TransferSummary, parse_path,
 };
 use rc_s3::S3Client;
 use serde::Serialize;
@@ -19,6 +21,21 @@ use tokio::io::AsyncWriteExt as _;
 use super::cp::{parse_age_cutoff, parse_byte_rate};
 use crate::exit_code::ExitCode;
 use crate::output::{Formatter, OutputConfig};
+
+const SOURCE_IDENTITY_METADATA_KEY: &str = "rc-source-etag";
+
+/// How `rc mirror` decides that a destination object already matches the source.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum CompareMode {
+    /// Skip when ETags match, or when size matches and destination metadata
+    /// records the source ETag from a previous `rc mirror` copy.
+    #[default]
+    Auto,
+    /// Skip only when destination and source ETags are identical.
+    Etag,
+    /// Skip when object sizes match, ignoring ETag differences.
+    Size,
+}
 
 const MIRROR_AFTER_HELP: &str = "\
 Examples:
@@ -92,6 +109,10 @@ pub struct MirrorArgs {
     #[arg(long)]
     pub summary: bool,
 
+    /// How existing destination objects are compared before skipping a copy
+    #[arg(long, value_enum, default_value_t = CompareMode::Auto)]
+    pub compare: CompareMode,
+
     /// Suppress non-error mirror output (legacy command-local alias)
     #[arg(long)]
     pub quiet: bool,
@@ -113,6 +134,18 @@ struct MirrorSnapshot {
     size_bytes: Option<u64>,
     modified: Option<Timestamp>,
     etag: Option<String>,
+    // Preserved source ETag from `x-amz-meta-rc-source-etag`. ListObjects does
+    // not return user metadata, so this is filled from HeadObject during Auto
+    // compare and must not participate in destination race detection.
+    identity_etag: Option<String>,
+}
+
+impl MirrorSnapshot {
+    fn content_matches(&self, other: &Self) -> bool {
+        self.size_bytes == other.size_bytes
+            && self.modified == other.modified
+            && self.etag == other.etag
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -210,6 +243,7 @@ trait MirrorRemoteTransfer: Send + Sync {
         source: &Path,
         content_type: Option<&str>,
         condition: RemoteWriteCondition,
+        identity_etag: Option<&str>,
     ) -> rc_core::Result<ObjectInfo>;
 }
 
@@ -230,15 +264,37 @@ impl MirrorRemoteTransfer for S3Client {
         source: &Path,
         content_type: Option<&str>,
         condition: RemoteWriteCondition,
+        identity_etag: Option<&str>,
     ) -> rc_core::Result<ObjectInfo> {
+        let mut user_metadata = HashMap::new();
+        if let Some(identity_etag) = identity_etag {
+            user_metadata.insert(
+                SOURCE_IDENTITY_METADATA_KEY.to_string(),
+                identity_etag.to_string(),
+            );
+        }
+        let options = ObjectWriteOptions {
+            attributes: Some(ObjectAttributes {
+                content_type: content_type.map(ToString::to_string),
+                user_metadata,
+                ..ObjectAttributes::default()
+            }),
+            ..ObjectWriteOptions::default()
+        };
         match condition {
             RemoteWriteCondition::IfAbsent => {
-                self.put_object_from_path_if_absent(path, source, content_type, None, |_| {})
+                self.put_object_from_path_if_absent_with_options(path, source, &options, |_| {})
                     .await
             }
             RemoteWriteCondition::IfMatch(etag) => {
-                self.put_object_from_path_if_match(path, source, content_type, None, &etag, |_| {})
-                    .await
+                self.put_object_from_path_if_match_with_options(
+                    path,
+                    source,
+                    &options,
+                    &etag,
+                    |_| {},
+                )
+                .await
             }
         }
     }
@@ -297,6 +353,7 @@ impl RuntimeEndpoint {
 struct LiveMirrorIo {
     source: RuntimeEndpoint,
     target: RuntimeEndpoint,
+    compare: CompareMode,
 }
 
 #[async_trait::async_trait]
@@ -324,7 +381,7 @@ impl MirrorIo for LiveMirrorIo {
             // A previous attempt may have removed the entry before its response was lost.
             return Ok(0);
         };
-        if current.snapshot != operation.target.snapshot {
+        if !current.snapshot.content_matches(&operation.target.snapshot) {
             return Err(Error::Conflict(format!(
                 "Destination changed before removal: {}",
                 operation.relative_path
@@ -401,7 +458,13 @@ impl LiveMirrorIo {
             let size = operation.source.snapshot.size_bytes.unwrap_or_default();
             let condition = remote_write_condition(operation)?;
             let info = client
-                .mirror_upload(target_path, &staged, content_type.as_deref(), condition)
+                .mirror_upload(
+                    target_path,
+                    &staged,
+                    content_type.as_deref(),
+                    condition,
+                    None,
+                )
                 .await?;
             Ok(object_size(&info).unwrap_or(size))
         }
@@ -433,7 +496,12 @@ impl LiveMirrorIo {
             ));
         };
 
-        match self.target_disposition(operation).await? {
+        let disposition =
+            source_preflight_then_target(source_client.as_ref(), source_path, operation, || {
+                self.target_disposition(operation)
+            })
+            .await?;
+        match disposition {
             TargetDisposition::AlreadyComplete => {
                 return Ok(operation.source.snapshot.size_bytes.unwrap_or_default());
             }
@@ -541,22 +609,50 @@ impl LiveMirrorIo {
         operation: &MirrorCopyOperation,
     ) -> rc_core::Result<TargetDisposition> {
         let current = self.target.current_entry(&operation.relative_path).await?;
-        if let Some(current) = &current
-            && source_matches_target(&operation.source, current)
-        {
-            return Ok(TargetDisposition::AlreadyComplete);
-        }
+        target_disposition_for_current(operation, current.as_ref(), self.compare)
+    }
+}
 
-        match (&operation.target_before, current) {
-            (None, None) => Ok(TargetDisposition::Ready),
-            (Some(expected), Some(current)) if expected.snapshot == current.snapshot => {
-                Ok(TargetDisposition::Ready)
-            }
-            _ => Err(Error::Conflict(format!(
-                "Destination changed after mirror planning: {}",
-                operation.relative_path
-            ))),
+async fn source_preflight_then_target<S, F, Fut, T>(
+    source_client: &S,
+    source_path: &RemotePath,
+    operation: &MirrorCopyOperation,
+    target_check: F,
+) -> rc_core::Result<T>
+where
+    S: MirrorRemoteTransfer + ?Sized,
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = rc_core::Result<T>>,
+{
+    let before = source_client.mirror_head(source_path).await?;
+    ensure_snapshot_matches(&operation.source, &before)?;
+    target_check().await
+}
+
+fn target_disposition_for_current(
+    operation: &MirrorCopyOperation,
+    current: Option<&MirrorEntry>,
+    compare: CompareMode,
+) -> rc_core::Result<TargetDisposition> {
+    if let Some(current) = current
+        && operation
+            .target_before
+            .as_ref()
+            .is_some_and(|expected| expected.snapshot.content_matches(&current.snapshot))
+        && source_matches_target(&operation.source, current, compare)
+    {
+        return Ok(TargetDisposition::AlreadyComplete);
+    }
+
+    match (&operation.target_before, current) {
+        (None, None) => Ok(TargetDisposition::Ready),
+        (Some(expected), Some(current)) if expected.snapshot.content_matches(&current.snapshot) => {
+            Ok(TargetDisposition::Ready)
         }
+        _ => Err(Error::Conflict(format!(
+            "Destination changed after mirror planning: {}",
+            operation.relative_path
+        ))),
     }
 }
 
@@ -619,7 +715,13 @@ where
             .as_deref()
             .or(before.content_type.as_deref());
         let info = target_client
-            .mirror_upload(target_path, &staging, content_type, condition)
+            .mirror_upload(
+                target_path,
+                &staging,
+                content_type,
+                condition,
+                operation.source.snapshot.etag.as_deref(),
+            )
             .await?;
         Ok(object_size(&info)
             .or(operation.source.snapshot.size_bytes)
@@ -691,7 +793,7 @@ pub async fn execute(args: MirrorArgs, mut output_config: OutputConfig) -> ExitC
                 );
             }
         };
-    let (target_runtime, target_manifest) =
+    let (target_runtime, mut target_manifest) =
         match prepare_endpoint(&target, MissingRootPolicy::Empty, &alias_manager).await {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -701,12 +803,26 @@ pub async fn execute(args: MirrorArgs, mut output_config: OutputConfig) -> ExitC
                 );
             }
         };
+    if let Err(error) = enrich_destination_identity(
+        &source_manifest,
+        &mut target_manifest,
+        &target_runtime,
+        args.compare,
+    )
+    .await
+    {
+        return formatter.fail(
+            exit_code_for_error(&error),
+            &format!("Failed to inspect destination identity: {error}"),
+        );
+    }
     let copy_plan = match build_copy_plan(
         &source_manifest,
         &target_manifest,
         &target_runtime.spec(),
         &selection,
         args.overwrite,
+        args.compare,
     ) {
         Ok(plan) => plan,
         Err(error) => return formatter.fail(exit_code_for_error(&error), &error.to_string()),
@@ -728,6 +844,7 @@ pub async fn execute(args: MirrorArgs, mut output_config: OutputConfig) -> ExitC
     let io = Arc::new(LiveMirrorIo {
         source: source_runtime,
         target: target_runtime,
+        compare: args.compare,
     });
     let reports =
         match execute_operation_plans(io, copy_plan, remove_plan, controls, args.remove).await {
@@ -1025,6 +1142,7 @@ fn build_copy_plan(
     target_endpoint: &MirrorEndpointSpec,
     selection: &TransferSelection,
     overwrite: bool,
+    compare: CompareMode,
 ) -> rc_core::Result<TransferPlan<MirrorCopyOperation>> {
     let mut candidates = Vec::with_capacity(source.entries.len());
     for entry in source.entries.values() {
@@ -1060,7 +1178,9 @@ fn build_copy_plan(
     for candidate in selected.items {
         let should_copy = match &candidate.payload.target_before {
             None => true,
-            Some(target) if source_matches_target(&candidate.payload.source, target) => false,
+            Some(target) if source_matches_target(&candidate.payload.source, target, compare) => {
+                false
+            }
             Some(_) => overwrite,
         };
         if should_copy {
@@ -1414,6 +1534,7 @@ fn snapshot_from_metadata(metadata: &std::fs::Metadata) -> MirrorSnapshot {
             .ok()
             .and_then(|value| value.try_into().ok()),
         etag: None,
+        identity_etag: None,
     }
 }
 
@@ -1433,14 +1554,55 @@ fn snapshot_from_object(object: &ObjectInfo) -> rc_core::Result<MirrorSnapshot> 
         size_bytes,
         modified: object.last_modified,
         etag: object.etag.clone(),
+        identity_etag: identity_etag_from_metadata(object.metadata.as_ref()),
     })
+}
+
+fn identity_etag_from_metadata(metadata: Option<&HashMap<String, String>>) -> Option<String> {
+    metadata.and_then(|metadata| {
+        metadata.iter().find_map(|(key, value)| {
+            let normalized = key.to_ascii_lowercase();
+            let key = normalized
+                .strip_prefix("x-amz-meta-")
+                .unwrap_or(normalized.as_str());
+            (key == SOURCE_IDENTITY_METADATA_KEY && !value.is_empty()).then(|| value.clone())
+        })
+    })
+}
+
+fn destination_needs_identity_lookup(
+    source: &MirrorEntry,
+    target: &MirrorEntry,
+    compare: CompareMode,
+) -> bool {
+    if !matches!(compare, CompareMode::Auto) {
+        return false;
+    }
+    if source.snapshot.size_bytes.is_none()
+        || source.snapshot.size_bytes != target.snapshot.size_bytes
+    {
+        return false;
+    }
+    let Some(source_etag) = source.snapshot.etag.as_ref() else {
+        return false;
+    };
+    if target.snapshot.etag.as_ref() == Some(source_etag) {
+        return false;
+    }
+    if target.snapshot.identity_etag.is_some() {
+        return false;
+    }
+    matches!(
+        (&source.location, &target.location),
+        (MirrorLocation::Remote(_), MirrorLocation::Remote(_))
+    )
 }
 
 fn object_size(object: &ObjectInfo) -> Option<u64> {
     object.size_bytes.and_then(|size| u64::try_from(size).ok())
 }
 
-fn source_matches_target(source: &MirrorEntry, target: &MirrorEntry) -> bool {
+fn source_matches_target(source: &MirrorEntry, target: &MirrorEntry, compare: CompareMode) -> bool {
     let (Some(source_size), Some(target_size)) =
         (source.snapshot.size_bytes, target.snapshot.size_bytes)
     else {
@@ -1449,24 +1611,78 @@ fn source_matches_target(source: &MirrorEntry, target: &MirrorEntry) -> bool {
     if source_size != target_size {
         return false;
     }
-    if let (Some(source_etag), Some(target_etag)) = (&source.snapshot.etag, &target.snapshot.etag) {
-        return source_etag == target_etag;
-    }
-    match (&source.location, &target.location) {
-        (MirrorLocation::Remote(_), MirrorLocation::Remote(_)) => false,
-        (MirrorLocation::Local(_), MirrorLocation::Remote(_)) => {
-            match (source.snapshot.modified, target.snapshot.modified) {
-                (Some(source_modified), Some(target_modified)) => {
-                    target_modified >= source_modified
+    match compare {
+        CompareMode::Size => true,
+        CompareMode::Etag => {
+            source.snapshot.etag.is_some() && source.snapshot.etag == target.snapshot.etag
+        }
+        CompareMode::Auto => {
+            if source.snapshot.etag.is_some() && source.snapshot.etag == target.snapshot.etag {
+                return true;
+            }
+            if source
+                .snapshot
+                .etag
+                .as_ref()
+                .zip(target.snapshot.identity_etag.as_ref())
+                .is_some_and(|(source_etag, identity_etag)| source_etag == identity_etag)
+            {
+                return true;
+            }
+            match (&source.location, &target.location) {
+                (MirrorLocation::Remote(_), MirrorLocation::Remote(_)) => false,
+                (MirrorLocation::Local(_), MirrorLocation::Remote(_)) => {
+                    match (source.snapshot.modified, target.snapshot.modified) {
+                        (Some(source_modified), Some(target_modified)) => {
+                            target_modified >= source_modified
+                        }
+                        _ => false,
+                    }
                 }
-                _ => false,
+                _ => {
+                    source.snapshot.modified.is_some()
+                        && source.snapshot.modified == target.snapshot.modified
+                }
             }
         }
-        _ => {
-            source.snapshot.modified.is_some()
-                && source.snapshot.modified == target.snapshot.modified
+    }
+}
+
+async fn enrich_destination_identity(
+    source: &MirrorManifest,
+    target: &mut MirrorManifest,
+    target_runtime: &RuntimeEndpoint,
+    compare: CompareMode,
+) -> rc_core::Result<()> {
+    let RuntimeEndpoint::Remote { client, .. } = target_runtime else {
+        return Ok(());
+    };
+    if !matches!(compare, CompareMode::Auto) {
+        return Ok(());
+    }
+    for (relative_path, source_entry) in &source.entries {
+        let Some(target_entry) = target.entries.get(relative_path) else {
+            continue;
+        };
+        if !destination_needs_identity_lookup(source_entry, target_entry, compare) {
+            continue;
+        }
+        let MirrorLocation::Remote(path) = &target_entry.location else {
+            continue;
+        };
+        let path = path.clone();
+        match client.head_object(&path).await {
+            Ok(info) => {
+                if let Some(target_entry) = target.entries.get_mut(relative_path) {
+                    target_entry.snapshot.identity_etag =
+                        identity_etag_from_metadata(info.metadata.as_ref());
+                }
+            }
+            Err(Error::NotFound(_)) => {}
+            Err(error) => return Err(error),
         }
     }
+    Ok(())
 }
 
 fn path_is_protected(relative_path: &str, protected_paths: &[String]) -> bool {
@@ -1501,7 +1717,11 @@ fn validate_local_entry(entry: &MirrorEntry) -> rc_core::Result<()> {
 }
 
 fn ensure_snapshot_matches(entry: &MirrorEntry, object: &ObjectInfo) -> rc_core::Result<()> {
-    if snapshot_from_object(object)? != entry.snapshot {
+    let current = snapshot_from_object(object)?;
+    if current.size_bytes != entry.snapshot.size_bytes
+        || current.modified != entry.snapshot.modified
+        || current.etag != entry.snapshot.etag
+    {
         return Err(Error::Conflict(format!(
             "Source changed during mirror: {}",
             entry.relative_path

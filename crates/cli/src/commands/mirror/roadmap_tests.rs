@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -9,10 +9,20 @@ use rc_core::{Error, RemotePath, TransferControls, TransferOutcomeState, Transfe
 use super::*;
 
 fn snapshot(size: u64, modified: &str, etag: Option<&str>) -> MirrorSnapshot {
+    snapshot_with_identity(size, modified, etag, None)
+}
+
+fn snapshot_with_identity(
+    size: u64,
+    modified: &str,
+    etag: Option<&str>,
+    identity_etag: Option<&str>,
+) -> MirrorSnapshot {
     MirrorSnapshot {
         size_bytes: Some(size),
         modified: Some(modified.parse::<Timestamp>().expect("valid test timestamp")),
         etag: etag.map(ToOwned::to_owned),
+        identity_etag: identity_etag.map(ToOwned::to_owned),
     }
 }
 
@@ -98,6 +108,7 @@ fn planners_map_all_supported_directions_without_changing_relative_paths() {
             &target,
             &TransferSelection::default(),
             false,
+            CompareMode::Auto,
         )
         .expect("build copy plan");
         assert_eq!(plan.items.len(), 1);
@@ -127,6 +138,7 @@ fn equivalent_destination_is_restart_safe_and_not_planned_again() {
         &MirrorEndpointSpec::Remote(RemotePath::new("dst", "bucket", "backup")),
         &TransferSelection::default(),
         true,
+        CompareMode::Auto,
     )
     .expect("build restart plan");
 
@@ -156,6 +168,7 @@ fn changed_destination_requires_overwrite() {
         &destination,
         &TransferSelection::default(),
         false,
+        CompareMode::Auto,
     )
     .expect("build non-overwrite plan");
     let overwritten = build_copy_plan(
@@ -164,6 +177,7 @@ fn changed_destination_requires_overwrite() {
         &destination,
         &TransferSelection::default(),
         true,
+        CompareMode::Auto,
     )
     .expect("build overwrite plan");
 
@@ -261,6 +275,7 @@ async fn copy_failure_preserves_partial_results_and_blocks_every_removal() {
         &MirrorEndpointSpec::Remote(RemotePath::new("dst", "bucket", "backup")),
         &TransferSelection::default(),
         true,
+        CompareMode::Auto,
     )
     .expect("build copy plan");
     let remove_plan =
@@ -309,6 +324,7 @@ async fn a_removal_retry_treats_an_already_absent_target_as_complete() {
         target: RuntimeEndpoint::Local {
             root: root.path().to_path_buf(),
         },
+        compare: CompareMode::Auto,
     };
 
     let removed = io
@@ -373,6 +389,7 @@ fn empty_manifests_produce_empty_deterministic_plans() {
         &MirrorEndpointSpec::Local(PathBuf::from("/target")),
         &TransferSelection::default(),
         true,
+        CompareMode::Auto,
     )
     .expect("empty copy plan");
     let remove = build_remove_plan(
@@ -410,6 +427,7 @@ fn filtered_nested_tree_is_stably_sorted() {
         &MirrorEndpointSpec::Remote(RemotePath::new("dst", "bucket", "root")),
         &selection,
         false,
+        CompareMode::Auto,
     )
     .expect("filtered plan");
 
@@ -446,6 +464,7 @@ struct PathUploadCall {
     condition: RemoteWriteCondition,
     size: u64,
     staging: PathBuf,
+    identity_etag: Option<String>,
 }
 
 struct TestRemoteSource {
@@ -505,6 +524,7 @@ impl MirrorRemoteTransfer for TestRemoteSource {
         _source: &Path,
         _content_type: Option<&str>,
         _condition: RemoteWriteCondition,
+        _identity_etag: Option<&str>,
     ) -> rc_core::Result<ObjectInfo> {
         Err(Error::General(
             "test source cannot upload mirror objects".to_string(),
@@ -542,6 +562,7 @@ impl MirrorRemoteTransfer for TestRemoteTarget {
         source: &Path,
         content_type: Option<&str>,
         condition: RemoteWriteCondition,
+        identity_etag: Option<&str>,
     ) -> rc_core::Result<ObjectInfo> {
         let size = tokio::fs::metadata(source).await?.len();
         self.uploads
@@ -553,6 +574,7 @@ impl MirrorRemoteTransfer for TestRemoteTarget {
                 condition,
                 size,
                 staging: source.to_path_buf(),
+                identity_etag: identity_etag.map(ToOwned::to_owned),
             });
         if let Some(error) = &self.upload_error {
             return Err(Error::Network(error.clone()));
@@ -579,6 +601,7 @@ fn remote_transfer_fixture(
             size_bytes: Some(size),
             modified: Some(modified),
             etag: Some("source-etag".to_string()),
+            identity_etag: None,
         },
     };
     let operation = MirrorCopyOperation {
@@ -643,6 +666,7 @@ async fn large_remote_copy_uses_path_streaming_preserves_metadata_and_cleans_sta
         Some("application/octet-stream")
     );
     assert_eq!(uploads[0].condition, RemoteWriteCondition::IfAbsent);
+    assert_eq!(uploads[0].identity_etag.as_deref(), Some("source-etag"));
     assert!(!uploads[0].staging.exists());
 }
 
@@ -770,6 +794,26 @@ async fn truncated_remote_download_is_rejected_and_cleaned_before_upload() {
 }
 
 #[tokio::test]
+async fn remote_source_preflight_runs_before_target_identity_check() {
+    let (mut source, operation) = remote_transfer_fixture(4, None);
+    source.info.etag = Some("replacement-etag".to_string());
+    let MirrorLocation::Remote(source_path) = &operation.source.location else {
+        panic!("expected remote source")
+    };
+    let target_checked = Arc::new(Mutex::new(false));
+    let target_checked_for_check = Arc::clone(&target_checked);
+
+    let result = source_preflight_then_target(&source, source_path, &operation, || async move {
+        *target_checked_for_check.lock().expect("target check lock") = true;
+        Ok::<(), Error>(())
+    })
+    .await;
+
+    assert!(matches!(result, Err(Error::Conflict(_))));
+    assert!(!*target_checked.lock().expect("target check lock"));
+}
+
+#[tokio::test]
 async fn cancelling_a_remote_transfer_drops_and_removes_its_staging_file() {
     let (mut source, operation) = remote_transfer_fixture(4, None);
     let started = Arc::new(tokio::sync::Notify::new());
@@ -833,9 +877,340 @@ fn remote_overwrite_requires_the_planned_etag() {
 fn remote_entries_without_two_etags_are_never_assumed_equal() {
     let source = remote_entry("source", "root/file.txt", "file.txt", "same");
     let mut target = remote_entry("target", "root/file.txt", "file.txt", "same");
-    assert!(source_matches_target(&source, &target));
+    assert!(source_matches_target(&source, &target, CompareMode::Auto));
     target.snapshot.etag = None;
-    assert!(!source_matches_target(&source, &target));
+    assert!(!source_matches_target(&source, &target, CompareMode::Auto));
+}
+
+fn remote_entry_with_identity(
+    alias: &str,
+    key: &str,
+    relative: &str,
+    etag: &str,
+    identity_etag: &str,
+) -> MirrorEntry {
+    let mut entry = remote_entry(alias, key, relative, etag);
+    entry.snapshot.identity_etag = Some(identity_etag.to_string());
+    entry
+}
+
+#[test]
+fn auto_compare_skips_when_source_etag_is_preserved_in_destination_metadata() {
+    let source = manifest([remote_entry(
+        "src",
+        "source/report.txt",
+        "report.txt",
+        "source-etag",
+    )]);
+    let target = manifest([remote_entry_with_identity(
+        "dst",
+        "backup/report.txt",
+        "report.txt",
+        "multipart-etag-1",
+        "source-etag",
+    )]);
+
+    let plan = build_copy_plan(
+        &source,
+        &target,
+        &MirrorEndpointSpec::Remote(RemotePath::new("dst", "bucket", "backup")),
+        &TransferSelection::default(),
+        true,
+        CompareMode::Auto,
+    )
+    .expect("build identity-aware plan");
+
+    assert!(plan.items.is_empty());
+    assert_eq!(plan.summary.skipped, 1);
+}
+
+#[test]
+fn runtime_identity_shortcut_requires_the_planned_destination_snapshot() {
+    let source = remote_entry("src", "source/report.txt", "report.txt", "source-etag");
+    let current = remote_entry_with_identity(
+        "dst",
+        "backup/report.txt",
+        "report.txt",
+        "multipart-etag-1",
+        "source-etag",
+    );
+    let mut operation = MirrorCopyOperation {
+        relative_path: "report.txt".to_string(),
+        source: source.clone(),
+        target: current.location.clone(),
+        target_before: Some(current.clone()),
+    };
+
+    assert!(matches!(
+        target_disposition_for_current(&operation, Some(&current), CompareMode::Auto),
+        Ok(TargetDisposition::AlreadyComplete)
+    ));
+
+    let mut replaced = current.clone();
+    replaced.snapshot.etag = Some("multipart-etag-2".to_string());
+    assert!(matches!(
+        target_disposition_for_current(&operation, Some(&replaced), CompareMode::Auto),
+        Err(Error::Conflict(_))
+    ));
+
+    operation.target_before = None;
+    assert!(matches!(
+        target_disposition_for_current(&operation, Some(&current), CompareMode::Auto),
+        Err(Error::Conflict(_))
+    ));
+}
+
+#[test]
+fn runtime_identity_shortcut_requires_the_current_source_snapshot() {
+    let source = remote_entry("src", "source/report.txt", "report.txt", "source-etag");
+    let mut current = ObjectInfo::file("source/report.txt", 4);
+    current.last_modified = source.snapshot.modified;
+    current.etag = source.snapshot.etag.clone();
+    assert!(ensure_snapshot_matches(&source, &current).is_ok());
+
+    current.etag = Some("replacement-etag".to_string());
+    assert!(matches!(
+        ensure_snapshot_matches(&source, &current),
+        Err(Error::Conflict(_))
+    ));
+}
+
+#[test]
+fn auto_compare_copies_when_identity_metadata_is_missing() {
+    let source = manifest([remote_entry(
+        "src",
+        "source/report.txt",
+        "report.txt",
+        "source-etag",
+    )]);
+    let target = manifest([remote_entry(
+        "dst",
+        "backup/report.txt",
+        "report.txt",
+        "multipart-etag-1",
+    )]);
+
+    let plan = build_copy_plan(
+        &source,
+        &target,
+        &MirrorEndpointSpec::Remote(RemotePath::new("dst", "bucket", "backup")),
+        &TransferSelection::default(),
+        true,
+        CompareMode::Auto,
+    )
+    .expect("build plan without identity metadata");
+
+    assert_eq!(plan.items.len(), 1);
+    assert_eq!(plan.summary.skipped, 0);
+}
+
+#[test]
+fn auto_compare_copies_when_identity_metadata_does_not_match() {
+    let source = manifest([remote_entry(
+        "src",
+        "source/report.txt",
+        "report.txt",
+        "source-etag",
+    )]);
+    let target = manifest([remote_entry_with_identity(
+        "dst",
+        "backup/report.txt",
+        "report.txt",
+        "multipart-etag-1",
+        "other-etag",
+    )]);
+
+    let plan = build_copy_plan(
+        &source,
+        &target,
+        &MirrorEndpointSpec::Remote(RemotePath::new("dst", "bucket", "backup")),
+        &TransferSelection::default(),
+        true,
+        CompareMode::Auto,
+    )
+    .expect("build plan with mismatched identity");
+
+    assert_eq!(plan.items.len(), 1);
+    assert_eq!(plan.summary.skipped, 0);
+}
+
+#[test]
+fn size_mismatch_never_skips_regardless_of_compare_mode() {
+    let source = remote_entry("src", "source/report.txt", "report.txt", "source-etag");
+    let mut target = remote_entry_with_identity(
+        "dst",
+        "backup/report.txt",
+        "report.txt",
+        "source-etag",
+        "source-etag",
+    );
+    target.snapshot.size_bytes = Some(8);
+
+    for compare in [CompareMode::Auto, CompareMode::Etag, CompareMode::Size] {
+        assert!(
+            !source_matches_target(&source, &target, compare),
+            "{compare:?} must copy when sizes differ"
+        );
+        assert!(
+            !destination_needs_identity_lookup(&source, &target, compare),
+            "{compare:?} must not HeadObject when sizes differ"
+        );
+    }
+
+    let plan = build_copy_plan(
+        &manifest([source]),
+        &manifest([target]),
+        &MirrorEndpointSpec::Remote(RemotePath::new("dst", "bucket", "backup")),
+        &TransferSelection::default(),
+        true,
+        CompareMode::Auto,
+    )
+    .expect("build plan for size mismatch");
+
+    assert_eq!(plan.items.len(), 1);
+    assert_eq!(plan.summary.skipped, 0);
+}
+
+#[test]
+fn etag_compare_still_copies_when_only_identity_metadata_matches() {
+    let source = manifest([remote_entry(
+        "src",
+        "source/report.txt",
+        "report.txt",
+        "source-etag",
+    )]);
+    let target = manifest([remote_entry_with_identity(
+        "dst",
+        "backup/report.txt",
+        "report.txt",
+        "multipart-etag-1",
+        "source-etag",
+    )]);
+
+    let plan = build_copy_plan(
+        &source,
+        &target,
+        &MirrorEndpointSpec::Remote(RemotePath::new("dst", "bucket", "backup")),
+        &TransferSelection::default(),
+        true,
+        CompareMode::Etag,
+    )
+    .expect("build etag-only plan");
+
+    assert_eq!(plan.items.len(), 1);
+}
+
+#[test]
+fn size_compare_skips_when_sizes_match_even_if_etags_differ() {
+    let source = manifest([remote_entry(
+        "src",
+        "source/report.txt",
+        "report.txt",
+        "source-etag",
+    )]);
+    let target = manifest([remote_entry(
+        "dst",
+        "backup/report.txt",
+        "report.txt",
+        "multipart-etag-1",
+    )]);
+
+    let plan = build_copy_plan(
+        &source,
+        &target,
+        &MirrorEndpointSpec::Remote(RemotePath::new("dst", "bucket", "backup")),
+        &TransferSelection::default(),
+        true,
+        CompareMode::Size,
+    )
+    .expect("build size-only plan");
+
+    assert!(plan.items.is_empty());
+    assert_eq!(plan.summary.skipped, 1);
+}
+
+#[test]
+fn identity_metadata_is_read_case_insensitively() {
+    let metadata = HashMap::from([("Rc-Source-Etag".to_string(), "abc".to_string())]);
+    assert_eq!(
+        identity_etag_from_metadata(Some(&metadata)).as_deref(),
+        Some("abc")
+    );
+    assert_eq!(
+        identity_etag_from_metadata(Some(&HashMap::from([(
+            "x-amz-meta-rc-source-etag".to_string(),
+            "abc".to_string()
+        )])))
+        .as_deref(),
+        Some("abc")
+    );
+    assert_eq!(
+        identity_etag_from_metadata(Some(&HashMap::from([(
+            "rc-source-etag".to_string(),
+            String::new()
+        )]))),
+        None
+    );
+    assert_eq!(identity_etag_from_metadata(None), None);
+}
+
+#[test]
+fn destination_identity_lookup_is_limited_to_auto_remote_etag_mismatches() {
+    let source = remote_entry("src", "source/file.txt", "file.txt", "source-etag");
+    let mismatched = remote_entry("dst", "backup/file.txt", "file.txt", "other-etag");
+    let matching = remote_entry("dst", "backup/file.txt", "file.txt", "source-etag");
+    let already_enriched = remote_entry_with_identity(
+        "dst",
+        "backup/file.txt",
+        "file.txt",
+        "other-etag",
+        "source-etag",
+    );
+    let local_source = local_entry("/src", "file.txt");
+
+    assert!(destination_needs_identity_lookup(
+        &source,
+        &mismatched,
+        CompareMode::Auto
+    ));
+    assert!(!destination_needs_identity_lookup(
+        &source,
+        &matching,
+        CompareMode::Auto
+    ));
+    assert!(!destination_needs_identity_lookup(
+        &source,
+        &already_enriched,
+        CompareMode::Auto
+    ));
+    assert!(!destination_needs_identity_lookup(
+        &source,
+        &mismatched,
+        CompareMode::Etag
+    ));
+    assert!(!destination_needs_identity_lookup(
+        &source,
+        &mismatched,
+        CompareMode::Size
+    ));
+    assert!(!destination_needs_identity_lookup(
+        &local_source,
+        &mismatched,
+        CompareMode::Auto
+    ));
+}
+
+#[test]
+fn destination_race_check_ignores_identity_metadata() {
+    let planned = snapshot(4, "2026-07-21T04:00:00Z", Some("dest-etag"));
+    let current = snapshot_with_identity(
+        4,
+        "2026-07-21T04:00:00Z",
+        Some("dest-etag"),
+        Some("source-etag"),
+    );
+    assert!(planned.content_matches(&current));
+    assert_ne!(planned, current);
 }
 
 #[tokio::test]

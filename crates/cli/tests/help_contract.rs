@@ -439,6 +439,7 @@ fn top_level_command_help_contract() {
                 "--retry-initial-backoff-ms",
                 "--retry-max-backoff-ms",
                 "--summary",
+                "--compare",
             ],
         },
         HelpCase {

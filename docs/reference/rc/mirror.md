@@ -30,6 +30,7 @@ rc [GLOBAL OPTIONS] mirror [OPTIONS] <SOURCE> <TARGET>
 | `--retry-initial-backoff-ms <MS>` | Initial transient retry backoff. Defaults to `100`. |
 | `--retry-max-backoff-ms <MS>` | Maximum transient retry backoff. Defaults to `10000`. |
 | `--summary` | Print deterministic aggregate counts and transferred bytes in human output. |
+| `--compare <auto\|etag\|size>` | Choose how existing destination objects are compared before a copy is skipped. Defaults to `auto`. |
 | `--quiet` | Suppress non-error command output. The global `--quiet` option has the same effect. |
 
 ## Examples
@@ -39,6 +40,7 @@ rc mirror ./site/ rustfs/web/site/ --overwrite --summary
 rc mirror rustfs/archive/ ./restore/ --remove --dry-run
 rc mirror stage/data/ prod/data/ --include '**/*.json' --exclude '**/private/**'
 rc mirror stage/data/ prod/data/ --overwrite --remove --concurrency 8 --rate-limit 20MiB/s
+rc mirror stage/data/ prod/data/ --overwrite --compare auto
 ```
 
 ## Behavior
@@ -51,7 +53,17 @@ Remote keys that are absolute, contain traversal, use backslashes, collide after
 
 ### Comparison and restart behavior
 
-Entries are compared by size and the strongest stable metadata available. Remote-to-remote equality requires matching ETags. Downloads preserve the source modification time, and local-to-remote restart checks accept a same-size destination written no earlier than the source. A completed entry is skipped on a restarted command.
+Entries are compared by size and the strongest stable metadata available. `--compare` selects the skip rule:
+
+| Mode | Skip a copy when |
+| --- | --- |
+| `auto` (default) | Destination and source ETags match, or sizes match and destination user metadata `x-amz-meta-rc-source-etag` records the source ETag from a previous `rc mirror` copy. |
+| `etag` | Destination and source ETags are identical. Multipart re-uploads that change the stored ETag are treated as different. |
+| `size` | Object sizes match, ignoring ETag differences. |
+
+Remote-to-remote copies download through a temporary file and upload to the destination. Multipart completion often stores a different ETag than the source, so a second `auto` run would recopy every object if it compared ListObjects ETags alone. `rc mirror` therefore writes `x-amz-meta-rc-source-etag` on remote uploads that have a source ETag. ListObjects does not return user metadata, so `auto` issues HeadObject for same-size destinations whose listed ETags differ.
+
+Downloads preserve the source modification time, and local-to-remote restart checks accept a same-size destination written no earlier than the source. A completed entry is skipped on a restarted command.
 
 `--overwrite` authorizes replacing a changed destination; it does not disable concurrency checks. Mirror revalidates sources and compares local destination metadata again before persistence, so changes observed by those checks fail with the conflict exit code. New remote objects use `If-None-Match: *`, while existing remote objects and remote removals use the planned ETag as a condition; these service-side conditions also reject remote races after the final client-side check. Local replacement is atomic but is not a filesystem compare-and-swap, so a local writer racing after the final metadata check may be replaced.
 
@@ -70,6 +82,10 @@ Copy and removal phases use the shared transfer controls for filtering, concurre
 ### Compatibility and migration
 
 Existing remote-to-remote commands continue to work. `--parallel` is retained as an alias of the shared `--concurrency` option. Mirror no longer falls back to an unconditional byte copy when source metadata lookup fails, and missing remote ETags are no longer treated as proof of equality. Automation that depended on either unsafe fallback must handle explicit network or conflict exits and retry after re-planning.
+
+### BREAKING incremental identity contract migration
+
+`--compare auto|etag|size` and destination metadata `x-amz-meta-rc-source-etag` are additive. Default skip-on-matching-ETag behavior is unchanged. Objects copied before this change still recopy once under `auto`, then skip. This PR must be marked `BREAKING` because `docs/reference/rc/mirror.md` is a protected CLI behavior contract. No JSON schema or config `schema_version` bump applies.
 
 Global options shown in command syntax use the same meaning everywhere:
 
