@@ -7,11 +7,11 @@ use jiff::Timestamp;
 use rc_core::alias::RetryConfig;
 use rc_core::{
     AliasManager, Error, MetadataDirective, MultipartCopyCancellation, MultipartCopyOptions,
-    ObjectEncryptionRequest, ObjectInfo, ObjectKeyPolicy, ObjectStore as _, ObjectWriteOptions,
-    ParsedPath, RemotePath, SseCustomerKey, TransferCancellation, TransferCandidate,
-    TransferControls, TransferCopyOptions, TransferExecutor, TransferOutcomeState, TransferPlan,
-    TransferReadOptions, TransferSelection, normalize_relative_key, parse_path,
-    relative_local_path_from_key,
+    ObjectAttributes, ObjectEncryptionRequest, ObjectInfo, ObjectKeyPolicy, ObjectStore as _,
+    ObjectWriteOptions, ParsedPath, RemotePath, SseCustomerKey, TransferCancellation,
+    TransferCandidate, TransferControls, TransferCopyOptions, TransferExecutor,
+    TransferOutcomeState, TransferPlan, TransferReadOptions, TransferSelection,
+    normalize_relative_key, parse_path, relative_local_path_from_key,
 };
 use rc_s3::S3Client;
 use serde::Serialize;
@@ -685,12 +685,21 @@ fn validate_fidelity_directions(
             "Destination transfer policies require a remote destination".to_string(),
         ));
     }
+    let same_alias_remote_copy = target_remote
+        && sources.iter().any(|source| {
+            matches!(
+                source,
+                ParsedPath::Remote(source) if target.as_remote().is_some_and(|target| source.alias == target.alias)
+            )
+        });
     if any_remote && target_remote {
         let copy_options = transfer_copy_options(args, None, None)?;
-        if matches!(
-            copy_options.metadata_directive,
-            Some(MetadataDirective::Replace)
-        ) {
+        if same_alias_remote_copy
+            && matches!(
+                copy_options.metadata_directive,
+                Some(MetadataDirective::Replace)
+            )
+        {
             return Err(Error::UnsupportedFeature(
                 "RustFS beta.10 does not preserve complete metadata REPLACE semantics; tracked by rustfs/backlog#1463"
                     .to_string(),
@@ -1102,6 +1111,9 @@ fn validate_storage_class_plan(
         })?;
         let multipart = match &item.payload {
             CpOperation::LocalToRemote { .. } => size > MULTIPART_THRESHOLD,
+            CpOperation::RemoteToRemote { source, target, .. } if source.alias != target.alias => {
+                size > MULTIPART_THRESHOLD
+            }
             CpOperation::RemoteToRemote { .. } => rc_core::requires_multipart_copy(size),
             CpOperation::RemoteToLocal { .. } => false,
         };
@@ -1139,10 +1151,13 @@ async fn execute_planned_operation(
             source_info,
             encryption,
         } => {
+            let source_client = planned_client(clients, &source.alias)?;
+            let target_client = planned_client(clients, &target.alias)?;
             let progress_key = (item.source.clone(), item.target.clone());
             copy_progress.reset(&progress_key);
             let result = perform_planned_remote_copy(
-                client,
+                source_client,
+                target_client,
                 source,
                 target,
                 source_info,
@@ -1237,7 +1252,8 @@ struct PlannedRemoteCopyResult {
 
 #[allow(clippy::too_many_arguments)]
 async fn perform_planned_remote_copy(
-    client: &S3Client,
+    source_client: &S3Client,
+    target_client: &S3Client,
     source: &RemotePath,
     target: &RemotePath,
     source_info: &ObjectInfo,
@@ -1247,9 +1263,17 @@ async fn perform_planned_remote_copy(
     args: &CpArgs,
 ) -> rc_core::Result<PlannedRemoteCopyResult> {
     if source.alias != target.alias {
-        return Err(Error::UnsupportedFeature(
-            "Cross-alias S3-to-S3 copy is not supported".to_string(),
-        ));
+        return perform_cross_alias_remote_copy(
+            source_client,
+            target_client,
+            source,
+            target,
+            source_info,
+            encryption,
+            on_progress,
+            args,
+        )
+        .await;
     }
     if args.source_customer_key.is_some() || args.destination_customer_key.is_some() {
         return Err(Error::UnsupportedFeature(
@@ -1267,21 +1291,15 @@ async fn perform_planned_remote_copy(
                 "RustFS beta.10 does not persist storage class for multipart copies".to_string(),
             ));
         }
-        let current = client.head_object(source).await?;
-        if current.size_bytes != source_info.size_bytes
-            || source_info
-                .etag
-                .as_ref()
-                .zip(current.etag.as_ref())
-                .is_some_and(|(planned, current)| planned != current)
-        {
+        let current = source_client.head_object(source).await?;
+        if !source_identity_matches(source_info, &current) {
             return Err(Error::Conflict(format!(
                 "Source changed after copy planning: {source}"
             )));
         }
         let options = multipart_options_from_source(&current)?;
         let transfer = transfer_copy_options(args, current.version_id.clone(), encryption)?;
-        let copied = client
+        let copied = source_client
             .multipart_copy_with_transfer_options(
                 source,
                 target,
@@ -1300,7 +1318,7 @@ async fn perform_planned_remote_copy(
         });
     }
     let options = transfer_copy_options(args, source_info.version_id.clone(), encryption)?;
-    let copied = client
+    let copied = source_client
         .copy_object_with_transfer_options(source, target, &options)
         .await?;
     let bytes_copied = copied
@@ -1318,6 +1336,152 @@ async fn perform_planned_remote_copy(
         upload_id: None,
         object: copied,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn perform_cross_alias_remote_copy(
+    source_client: &S3Client,
+    target_client: &S3Client,
+    source: &RemotePath,
+    target: &RemotePath,
+    source_info: &ObjectInfo,
+    encryption: Option<&ObjectEncryptionRequest>,
+    on_progress: &(dyn Fn(u64) + Send + Sync),
+    args: &CpArgs,
+) -> rc_core::Result<PlannedRemoteCopyResult> {
+    // Server-side CopyObject cannot target a different alias/endpoint. Stream
+    // through a bounded temporary file so the destination write is a normal
+    // upload with the destination alias credentials.
+    if args.source_customer_key.is_some() || args.destination_customer_key.is_some() {
+        return Err(Error::UnsupportedFeature(
+            "RustFS beta.10 server-side SSE-C copy is not compatibility-proven; tracked by rustfs/backlog#1467"
+                .to_string(),
+        ));
+    }
+    let planned_size = source_info
+        .size_bytes
+        .and_then(|size| u64::try_from(size).ok())
+        .ok_or_else(|| Error::InvalidPath(format!("Source size is unavailable: {source}")))?;
+    if args.storage_class.is_some() && planned_size > MULTIPART_THRESHOLD {
+        return Err(Error::UnsupportedFeature(
+            "RustFS beta.10 does not persist storage class for multipart uploads".to_string(),
+        ));
+    }
+
+    let current = source_client.head_object(source).await?;
+    if !source_identity_matches(source_info, &current) {
+        return Err(Error::Conflict(format!(
+            "Source changed after copy planning: {source}"
+        )));
+    }
+
+    let staging = tempfile::Builder::new()
+        .prefix("rc-cp-cross-alias-")
+        .suffix(".part")
+        .tempfile()?
+        .into_temp_path();
+    async {
+        let downloaded = source_client
+            .download_object_to_path_with_transfer_options(
+                source,
+                &staging,
+                &TransferReadOptions {
+                    version_id: current.version_id.clone(),
+                    customer_key: args.source_customer_key.clone(),
+                    ..TransferReadOptions::default()
+                },
+                |copied, _total| on_progress(copied),
+            )
+            .await?;
+        if downloaded != planned_size {
+            return Err(Error::Conflict(format!(
+                "Source changed after copy planning: {source}"
+            )));
+        }
+        let after = source_client
+            .head_object_with_transfer_options(
+                source,
+                &TransferReadOptions {
+                    version_id: current.version_id.clone(),
+                    customer_key: args.source_customer_key.clone(),
+                    ..TransferReadOptions::default()
+                },
+            )
+            .await?;
+        if !source_identity_matches(&current, &after) {
+            return Err(Error::Conflict(format!(
+                "Source changed after copy planning: {source}"
+            )));
+        }
+        let options = piped_copy_write_options(args, &current, encryption)?;
+        let object = target_client
+            .put_object_from_path_with_options(target, &staging, &options, |copied| {
+                on_progress(copied)
+            })
+            .await?;
+        let bytes_copied = object
+            .size_bytes
+            .and_then(|size| u64::try_from(size).ok())
+            .unwrap_or(downloaded);
+        on_progress(bytes_copied);
+        Ok(PlannedRemoteCopyResult {
+            bytes_copied,
+            source_version_id: current.version_id.clone(),
+            destination_version_id: object.version_id.clone(),
+            upload_id: None,
+            object,
+        })
+    }
+    .await
+}
+
+fn source_identity_matches(planned: &ObjectInfo, current: &ObjectInfo) -> bool {
+    if planned.size_bytes != current.size_bytes {
+        return false;
+    }
+    match (&planned.etag, &current.etag) {
+        (Some(planned), Some(current)) => planned == current,
+        // Without an ETag an unversioned object has no stable read identity;
+        // only an identical explicit version can prove that it is unchanged.
+        (None, None) => {
+            planned.version_id.is_some()
+                && planned.version_id.as_ref() == current.version_id.as_ref()
+        }
+        _ => false,
+    }
+}
+
+fn piped_copy_write_options(
+    args: &CpArgs,
+    source: &ObjectInfo,
+    encryption: Option<&ObjectEncryptionRequest>,
+) -> rc_core::Result<ObjectWriteOptions> {
+    let mut options = object_write_options(
+        &args.fidelity,
+        args.content_type.as_deref(),
+        encryption,
+        args.destination_customer_key.as_ref(),
+        args.storage_class.clone(),
+    )?;
+    if matches!(
+        requested_metadata_directive(args),
+        Some(MetadataDirective::Replace)
+    ) {
+        return Ok(options);
+    }
+    let mut attributes = options.attributes.take().unwrap_or_default();
+    if attributes.content_type.is_none() {
+        attributes.content_type = source.content_type.clone();
+    }
+    if attributes.user_metadata.is_empty()
+        && let Some(metadata) = &source.metadata
+    {
+        attributes.user_metadata.clone_from(metadata);
+    }
+    if attributes != ObjectAttributes::default() {
+        options.attributes = Some(attributes);
+    }
+    Ok(options)
 }
 
 #[cfg(test)]
@@ -1351,10 +1515,28 @@ fn operation_alias(operation: &CpOperation) -> &str {
     }
 }
 
+fn operation_client_aliases(operation: &CpOperation) -> Vec<&str> {
+    match operation {
+        CpOperation::LocalToRemote { target, .. } => vec![target.alias.as_str()],
+        CpOperation::RemoteToLocal { source, .. } => vec![source.alias.as_str()],
+        CpOperation::RemoteToRemote { source, target, .. } => {
+            if source.alias == target.alias {
+                vec![source.alias.as_str()]
+            } else {
+                vec![source.alias.as_str(), target.alias.as_str()]
+            }
+        }
+    }
+}
+
 fn planned_client_aliases(items: &[TransferCandidate<CpOperation>]) -> BTreeSet<String> {
     items
         .iter()
-        .map(|item| operation_alias(&item.payload).to_string())
+        .flat_map(|item| {
+            operation_client_aliases(&item.payload)
+                .into_iter()
+                .map(ToOwned::to_owned)
+        })
         .collect()
 }
 
@@ -1881,18 +2063,13 @@ async fn build_remote_candidates(
         }
 
         let listing_source = recursive_listing_source(source);
-        if let ParsedPath::Remote(target) = target {
-            if source.alias != target.alias {
-                return Err(Error::UnsupportedFeature(
-                    "Cross-alias S3-to-S3 copy is not supported".to_string(),
-                ));
-            }
-            if remote_copy_scopes_overlap(&listing_source, target) {
-                return Err(Error::Conflict(format!(
-                    "Recursive source '{}' overlaps destination '{}'",
-                    listing_source, target
-                )));
-            }
+        if let ParsedPath::Remote(target) = target
+            && remote_copy_scopes_overlap(&listing_source, target)
+        {
+            return Err(Error::Conflict(format!(
+                "Recursive source '{}' overlaps destination '{}'",
+                listing_source, target
+            )));
         }
 
         let source_root = recursive_source_root(&listing_source, multiple_sources);
@@ -2028,11 +2205,6 @@ async fn build_remote_candidates(
             });
         }
         ParsedPath::Remote(target) => {
-            if source.alias != target.alias {
-                return Err(Error::UnsupportedFeature(
-                    "Cross-alias S3-to-S3 copy is not supported".to_string(),
-                ));
-            }
             let destination = if target_is_container {
                 remote_child(target, name, ObjectKeyPolicy::for_remote_destination())?
             } else {
@@ -2827,7 +2999,6 @@ async fn copy_s3_to_s3_prepared(
         );
     }
 
-    // For S3-to-S3, we need to handle same or different aliases
     let alias_manager = match AliasManager::new() {
         Ok(am) => am,
         Err(e) => {
@@ -2836,16 +3007,9 @@ async fn copy_s3_to_s3_prepared(
         }
     };
 
-    // For now, only support same-alias copies (server-side copy)
-    if src.alias != dst.alias {
-        return formatter.fail_with_suggestion(
-            ExitCode::UnsupportedFeature,
-            "Cross-alias S3-to-S3 copy not yet supported. Use download + upload.",
-            "Copy via a local path or split the operation into download and upload steps.",
-        );
-    }
-
-    let alias = match alias_manager.get(&src.alias) {
+    // Same-alias copies use server-side CopyObject. Different aliases download
+    // through a temporary file and upload with the destination credentials.
+    let source_alias = match alias_manager.get(&src.alias) {
         Ok(a) => a,
         Err(_) => {
             return formatter.fail_with_suggestion(
@@ -2855,7 +3019,7 @@ async fn copy_s3_to_s3_prepared(
             );
         }
     };
-    let client = match S3Client::new(alias).await {
+    let source_client = match S3Client::new(source_alias).await {
         Ok(c) => c,
         Err(e) => {
             return formatter.fail(
@@ -2863,6 +3027,31 @@ async fn copy_s3_to_s3_prepared(
                 &format!("Failed to create S3 client: {e}"),
             );
         }
+    };
+    let target_client;
+    let target_client_ref = if src.alias == dst.alias {
+        &source_client
+    } else {
+        let destination_alias = match alias_manager.get(&dst.alias) {
+            Ok(a) => a,
+            Err(_) => {
+                return formatter.fail_with_suggestion(
+                    ExitCode::NotFound,
+                    &format!("Alias '{}' not found", dst.alias),
+                    "Run `rc alias list` to inspect configured aliases or add one with `rc alias set ...`.",
+                );
+            }
+        };
+        target_client = match S3Client::new(destination_alias).await {
+            Ok(c) => c,
+            Err(e) => {
+                return formatter.fail(
+                    ExitCode::NetworkError,
+                    &format!("Failed to create destination S3 client: {e}"),
+                );
+            }
+        };
+        &target_client
     };
 
     let src_display = format!("{}/{}/{}", src.alias, src.bucket, src.key);
@@ -2878,7 +3067,7 @@ async fn copy_s3_to_s3_prepared(
         return ExitCode::Success;
     }
 
-    let source_info = match client.head_object(src).await {
+    let source_info = match source_client.head_object(src).await {
         Ok(info) => info,
         Err(Error::NotFound(_)) => {
             return formatter.fail_with_suggestion(
@@ -2897,7 +3086,15 @@ async fn copy_s3_to_s3_prepared(
     let source_size = source_info
         .size_bytes
         .and_then(|size| u64::try_from(size).ok());
-    if args.storage_class.is_some() && source_size.is_none_or(rc_core::requires_multipart_copy) {
+    if args.storage_class.is_some()
+        && source_size.is_none_or(|size| {
+            if src.alias == dst.alias {
+                rc_core::requires_multipart_copy(size)
+            } else {
+                size > MULTIPART_THRESHOLD
+            }
+        })
+    {
         return formatter.fail(
             ExitCode::UnsupportedFeature,
             "RustFS beta.10 does not persist storage class for multipart or unknown-size copies",
@@ -2927,7 +3124,8 @@ async fn copy_s3_to_s3_prepared(
     });
     let ignore_progress = |_: u64| {};
     let copy = perform_planned_remote_copy(
-        &client,
+        &source_client,
+        target_client_ref,
         src,
         dst,
         &source_info,
@@ -3464,6 +3662,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn planned_client_aliases_include_both_sides_of_a_cross_alias_copy() {
+        let candidate = TransferCandidate {
+            payload: CpOperation::RemoteToRemote {
+                source: RemotePath::new("alpha", "source", "file.txt"),
+                target: RemotePath::new("beta", "target", "file.txt"),
+                source_info: Box::new(ObjectInfo::file("file.txt", 4)),
+                encryption: None,
+            },
+            source: "alpha/source/file.txt".to_string(),
+            target: "beta/target/file.txt".to_string(),
+            relative_path: "file.txt".to_string(),
+            modified: None,
+            size_bytes: Some(4),
+        };
+
+        assert_eq!(
+            planned_client_aliases(&[candidate])
+                .into_iter()
+                .collect::<Vec<_>>(),
+            ["alpha", "beta"]
+        );
+    }
+
+    #[test]
+    fn planned_client_aliases_keep_same_alias_remote_copy_on_one_alias() {
+        let candidate = TransferCandidate {
+            payload: CpOperation::RemoteToRemote {
+                source: RemotePath::new("shared", "source", "file.txt"),
+                target: RemotePath::new("shared", "target", "file.txt"),
+                source_info: Box::new(ObjectInfo::file("file.txt", 4)),
+                encryption: None,
+            },
+            source: "shared/source/file.txt".to_string(),
+            target: "shared/target/file.txt".to_string(),
+            relative_path: "file.txt".to_string(),
+            modified: None,
+            size_bytes: Some(4),
+        };
+
+        assert_eq!(
+            planned_client_aliases(&[candidate])
+                .into_iter()
+                .collect::<Vec<_>>(),
+            ["shared"]
+        );
+    }
+
     #[tokio::test]
     async fn planning_client_reuses_one_connection_pool_per_alias() {
         let (alias_manager, _temp_dir) = temp_alias_manager();
@@ -3867,6 +4113,20 @@ mod tests {
             Err(Error::UnsupportedFeature(_))
         ));
 
+        let cross_alias_source =
+            ParsedPath::Remote(RemotePath::new("source", "source", "report.json"));
+        let cross_alias_target =
+            ParsedPath::Remote(RemotePath::new("destination", "target", "report.json"));
+        assert!(
+            validate_fidelity_directions(
+                &replace,
+                std::slice::from_ref(&cross_alias_source),
+                &cross_alias_target,
+            )
+            .is_ok(),
+            "metadata REPLACE is implemented by the cross-alias upload path"
+        );
+
         let mut tags = CpArgs::single("test/source/report.json", "test/target/report.json");
         tags.tagging_directive = Some(TaggingDirectiveArg::Replace);
         tags.fidelity.tags = vec!["env=prod".to_string()];
@@ -3881,6 +4141,23 @@ mod tests {
             validate_fidelity_directions(&checksum, std::slice::from_ref(&source), &target),
             Err(Error::UnsupportedFeature(_))
         ));
+    }
+
+    #[test]
+    fn source_identity_validation_detects_same_size_etag_changes() {
+        let mut planned = ObjectInfo::file("report.json", 4);
+        planned.etag = Some("planned".to_string());
+        let mut current = planned.clone();
+        assert!(source_identity_matches(&planned, &current));
+
+        current.etag = Some("changed".to_string());
+        assert!(!source_identity_matches(&planned, &current));
+
+        current.etag = None;
+        assert!(!source_identity_matches(&planned, &current));
+
+        planned.etag = None;
+        assert!(!source_identity_matches(&planned, &current));
     }
 
     #[test]
@@ -3929,6 +4206,90 @@ mod tests {
             validate_storage_class_plan(&plan, Some("STANDARD")),
             Err(Error::UnsupportedFeature(_))
         ));
+    }
+
+    #[test]
+    fn storage_class_plan_rejects_cross_alias_multipart_uploads() {
+        let plan = TransferPlan::build(
+            vec![TransferCandidate {
+                payload: CpOperation::RemoteToRemote {
+                    source: RemotePath::new("alpha", "source", "medium.bin"),
+                    target: RemotePath::new("beta", "target", "medium.bin"),
+                    source_info: Box::new(ObjectInfo::file(
+                        "medium.bin",
+                        (MULTIPART_THRESHOLD + 1) as i64,
+                    )),
+                    encryption: None,
+                },
+                source: "alpha/source/medium.bin".to_string(),
+                target: "beta/target/medium.bin".to_string(),
+                relative_path: "medium.bin".to_string(),
+                modified: None,
+                size_bytes: Some(MULTIPART_THRESHOLD + 1),
+            }],
+            &TransferSelection::default(),
+        );
+
+        assert!(matches!(
+            validate_storage_class_plan(&plan, Some("STANDARD")),
+            Err(Error::UnsupportedFeature(_))
+        ));
+    }
+
+    #[test]
+    fn piped_copy_preserves_source_content_type_unless_replaced() {
+        let mut source = ObjectInfo::file("file.txt", 4);
+        source.content_type = Some("text/plain".to_string());
+        let args = CpArgs::single("alpha/source/file.txt", "beta/target/file.txt");
+
+        let copied = piped_copy_write_options(&args, &source, None).expect("copy metadata");
+        assert_eq!(
+            copied
+                .attributes
+                .as_ref()
+                .and_then(|value| value.content_type.as_deref()),
+            Some("text/plain")
+        );
+
+        let mut replace = args;
+        replace.metadata_directive = Some(MetadataDirectiveArg::Replace);
+        let replaced = piped_copy_write_options(&replace, &source, None).expect("replace metadata");
+        assert!(
+            replaced
+                .attributes
+                .as_ref()
+                .is_none_or(|value| value.content_type.is_none())
+        );
+    }
+
+    #[test]
+    fn piped_copy_preserves_source_user_metadata_unless_replaced() {
+        let mut source = ObjectInfo::file("file.txt", 4);
+        source.metadata = Some(HashMap::from([(
+            "owner".to_string(),
+            "storage".to_string(),
+        )]));
+        let args = CpArgs::single("alpha/source/file.txt", "beta/target/file.txt");
+
+        let copied = piped_copy_write_options(&args, &source, None).expect("copy metadata");
+        assert_eq!(
+            copied
+                .attributes
+                .as_ref()
+                .and_then(|value| value.user_metadata.get("owner"))
+                .map(String::as_str),
+            Some("storage")
+        );
+
+        let mut replace = args;
+        replace.metadata_directive = Some(MetadataDirectiveArg::Replace);
+        let replaced = piped_copy_write_options(&replace, &source, None).expect("replace metadata");
+        assert!(
+            replaced
+                .attributes
+                .as_ref()
+                .is_none_or(|value| value.user_metadata.is_empty())
+        );
     }
 
     #[test]

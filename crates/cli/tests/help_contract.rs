@@ -441,6 +441,7 @@ fn top_level_command_help_contract() {
                 "--retry-max-backoff-ms",
                 "--summary",
                 "--portable-names",
+                "--compare",
             ],
         },
         HelpCase {
@@ -1127,6 +1128,7 @@ fn nested_subcommand_help_contract() {
                 "--policy",
                 "--policy-json",
                 "--expiry",
+                "--user",
             ],
         },
         HelpCase {
