@@ -63,6 +63,10 @@ impl TestServer {
             while !thread_stop.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        // Accepted sockets can inherit nonblocking mode on some platforms.
+                        stream
+                            .set_nonblocking(false)
+                            .expect("set accepted stream blocking");
                         if let Some(request) = read_request(&mut stream) {
                             let response = response_for(mode, &request);
                             thread_requests
