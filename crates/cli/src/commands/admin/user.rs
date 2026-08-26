@@ -266,17 +266,11 @@ async fn execute_passwd(args: PasswdArgs, formatter: &Formatter) -> ExitCode {
         "password",
     ) {
         Ok(source) => source,
-        Err(error) => {
-            formatter.error(&error.to_string());
-            return ExitCode::UsageError;
-        }
+        Err(error) => return formatter.fail(ExitCode::UsageError, &error.to_string()),
     };
     let secret = match source.load(&format!("New password for {}: ", args.access_key)) {
         Ok(value) => SecretValue::new(value.to_string()),
-        Err(error) => {
-            formatter.error(&error.to_string());
-            return ExitCode::UsageError;
-        }
+        Err(error) => return formatter.fail(ExitCode::UsageError, &error.to_string()),
     };
 
     match client.set_user_secret_key(&args.access_key, &secret).await {
@@ -304,8 +298,7 @@ async fn execute_passwd(args: PasswdArgs, formatter: &Formatter) -> ExitCode {
         }
         Err(error) => {
             let code = ExitCode::from_i32(error.exit_code()).unwrap_or(ExitCode::GeneralError);
-            formatter.error(&format!("Failed to reset the password: {error}"));
-            code
+            formatter.fail(code, &format!("Failed to reset the password: {error}"))
         }
     }
 }
@@ -340,7 +333,10 @@ async fn execute_user_mfa_status(args: UserMfaStatusArgs, formatter: &Formatter)
                 ));
                 if status.enabled {
                     if let Some(activated) = &status.activated_at {
-                        formatter.println(&format!("  Enabled on: {activated}"));
+                        formatter.println(&format!(
+                            "  Enabled on: {}",
+                            formatter.sanitize_text(activated)
+                        ));
                     }
                     formatter.println(&format!(
                         "  Recovery:   {} code(s) remaining",
@@ -352,8 +348,7 @@ async fn execute_user_mfa_status(args: UserMfaStatusArgs, formatter: &Formatter)
         }
         Err(error) => {
             let code = ExitCode::from_i32(error.exit_code()).unwrap_or(ExitCode::GeneralError);
-            formatter.error(&format!("Failed to read two-factor state: {error}"));
-            code
+            formatter.fail(code, &format!("Failed to read two-factor state: {error}"))
         }
     }
 }
@@ -366,8 +361,7 @@ async fn execute_user_mfa_reset(args: UserMfaResetArgs, formatter: &Formatter) -
 
     if let Err(error) = confirm_mfa_reset(&args.access_key, args.yes, formatter) {
         let code = ExitCode::from_i32(error.exit_code()).unwrap_or(ExitCode::GeneralError);
-        formatter.error(&error.to_string());
-        return code;
+        return formatter.fail(code, &error.to_string());
     }
 
     match client.user_mfa_reset(&args.access_key).await {
@@ -390,10 +384,10 @@ async fn execute_user_mfa_reset(args: UserMfaResetArgs, formatter: &Formatter) -
         }
         Err(error) => {
             let code = ExitCode::from_i32(error.exit_code()).unwrap_or(ExitCode::GeneralError);
-            formatter.error(&format!(
-                "Failed to clear two-factor authentication: {error}"
-            ));
-            code
+            formatter.fail(
+                code,
+                &format!("Failed to clear two-factor authentication: {error}"),
+            )
         }
     }
 }

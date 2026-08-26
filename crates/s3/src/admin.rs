@@ -670,6 +670,26 @@ impl AdminClient {
         body: Option<&[u8]>,
         response: BoundedJsonResponse,
     ) -> Result<T> {
+        let response_body = self
+            .request_bounded_bytes(method, path, query, body, response)
+            .await?;
+        serde_json::from_slice(&response_body).map_err(Error::Json)
+    }
+
+    /// One signed admin request with a bounded response, returning raw bytes.
+    ///
+    /// Every bounded admin family goes through here so the signing input, the
+    /// query encoding and the response bound cannot drift apart between them:
+    /// a second copy of this sequence is a second chance for a query parameter
+    /// to be encoded one way for SigV4 and another way on the wire.
+    async fn request_bounded_bytes(
+        &self,
+        method: Method,
+        path: &str,
+        query: Option<&[(&str, &str)]>,
+        body: Option<&[u8]>,
+        response: BoundedJsonResponse,
+    ) -> Result<Vec<u8>> {
         let mut url = self.admin_url(path);
         if let Some(query) = query {
             let query_string = query
@@ -717,51 +737,19 @@ impl AdminClient {
             ));
         }
 
-        serde_json::from_slice(&response_body).map_err(Error::Json)
+        Ok(response_body)
     }
 
-    /// One bounded, signed admin request for the account/MFA family, returning
-    /// the raw response body.
+    /// The response bound for the account/MFA family.
     ///
-    /// Bounded because an MFA response carries a rendered QR and a recovery-code
-    /// set: generous, but never unbounded.
-    async fn request_account_bytes(
-        &self,
-        method: Method,
-        path: &str,
-        body: Option<&[u8]>,
-    ) -> Result<Vec<u8>> {
-        let url = self.admin_url(path);
-        let body_bytes = body.unwrap_or_default();
-        let headers = self.request_headers(body_bytes)?;
-        let signed_headers = self
-            .sign_request(&method, &url, &headers, body_bytes)
-            .await?;
-        let mut request = self.http_client.request(method, &url);
-        for (name, value) in &signed_headers {
-            request = request.header(name, value);
+    /// Generous because an MFA response carries a rendered QR and a
+    /// recovery-code set, but never unbounded.
+    fn account_response() -> BoundedJsonResponse {
+        BoundedJsonResponse {
+            max_bytes: MAX_ACCOUNT_RESPONSE_BYTES,
+            name: "Account administration response",
+            error_mapper: |client, status, body| client.map_error(status, body),
         }
-        if !body_bytes.is_empty() {
-            request = request.body(body_bytes.to_vec());
-        }
-
-        let response = request
-            .send()
-            .await
-            .map_err(|_| Error::Network("Account administration request failed".to_string()))?;
-        let status = response.status();
-        let response_body = read_bounded_response_body(
-            response,
-            MAX_ACCOUNT_RESPONSE_BYTES,
-            "Account administration response",
-        )
-        .await?;
-
-        if !status.is_success() {
-            return Err(self.map_error(status, &String::from_utf8_lossy(&response_body)));
-        }
-
-        Ok(response_body)
     }
 
     /// A request whose response is a JSON document.
@@ -773,9 +761,12 @@ impl AdminClient {
         &self,
         method: Method,
         path: &str,
+        query: Option<&[(&str, &str)]>,
         body: Option<&[u8]>,
     ) -> Result<T> {
-        let response_body = self.request_account_bytes(method, path, body).await?;
+        let response_body = self
+            .request_bounded_bytes(method, path, query, body, Self::account_response())
+            .await?;
         if response_body.is_empty() {
             return Err(Error::General(
                 "RustFS returned an empty account administration response".to_string(),
@@ -789,9 +780,11 @@ impl AdminClient {
         &self,
         method: Method,
         path: &str,
+        query: Option<&[(&str, &str)]>,
         body: Option<&[u8]>,
     ) -> Result<()> {
-        self.request_account_bytes(method, path, body).await?;
+        self.request_bounded_bytes(method, path, query, body, Self::account_response())
+            .await?;
         Ok(())
     }
 
@@ -3399,7 +3392,7 @@ impl OidcReadApi for AdminClient {
 #[async_trait]
 impl AccountApi for AdminClient {
     async fn account_info(&self) -> Result<AccountInfo> {
-        self.request_account_json(Method::GET, "/account/info", None)
+        self.request_account_json(Method::GET, "/account/info", None, None)
             .await
     }
 
@@ -3420,7 +3413,7 @@ impl AccountApi for AdminClient {
         }))
         .map_err(|_| Error::General("Failed to encode the password change request".to_string()))?;
 
-        self.request_account_json(Method::POST, "/account/password", Some(&body))
+        self.request_account_json(Method::POST, "/account/password", None, Some(&body))
             .await
     }
 }
@@ -3428,20 +3421,20 @@ impl AccountApi for AdminClient {
 #[async_trait]
 impl AccountMfaApi for AdminClient {
     async fn account_mfa_status(&self) -> Result<MfaStatus> {
-        self.request_account_json(Method::GET, "/account/mfa", None)
+        self.request_account_json(Method::GET, "/account/mfa", None, None)
             .await
     }
 
     async fn account_mfa_enroll(&self) -> Result<MfaEnrollment> {
         // An empty JSON object rather than no body: the endpoint is a POST and
         // some proxies drop a bodyless one.
-        self.request_account_json(Method::POST, "/account/mfa/enroll", Some(b"{}"))
+        self.request_account_json(Method::POST, "/account/mfa/enroll", None, Some(b"{}"))
             .await
     }
 
     async fn account_mfa_activate(&self, code: &SecretValue) -> Result<RecoveryCodes> {
         let body = encode_code_request(code)?;
-        self.request_account_json(Method::POST, "/account/mfa/activate", Some(&body))
+        self.request_account_json(Method::POST, "/account/mfa/activate", None, Some(&body))
             .await
     }
 
@@ -3463,14 +3456,19 @@ impl AccountMfaApi for AdminClient {
         }))
         .map_err(|_| Error::General("Failed to encode the disable request".to_string()))?;
 
-        self.request_account_empty(Method::POST, "/account/mfa/disable", Some(&body))
+        self.request_account_empty(Method::POST, "/account/mfa/disable", None, Some(&body))
             .await
     }
 
     async fn account_mfa_recovery_codes(&self, code: &SecretValue) -> Result<RecoveryCodes> {
         let body = encode_code_request(code)?;
-        self.request_account_json(Method::POST, "/account/mfa/recovery-codes", Some(&body))
-            .await
+        self.request_account_json(
+            Method::POST,
+            "/account/mfa/recovery-codes",
+            None,
+            Some(&body),
+        )
+        .await
     }
 }
 
@@ -3494,13 +3492,13 @@ impl UserCredentialApi for AdminClient {
 
         let body = serde_json::to_vec(&serde_json::json!({ "secret_key": secret_key.expose() }))
             .map_err(|_| Error::General("Failed to encode the secret key request".to_string()))?;
-        let path = format!(
-            "/set-user-secret-key?accessKey={}",
-            urlencoding::encode(access_key)
-        );
-
-        self.request_account_json(Method::PUT, &path, Some(&body))
-            .await
+        self.request_account_json(
+            Method::PUT,
+            "/set-user-secret-key",
+            Some(&[("accessKey", access_key)]),
+            Some(&body),
+        )
+        .await
     }
 
     async fn user_mfa_status(&self, access_key: &str) -> Result<UserMfaStatus> {
@@ -3509,8 +3507,13 @@ impl UserCredentialApi for AdminClient {
                 "Access key must not be empty".to_string(),
             ));
         }
-        let path = format!("/user/mfa?accessKey={}", urlencoding::encode(access_key));
-        self.request_account_json(Method::GET, &path, None).await
+        self.request_account_json(
+            Method::GET,
+            "/user/mfa",
+            Some(&[("accessKey", access_key)]),
+            None,
+        )
+        .await
     }
 
     async fn user_mfa_reset(&self, access_key: &str) -> Result<()> {
@@ -3519,9 +3522,13 @@ impl UserCredentialApi for AdminClient {
                 "Access key must not be empty".to_string(),
             ));
         }
-        let path = format!("/user/mfa?accessKey={}", urlencoding::encode(access_key));
-        self.request_account_empty(Method::DELETE, &path, None)
-            .await
+        self.request_account_empty(
+            Method::DELETE,
+            "/user/mfa",
+            Some(&[("accessKey", access_key)]),
+            None,
+        )
+        .await
     }
 }
 

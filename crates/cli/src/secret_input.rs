@@ -58,7 +58,7 @@ impl SecretLocator {
     pub(crate) fn load_customer_key(&self) -> Result<SseCustomerKey> {
         self.validate()?;
         let bytes = match self {
-            Self::File(path) => read_protected_key_file(path)?,
+            Self::File(path) => read_protected_file(path, &SSE_C_KEY_FILE)?,
             Self::Environment(name) => read_environment_key(name)?,
         };
         if bytes.len() != 32 {
@@ -76,24 +76,87 @@ fn valid_environment_name(name: &str) -> bool {
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
-fn read_protected_key_file(path: &Path) -> Result<Zeroizing<Vec<u8>>> {
-    let path_metadata = std::fs::symlink_metadata(path)
-        .map_err(|_| Error::InvalidPath("Failed to inspect SSE-C key file".to_string()))?;
-    if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
-        return Err(Error::InvalidPath(
-            "SSE-C key input must be a regular file, not a symlink".to_string(),
-        ));
+/// How a file holding secret material is read.
+///
+/// An SSE-C key and an account password are different shapes of secret, and one
+/// reader serving both silently truncated the longer one. Everything that
+/// differs between them lives here, so a caller cannot inherit a length bound,
+/// a hardening rule, or an error message meant for the other.
+struct ProtectedFileSpec {
+    /// Most bytes to read from the file.
+    read_limit: usize,
+    /// Report a file longer than `read_limit` instead of returning the prefix.
+    ///
+    /// Off for the SSE-C key, whose caller checks for exactly 32 bytes and has
+    /// its own wording for a file that is not: reading 33 and letting that check
+    /// speak keeps its message unchanged. On wherever nothing downstream
+    /// verifies the length, which is where a silent prefix becomes a password
+    /// the operator does not know.
+    reject_oversize: bool,
+    /// Noun used in error messages, so a password failure never mentions SSE-C.
+    subject: &'static str,
+    /// Require a regular file, not a symlink, with no group or other permission.
+    ///
+    /// On for an SSE-C key: long-lived encryption material, placed by the
+    /// operator, where a symlink or a readable mode is worth refusing. Off for
+    /// an account password, which is routinely a Kubernetes secret mount —
+    /// those are symlinks into `..data/` and are group-readable inside the
+    /// container by default, so the strict rule rejects an ordinary deployment.
+    owner_only_regular_file: bool,
+}
+
+/// A 32-byte SSE-C customer key.
+///
+/// Reads 33 so `load_customer_key` can distinguish "exactly 32" from "more than
+/// that" and report it in the words it always has.
+const SSE_C_KEY_FILE: ProtectedFileSpec = ProtectedFileSpec {
+    read_limit: 33,
+    reject_oversize: false,
+    subject: "SSE-C key file",
+    owner_only_regular_file: true,
+};
+
+/// A password or secret key. S3 sets no maximum secret-key length, so this is a
+/// sanity bound on a file meant to hold a single line, not a protocol limit.
+const ACCOUNT_SECRET_FILE: ProtectedFileSpec = ProtectedFileSpec {
+    read_limit: 4096,
+    reject_oversize: true,
+    subject: "secret file",
+    owner_only_regular_file: false,
+};
+
+fn read_protected_file(path: &Path, spec: &ProtectedFileSpec) -> Result<Zeroizing<Vec<u8>>> {
+    let subject = spec.subject;
+
+    // `symlink_metadata` when a symlink is a hard error, plain `metadata` when
+    // one is allowed: either way the identity check below compares against the
+    // file that was actually opened.
+    let path_metadata = if spec.owner_only_regular_file {
+        std::fs::symlink_metadata(path)
+    } else {
+        std::fs::metadata(path)
+    }
+    // No article here, unlike its siblings: `tests/sse_customer.rs` pins this
+    // exact string, and rewording another command's error is not this change's
+    // business.
+    .map_err(|_| Error::InvalidPath(format!("Failed to inspect {subject}")))?;
+    if !path_metadata.is_file() {
+        return Err(Error::InvalidPath(if spec.owner_only_regular_file {
+            format!("The {subject} must be a regular file, not a symlink")
+        } else {
+            format!("The {subject} must be a regular file")
+        }));
     }
 
     let file = File::open(path)
-        .map_err(|_| Error::InvalidPath("Failed to open SSE-C key file".to_string()))?;
+        .map_err(|_| Error::InvalidPath(format!("Failed to open the {subject}")))?;
     let file_metadata = file
         .metadata()
-        .map_err(|_| Error::InvalidPath("Failed to inspect opened SSE-C key file".to_string()))?;
+        .map_err(|_| Error::InvalidPath(format!("Failed to inspect the opened {subject}")))?;
     if !file_metadata.is_file() {
-        return Err(Error::InvalidPath(
-            "SSE-C key input must remain a regular file while opening".to_string(),
-        ));
+        return Err(Error::InvalidPath(format!(
+            "The {subject} must remain a regular file while opening"
+        )));
     }
 
     #[cfg(unix)]
@@ -102,18 +165,18 @@ fn read_protected_key_file(path: &Path) -> Result<Zeroizing<Vec<u8>>> {
 
         if path_metadata.dev() != file_metadata.dev() || path_metadata.ino() != file_metadata.ino()
         {
-            return Err(Error::InvalidPath(
-                "SSE-C key file changed while being opened".to_string(),
-            ));
+            return Err(Error::InvalidPath(format!(
+                "The {subject} changed while being opened"
+            )));
         }
-        if file_metadata.permissions().mode() & 0o077 != 0 {
-            return Err(Error::InvalidPath(
-                "SSE-C key file cannot grant group or other permissions".to_string(),
-            ));
+        if spec.owner_only_regular_file && file_metadata.permissions().mode() & 0o077 != 0 {
+            return Err(Error::InvalidPath(format!(
+                "The {subject} cannot grant group or other permissions"
+            )));
         }
     }
 
-    read_exact_key(file)
+    read_bounded(file, spec)
 }
 
 fn read_environment_key(name: &str) -> Result<Zeroizing<Vec<u8>>> {
@@ -125,12 +188,31 @@ fn read_environment_key(name: &str) -> Result<Zeroizing<Vec<u8>>> {
     Ok(Zeroizing::new(value.into_bytes()))
 }
 
-fn read_exact_key(reader: impl Read) -> Result<Zeroizing<Vec<u8>>> {
-    let mut bytes = Zeroizing::new(Vec::with_capacity(33));
+/// Read at most `read_limit`, and fail rather than truncate when there is more.
+///
+/// Truncating is the dangerous outcome: an operator who fed a 40-character
+/// secret key to `--new-password-file` would have set a password consisting of
+/// its first 33 bytes, with nothing anywhere saying so.
+fn read_bounded(reader: impl Read, spec: &ProtectedFileSpec) -> Result<Zeroizing<Vec<u8>>> {
+    let subject = spec.subject;
+    // One past the bound when oversize is an error, so a file exactly at the
+    // bound is not mistaken for one that ran over it.
+    let probe = if spec.reject_oversize {
+        spec.read_limit.saturating_add(1)
+    } else {
+        spec.read_limit
+    };
+    let mut bytes = Zeroizing::new(Vec::with_capacity(probe));
     reader
-        .take(33)
+        .take(probe as u64)
         .read_to_end(&mut bytes)
-        .map_err(|_| Error::InvalidPath("Failed to read SSE-C key file".to_string()))?;
+        .map_err(|_| Error::InvalidPath(format!("Failed to read the {subject}")))?;
+    if spec.reject_oversize && bytes.len() > spec.read_limit {
+        return Err(Error::InvalidPath(format!(
+            "The {subject} is larger than {} bytes",
+            spec.read_limit
+        )));
+    }
     Ok(bytes)
 }
 
@@ -338,9 +420,12 @@ impl SecretSource {
                 Ok(value)
             }
             Self::File(path) => {
-                let bytes = read_protected_key_file(path)?;
-                let text = String::from_utf8(bytes.to_vec())
-                    .map_err(|_| Error::InvalidPath("Secret file must be UTF-8".to_string()))?;
+                let bytes = read_protected_file(path, &ACCOUNT_SECRET_FILE)?;
+                // Borrow the zeroizing buffer rather than copying out of it:
+                // `String::from_utf8(bytes.to_vec())` would leave two further
+                // copies of the secret in memory with nothing to wipe them.
+                let text = std::str::from_utf8(&bytes)
+                    .map_err(|_| Error::InvalidPath("The secret file must be UTF-8".to_string()))?;
                 // First line only: an editor-written file usually has a trailing
                 // newline, and a stray second line is more likely a mistake than
                 // part of the secret.
@@ -352,7 +437,7 @@ impl SecretSource {
                         .to_string(),
                 );
                 if value.is_empty() {
-                    return Err(Error::InvalidPath("Secret file is empty".to_string()));
+                    return Err(Error::InvalidPath("The secret file is empty".to_string()));
                 }
                 Ok(value)
             }
@@ -390,4 +475,88 @@ pub(crate) fn read_code_interactive(prompt: &str) -> Result<Zeroizing<String>> {
 pub(crate) fn can_prompt(is_json: bool) -> bool {
     use std::io::IsTerminal;
     !is_json && std::io::stdin().is_terminal()
+}
+
+#[cfg(test)]
+mod account_secret_tests {
+    use super::*;
+    use std::io::Write as _;
+
+    fn write_secret_file(contents: &[u8]) -> tempfile::NamedTempFile {
+        let mut file = tempfile::NamedTempFile::new().expect("create secret file");
+        file.write_all(contents).expect("write secret file");
+        file
+    }
+
+    #[test]
+    fn a_secret_longer_than_the_sse_c_bound_is_read_whole() {
+        // The regression this guards: the reader was shared with SSE-C and
+        // stopped at 33 bytes, so a 40-character secret key silently became a
+        // password made of its first 33 bytes.
+        let secret = "A".repeat(40);
+        let file = write_secret_file(secret.as_bytes());
+        let loaded = SecretSource::File(file.path().to_path_buf())
+            .load("")
+            .expect("a 40-byte secret must load");
+
+        assert_eq!(loaded.as_str(), secret);
+    }
+
+    #[test]
+    fn an_oversized_secret_file_is_rejected_rather_than_truncated() {
+        let file = write_secret_file(&vec![b'A'; ACCOUNT_SECRET_FILE.read_limit + 1]);
+        let error = SecretSource::File(file.path().to_path_buf())
+            .load("")
+            .expect_err("an oversized file must fail");
+
+        assert!(matches!(error, Error::InvalidPath(_)), "{error:?}");
+        assert!(error.to_string().contains("larger than"), "{error}");
+        // Never the contents, however long.
+        assert!(!error.to_string().contains("AAAA"), "{error}");
+    }
+
+    #[test]
+    fn secret_file_errors_never_mention_sse_c() {
+        // Somebody changing a password should not be told about an SSE-C key.
+        let missing = SecretSource::File(PathBuf::from("no-such-secret-file"))
+            .load("")
+            .expect_err("a missing file must fail");
+        assert!(!missing.to_string().contains("SSE-C"), "{missing}");
+
+        let empty = write_secret_file(b"");
+        let error = SecretSource::File(empty.path().to_path_buf())
+            .load("")
+            .expect_err("an empty file must fail");
+        assert!(!error.to_string().contains("SSE-C"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_group_readable_secret_file_loads() {
+        // The shape Kubernetes mounts a secret in: a symlink into `..data/`,
+        // group-readable inside the container. The SSE-C rules reject both.
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let file = write_secret_file(b"projected-secret\n");
+        std::fs::set_permissions(file.path(), std::fs::Permissions::from_mode(0o644))
+            .expect("relax permissions the way a projected volume does");
+
+        let link_dir = tempfile::TempDir::new().expect("create link directory");
+        let link = link_dir.path().join("password");
+        symlink(file.path(), &link).expect("create the secret symlink");
+
+        let loaded = SecretSource::File(link)
+            .load("")
+            .expect("a projected secret must load");
+        assert_eq!(loaded.as_str(), "projected-secret");
+    }
+
+    #[test]
+    fn only_the_first_line_of_a_secret_file_is_used() {
+        let file = write_secret_file(b"the-secret\nnot-part-of-it\n");
+        let loaded = SecretSource::File(file.path().to_path_buf())
+            .load("")
+            .expect("load first line");
+        assert_eq!(loaded.as_str(), "the-secret");
+    }
 }

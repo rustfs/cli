@@ -21,7 +21,8 @@ use crate::exit_code::ExitCode;
 use crate::output::{Formatter, qr};
 use crate::secret_input::{SecretSource, can_prompt, read_code_interactive};
 use rc_core::admin::{
-    AccountApi, AccountInfo, AccountMfaApi, MfaEnrollment, MfaStatus, RecoveryCodes, SecretValue,
+    AccountApi, AccountInfo, AccountMfaApi, CredentialsSource, IdentityType, MfaEnrollment,
+    MfaStatus, RecoveryCodes, SecretValue,
 };
 use rc_core::{Error, Result};
 
@@ -211,7 +212,12 @@ impl From<AccountInfo> for AccountInfoOutput {
 #[derive(Serialize)]
 struct PasswordChangeOutput {
     success: bool,
-    access_key: String,
+    /// Absent when the identity could not be read.
+    ///
+    /// Omitted rather than filled with the alias name: `"access_key": "prod"`
+    /// for an alias called `prod` reads as an access key and is not one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    access_key: Option<String>,
     sessions_revoked: u32,
     message: String,
 }
@@ -319,17 +325,29 @@ fn print_account_info(info: &AccountInfo, formatter: &Formatter) {
             "user"
         }
     ));
-    formatter.println(&format!("Status:      {}", info.status));
+    formatter.println(&format!(
+        "Status:      {}",
+        formatter.sanitize_text(&info.status)
+    ));
     formatter.println(&format!("Credentials: {}", info.credentials_source));
 
     if let Some(session) = &info.session_access_key {
-        formatter.println(&format!("Session key: {session}"));
+        formatter.println(&format!(
+            "Session key: {}",
+            formatter.sanitize_text(session)
+        ));
     }
     if !info.policies.is_empty() {
-        formatter.println(&format!("Policies:    {}", info.policies.join(", ")));
+        formatter.println(&format!(
+            "Policies:    {}",
+            formatter.sanitize_text(&info.policies.join(", "))
+        ));
     }
     if !info.member_of.is_empty() {
-        formatter.println(&format!("Groups:      {}", info.member_of.join(", ")));
+        formatter.println(&format!(
+            "Groups:      {}",
+            formatter.sanitize_text(&info.member_of.join(", "))
+        ));
     }
 
     formatter.println(&format!(
@@ -348,9 +366,29 @@ fn print_account_info(info: &AccountInfo, formatter: &Formatter) {
     if !info.mutable.password {
         formatter.println("");
         formatter.println("This identity's password cannot be changed here.");
-        if let Some(reason) = &info.mfa.enrollment_blocked_reason {
-            formatter.println(&format!("  {reason}"));
+        formatter.println(&format!("  {}", password_immutability_hint(info)));
+    }
+}
+
+/// Explain an immutable password from the fields the server actually sends.
+///
+/// There is no per-field reason on the wire: `AccountMutability` is two bools,
+/// and `enrollment_blocked_reason` belongs to enrollment. Reading that field
+/// here attributed a two-factor restriction to the password, and printed
+/// nothing at all in the environment-root case where it is absent — which is
+/// the one case a user is most likely to hit.
+fn password_immutability_hint(info: &AccountInfo) -> &'static str {
+    match (info.credentials_source, info.identity_type) {
+        (CredentialsSource::Env, _) => {
+            "It is provisioned from the server environment (RUSTFS_ACCESS_KEY / RUSTFS_SECRET_KEY) and cannot be changed while the server is running."
         }
+        (_, IdentityType::Sts) => {
+            "It is a temporary session credential. Change the password of the identity it was minted from."
+        }
+        (_, IdentityType::ServiceAccount) => {
+            "It is a service account. Change the password of its parent identity."
+        }
+        _ => "The server reports this identity's secret as read-only.",
     }
 }
 
@@ -389,13 +427,6 @@ async fn execute_passwd(args: PasswdArgs, formatter: &Formatter) -> ExitCode {
         Err(error) => return usage_failure(formatter, error),
     };
 
-    let access_key = match client.account_info().await {
-        Ok(info) => info.access_key,
-        // Reporting the identity is a convenience; failing to read it must not
-        // block the rotation.
-        Err(_) => args.alias.clone(),
-    };
-
     match client.account_change_password(&current, &new).await {
         Ok(result) => {
             let message = if result.sessions_revoked > 0 {
@@ -408,6 +439,11 @@ async fn execute_passwd(args: PasswdArgs, formatter: &Formatter) -> ExitCode {
             };
 
             if formatter.is_json() {
+                // Only the JSON shape names the identity, so the human path does
+                // not pay for the extra round-trip. Reporting the identity is a
+                // convenience: failing to read it leaves the field out rather
+                // than blocking a rotation that already succeeded.
+                let access_key = client.account_info().await.ok().map(|info| info.access_key);
                 formatter.json(&PasswordChangeOutput {
                     success: true,
                     access_key,
@@ -454,13 +490,19 @@ async fn execute_mfa_status(args: MfaStatusArgs, formatter: &Formatter) -> ExitC
                 if status.enabled {
                     formatter.println(&format!(
                         "  Algorithm: {} / {} digits / {}s period",
-                        status.algorithm, status.digits, status.period_seconds
+                        formatter.sanitize_text(&status.algorithm),
+                        status.digits,
+                        status.period_seconds
                     ));
                     if let Some(activated) = &status.activated_at {
-                        formatter.println(&format!("  Enabled on: {activated}"));
+                        formatter.println(&format!(
+                            "  Enabled on: {}",
+                            formatter.sanitize_text(activated)
+                        ));
                     }
                     if let Some(last) = &status.last_verified_at {
-                        formatter.println(&format!("  Last used:  {last}"));
+                        formatter
+                            .println(&format!("  Last used:  {}", formatter.sanitize_text(last)));
                     }
                     formatter.println(&format!(
                         "  Recovery:   {} code(s) remaining",
@@ -478,7 +520,10 @@ async fn execute_mfa_status(args: MfaStatusArgs, formatter: &Formatter) -> ExitC
                 if !status.enrollment_available
                     && let Some(reason) = &status.enrollment_blocked_reason
                 {
-                    formatter.println(&format!("  Enrollment unavailable: {reason}"));
+                    formatter.println(&format!(
+                        "  Enrollment unavailable: {}",
+                        formatter.sanitize_text(reason)
+                    ));
                 }
             }
             ExitCode::Success
@@ -496,13 +541,16 @@ async fn execute_mfa_enroll(args: MfaEnrollArgs, formatter: &Formatter) -> ExitC
     match client.account_mfa_enroll().await {
         Ok(enrollment) => {
             if formatter.is_json() {
+                // Moved, not cloned: the branches are exclusive, and the
+                // secret should not get a second copy in memory just to be
+                // serialized.
                 formatter.json(&MfaEnrollOutput {
-                    secret_base32: enrollment.secret_base32.clone(),
-                    otpauth_uri: enrollment.otpauth_uri.clone(),
-                    algorithm: enrollment.algorithm.clone(),
+                    secret_base32: enrollment.secret_base32,
+                    otpauth_uri: enrollment.otpauth_uri,
+                    algorithm: enrollment.algorithm,
                     digits: enrollment.digits,
                     period_seconds: enrollment.period_seconds,
-                    expires_at: enrollment.expires_at.clone(),
+                    expires_at: enrollment.expires_at,
                 });
             } else {
                 print_enrollment(&enrollment, args.no_qr, formatter);
@@ -514,19 +562,37 @@ async fn execute_mfa_enroll(args: MfaEnrollArgs, formatter: &Formatter) -> ExitC
 }
 
 fn print_enrollment(enrollment: &MfaEnrollment, no_qr: bool, formatter: &Formatter) {
-    formatter.println("Scan this QR code with your authenticator app:");
-    qr::print_qr(formatter, &enrollment.qr_utf8, no_qr);
+    formatter.println("Two-factor enrollment started.");
+
+    // Only claim there is a code to scan once one has been printed. `--no-qr`, a
+    // terminal too narrow for the symbol, and an empty payload all skip it, and
+    // telling somebody to scan a code that is not on their screen sends them
+    // looking for a rendering bug.
+    if qr::print_qr(formatter, &enrollment.qr_utf8, no_qr) {
+        formatter
+            .println("Scan the code above with your authenticator app, or add the key by hand:");
+    } else {
+        formatter.println("Add this account to your authenticator app by hand:");
+    }
 
     formatter.println(&format!(
         "Manual setup key: {}",
-        group_secret(&enrollment.secret_base32)
+        group_secret(&formatter.sanitize_text(&enrollment.secret_base32))
     ));
-    formatter.println(&format!("Setup URI:        {}", enrollment.otpauth_uri));
+    formatter.println(&format!(
+        "Setup URI:        {}",
+        formatter.sanitize_text(&enrollment.otpauth_uri)
+    ));
     formatter.println(&format!(
         "Parameters:       {} / {} digits / {}s period",
-        enrollment.algorithm, enrollment.digits, enrollment.period_seconds
+        formatter.sanitize_text(&enrollment.algorithm),
+        enrollment.digits,
+        enrollment.period_seconds
     ));
-    formatter.println(&format!("Expires:          {}", enrollment.expires_at));
+    formatter.println(&format!(
+        "Expires:          {}",
+        formatter.sanitize_text(&enrollment.expires_at)
+    ));
     formatter.println("");
     formatter.println("Then confirm with:");
     formatter.println("  rc admin account mfa activate <alias> --code <6-digit code>");
@@ -549,6 +615,10 @@ async fn execute_mfa_activate(args: MfaCodeArgs, formatter: &Formatter) -> ExitC
         Err(code) => return code,
     };
 
+    if let Err(exit) = ensure_output_path_is_free(args.output_file.as_deref(), formatter) {
+        return exit;
+    }
+
     let code = match resolve_code(args.code, args.code_from_env, formatter) {
         Ok(code) => code,
         Err(exit) => return exit,
@@ -565,6 +635,10 @@ async fn execute_mfa_recovery_codes(args: MfaCodeArgs, formatter: &Formatter) ->
         Ok(client) => client,
         Err(code) => return code,
     };
+
+    if let Err(exit) = ensure_output_path_is_free(args.output_file.as_deref(), formatter) {
+        return exit;
+    }
 
     let code = match resolve_code(args.code, args.code_from_env, formatter) {
         Ok(code) => code,
@@ -583,11 +657,10 @@ async fn execute_mfa_disable(args: MfaDisableArgs, formatter: &Formatter) -> Exi
         Err(code) => return code,
     };
 
-    let code = match resolve_code(args.code, args.code_from_env, formatter) {
-        Ok(code) => code,
-        Err(exit) => return exit,
-    };
-
+    // Validate every flag before resolving the code. Resolving may prompt, and a
+    // TOTP code is single-use against a 30-second window: burning one only to
+    // then report that `--password-from-env` and `--password-file` conflict
+    // costs the user a wait they did not need.
     let interactive = can_prompt(formatter.is_json());
     let password_source = match SecretSource::resolve(
         args.password_from_env,
@@ -598,6 +671,12 @@ async fn execute_mfa_disable(args: MfaDisableArgs, formatter: &Formatter) -> Exi
         Ok(source) => source,
         Err(error) => return usage_failure(formatter, error),
     };
+
+    let code = match resolve_code(args.code, args.code_from_env, formatter) {
+        Ok(code) => code,
+        Err(exit) => return exit,
+    };
+
     let password = match password_source.load("Account password: ") {
         Ok(value) => SecretValue::new(value.to_string()),
         Err(error) => return usage_failure(formatter, error),
@@ -666,40 +745,95 @@ fn resolve_code(
     }
 }
 
+/// Reject an occupied output path *before* the server issues a set.
+///
+/// `write_recovery_codes` will not clobber an existing file, and by the time it
+/// runs the server has already activated or rotated: the set it refuses to
+/// write is the only copy that will ever exist, and the previous set is already
+/// invalid. Checking here costs a syscall; checking there costs the codes.
+fn ensure_output_path_is_free(
+    output_file: Option<&std::path::Path>,
+    formatter: &Formatter,
+) -> std::result::Result<(), ExitCode> {
+    let Some(path) = output_file else {
+        return Ok(());
+    };
+    // `symlink_metadata`, not `exists`: a dangling symlink reports absent but
+    // still makes the `create_new` open fail with `AlreadyExists`.
+    if std::fs::symlink_metadata(path).is_ok() {
+        // Through `fail`, not `usage_failure`, so this reports the same exit
+        // code as `write_recovery_codes` refusing the very same path later.
+        return Err(fail(
+            formatter,
+            "Cannot write the recovery codes",
+            Error::Conflict(format!(
+                "{} already exists; choose another path",
+                path.display()
+            )),
+        ));
+    }
+    Ok(())
+}
+
 /// Print or write a recovery-code set.
 ///
-/// These exist in plaintext exactly once, so the human-readable path is loud
-/// about that and the file path refuses to clobber an existing file rather than
-/// destroying a set the user may not have stored yet.
+/// These exist in plaintext exactly once. The file path refuses to clobber an
+/// existing file, and if the write fails anyway the set is printed instead of
+/// being dropped: a file the operator has to re-create is a nuisance, a set
+/// nobody ever saw is a locked-out account.
 fn emit_recovery_codes(
     codes: RecoveryCodes,
     output_file: Option<PathBuf>,
     formatter: &Formatter,
     activated: bool,
 ) -> ExitCode {
-    if let Some(path) = output_file {
-        if let Err(error) = write_recovery_codes(&path, &codes.recovery_codes) {
-            return fail(formatter, "Failed to write the recovery codes", error);
-        }
-        if formatter.is_json() {
-            formatter.json(&MfaOperationOutput {
-                success: true,
-                message: format!("Recovery codes written to {}", path.display()),
-            });
-        } else {
-            formatter.println(&format!(
-                "{} recovery code(s) written to {} (mode 0600).",
-                codes.recovery_codes.len(),
-                path.display()
-            ));
-        }
-        return ExitCode::Success;
-    }
+    let Some(path) = output_file else {
+        return print_recovery_codes(&codes, formatter, activated);
+    };
 
+    match write_recovery_codes(&path, &codes.recovery_codes) {
+        Ok(()) => {
+            if formatter.is_json() {
+                formatter.json(&MfaOperationOutput {
+                    success: true,
+                    message: format!("Recovery codes written to {}", path.display()),
+                });
+            } else {
+                formatter.println(&format!(
+                    "{} recovery code(s) written to {} (mode 0600).",
+                    codes.recovery_codes.len(),
+                    path.display()
+                ));
+            }
+            ExitCode::Success
+        }
+        Err(error) => {
+            // The server has already issued this set and invalidated any
+            // previous one, so it exists nowhere but in this process. Print it
+            // before reporting the failure. In `--json` mode the codes go to
+            // stdout and the error to stderr, so a script gets both and the
+            // exit code still says the file was not written.
+            print_recovery_codes(&codes, formatter, activated);
+            fail(
+                formatter,
+                &format!(
+                    "The codes above were NOT written to {}; store them now",
+                    path.display()
+                ),
+                error,
+            )
+        }
+    }
+}
+
+fn print_recovery_codes(codes: &RecoveryCodes, formatter: &Formatter, activated: bool) -> ExitCode {
     if formatter.is_json() {
+        // Not sanitized: `serde_json` escapes control characters correctly, and
+        // a consumer needs the value the server sent. Escaping is a terminal
+        // concern, so it belongs on the human path below and nowhere else.
         formatter.json(&RecoveryCodesOutput {
-            recovery_codes: codes.recovery_codes,
-            generated_at: codes.generated_at,
+            recovery_codes: codes.recovery_codes.clone(),
+            generated_at: codes.generated_at.clone(),
         });
         return ExitCode::Success;
     }
@@ -712,7 +846,11 @@ fn emit_recovery_codes(
     formatter.println("");
     formatter.println("Save these recovery codes. They are shown only once:");
     for (index, code) in codes.recovery_codes.iter().enumerate() {
-        formatter.println(&format!("  {:2}. {code}", index + 1));
+        formatter.println(&format!(
+            "  {:2}. {}",
+            index + 1,
+            formatter.sanitize_text(code)
+        ));
     }
     formatter.println("");
     formatter.println("Each code works once. Store them somewhere only you can reach.");
@@ -751,15 +889,18 @@ fn write_recovery_codes(path: &std::path::Path, codes: &[String]) -> Result<()> 
     Ok(())
 }
 
+/// Report a failed operation and return its exit code.
+///
+/// `Formatter::fail` rather than `error`: the latter builds the descriptor from
+/// a bare message, so the `--json` error envelope carried `code: null` while
+/// every other command reported the real one.
 fn fail(formatter: &Formatter, context: &str, error: Error) -> ExitCode {
     let code = ExitCode::from_i32(error.exit_code()).unwrap_or(ExitCode::GeneralError);
-    formatter.error(&format!("{context}: {error}"));
-    code
+    formatter.fail(code, &format!("{context}: {error}"))
 }
 
 fn usage_failure(formatter: &Formatter, error: Error) -> ExitCode {
-    formatter.error(&error.to_string());
-    ExitCode::UsageError
+    formatter.fail(ExitCode::UsageError, &error.to_string())
 }
 
 #[cfg(test)]

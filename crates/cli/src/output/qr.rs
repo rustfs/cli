@@ -40,7 +40,10 @@ pub fn print_qr(formatter: &Formatter, qr_utf8: &str, suppressed: bool) -> bool 
 
     formatter.println("");
     for line in qr_utf8.lines() {
-        formatter.println(line);
+        // The symbol is server-rendered, so it is escaped like any other server
+        // text before it reaches a terminal. Block-drawing characters survive
+        // untouched; an escape sequence smuggled in alongside them does not.
+        formatter.println(&formatter.sanitize_text(line));
     }
     formatter.println("");
     true

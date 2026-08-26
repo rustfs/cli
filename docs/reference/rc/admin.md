@@ -136,10 +136,17 @@ No command accepts a password on the command line, where it would be captured by
 shell history and visible in `ps`. Each password is read from one of:
 
 - `--*-from-env NAME` — a named environment variable.
-- `--*-file PATH` — the first line of a file, which must not be group- or
-  world-readable.
+- `--*-file PATH` — the first line of a file, up to 4096 bytes. A longer file is
+  reported rather than truncated, so a secret can never be silently shortened
+  into a password nobody knows. The file may be a symlink and may be group- or
+  world-readable, because a Kubernetes projected secret is both.
 - an interactive prompt with echo off, offered only when stdin is a terminal and
   the output is human-readable.
+
+The SSE-C key file (`--sse-c-key-file` on the data commands) is stricter: it must
+be a regular file of exactly 32 bytes with no group or other permission. That key
+is long-lived encryption material an operator places directly, where a symlink or
+a readable mode is worth refusing; an account password is neither.
 
 Verification codes additionally accept `--code CODE` because a TOTP code is
 valid for at most 90 seconds. `--code` and `--code-from-env` are mutually
@@ -166,7 +173,13 @@ Recovery codes are returned in plaintext exactly once, by `mfa activate` and
 `mfa recovery-codes`; the server stores only their hashes and cannot show them
 again. `--output-file PATH` writes them with mode `0600` and refuses to
 overwrite an existing file, because that file may hold the only copy of a
-previous set. Without `--output-file` they are printed to stdout.
+previous set. The path is checked before the request is sent: by the time the
+write runs the server has already rotated, so refusing then would destroy the
+only copy of the new set as well. If the write fails anyway — a mistyped
+directory, a full disk — the codes are printed instead of dropped, and the
+command still exits non-zero to say the file was not written. In `--json` mode
+they go to stdout and the error to stderr, so a script gets both. Without
+`--output-file` they are printed to stdout.
 
 Each code works once. Generating a new set invalidates the previous one.
 
