@@ -61,7 +61,6 @@ jobs:
           INPUT_RUN_ID: ${{ inputs.build_run_id || github.event.inputs.build_run_id }}
           INPUT_HEAD_SHA: ${{ inputs.head_sha || github.event.inputs.head_sha }}
           REPOSITORY: ${{ github.repository }}
-          EVENT_NAME: ${{ github.event_name }}
           CURRENT_RUN_ID: ${{ github.run_id }}
         shell: bash
         run: |
@@ -103,7 +102,19 @@ jobs:
           fi
 
           if [[ "${RUN_CONCLUSION}" != "success" ]]; then
-            if [[ "${EVENT_NAME}" != "workflow_call" || "${BUILD_RUN_ID}" != "${CURRENT_RUN_ID}" || -n "${RUN_CONCLUSION}" ]]; then
+            if [[ -z "${RUN_CONCLUSION}" && "${BUILD_RUN_ID}" == "${CURRENT_RUN_ID}" ]]; then
+              echo "Validating artifacts from the current release workflow run"
+            elif [[ "${RUN_CONCLUSION}" == "failure" ]]; then
+              FAILED_REQUIRED_JOBS=$(gh api \
+                "repos/${REPOSITORY}/actions/runs/${BUILD_RUN_ID}/jobs?filter=latest&per_page=100" \
+                --paginate \
+                --jq '.jobs[] | select((.name | startswith("Package DEB/RPM /") | not) and .conclusion != "success" and .conclusion != "skipped") | .name')
+              if [[ -n "${FAILED_REQUIRED_JOBS}" ]]; then
+                echo "Workflow run ${BUILD_RUN_ID} has failed required jobs: ${FAILED_REQUIRED_JOBS}"
+                exit 1
+              fi
+              echo "Retrying packaging after an isolated DEB/RPM workflow failure"
+            else
               echo "Workflow run ${BUILD_RUN_ID} did not complete successfully: ${RUN_CONCLUSION}"
               exit 1
             fi
