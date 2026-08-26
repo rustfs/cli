@@ -101,28 +101,82 @@ jobs:
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
+          # Any change to these needs the marker: a new exit code, a new config
+          # field or a new schema property extends a contract even when nothing
+          # existing moves.
           PROTECTED_FILES=(
-            "docs/reference/rc/"
             "schemas/output_v1.json"
             "crates/cli/src/exit_code.rs"
             "crates/core/src/config.rs"
           )
 
-          CHANGED_FILES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD)
+          # The command reference is a contract too, but adding a section to it
+          # is how a new command gets documented — required by AGENTS.md § 3 of
+          # the Breaking Change process, in fact. Demanding the marker for that
+          # makes every additive PR claim to be breaking, so these paths need it
+          # only when existing lines move: a rewritten sentence, a removed flag,
+          # a deleted or renamed page.
+          ADDITIVE_OK_FILES=(
+            "docs/reference/rc/"
+          )
+
+          BASE="origin/${{ github.base_ref }}"
+          CHANGED_FILES=$(git diff --name-only "$BASE"...HEAD)
+
+          # Paths under a protected prefix, one per line.
+          matched_paths() {
+            local protected_path="${1%/}"
+            printf '%s\n' "$CHANGED_FILES" \
+              | grep -E "^$(printf '%s' "$protected_path" | sed 's/[.[\*^$]/\\&/g')(/|$)" || true
+          }
+
+          require_marker() {
+            local subject="$1"
+            echo "::warning::Protected file modified: $subject"
+            echo "This change requires the Breaking Change process. See AGENTS.md."
+            if ! grep -q "BREAKING" <<< "$PR_BODY"; then
+              echo "::error::Protected file $subject modified without BREAKING marker in PR description"
+              return 1
+            fi
+          }
+
+          status=0
 
           for file in "${PROTECTED_FILES[@]}"; do
-            protected_path="${file%/}"
-            if echo "$CHANGED_FILES" | grep -Fxq "$protected_path" || echo "$CHANGED_FILES" | grep -q "^$protected_path/"; then
-              echo "::warning::Protected file modified: $file"
-              echo "This change requires the Breaking Change process. See AGENTS.md."
-
-              # Check if PR body contains BREAKING marker
-              if ! grep -q "BREAKING" <<< "$PR_BODY"; then
-                echo "::error::Protected file $file modified without BREAKING marker in PR description"
-                exit 1
-              fi
+            if [ -n "$(matched_paths "$file")" ]; then
+              require_marker "$file" || status=1
             fi
           done
+
+          for file in "${ADDITIVE_OK_FILES[@]}"; do
+            paths=$(matched_paths "$file")
+            [ -n "$paths" ] || continue
+
+            # Rename detection off on purpose: moving a reference page changes
+            # where readers and links land, so it should count as a rewrite
+            # rather than as a no-op.
+            removed=0
+            count=0
+            while IFS= read -r path; do
+              [ -n "$path" ] || continue
+              count=$((count + 1))
+              deleted=$(
+                git diff --numstat --no-renames "$BASE"...HEAD -- "$path" \
+                  | awk '{ total += $2 } END { print total + 0 }'
+              )
+              removed=$((removed + deleted))
+            done <<< "$paths"
+
+            if [ "$removed" -gt 0 ]; then
+              require_marker "$file ($removed line(s) changed or removed)" || status=1
+            else
+              echo "$file changed by addition only ($count file(s)); no marker required"
+            fi
+          done
+
+          if [ "$status" -ne 0 ]; then
+            exit 1
+          fi
           echo "Protected files check passed"
 
   msrv:
