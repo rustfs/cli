@@ -191,6 +191,31 @@ asks for confirmation; `--yes` is required in `--json` mode or when stdin is not
 a terminal. The account is left protected by its password alone until the user
 enrols again.
 
+### Exit codes
+
+Every other workflow in this reference states how its failures are classified, so
+these do too. The account and two-factor commands map the server's answer onto
+the standard codes:
+
+| Condition | Code |
+|---|---|
+| Wrong verification code, recovery code, or password | authentication (4) |
+| Locked out after repeated wrong codes | network (3) |
+| At-rest protection not configured on the server | unsupported (7) |
+| Route absent, on a server predating these endpoints | not found (5) |
+| Recovery-code output path already occupied | conflict (6) |
+| Missing, conflicting, or unprompted flags | usage (2) |
+| Already enabled, not enabled, or no pending enrollment | general (1) |
+
+The lockout deserves a note, because network (3) usually means "retry". It is
+retryable here too, but only after the delay the server reports — the code comes
+from `SlowDown`, which is the S3 vocabulary's closest analogue to a rate limit.
+A script that retries immediately will simply be refused again.
+
+A failed `--output-file` write is the one case where a non-zero exit does not mean
+nothing happened: the server has already issued the set, so the codes are printed
+and the exit code reports only that the file was not written.
+
 ### Root identities
 
 A root identity provisioned from `RUSTFS_ACCESS_KEY` cannot have its password or

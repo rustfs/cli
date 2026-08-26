@@ -195,7 +195,9 @@ fn mfa_status_succeeds_against_a_server_that_answers() {
 }
 
 #[test]
-fn mfa_enroll_reports_unsupported_when_the_server_has_no_such_route() {
+fn mfa_enroll_reports_unsupported_when_at_rest_protection_is_missing() {
+    // 501, which the server sends when `RUSTFS_IAM_MASTER_KEY` is unset. Not to
+    // be confused with an absent route, which is a 404 and a different code.
     let config_dir = tempfile::tempdir().expect("create config dir");
     let (endpoint, receiver, handle) = start_admin_response_test_server(
         "501 Not Implemented",
@@ -535,6 +537,68 @@ fn user_mfa_status_reports_auth_error_when_the_server_refuses() {
         .expect("run rc command");
 
     assert_eq!(output.status.code(), Some(4), "expected AuthError");
+    receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("captured admin request");
+    handle.join().expect("admin test server finished");
+}
+
+// ---------------------------------------------------------------------------
+// The exit-code table in docs/reference/rc/admin.md
+// ---------------------------------------------------------------------------
+
+/// The reference documents how each failure is classified, and that file is a
+/// protected contract. These pin the two rows a reader is most likely to build
+/// retry logic around, so the table cannot drift away from the code silently.
+#[test]
+fn a_lockout_is_reported_as_retryable_rather_than_a_refusal() {
+    // The server answers `SlowDown` once the attempt limit is reached. That maps
+    // to the network code, which normally means "retry" — the reference says why
+    // it means "retry later" here, and this holds it to that class.
+    let config_dir = tempfile::tempdir().expect("create config dir");
+    let (endpoint, receiver, handle) = start_admin_response_test_server(
+        "503 Service Unavailable",
+        "application/json",
+        r#"{"Code":"SlowDown","Message":"too many attempts; try again in 900 seconds"}"#
+            .to_string(),
+    );
+
+    let output = rc()
+        .args([
+            "--json", "admin", "account", "mfa", "activate", "myalias", "--code", "123456",
+        ])
+        .env("RC_CONFIG_DIR", config_dir.path())
+        .env("RC_HOST_myalias", rc_host_alias(&endpoint))
+        .output()
+        .expect("run rc command");
+
+    assert_eq!(output.status.code(), Some(3), "expected NetworkError");
+    receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("captured admin request");
+    handle.join().expect("admin test server finished");
+}
+
+#[test]
+fn an_absent_route_is_reported_as_not_found() {
+    // A server predating these endpoints. Distinct from the 501 an up-to-date
+    // server sends when at-rest protection is unconfigured, which is the row
+    // above it in the table.
+    let config_dir = tempfile::tempdir().expect("create config dir");
+    let (endpoint, receiver, handle) = start_admin_response_test_server(
+        "404 Not Found",
+        "application/json",
+        r#"{"Code":"NoSuchKey","Message":"unknown route"}"#.to_string(),
+    );
+
+    let output = rc()
+        .args(["--json", "admin", "account", "mfa", "status", "myalias"])
+        .env("RC_CONFIG_DIR", config_dir.path())
+        .env("RC_HOST_myalias", rc_host_alias(&endpoint))
+        .output()
+        .expect("run rc command");
+
+    assert_eq!(output.status.code(), Some(5), "expected NotFound");
     receiver
         .recv_timeout(Duration::from_secs(5))
         .expect("captured admin request");
