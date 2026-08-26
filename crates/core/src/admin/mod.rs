@@ -4,6 +4,7 @@
 //! IAM users, policies, groups, service accounts, and cluster operations.
 
 mod access_keys;
+mod account;
 mod bucket_metadata;
 mod capabilities;
 mod cluster;
@@ -26,6 +27,12 @@ pub use access_keys::{
     IAM_ACCESS_KEYS_BULK_OPENID_CAPABILITY, MAX_IAM_ACCESS_KEY_RESULTS,
     MAX_IAM_ACCESS_KEY_SELECTOR_BYTES, MAX_IAM_ACCESS_KEY_SELECTORS,
     MAX_IAM_ACCESS_KEYS_RESPONSE_BYTES,
+};
+pub use account::{
+    ACCOUNT_CAPABILITY, ACCOUNT_MFA_CAPABILITY, AccountApi, AccountInfo, AccountMfaApi,
+    AccountMfaSummary, AccountMutability, CredentialsSource, IdentityType,
+    MAX_ACCOUNT_RESPONSE_BYTES, MfaEnrollment, MfaStatus, PasswordChangeResult, RecoveryCodes,
+    SecretValue, USER_MFA_CAPABILITY, UserCredentialApi, UserMfaStatus,
 };
 pub use bucket_metadata::{
     BUCKET_METADATA_CAPABILITY, BucketMetadataApi, BucketMetadataArchive,

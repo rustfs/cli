@@ -7,8 +7,10 @@ use clap::Parser;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 mod commands;
+mod confirm;
 mod exit_code;
 mod output;
+mod private_file;
 mod secret_input;
 
 use commands::Cli;
