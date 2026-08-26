@@ -8,10 +8,10 @@ use clap::Subcommand;
 use serde::Serialize;
 
 use super::get_admin_client;
+use crate::confirm::{Confirmation, confirm};
 use crate::exit_code::ExitCode;
 use crate::output::Formatter;
 use crate::secret_input::{SecretSource, can_prompt};
-use rc_core::Error;
 use rc_core::admin::{AdminApi, SecretValue, User, UserCredentialApi, UserStatus};
 
 const ADD_USER_AFTER_HELP: &str = "\
@@ -398,40 +398,19 @@ async fn execute_user_mfa_reset(args: UserMfaResetArgs, formatter: &Formatter) -
 /// — the user has to enrol again — so a non-interactive run must say `--yes`
 /// rather than have the confirmation silently skipped.
 fn confirm_mfa_reset(access_key: &str, yes: bool, formatter: &Formatter) -> rc_core::Result<()> {
-    use std::io::{BufRead as _, IsTerminal as _, Write as _};
-
-    if yes {
-        return Ok(());
-    }
-    if formatter.is_json() || !std::io::stdin().is_terminal() {
-        return Err(Error::InvalidPath(
-            "Clearing a user's second factor requires --yes in non-interactive or JSON mode"
-                .to_string(),
-        ));
-    }
-
-    let mut stderr = std::io::stderr().lock();
-    write!(
-        stderr,
-        "Clear two-factor authentication for '{}'? The account will be protected by its password alone. [y/N] ",
+    let prompt = format!(
+        "Clear two-factor authentication for '{}'? The account will be protected by its password alone. [y/N]",
         formatter.sanitize_text(access_key)
+    );
+    confirm(
+        &Confirmation {
+            prompt: &prompt,
+            requires_yes: "Clearing a user's second factor requires --yes in non-interactive or JSON mode",
+            declined: "Clearing two-factor authentication was declined",
+        },
+        yes,
+        formatter,
     )
-    .map_err(Error::Io)?;
-    stderr.flush().map_err(Error::Io)?;
-
-    let mut answer = String::new();
-    std::io::stdin()
-        .lock()
-        .read_line(&mut answer)
-        .map_err(Error::Io)?;
-
-    if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
-        Ok(())
-    } else {
-        Err(Error::Interrupted(
-            "Clearing two-factor authentication was declined".to_string(),
-        ))
-    }
 }
 
 async fn execute_list(args: ListArgs, formatter: &Formatter) -> ExitCode {
@@ -733,7 +712,7 @@ mod tests {
         });
 
         let error = confirm_mfa_reset("analyst", false, &formatter).expect_err("must refuse");
-        assert!(matches!(error, Error::InvalidPath(_)), "{error:?}");
+        assert!(matches!(error, rc_core::Error::InvalidPath(_)), "{error:?}");
         assert!(error.to_string().contains("--yes"), "{error}");
     }
 

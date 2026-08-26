@@ -9,11 +9,12 @@ use rc_core::{Error, Result};
 use serde::Serialize;
 use serde_json::Value;
 use std::fs::File;
-use std::io::{BufRead, IsTerminal, Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
 use super::{emit_observability_error, get_admin_client};
+use crate::confirm::{Confirmation, confirm};
 use crate::exit_code::ExitCode;
 use crate::output::Formatter;
 
@@ -554,35 +555,19 @@ async fn prepare_and_delete(
 }
 
 fn confirm_delete(provider: &OidcProvider, yes: bool, formatter: &Formatter) -> Result<()> {
-    if yes {
-        return Ok(());
-    }
-    if formatter.is_json() || !std::io::stdin().is_terminal() {
-        return Err(Error::InvalidPath(
-            "OIDC provider deletion requires --yes in non-interactive or JSON mode".to_string(),
-        ));
-    }
-
-    let mut stderr = std::io::stderr().lock();
-    write!(
-        stderr,
-        "Delete OIDC provider '{}'? [y/N] ",
+    let prompt = format!(
+        "Delete OIDC provider '{}'? [y/N]",
         safe(&provider.provider_id, formatter)
+    );
+    confirm(
+        &Confirmation {
+            prompt: &prompt,
+            requires_yes: "OIDC provider deletion requires --yes in non-interactive or JSON mode",
+            declined: "OIDC provider deletion was declined",
+        },
+        yes,
+        formatter,
     )
-    .map_err(Error::Io)?;
-    stderr.flush().map_err(Error::Io)?;
-    let mut answer = String::new();
-    std::io::stdin()
-        .lock()
-        .read_line(&mut answer)
-        .map_err(Error::Io)?;
-    if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
-        Ok(())
-    } else {
-        Err(Error::Interrupted(
-            "OIDC provider deletion was declined".to_string(),
-        ))
-    }
 }
 
 async fn prepare_and_apply_mutation(

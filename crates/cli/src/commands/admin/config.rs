@@ -17,6 +17,7 @@ use zeroize::Zeroizing;
 use super::get_admin_client;
 use crate::exit_code::ExitCode;
 use crate::output::Formatter;
+use crate::private_file::write_private_file;
 
 #[derive(Subcommand, Debug)]
 #[command(disable_help_subcommand = true)]
@@ -837,20 +838,6 @@ fn read_protected_value_file(path: &Path) -> rc_core::Result<Zeroizing<String>> 
         ));
     }
     Ok(Zeroizing::new(value.to_string()))
-}
-
-fn write_private_file(path: &Path, contents: &[u8]) -> rc_core::Result<()> {
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path)?;
-    use std::io::Write;
-    file.write_all(contents)?;
-    Ok(())
 }
 
 fn emit_error(error: &Error, formatter: &Formatter) -> ExitCode {

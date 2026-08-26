@@ -19,6 +19,7 @@ use serde::Serialize;
 use super::get_admin_client;
 use crate::exit_code::ExitCode;
 use crate::output::{Formatter, qr};
+use crate::private_file::write_private_file;
 use crate::secret_input::{SecretSource, can_prompt, read_code_interactive};
 use rc_core::admin::{
     AccountApi, AccountInfo, AccountMfaApi, CredentialsSource, IdentityType, MfaEnrollment,
@@ -858,35 +859,24 @@ fn print_recovery_codes(codes: &RecoveryCodes, formatter: &Formatter, activated:
 }
 
 /// Write recovery codes to a new file with owner-only permissions.
+///
+/// The file mechanics are shared with `admin config export`; only the reading of
+/// the failure is local. An occupied path is a `Conflict` here rather than a
+/// plain I/O error, because what is in the way may be the only copy of a
+/// previous set and the operator has to decide what happens to it.
 fn write_recovery_codes(path: &std::path::Path, codes: &[String]) -> Result<()> {
-    use std::io::Write as _;
-
-    let mut options = std::fs::OpenOptions::new();
-    // `create_new` so an existing file is never silently overwritten: it may
-    // hold the only copy of a previous set.
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-
-    let mut file = options.open(path).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::AlreadyExists {
-            Error::Conflict(format!(
-                "{} already exists; choose another path",
-                path.display()
-            ))
-        } else {
-            Error::Io(error)
-        }
-    })?;
-
+    let mut contents = String::new();
     for code in codes {
-        writeln!(file, "{code}").map_err(Error::Io)?;
+        contents.push_str(code);
+        contents.push('\n');
     }
-    file.flush().map_err(Error::Io)?;
-    Ok(())
+
+    write_private_file(path, contents.as_bytes()).map_err(|error| match error {
+        Error::Io(io) if io.kind() == std::io::ErrorKind::AlreadyExists => Error::Conflict(
+            format!("{} already exists; choose another path", path.display()),
+        ),
+        other => other,
+    })
 }
 
 /// Report a failed operation and return its exit code.

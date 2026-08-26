@@ -20,9 +20,9 @@ use rc_core::{AliasManager, Error, ObjectStore as _};
 use rc_s3::{AdminClient, S3Client};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::io::{BufRead as _, IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
 
+use crate::confirm::{Confirmation, confirm};
 use crate::exit_code::ExitCode;
 use crate::output::{Formatter, OutputConfig};
 
@@ -1988,35 +1988,15 @@ async fn execute_check(args: CheckArgs, output_config: OutputConfig) -> ExitCode
 }
 
 fn confirm_replication_check(yes: bool, formatter: &Formatter) -> rc_core::Result<()> {
-    if yes {
-        return Ok(());
-    }
-    if formatter.is_json() || !std::io::stdin().is_terminal() {
-        return Err(Error::InvalidPath(
-            "Replication check performs temporary remote writes and deletes; pass --yes in non-interactive or JSON mode"
-                .to_string(),
-        ));
-    }
-
-    let mut stderr = std::io::stderr().lock();
-    write!(
-        stderr,
-        "Replication check writes and deletes a temporary object on every configured target. Continue? [y/N] "
+    confirm(
+        &Confirmation {
+            prompt: "Replication check writes and deletes a temporary object on every configured target. Continue? [y/N]",
+            requires_yes: "Replication check performs temporary remote writes and deletes; pass --yes in non-interactive or JSON mode",
+            declined: "Replication check was declined",
+        },
+        yes,
+        formatter,
     )
-    .map_err(Error::Io)?;
-    stderr.flush().map_err(Error::Io)?;
-    let mut answer = String::new();
-    std::io::stdin()
-        .lock()
-        .read_line(&mut answer)
-        .map_err(Error::Io)?;
-    if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
-        Ok(())
-    } else {
-        Err(Error::Interrupted(
-            "Replication check was declined".to_string(),
-        ))
-    }
 }
 
 fn output_replication_check(
