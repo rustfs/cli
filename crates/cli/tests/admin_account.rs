@@ -13,7 +13,8 @@ use std::process::Command;
 use std::time::Duration;
 
 use admin_support::{
-    rc_binary, rc_host_alias, start_admin_response_test_server, start_admin_test_server,
+    rc_binary, rc_host_alias, start_admin_response_test_server, start_admin_sequence_test_server,
+    start_admin_test_server,
 };
 
 /// An alias pointing at a port nothing is listening on.
@@ -160,6 +161,64 @@ fn account_passwd_sends_a_secret_longer_than_the_former_thirty_three_byte_bound(
         body.contains(&long_secret),
         "the whole 40-byte secret must reach the server, got: {body}"
     );
+    handle.join().expect("admin test server finished");
+}
+
+#[test]
+fn account_passwd_json_succeeds_when_the_optional_identity_lookup_fails() {
+    let config_dir = tempfile::tempdir().expect("create config dir");
+    let (endpoint, receiver, handle) = start_admin_sequence_test_server(vec![
+        ("200 OK", r#"{"sessions_revoked":3}"#),
+        (
+            "403 Forbidden",
+            r#"{"Code":"AccessDenied","Message":"identity lookup denied"}"#,
+        ),
+    ]);
+
+    let output = rc()
+        .args([
+            "--json",
+            "admin",
+            "account",
+            "passwd",
+            "myalias",
+            "--current-password-from-env",
+            "RC_TEST_CURRENT",
+            "--new-password-from-env",
+            "RC_TEST_NEW",
+        ])
+        .env("RC_CONFIG_DIR", config_dir.path())
+        .env("RC_HOST_myalias", rc_host_alias(&endpoint))
+        .env("RC_TEST_CURRENT", "old-password")
+        .env("RC_TEST_NEW", "new-password")
+        .output()
+        .expect("run rc command");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("password change JSON output");
+    assert_eq!(json["success"], true);
+    assert_eq!(json["sessions_revoked"], 3);
+    assert!(
+        json.get("access_key").is_none(),
+        "an optional identity lookup failure must omit the key, output: {json}"
+    );
+
+    let password_request = receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("captured password request");
+    assert_eq!(password_request.method, "POST");
+    assert_eq!(password_request.target, "/rustfs/admin/v3/account/password");
+    let identity_request = receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("captured identity request");
+    assert_eq!(identity_request.method, "GET");
+    assert_eq!(identity_request.target, "/rustfs/admin/v3/account/info");
     handle.join().expect("admin test server finished");
 }
 
