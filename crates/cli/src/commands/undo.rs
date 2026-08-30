@@ -361,6 +361,7 @@ async fn execute_plan_item<S: UndoStore>(
         UndoAction::RestoreVersion { source_version_id } => {
             let options = CopyObjectOptions {
                 source_version_id: Some(source_version_id.clone()),
+                source_etag: None,
             };
             store.copy_version(&path, &options).await.and_then(|info| {
                 let created_version_id = info.version_id.ok_or_else(|| {

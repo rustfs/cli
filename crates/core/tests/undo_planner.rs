@@ -173,8 +173,9 @@ fn overwrite_after_delete_marker_is_refused_instead_of_guessing() {
 }
 
 #[test]
-fn copy_options_reject_empty_source_version_ids() {
+fn copy_options_reject_empty_source_identities() {
     assert!(CopyObjectOptions::for_source_version(Some(String::new())).is_err());
+    assert!(CopyObjectOptions::for_source_identity(None, Some(String::new())).is_err());
     assert_eq!(
         CopyObjectOptions::for_source_version(Some("data-v1".to_string()))
             .expect("valid source version")

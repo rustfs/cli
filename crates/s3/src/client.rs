@@ -5501,17 +5501,18 @@ impl ObjectStore for S3Client {
         encryption: Option<&ObjectEncryptionRequest>,
     ) -> Result<ObjectInfo> {
         let copy_source = encoded_copy_source(src, options.source_version_id.as_deref());
-        let response = apply_object_encryption_to_copy_request(
+        let mut request = apply_object_encryption_to_copy_request(
             self.inner
                 .copy_object()
                 .copy_source(&copy_source)
                 .bucket(&dst.bucket)
                 .key(&dst.key),
             encryption,
-        )
-        .send()
-        .await
-        .map_err(|error| {
+        );
+        if let Some(source_etag) = options.source_etag.as_deref() {
+            request = request.copy_source_if_match(quoted_etag(source_etag));
+        }
+        let response = request.send().await.map_err(|error| {
             Self::map_object_request_error(&error, src, options.source_version_id.as_deref())
         })?;
 
@@ -5554,6 +5555,9 @@ impl ObjectStore for S3Client {
         .set_storage_class(storage_class);
         if matches!(options.metadata_directive, Some(MetadataDirective::Copy)) {
             request = request.metadata_directive(aws_sdk_s3::types::MetadataDirective::Copy);
+        }
+        if let Some(source_etag) = options.source_etag.as_deref() {
+            request = request.copy_source_if_match(quoted_etag(source_etag));
         }
         request = apply_object_lock_to_copy_request(request, &options.destination)?;
         let response = request.send().await.map_err(|error| {
@@ -11390,6 +11394,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn copy_object_with_options_conditions_on_source_etag() {
+        let response = http::Response::builder()
+            .status(412)
+            .header("x-amz-error-code", "PreconditionFailed")
+            .body(SdkBody::from(
+                "<Error><Code>PreconditionFailed</Code><Message>source changed</Message></Error>",
+            ))
+            .expect("build precondition response");
+        let (client, request_receiver) = test_s3_client(Some(response));
+        let src = RemotePath::new("test", "source-bucket", "src.txt");
+        let dst = RemotePath::new("test", "destination-bucket", "dst.txt");
+        let options =
+            CopyObjectOptions::for_source_identity(None, Some("planned-source-etag".to_string()))
+                .expect("valid source identity");
+
+        let error = client
+            .copy_object_with_options(&src, &dst, &options, None)
+            .await
+            .expect_err("a changed source must block the copy");
+
+        let request = request_receiver.expect_request();
+        assert_eq!(
+            request.headers().get("x-amz-copy-source-if-match"),
+            Some("\"planned-source-etag\"")
+        );
+        assert!(matches!(error, Error::Conflict(_)));
+    }
+
+    #[tokio::test]
     async fn transfer_copy_sends_explicit_metadata_copy_directive() {
         let response = http::Response::builder()
             .status(500)
@@ -11407,6 +11440,7 @@ mod tests {
                 &src,
                 &dst,
                 &TransferCopyOptions {
+                    source_etag: Some("planned-source-etag".to_string()),
                     metadata_directive: Some(MetadataDirective::Copy),
                     destination: ObjectWriteOptions {
                         storage_class: Some("STANDARD".to_string()),
@@ -11425,6 +11459,10 @@ mod tests {
         assert_eq!(
             request.headers().get("x-amz-storage-class"),
             Some("STANDARD")
+        );
+        assert_eq!(
+            request.headers().get("x-amz-copy-source-if-match"),
+            Some("\"planned-source-etag\"")
         );
     }
 
