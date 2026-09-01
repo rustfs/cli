@@ -3778,6 +3778,44 @@ mod tests {
     }
 
     #[test]
+    fn status_output_reports_captured_minio_wire_without_fabricating_latency() {
+        let metrics: ReplicationMetrics = serde_json::from_str(include_str!(
+            "../../../core/tests/fixtures/replication_metrics_minio_v1.json"
+        ))
+        .expect("captured MinIO-compatible metrics");
+        let value = serde_json::to_value(replication_status_output("source", metrics.clone()))
+            .expect("status JSON");
+
+        assert_eq!(value["schema_version"], 3);
+        assert_eq!(value["data"]["availability"], "available");
+        assert_eq!(value["data"]["cluster"]["state"], "complete");
+        assert_eq!(value["data"]["cluster"]["observed_nodes"], 1);
+        assert_eq!(value["data"]["cluster"]["expected_nodes"], 1);
+        assert_eq!(value["data"]["totals"]["replicated_count"], 1);
+        assert_eq!(value["data"]["totals"]["replicated_size_bytes"], 20);
+        assert_eq!(value["data"]["targets"][0]["replicated_count"], 1);
+        assert_eq!(value["data"]["targets"][0]["replicated_size_bytes"], 20);
+        assert_eq!(value["data"]["targets"][0]["latency"]["average_ms"], 0.0);
+        assert_eq!(
+            value["data"]["targets"][0]["latency"]["scope"],
+            "unavailable"
+        );
+        assert_eq!(
+            value["data"]["targets"][0]["bandwidth"]["scope"],
+            "legacy_unknown"
+        );
+
+        let formatter = Formatter::new(OutputConfig {
+            no_color: true,
+            ..Default::default()
+        });
+        let output = replication_status_lines("source", &metrics, &formatter).join("\n");
+        assert!(output.contains("provider=available, cluster=complete (1/1 nodes)"));
+        assert!(output.contains("Totals: replicated 1 / 0 objects, 20 / 0 bytes"));
+        assert!(output.contains("1 / 20 bytes  0 / 0 bytes  unavailable  legacy_unknown"));
+    }
+
+    #[test]
     fn status_output_marks_legacy_availability_unknown() {
         let metrics: ReplicationMetrics = serde_json::from_str(
             r#"{"stats":{},"replica_size":0,"replica_count":0,

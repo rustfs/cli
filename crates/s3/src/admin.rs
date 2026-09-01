@@ -1232,6 +1232,64 @@ impl AdminClient {
         }
     }
 
+    fn unique_redacted_extension_key(
+        &self,
+        mut key: String,
+        next_suffix: &mut BTreeMap<String, u64>,
+        occupied: impl Fn(&str) -> bool,
+    ) -> String {
+        self.redact_admin_credentials(&mut key);
+        let base = key.clone();
+        let suffix = next_suffix.entry(base.clone()).or_insert(2);
+        while occupied(&key) {
+            key = format!("{base}#{suffix}");
+            *suffix += 1;
+        }
+        key
+    }
+
+    fn sanitize_replication_extension_value(&self, value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::String(value) => self.redact_admin_credentials(value),
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    self.sanitize_replication_extension_value(value);
+                }
+            }
+            serde_json::Value::Object(values) => {
+                let mut sanitized = serde_json::Map::with_capacity(values.len());
+                let mut next_suffix = BTreeMap::new();
+                for (key, mut value) in std::mem::take(values) {
+                    let key =
+                        self.unique_redacted_extension_key(key, &mut next_suffix, |candidate| {
+                            sanitized.contains_key(candidate)
+                        });
+                    self.sanitize_replication_extension_value(&mut value);
+                    sanitized.insert(key, value);
+                }
+                *values = sanitized;
+            }
+            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            }
+        }
+    }
+
+    fn sanitize_replication_extensions(
+        &self,
+        extensions: &mut BTreeMap<String, serde_json::Value>,
+    ) {
+        let mut sanitized = BTreeMap::new();
+        let mut next_suffix = BTreeMap::new();
+        for (key, mut value) in std::mem::take(extensions) {
+            let key = self.unique_redacted_extension_key(key, &mut next_suffix, |candidate| {
+                sanitized.contains_key(candidate)
+            });
+            self.sanitize_replication_extension_value(&mut value);
+            sanitized.insert(key, value);
+        }
+        *extensions = sanitized;
+    }
+
     fn redact_admin_credentials(&self, value: &mut String) {
         let mut credentials = [&self.access_key, &self.secret_key];
         credentials.sort_by_key(|credential| std::cmp::Reverse(credential.len()));
@@ -1320,17 +1378,13 @@ impl AdminClient {
 
     fn sanitize_replication_metrics(&self, metrics: &mut ReplicationMetrics) {
         self.sanitize_replication_scope(&mut metrics.queue_scope);
-        for value in metrics.extra.values_mut() {
-            self.redact_admin_credentials_in_value(value);
-        }
+        self.sanitize_replication_extensions(&mut metrics.extra);
         for (arn, mut target) in std::mem::take(&mut metrics.stats) {
             let mut redacted_arn = arn;
             self.redact_admin_credentials(&mut redacted_arn);
             self.sanitize_replication_scope(&mut target.latency_scope);
             self.sanitize_replication_scope(&mut target.bandwidth_scope);
-            for value in target.extra.values_mut() {
-                self.redact_admin_credentials_in_value(value);
-            }
+            self.sanitize_replication_extensions(&mut target.extra);
             metrics.stats.insert(redacted_arn, target);
         }
     }
@@ -1342,13 +1396,9 @@ impl AdminClient {
             if let ReplicationMetricScope::Unknown(value) = &mut target.observation_scope {
                 self.redact_admin_credentials(value);
             }
-            for value in target.extra.values_mut() {
-                self.redact_admin_credentials_in_value(value);
-            }
+            self.sanitize_replication_extensions(&mut target.extra);
         }
-        for value in mrf.extra.values_mut() {
-            self.redact_admin_credentials_in_value(value);
-        }
+        self.sanitize_replication_extensions(&mut mrf.extra);
     }
 
     fn map_inspect_archive_error(&self, status: StatusCode, body: &str) -> Error {
@@ -5830,7 +5880,9 @@ mod tests {
         (endpoint, receiver, handle)
     }
 
-    fn start_admin_chunked_overflow_server() -> (
+    fn start_admin_chunked_overflow_server(
+        max_bytes: usize,
+    ) -> (
         String,
         mpsc::Receiver<CapturedAdminRequest>,
         mpsc::Receiver<()>,
@@ -5850,7 +5902,7 @@ mod tests {
 
             let header = b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n";
             let chunk = vec![b'x'; 64 * 1024];
-            let mut remaining = MAX_REPLICATION_DIFF_RESPONSE_BYTES;
+            let mut remaining = max_bytes;
             let mut write_failed = stream.write_all(header).is_err();
             while remaining > 0 && !write_failed {
                 let chunk_len = remaining.min(chunk.len());
@@ -10348,7 +10400,8 @@ mod tests {
         assert!(matches!(declared, Error::General(message) if message.contains("response limit")));
         handle.join().expect("server thread");
 
-        let (endpoint, _receiver, completion) = start_admin_chunked_overflow_server();
+        let (endpoint, _receiver, completion) =
+            start_admin_chunked_overflow_server(MAX_REPLICATION_DIFF_RESPONSE_BYTES);
         let chunked = anonymous_admin_client_for_endpoint(&endpoint)
             .replication_diff("source", None)
             .await
@@ -10390,6 +10443,55 @@ mod tests {
         assert!(metrics.stats.contains_key("arn:[REDACTED]"));
         assert_eq!(
             metrics.stats["arn:[REDACTED]"].extra["Future"],
+            "[REDACTED]"
+        );
+        assert_eq!(
+            receiver.recv().expect("request").target,
+            "/rustfs/admin/v3/replicationmetrics?bucket=source%20bucket"
+        );
+        handle.join().expect("server thread");
+    }
+
+    #[tokio::test]
+    async fn replication_metrics_decodes_captured_minio_wire_and_sanitizes_extensions() {
+        let mut body: serde_json::Value = serde_json::from_str(include_str!(
+            "../../core/tests/fixtures/replication_metrics_minio_v1.json"
+        ))
+        .expect("captured metrics fixture");
+        let arn =
+            "arn:minio:replication:us-east-1:00000000-0000-0000-0000-000000000000:destination";
+        body["Top-access"] = serde_json::json!({"credential": "secret"});
+        body["Stats"][arn]["Target-secret"] =
+            serde_json::json!({"credential": "access", "nested-access": "secret"});
+        let (endpoint, receiver, handle) = start_admin_owned_test_server(
+            "200 OK",
+            "application/json",
+            serde_json::to_string(&body).expect("encoded fixture"),
+        );
+
+        let metrics = admin_client_for_endpoint(&endpoint)
+            .replication_metrics("source bucket")
+            .await
+            .expect("captured MinIO-compatible metrics");
+
+        let target = &metrics.stats[arn];
+        assert_eq!(metrics.replicated_count, 1);
+        assert_eq!(metrics.replicated_size, 20);
+        assert_eq!(target.replicated_count, 1);
+        assert_eq!(target.replicated_size, 20);
+        assert_eq!(
+            target.latency_scope,
+            Some(ReplicationMetricScope::Unavailable)
+        );
+        assert!(metrics.extra.contains_key("Top-[REDACTED]"));
+        assert!(target.extra.contains_key("Target-[REDACTED]"));
+        assert_eq!(metrics.extra["Top-[REDACTED]"]["credential"], "[REDACTED]");
+        assert_eq!(
+            target.extra["Target-[REDACTED]"]["credential"],
+            "[REDACTED]"
+        );
+        assert_eq!(
+            target.extra["Target-[REDACTED]"]["nested-[REDACTED]"],
             "[REDACTED]"
         );
         assert_eq!(
@@ -10502,6 +10604,17 @@ mod tests {
             .expect_err("oversized success");
         assert!(matches!(error, Error::General(message) if message.contains("response limit")));
         handle.join().expect("server thread");
+
+        let (endpoint, _receiver, completion) =
+            start_admin_chunked_overflow_server(MAX_REPLICATION_INSPECTION_RESPONSE_BYTES);
+        let error = anonymous_admin_client_for_endpoint(&endpoint)
+            .replication_metrics("source")
+            .await
+            .expect_err("oversized chunked success");
+        assert!(matches!(error, Error::General(message) if message.contains("response limit")));
+        completion
+            .recv_timeout(Duration::from_secs(5))
+            .expect("chunked overflow server should complete within its socket timeout");
 
         let (endpoint, _receiver, handle) = start_admin_declared_length_server(
             "403 Forbidden",
