@@ -1,0 +1,36 @@
+{
+  "Stats": {
+    "arn:minio:replication:us-east-1:00000000-0000-0000-0000-000000000000:destination": {
+      "replicationCount": 1,
+      "completedReplicationSize": 20,
+      "limitInBits": 0,
+      "currentBandwidth": 0.0,
+      "failed": {
+        "lastMinute": { "count": 0.0, "bytes": 0 },
+        "lastHour": { "count": 0.0, "bytes": 0 },
+        "totals": { "count": 0.0, "bytes": 0 }
+      },
+      "failedReplicationSize": 0,
+      "failedReplicationCount": 0
+    }
+  },
+  "completedReplicationSize": 20,
+  "replicaSize": 0,
+  "replicaCount": 0,
+  "replicationCount": 1,
+  "failed": {
+    "lastMinute": { "count": 0.0, "bytes": 0 },
+    "lastHour": { "count": 0.0, "bytes": 0 },
+    "totals": { "count": 0.0, "bytes": 0 }
+  },
+  "queued": {
+    "curr": { "count": 0.0, "bytes": 0.0 },
+    "avg": { "count": 0.0, "bytes": 0.0 },
+    "max": { "count": 0.0, "bytes": 0.0 },
+    "peak": { "count": 0.0, "bytes": 0.0 }
+  },
+  "provider_available": true,
+  "cluster_complete": true,
+  "observed_node_count": 1,
+  "expected_node_count": 1
+}
