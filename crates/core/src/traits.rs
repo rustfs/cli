@@ -135,17 +135,35 @@ pub struct ObjectReadOptions {
 pub struct CopyObjectOptions {
     /// Exact historical source version to copy. `None` selects the current source.
     pub source_version_id: Option<String>,
+    /// Copy only when the selected source still has this ETag.
+    pub source_etag: Option<String>,
 }
 
 impl CopyObjectOptions {
     /// Build copy options while rejecting an ambiguous empty source version identifier.
     pub fn for_source_version(source_version_id: Option<String>) -> Result<Self> {
+        Self::for_source_identity(source_version_id, None)
+    }
+
+    /// Build copy options pinned to an exact source version or ETag.
+    pub fn for_source_identity(
+        source_version_id: Option<String>,
+        source_etag: Option<String>,
+    ) -> Result<Self> {
         if source_version_id.as_deref().is_some_and(str::is_empty) {
             return Err(Error::InvalidPath(
                 "Source version ID cannot be empty".to_string(),
             ));
         }
-        Ok(Self { source_version_id })
+        if source_etag.as_deref().is_some_and(str::is_empty) {
+            return Err(Error::InvalidPath(
+                "Source ETag cannot be empty".to_string(),
+            ));
+        }
+        Ok(Self {
+            source_version_id,
+            source_etag,
+        })
     }
 }
 
@@ -793,10 +811,9 @@ pub trait ObjectStore: Send + Sync {
         options: &CopyObjectOptions,
         encryption: Option<&ObjectEncryptionRequest>,
     ) -> Result<ObjectInfo> {
-        if options.source_version_id.is_some() {
+        if options.source_version_id.is_some() || options.source_etag.is_some() {
             return Err(Error::UnsupportedFeature(
-                "Exact-version server-side copy is not implemented by this object store"
-                    .to_string(),
+                "Exact-source server-side copy is not implemented by this object store".to_string(),
             ));
         }
         self.copy_object(src, dst, encryption).await

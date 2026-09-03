@@ -1686,6 +1686,10 @@ fn recursive_copy_executes_the_planned_server_side_copy() {
         copies[0].headers.get("x-amz-copy-source"),
         Some(&"source/src/a.txt".to_string())
     );
+    assert_eq!(
+        copies[0].headers.get("x-amz-copy-source-if-match"),
+        Some(&"\"source-etag\"".to_string())
+    );
 }
 
 #[test]

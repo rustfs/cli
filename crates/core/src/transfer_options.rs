@@ -474,6 +474,8 @@ impl From<ObjectReadOptions> for TransferReadOptions {
 pub struct TransferCopyOptions {
     /// Source version, checksum, and SSE-C selection.
     pub source: TransferReadOptions,
+    /// Copy only when the selected source still has this ETag.
+    pub source_etag: Option<String>,
     /// Source metadata handling requested for the destination.
     pub metadata_directive: Option<MetadataDirective>,
     /// Source tag handling requested for the destination.
@@ -486,6 +488,11 @@ impl TransferCopyOptions {
     /// Validate directives and their replacement payloads before mutation.
     pub fn validate(&self) -> Result<()> {
         self.source.validate()?;
+        if self.source_etag.as_deref().is_some_and(str::is_empty) {
+            return Err(Error::InvalidPath(
+                "Source ETag cannot be empty".to_string(),
+            ));
+        }
         self.destination.validate()?;
         match self.metadata_directive {
             None | Some(MetadataDirective::Copy) if self.destination.attributes.is_some() => {
@@ -529,7 +536,8 @@ impl TransferCopyOptions {
         }
         let source = self.source.legacy_read_options()?;
         let encryption = self.destination.legacy_copy_encryption()?;
-        let copy = CopyObjectOptions::for_source_version(source.version_id)?;
+        let copy =
+            CopyObjectOptions::for_source_identity(source.version_id, self.source_etag.clone())?;
         Ok((copy, encryption))
     }
 

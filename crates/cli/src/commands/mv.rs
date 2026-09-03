@@ -406,8 +406,10 @@ async fn copy_for_move(
         }
         None => {
             let source_info = source_client.head_object(source).await?;
-            let copy_options =
-                CopyObjectOptions::for_source_version(source_info.version_id.clone())?;
+            let copy_options = CopyObjectOptions::for_source_identity(
+                source_info.version_id.clone(),
+                source_info.etag.clone(),
+            )?;
             let object = source_client
                 .copy_object_with_options(source, target, &copy_options, encryption)
                 .await?;

@@ -618,6 +618,7 @@ fn requested_metadata_directive(args: &CpArgs) -> Option<MetadataDirective> {
 fn transfer_copy_options(
     args: &CpArgs,
     source_version_id: Option<String>,
+    source_etag: Option<String>,
     encryption: Option<&ObjectEncryptionRequest>,
 ) -> rc_core::Result<TransferCopyOptions> {
     let metadata_directive = requested_metadata_directive(args);
@@ -645,6 +646,7 @@ fn transfer_copy_options(
             customer_key: args.source_customer_key.clone(),
             ..TransferReadOptions::default()
         },
+        source_etag,
         metadata_directive,
         tagging_directive,
         destination,
@@ -697,7 +699,7 @@ fn validate_fidelity_directions(
             )
         });
     if any_remote && target_remote {
-        let copy_options = transfer_copy_options(args, None, None)?;
+        let copy_options = transfer_copy_options(args, None, None, None)?;
         if same_alias_remote_copy
             && matches!(
                 copy_options.metadata_directive,
@@ -1303,7 +1305,7 @@ async fn perform_planned_remote_copy(
             )));
         }
         let options = multipart_options_from_source(&current)?;
-        let transfer = transfer_copy_options(args, current.version_id.clone(), encryption)?;
+        let transfer = transfer_copy_options(args, current.version_id.clone(), None, encryption)?;
         let copied = source_client
             .multipart_copy_with_transfer_options(
                 source,
@@ -1323,7 +1325,12 @@ async fn perform_planned_remote_copy(
             object: copied.object,
         });
     }
-    let options = transfer_copy_options(args, source_info.version_id.clone(), encryption)?;
+    let options = transfer_copy_options(
+        args,
+        source_info.version_id.clone(),
+        source_info.etag.clone(),
+        encryption,
+    )?;
     let copied = source_client
         .copy_object_with_transfer_options(source, target, &options)
         .await?;
@@ -4233,11 +4240,17 @@ mod tests {
         args.fidelity.retain_until = Some("2099-01-02T03:04:05Z".to_string());
         args.fidelity.legal_hold = Some("ON".to_string());
 
-        let options =
-            transfer_copy_options(&args, Some("source-v1".to_string()), None).expect("copy policy");
+        let options = transfer_copy_options(
+            &args,
+            Some("source-v1".to_string()),
+            Some("source-etag".to_string()),
+            None,
+        )
+        .expect("copy policy");
         assert_eq!(options.metadata_directive, Some(MetadataDirective::Copy));
         assert!(options.destination.attributes.is_none());
         assert_eq!(options.source.version_id.as_deref(), Some("source-v1"));
+        assert_eq!(options.source_etag.as_deref(), Some("source-etag"));
         assert!(options.destination.retention.is_some());
         assert_eq!(
             options.destination.legal_hold,
