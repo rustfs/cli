@@ -604,3 +604,98 @@ fn an_absent_route_is_reported_as_not_found() {
         .expect("captured admin request");
     handle.join().expect("admin test server finished");
 }
+
+#[test]
+fn a_wrong_current_password_is_a_general_error_not_an_authentication_one() {
+    // The account handler answers a wrong current secret with `InvalidRequest`,
+    // not `AccessDenied`, so that its message is indistinguishable from the
+    // new-password validation failures and cannot be probed. `map_error` sends
+    // 400 to `General`, so a password change reports 1 where `mfa disable`
+    // reports 4 for the same mistake. The table says so; this holds it there.
+    let config_dir = tempfile::tempdir().expect("create config dir");
+    let secret_dir = tempfile::tempdir().expect("create secret dir");
+    let current = secret_dir.path().join("current");
+    let new = secret_dir.path().join("new");
+    fs::write(&current, "wrong-password\n").expect("write current password");
+    fs::write(&new, "a-sufficiently-long-new-password\n").expect("write new password");
+
+    let (endpoint, receiver, handle) = start_admin_response_test_server(
+        "400 Bad Request",
+        "application/json",
+        r#"{"Code":"InvalidRequest","Message":"the current secret key is incorrect"}"#.to_string(),
+    );
+
+    let output = rc()
+        .args([
+            "--json",
+            "admin",
+            "account",
+            "passwd",
+            "myalias",
+            "--current-password-file",
+            current.to_str().expect("utf-8 path"),
+            "--new-password-file",
+            new.to_str().expect("utf-8 path"),
+        ])
+        .env("RC_CONFIG_DIR", config_dir.path())
+        .env("RC_HOST_myalias", rc_host_alias(&endpoint))
+        .output()
+        .expect("run rc command");
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "expected GeneralError, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("captured admin request");
+    handle.join().expect("admin test server finished");
+}
+
+#[test]
+fn a_wrong_password_on_mfa_disable_is_an_authentication_error() {
+    // The counterpart row. `mfa disable` has no probing ambiguity to protect
+    // against, so the server uses `AccessDenied` and the exit code is 4. Pinned
+    // alongside the row above so the pair cannot silently converge.
+    let config_dir = tempfile::tempdir().expect("create config dir");
+    let secret_dir = tempfile::tempdir().expect("create secret dir");
+    let current = secret_dir.path().join("current");
+    fs::write(&current, "wrong-password\n").expect("write current password");
+
+    let (endpoint, receiver, handle) = start_admin_response_test_server(
+        "403 Forbidden",
+        "application/json",
+        r#"{"Code":"AccessDenied","Message":"the current secret key is incorrect"}"#.to_string(),
+    );
+
+    let output = rc()
+        .args([
+            "--json",
+            "admin",
+            "account",
+            "mfa",
+            "disable",
+            "myalias",
+            "--code",
+            "123456",
+            "--password-file",
+            current.to_str().expect("utf-8 path"),
+        ])
+        .env("RC_CONFIG_DIR", config_dir.path())
+        .env("RC_HOST_myalias", rc_host_alias(&endpoint))
+        .output()
+        .expect("run rc command");
+
+    assert_eq!(
+        output.status.code(),
+        Some(4),
+        "expected AuthError, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("captured admin request");
+    handle.join().expect("admin test server finished");
+}

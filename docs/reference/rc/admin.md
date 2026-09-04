@@ -199,13 +199,23 @@ the standard codes:
 
 | Condition | Code |
 |---|---|
-| Wrong verification code, recovery code, or password | authentication (4) |
+| Wrong verification code or recovery code | authentication (4) |
+| Wrong account password on `mfa disable` | authentication (4) |
+| Wrong current password on `account passwd` | general (1) |
 | Locked out after repeated wrong codes | network (3) |
 | At-rest protection not configured on the server | unsupported (7) |
 | Route absent, on a server predating these endpoints | not found (5) |
 | Recovery-code output path already occupied | conflict (6) |
 | Missing, conflicting, or unprompted flags | usage (2) |
 | Already enabled, not enabled, or no pending enrollment | general (1) |
+
+The two password rows differ because the server answers them differently.
+`mfa disable` refuses a wrong password with `AccessDenied`, which is the
+authentication class. `account passwd` answers `InvalidRequest` instead, and
+deliberately with the same message its new-password validation uses, so that a
+caller cannot tell "wrong current password" from "new password rejected" by
+probing. That lands in general (1). A script that reads 4 as "bad credentials"
+will not see it for a password change.
 
 The lockout deserves a note, because network (3) usually means "retry". It is
 retryable here too, but only after the delay the server reports — the code comes
