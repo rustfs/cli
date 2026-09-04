@@ -100,30 +100,7 @@ jobs:
       - name: Check protected files
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
-        run: |
-          PROTECTED_FILES=(
-            "docs/reference/rc/"
-            "schemas/output_v1.json"
-            "crates/cli/src/exit_code.rs"
-            "crates/core/src/config.rs"
-          )
-
-          CHANGED_FILES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD)
-
-          for file in "${PROTECTED_FILES[@]}"; do
-            protected_path="${file%/}"
-            if echo "$CHANGED_FILES" | grep -Fxq "$protected_path" || echo "$CHANGED_FILES" | grep -q "^$protected_path/"; then
-              echo "::warning::Protected file modified: $file"
-              echo "This change requires the Breaking Change process. See AGENTS.md."
-
-              # Check if PR body contains BREAKING marker
-              if ! grep -q "BREAKING" <<< "$PR_BODY"; then
-                echo "::error::Protected file $file modified without BREAKING marker in PR description"
-                exit 1
-              fi
-            fi
-          done
-          echo "Protected files check passed"
+        run: ./scripts/check-protected-files.sh "origin/${{ github.base_ref }}"
 
   msrv:
     name: Minimum Supported Rust Version
