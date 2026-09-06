@@ -94,3 +94,5 @@ pub use undo::{
     UndoAction, UndoObjectResult, UndoOutcome, UndoPlan, UndoPlanItem, plan_object_undo,
 };
 pub use watch::{WatchApi, WatchEvent, WatchFrame, WatchRequest, WatchSource, WatchStream};
+
+pub mod catalog;
