@@ -213,3 +213,73 @@ async fn catalog_ref_create_preserves_absence_requirement() {
     );
     assert_eq!(body["updates"][0]["ref-name"], "release");
 }
+
+#[tokio::test]
+async fn catalog_redaction_preserves_refs_schema_and_properties() {
+    let metadata = json!({
+        "refs":{"password-audit":{"snapshot-id":7,"type":"tag"}},
+        "schemas":[{"fields":[{"id":1,"name":"password","type":"string"}]}],
+        "properties":{"authorization-mode":"strict","password-policy":"required"}
+    });
+    let (client, task) = server(vec![(200, json!({
+        "metadata":metadata,
+        "refs":{"password-audit":{"snapshot-id":7,"type":"tag"}},
+        "user-defined-ref-count":1,
+        "properties":{"authorization-mode":"strict"},
+        "storage-credentials":[{"config":{"s3.secret-access-key":"vended-secret"}}],
+        "config":{"s3.access-key-id":"vended-access","s3.secret-access-key":"vended-secret","s3.session-token":"vended-token","s3.region":"us-east-1"},
+        "defaults":{"s3.secret-access-key":"default-secret","warehouse":"warehouse"},
+        "overrides":{"s3.session-token":"override-token","s3.endpoint":"http://localhost"}
+    }))]).await;
+    let result = client.catalog(&request(Op::TableShow)).await.unwrap();
+    assert_eq!(result["metadata"], metadata);
+    assert_eq!(result["refs"]["password-audit"]["snapshot-id"], 7);
+    assert_eq!(result["properties"]["authorization-mode"], "strict");
+    assert_eq!(result["config"], json!({"s3.region":"us-east-1"}));
+    assert_eq!(result["defaults"], json!({"warehouse":"warehouse"}));
+    assert_eq!(
+        result["overrides"],
+        json!({"s3.endpoint":"http://localhost"})
+    );
+    assert!(result.get("storage-credentials").is_none());
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn catalog_namespace_pages_preserve_encoded_parent() {
+    let (client, task) = server(vec![
+        (
+            200,
+            json!({"namespaces":[["sales","eu","one"]],"next-page-token":"a+/="}),
+        ),
+        (200, json!({"namespaces":[["sales","eu","two"]]})),
+    ])
+    .await;
+    let req = CatalogRequest::new(
+        Op::NamespaceList,
+        CatalogTarget::parse("a/warehouse/sales.eu", ResourceKind::Namespace).unwrap(),
+    );
+    let result = client.catalog(&req).await.unwrap();
+    assert_eq!(result["namespaces"].as_array().unwrap().len(), 2);
+    for (index, raw) in task.await.unwrap().iter().enumerate() {
+        let target = raw.split_whitespace().nth(1).unwrap();
+        let url = url::Url::parse(&format!("http://localhost{target}")).unwrap();
+        assert_eq!(url.path(), "/iceberg/v1/warehouse/namespaces");
+        assert_eq!(
+            url.query_pairs()
+                .find(|(key, _)| key == "parent")
+                .unwrap()
+                .1,
+            "sales\u{1f}eu"
+        );
+        if index == 1 {
+            assert_eq!(
+                url.query_pairs()
+                    .find(|(key, _)| key == "pageToken")
+                    .unwrap()
+                    .1,
+                "a+/="
+            );
+        }
+    }
+}

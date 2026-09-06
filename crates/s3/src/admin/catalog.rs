@@ -190,33 +190,22 @@ fn catalog_error(status: StatusCode, message: &str) -> Error {
     }
 }
 
-// Catalog responses may contain optional credential bundles even when not requested.
+// Credentials belong to protocol configuration maps, not arbitrary metadata keys.
 fn remove_credentials(value: &mut Value) {
-    match value {
-        Value::Object(map) => {
-            map.retain(|key, _| {
-                let key = key.to_ascii_lowercase().replace(['-', '_', '.'], "");
-                ![
-                    "storagecredentials",
-                    "accesskey",
-                    "secretkey",
-                    "sessiontoken",
-                    "authorization",
-                    "password",
-                ]
-                .iter()
-                .any(|part| key.contains(part))
-            });
-            for value in map.values_mut() {
-                remove_credentials(value);
+    let Some(response) = value.as_object_mut() else {
+        return;
+    };
+    response.remove("storage-credentials");
+    for field in ["config", "defaults", "overrides"] {
+        if let Some(config) = response.get_mut(field).and_then(Value::as_object_mut) {
+            for key in [
+                "s3.access-key-id",
+                "s3.secret-access-key",
+                "s3.session-token",
+            ] {
+                config.remove(key);
             }
         }
-        Value::Array(values) => {
-            for value in values {
-                remove_credentials(value);
-            }
-        }
-        _ => {}
     }
 }
 
@@ -228,6 +217,9 @@ impl AdminClient {
             let mut query = url.query_pairs_mut();
             if request.operation == Op::Config {
                 query.append_pair("warehouse", &request.target.warehouse);
+            }
+            if request.operation == Op::NamespaceList && !request.target.namespace.is_empty() {
+                query.append_pair("parent", &request.target.namespace.join("\u{1f}"));
             }
             if request.operation.is_list() {
                 query.append_pair("pageSize", &request.page_size.to_string());

@@ -37,7 +37,7 @@ Use a compatible engine such as PyIceberg, DuckDB or Spark to write and query ro
 
 ## Read and namespace operations
 
-- `namespace list WAREHOUSE`, `show NAMESPACE`, `exists NAMESPACE`, `remove NAMESPACE`.
+- `namespace list WAREHOUSE` lists root namespaces; `namespace list NAMESPACE` lists its direct children, for example `rc table namespace list local/analytics/sales.eu`. `show NAMESPACE`, `exists NAMESPACE`, and `remove NAMESPACE` address an individual namespace.
 - `namespace update NAMESPACE --set key=value --remove key` changes properties; the same key cannot occur in both sets.
 - `table list NAMESPACE`, `show TABLE --snapshots all|refs`, `exists TABLE`.
 - `snapshot list TABLE --snapshots all|refs` and `snapshot show TABLE SNAPSHOT_ID` project LoadTable metadata; they are not a separate server scan or SQL query.
@@ -149,6 +149,6 @@ The `background-enabled` server configuration does not make this CLI a daemon or
 
 ## Output and errors
 
-`--json` uses the existing output v3 envelope with `type: table_catalog`. Success is written to stdout and errors to stderr. Success `data` contains `operation` and the server `result` (or snapshot projection). Use `.data.result` when consuming JSON. Human output prints readable JSON for nested catalog documents. Sensitive credential fields are removed, including unexpected credential bundles in LoadTable responses.
+`--json` uses the existing output v3 envelope with `type: table_catalog`. Success is written to stdout and errors to stderr. Success `data` contains `operation` and the server `result` (or snapshot projection). Use `.data.result` when consuming JSON. Human output prints readable JSON for nested catalog documents. Top-level `storage-credentials` bundles and credential keys in the protocol `config`, `defaults`, and `overrides` maps are removed. Business properties, schema fields and ref names are preserved, including names containing words such as `password` or `authorization`. Known alias credential values remain redacted.
 
 Exit codes: 2 invalid arguments/request, 3 network/transient service error, 4 authentication/authorization, 5 not found, 6 conflict/precondition failure, 7 unsupported operation. Mutations with a lost response have an unknown outcome and are not retried automatically. Error envelopes conservatively report `retryable: false`; callers must decide whether a read retry or an exact commit replay is safe. No automatic cross-warehouse rename, purge, overwrite registration, staged create, v3, multi-table commit, table replication, table encryption policy or Delta Sharing is offered.

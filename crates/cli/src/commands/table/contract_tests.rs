@@ -274,3 +274,41 @@ fn catalog_pointer_commit_requires_conditions_and_rejects_ignored_updates() {
         assert_eq!(prepare_command(args).is_ok(), valid, "{body}");
     }
 }
+
+#[test]
+fn catalog_namespace_list_accepts_root_and_parent_targets() {
+    for (target, namespace) in [
+        ("a/warehouse", Vec::<String>::new()),
+        ("a/warehouse/sales.eu", vec!["sales".into(), "eu".into()]),
+    ] {
+        let args = [
+            "rc",
+            "table",
+            "namespace",
+            "list",
+            target,
+            "--page-token",
+            "opaque",
+            "--no-paginate",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let prepared = prepare_command(args).unwrap();
+        assert_eq!(prepared.request.operation, Op::NamespaceList);
+        assert_eq!(prepared.request.target.namespace, namespace);
+        assert_eq!(prepared.request.page_token.as_deref(), Some("opaque"));
+        assert!(prepared.request.single_page);
+    }
+    for target in [
+        "a/warehouse/sales..eu",
+        "a/warehouse/sales%2Feu",
+        "a/warehouse/sales/table",
+    ] {
+        let args = ["rc", "table", "namespace", "list", target]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        assert!(prepare_command(args).is_err());
+    }
+}

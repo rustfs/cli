@@ -230,6 +230,7 @@ pub enum WarehouseCommands {
 #[derive(Debug, Subcommand)]
 pub enum NamespaceCommands {
     Create(NamespaceCreateArgs),
+    /// List root namespaces for a warehouse, or direct children of a namespace
     List(ListArgs),
     Show(TargetArgs),
     Exists(TargetArgs),
@@ -437,7 +438,14 @@ fn prepare_table(command: TableCommands) -> Result<Prepared> {
             prepare(Op::WarehouseShow, a, Kind::Warehouse)
         }
         TableCommands::Namespace(command) => match command {
-            NamespaceCommands::List(a) => list(Op::NamespaceList, a, Kind::Warehouse),
+            NamespaceCommands::List(a) => {
+                let kind = if a.target.target.split('/').count() == 2 {
+                    Kind::Warehouse
+                } else {
+                    Kind::Namespace
+                };
+                list(Op::NamespaceList, a, kind)
+            }
             NamespaceCommands::Show(a) => prepare(Op::NamespaceShow, a, Kind::Namespace),
             NamespaceCommands::Exists(a) => prepare(Op::NamespaceExists, a, Kind::Namespace),
             NamespaceCommands::Remove(a) => prepare(Op::NamespaceRemove, a, Kind::Namespace),
