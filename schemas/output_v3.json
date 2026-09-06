@@ -25,6 +25,7 @@
       "type": "string",
       "enum": [
         "capabilities",
+        "table_catalog",
         "versioned_objects",
         "locks",
         "multipart_uploads",
@@ -2044,6 +2045,12 @@
             "data": { "$ref": "#/definitions/bucketOperationsSuccessData" }
           }
         }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/definitions/successEnvelope" },
+        { "properties": { "type": { "const": "table_catalog" }, "data": { "type": "object" } } }
       ]
     },
     { "$ref": "#/definitions/errorOutput" }

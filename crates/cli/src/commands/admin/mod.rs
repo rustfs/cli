@@ -40,6 +40,9 @@ use rc_s3::AdminClient;
 /// Admin subcommands for IAM and cluster management
 #[derive(Subcommand, Debug)]
 pub enum AdminCommands {
+    /// Manage table catalog maintenance, recovery and migration
+    #[command(subcommand)]
+    Table(super::table::AdminTableCommands),
     /// Manage the identity this alias authenticates as
     #[command(subcommand)]
     Account(account::AccountCommands),
@@ -140,6 +143,7 @@ pub async fn execute(cmd: AdminCommands, output_config: OutputConfig) -> ExitCod
     let formatter = Formatter::new(output_config);
 
     match cmd {
+        AdminCommands::Table(cmd) => super::table::execute_admin(cmd, &formatter).await,
         AdminCommands::Account(account_cmd) => account::execute(account_cmd, &formatter).await,
         AdminCommands::Capabilities(args) => capabilities::execute(args, &formatter).await,
         AdminCommands::Diagnostics(command) => diagnostics::execute(command, &formatter).await,

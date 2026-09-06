@@ -368,6 +368,8 @@ rc du local/photos --fallback --incomplete
 
 ## Command Overview
 
+For Iceberg catalog and administrative workflows, see [table catalog commands](docs/usage/table-catalog.md).
+
 For full command documentation, see the [`rc` command reference](docs/reference/rc/README.md).
 
 | Command       | Description                                                                  |

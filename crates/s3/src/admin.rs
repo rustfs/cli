@@ -11074,3 +11074,5 @@ mod tests {
         }
     }
 }
+
+mod catalog;

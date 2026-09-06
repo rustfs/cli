@@ -58,6 +58,7 @@ mod rm;
 mod share;
 mod sql;
 mod stat;
+mod table;
 mod tag;
 mod transfer_fidelity;
 mod tree;
@@ -224,6 +225,9 @@ impl GlobalOutputOptions {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
+    /// Manage RustFS Iceberg tables and namespaces
+    #[command(subcommand)]
+    Table(table::TableCommands),
     /// Manage storage service aliases
     #[command(subcommand)]
     Alias(alias::AliasCommands),
@@ -391,6 +395,15 @@ pub async fn execute(cli: Cli) -> ExitCode {
     };
 
     match cli.command {
+        Commands::Table(cmd) => {
+            table::execute(
+                cmd,
+                &crate::output::Formatter::new(
+                    output_options.resolve(OutputBehavior::StructuredDefault),
+                ),
+            )
+            .await
+        }
         Commands::Alias(cmd) => {
             alias::execute(cmd, output_options.resolve(OutputBehavior::HumanDefault)).await
         }
