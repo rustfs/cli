@@ -1,0 +1,13 @@
+{
+  "schema_version": 3,
+  "type": "on_demand_migration",
+  "status": "error",
+  "error": {
+    "type": "unsupported_feature",
+    "message": "Unsupported feature: server does not support on-demand migration",
+    "retryable": false,
+    "capability": "admin.on-demand-migration",
+    "server": null,
+    "suggestion": "Upgrade RustFS to a release that ships on-demand migration."
+  }
+}

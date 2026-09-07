@@ -192,6 +192,14 @@ rc admin service-account update local/ SAKEY123 --policy ./service-account-polic
 rc admin access-key info local/ AKIAIOSFODNN7EXAMPLE
 rc admin access-key info local/ AKIAIOSFODNN7EXAMPLE --json
 
+# On-demand migration: serve misses from an external source bucket and backfill the rest
+RC_ODM_SECRET_KEY=... rc admin bucket migration set local/photos --provider minio \
+  --endpoint https://source.example.com:9000 --region us-east-1 \
+  --source-bucket legacy-photos --access-key AKIASOURCE --dry-run
+rc admin bucket migration status local/photos
+rc admin bucket migration backfill start local/photos
+rc admin bucket migration backfill status local/photos --watch
+
 # Manage bucket event notifications
 rc event add local/my-bucket arn:aws:sns:us-east-1:123456789012:topic --event 's3:ObjectCreated:*'
 rc event list local/my-bucket

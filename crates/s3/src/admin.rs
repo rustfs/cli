@@ -11076,3 +11076,4 @@ mod tests {
 }
 
 mod catalog;
+mod on_demand_migration;

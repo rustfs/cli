@@ -2,7 +2,7 @@
 
 ## Purpose
 
-The `rc admin` operation manages the RustFS Admin API, including scanner and storage diagnostics, bounded realtime metrics, KMS inspection and key lifecycle management, cluster information, healing, pools, expansion, decommissioning, rebalance workflows, IAM users, policies, groups, service accounts, site replication, and service control.
+The `rc admin` operation manages the RustFS Admin API, including scanner and storage diagnostics, bounded realtime metrics, KMS inspection and key lifecycle management, cluster information, healing, pools, expansion, decommissioning, rebalance workflows, IAM users, policies, groups, service accounts, per-bucket on-demand migration, site replication, and service control.
 
 `rc admin` does not implement the MinIO Admin API. MinIO aliases remain available to S3 data commands, but MinIO administrative operations require a MinIO-compatible admin client.
 
@@ -62,6 +62,10 @@ rc admin diagnostics client-devnull <ALIAS> [--size <SIZE>] [--timeout <DURATION
 rc admin config <get|set|delete|help|history|restore|export|import> ...
 rc admin config module-switch <get|set> ...
 rc admin bucket-metadata <export|import> <ALIAS> ...
+rc admin bucket migration set <ALIAS>/<BUCKET> --provider <s3|aws|minio|rustfs|r2|gcs> [--endpoint URL] --region <R> --source-bucket <B> [OPTIONS] [--dry-run]
+rc admin bucket migration <get|rm|status> <ALIAS>/<BUCKET> [--watch [--interval SECONDS]]
+rc admin bucket migration backfill start <ALIAS>/<BUCKET> [--prefix P] [--skip-existing always|etag_or_size] [--dry-run]
+rc admin bucket migration backfill <cancel|status> <ALIAS>/<BUCKET> [--watch [--interval SECONDS]]
 rc admin replicate add <ALIAS> <ALIAS> [<ALIAS>...]
 rc admin replicate <info|status> <ALIAS> [OPTIONS]
 rc admin replicate edit <ALIAS> --site <DEPLOYMENT_ID|NAME> [EDIT OPTIONS] --yes
@@ -95,6 +99,7 @@ rc admin replicate remove <ALIAS> <--all|--site <NAME>>
 | `service` | Control the server process: restart, stop, freeze, unfreeze. |
 | `config` | Inspect, plan, export, and mutate RustFS server configuration. |
 | `bucket-metadata` | Export or import validated per-bucket configuration archives. |
+| `bucket migration` | Configure, inspect, and backfill On-Demand Migration from an external S3-compatible source bucket. |
 | `replicate` | Manage site replication across clusters. |
 
 ## Account and Two-Factor Workflow
@@ -771,6 +776,49 @@ Server exports redact replication-target credentials. The client never prints ar
 `--conflict fail` stops before mutation if any imported config differs from current state. `overwrite` sends differing configs, while `skip` removes only conflicting entries from the outgoing archive. Identical entries are never resent. Missing destination buckets remain eligible for the server's create-on-import behavior, while a selected bucket absent from the source archive is a distinct not-found error.
 
 An import is one bounded PUT and is never automatically retried. A transport failure or server error can mean that only part of the archive was applied; inspect every selected bucket before deciding whether to retry. Successful JSON output uses output schema v3 with one `admin_operations` result per selected bucket.
+
+## On-Demand Migration Workflow
+
+`rc admin bucket migration` manages RustFS On-Demand Migration: a bucket names an external S3-compatible source bucket, a GET that misses locally is served from that source and stored locally in the same pass, and a background backfill job pulls the rest. It is the RustFS equivalent of Cloudflare R2 Sippy or Tigris shadow buckets. The server-side operations guide is `docs/operations/on-demand-migration.md` in `rustfs/rustfs`; the wire contract is pinned by the fixtures vendored under `crates/core/tests/fixtures/on_demand_migration/`.
+
+Every command takes the local bucket as `<ALIAS>/<BUCKET>`.
+
+| Command | Description |
+| --- | --- |
+| `rc admin bucket migration set <ALIAS>/<BUCKET> --provider <P> [--endpoint URL] --region <R> --source-bucket <B> [--prefix P] [--source-prefix SP] [--access-key AK [--secret-key SK] \| --public] [--path-style auto\|path\|virtual] [--skip-tls-verify] [--ca-cert FILE] [--head proxy\|local_only] [--range-get serve_and_backfill\|serve_only] [--source-error propagate\|not_found] [--no-preserve-etag] [--copy-tags] [--no-events] [--inline-max-bytes N] [--max-concurrent-pulls N] [--dry-run]` | Validate the configuration, probe the source (`HeadBucket` plus a one-key listing) and save it. `--dry-run` sends `PUT ...?dry-run=true`, which validates and probes without saving. |
+| `rc admin bucket migration get <ALIAS>/<BUCKET>` | Print the saved configuration as a table. Credentials are shown as `REDACTED`. |
+| `rc admin bucket migration rm <ALIAS>/<BUCKET>` | Remove the configuration. Idempotent; objects already pulled stay in place. |
+| `rc admin bucket migration status <ALIAS>/<BUCKET> [--watch] [--interval SECONDS]` | Print the answering node's runtime status: source-hit ratio, migrated bytes, in-flight and queued pulls, breaker state, request and failure counters, and the last source error. |
+| `rc admin bucket migration backfill start <ALIAS>/<BUCKET> [--prefix P] [--skip-existing always\|etag_or_size] [--dry-run]` | Start the background job that walks the source listing and pulls what is missing locally. `--dry-run` lists and counts without queuing anything. |
+| `rc admin bucket migration backfill cancel <ALIAS>/<BUCKET>` | Ask the running job to stop at its next checkpoint. |
+| `rc admin bucket migration backfill status <ALIAS>/<BUCKET> [--watch] [--interval SECONDS]` | Print the job checkpoint. With `--watch`, refresh one progress line every `--interval` seconds (default 2) until the job reaches a terminal state, then print the final checkpoint. |
+
+### Secret handling
+
+`set` needs the source secret key whenever `--access-key` is given. It is taken, in order, from `--secret-key`, from the `RC_ODM_SECRET_KEY` environment variable, or from a hidden terminal prompt. Prefer the variable or the prompt: a flag value lands in shell history and in `ps` output. The prompt is only offered when standard input is a terminal and output is human-readable; with `--json` or in a script the variable is required and a missing one is a usage error before any request is sent.
+
+The server returns every credential as the placeholder `REDACTED`, and `set` replaces the configuration wholesale rather than merging into it. `rc` therefore refuses the placeholder as a secret: editing an existing configuration means passing the real secret again. `--public` configures anonymous access and is mutually exclusive with the credential flags.
+
+`--endpoint` must be `scheme://host[:port]` with no path, query, fragment or embedded userinfo; it is optional only for `--provider aws`, where the server derives it from `--region`. `--ca-cert` reads a PEM bundle of at most 64 KiB. Arguments are validated before the secret is read, so a typo never costs a prompt.
+
+### Output
+
+Human output prints one aligned key/value table per document. `status` renders `served_by_source_ratio` exactly as the server reports it: a percentage when present and an em dash (`—`) when the server returns `null`, never zero, because a missing ratio and a zero ratio mean different things. `--json` wraps every result in output schema v3 with `type: on_demand_migration` and `data: {operation, bucket, result}`, where `result` is the server document with credentials redacted. `--watch` with `--json` emits one compact record per refresh on stdout; without `--json`, the backfill progress line is written to stderr so stdout carries only the final document.
+
+Every response field is optional on the client with the server default, so an older server that omits a field still parses, and unknown fields from a newer server are ignored.
+
+### Exit codes
+
+| Condition | Code |
+|---|---|
+| Malformed target, missing or conflicting flags, invalid endpoint or CA file, configuration rejected by the server (`InvalidArgument`), module switch off (`OnDemandMigrationDisabled`) | usage (2) |
+| Source unreachable during the probe (`OnDemandMigrationSourceUnreachable`), transport failure, 5xx | network (3) |
+| Not authorized, or the licence denies the entitlement (`AccessDenied`) | authentication (4) |
+| No configuration (`NoSuchConfiguration`), no such bucket, no backfill job recorded | not found (5) |
+| A backfill job already holds the lease (409 `OnDemandMigrationBackfillRunning`) | conflict (6) |
+| Route family absent (the server predates on-demand migration), or the provider was excluded at build time (501) | unsupported (7) |
+
+A 404 that does not carry one of the route family's own error codes means the whole feature is missing from the server; `rc` prints `server does not support on-demand migration` and exits 7 rather than treating the bucket as unconfigured. Writes are never automatically retried: a `set` probes the source and a backfill start takes a lease, so a repeated request is a second decision.
 
 ## Site Replication Workflow
 

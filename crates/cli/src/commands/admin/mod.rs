@@ -5,6 +5,7 @@
 
 mod access_key;
 mod account;
+mod bucket;
 mod bucket_metadata;
 mod capabilities;
 mod config;
@@ -46,6 +47,10 @@ pub enum AdminCommands {
     /// Manage the identity this alias authenticates as
     #[command(subcommand)]
     Account(account::AccountCommands),
+
+    /// Manage per-bucket features such as on-demand migration from an external source
+    #[command(subcommand)]
+    Bucket(bucket::BucketCommands),
 
     /// Discover effective RustFS runtime capabilities
     Capabilities(capabilities::CapabilitiesArgs),
@@ -145,6 +150,7 @@ pub async fn execute(cmd: AdminCommands, output_config: OutputConfig) -> ExitCod
     match cmd {
         AdminCommands::Table(cmd) => super::table::execute_admin(cmd, &formatter).await,
         AdminCommands::Account(account_cmd) => account::execute(account_cmd, &formatter).await,
+        AdminCommands::Bucket(command) => bucket::execute(command, &formatter).await,
         AdminCommands::Capabilities(args) => capabilities::execute(args, &formatter).await,
         AdminCommands::Diagnostics(command) => diagnostics::execute(command, &formatter).await,
         AdminCommands::Config(config_cmd) => config::execute(config_cmd, &formatter).await,

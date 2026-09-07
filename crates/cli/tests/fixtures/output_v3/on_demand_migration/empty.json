@@ -1,0 +1,13 @@
+{
+  "schema_version": 3,
+  "type": "on_demand_migration",
+  "status": "success",
+  "data": {
+    "operation": "backfill_status",
+    "bucket": "photos",
+    "result": {
+      "bucket": "photos",
+      "job": null
+    }
+  }
+}

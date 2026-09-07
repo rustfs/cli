@@ -16,6 +16,7 @@ mod kms;
 mod kms_diagnostic;
 mod observability;
 mod oidc;
+mod on_demand_migration;
 mod replication;
 mod site;
 pub mod tier;
@@ -112,6 +113,18 @@ pub use oidc::{
     MAX_OIDC_RESPONSE_BYTES, OidcMutationApi, OidcMutationRequest, OidcMutationResult,
     OidcProvider, OidcProviderList, OidcProviderSource, OidcReadApi, OidcValidationRequest,
     OidcValidationResult,
+};
+pub use on_demand_migration::{
+    BackfillJob, BackfillJobResult, BackfillLastError, BackfillOwner, BackfillStartRequest,
+    BackfillSummary, BreakerStatus, FilterRequest, FilterView, HeadPolicy, LastSourceError,
+    LatencyBucket, MAX_CONCURRENT_PULLS, MAX_INLINE_MAX_BYTES,
+    MAX_ON_DEMAND_MIGRATION_CA_CERT_BYTES, MAX_ON_DEMAND_MIGRATION_RESPONSE_BYTES,
+    ON_DEMAND_MIGRATION_CAPABILITY, OnDemandMigrationApi, OnDemandMigrationConfigRequest,
+    OnDemandMigrationConfigResult, OnDemandMigrationConfigView, OnDemandMigrationSetResult,
+    OnDemandMigrationStatus, PathStyle, PolicyConfig, ProbeSummary, REDACTED_SECRET,
+    RangeGetPolicy, RuntimeCounters, SkipExisting, SourceCredentialsRequest, SourceCredentialsView,
+    SourceErrorPolicy, SourceLatency, SourceProvider, SourceRequest, SourceTimeout, SourceView,
+    TlsRequest, TlsView, is_terminal_backfill_state, validate_ca_cert_pem, validate_local_bucket,
 };
 pub use replication::{
     MAX_REPLICATION_DIFF_RESPONSE_BYTES, MAX_REPLICATION_INSPECTION_RESPONSE_BYTES,

@@ -26,6 +26,7 @@
       "enum": [
         "capabilities",
         "table_catalog",
+        "on_demand_migration",
         "versioned_objects",
         "locks",
         "multipart_uploads",
@@ -65,6 +66,18 @@
         "request_id": { "$ref": "#/definitions/nullableString" },
         "server_version": { "$ref": "#/definitions/nullableString" },
         "generated_at": { "$ref": "#/definitions/nullableTimestamp" }
+      }
+    },
+    "onDemandMigrationSuccessData": {
+      "type": "object",
+      "required": ["operation", "bucket", "result"],
+      "properties": {
+        "operation": {
+          "type": "string",
+          "enum": ["set", "get", "remove", "status", "backfill_start", "backfill_cancel", "backfill_status"]
+        },
+        "bucket": { "type": "string" },
+        "result": { "type": "object" }
       }
     },
     "successEnvelope": {
@@ -2051,6 +2064,17 @@
       "allOf": [
         { "$ref": "#/definitions/successEnvelope" },
         { "properties": { "type": { "const": "table_catalog" }, "data": { "type": "object" } } }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/definitions/successEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "on_demand_migration" },
+            "data": { "$ref": "#/definitions/onDemandMigrationSuccessData" }
+          }
+        }
       ]
     },
     { "$ref": "#/definitions/errorOutput" }
