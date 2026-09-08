@@ -130,7 +130,7 @@ rc anonymous list local/bucket
 rc anonymous set public local/bucket/public
 
 # Generate download link
-rc share download local/bucket/file.txt --expire 24h
+rc share local/bucket/file.txt --expire 24h
 
 # View directory tree
 rc tree local/bucket -L 3
@@ -168,7 +168,7 @@ rc admin user list local/
 rc admin user add local/ newuser secretpassword
 
 # Create a policy
-rc admin policy create local/ readonly --file policy.json
+rc admin policy create local/ readonly policy.json
 
 # Attach policy to user
 rc admin policy attach local/ readonly --user newuser
