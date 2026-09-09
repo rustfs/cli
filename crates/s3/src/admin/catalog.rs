@@ -302,8 +302,7 @@ impl AdminClient {
             serde_json::from_slice(&bytes)
                 .map_err(|_| Error::General("Invalid catalog JSON response".into()))?
         };
-        if !value.is_object()
-            && !(request.operation == Op::MaintenanceConfigShow && value.is_null())
+        if !(value.is_object() || request.operation == Op::MaintenanceConfigShow && value.is_null())
         {
             return Err(Error::General("Catalog response must be an object".into()));
         }

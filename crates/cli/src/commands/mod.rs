@@ -880,6 +880,28 @@ mod tests {
     }
 
     #[test]
+    fn cli_accepts_sql_csv_input_record_delimiter() {
+        let cli = Cli::try_parse_from([
+            "rc",
+            "sql",
+            "local/reports/data.csv",
+            "--query",
+            "SELECT * FROM S3Object",
+            "--csv-input-record-delimiter",
+            "\r\n",
+        ])
+        .expect("parse CSV input record delimiter");
+
+        match cli.command {
+            Commands::Sql(arg) => {
+                assert!(matches!(arg.input_format, sql::InputFormatArg::Csv));
+                assert_eq!(arg.csv_input_record_delimiter.as_deref(), Some("\r\n"));
+            }
+            other => panic!("expected sql command, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn cli_accepts_sql_defaults() {
         let cli = Cli::try_parse_from([
             "rc",
