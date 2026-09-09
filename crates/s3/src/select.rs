@@ -295,7 +295,9 @@ fn map_select_initial_error(
     match &err {
         SdkError::ServiceError(se) => {
             let code = resolve_http_service_error_code(se.err(), se.raw());
-            classify_aws_code(code, &err.to_string())
+            let fallback = err.to_string();
+            let message = se.err().message().unwrap_or(&fallback);
+            classify_aws_code(code, message)
         }
         SdkError::TimeoutError(_) => Error::Network("Request timeout".to_string()),
         SdkError::DispatchFailure(e) => Error::Network(format!("Network dispatch error: {e:?}")),
@@ -312,7 +314,9 @@ fn map_select_stream_error(
     match &err {
         SdkError::ServiceError(se) => {
             let code = resolve_event_stream_error_code(se.err(), se.raw());
-            classify_aws_code(code, &err.to_string())
+            let fallback = err.to_string();
+            let message = se.err().message().unwrap_or(&fallback);
+            classify_aws_code(code, message)
         }
         SdkError::TimeoutError(_) => Error::Network("Request timeout".to_string()),
         SdkError::DispatchFailure(e) => Error::Network(format!("Network dispatch error: {e:?}")),
@@ -324,6 +328,9 @@ fn map_select_stream_error(
 
 fn classify_aws_code(code: Option<&str>, text: &str) -> Error {
     let c = code.filter(|s| !s.is_empty());
+    if text.contains("NotImplemented") && c != Some("NotImplemented") {
+        return Error::UnsupportedFeature("The backend does not support S3 Select.".to_string());
+    }
     match c {
         Some("NoSuchKey") => Error::NotFound("Object not found".to_string()),
         Some("NoSuchBucket") => Error::NotFound("Bucket not found".to_string()),
@@ -331,12 +338,26 @@ fn classify_aws_code(code: Option<&str>, text: &str) -> Error {
         Some("NotImplemented") => {
             Error::UnsupportedFeature("The backend does not support S3 Select.".to_string())
         }
-        Some("InvalidArgument") => Error::General(format!("Invalid S3 Select request: {text}")),
-        Some(_) if text.contains("NotImplemented") => {
-            Error::UnsupportedFeature("The backend does not support S3 Select.".to_string())
-        }
-        Some(_) => Error::General(text.to_string()),
+        Some("SlowDown" | "Busy") => Error::Network(service_error_detail(c, text)),
+        Some("InvalidArgument") => Error::General(format!(
+            "Invalid S3 Select request: {}",
+            service_error_detail(c, text)
+        )),
+        Some("UnsupportedScanRangeInput") => Error::General(service_error_detail(c, text)),
+        Some(_) => Error::General(service_error_detail(c, text)),
         None => classify_aws_code_missing_metadata(text),
+    }
+}
+
+fn service_error_detail(code: Option<&str>, text: &str) -> String {
+    let text = text.trim();
+    match (
+        code,
+        text.is_empty() || text.eq_ignore_ascii_case("service error"),
+    ) {
+        (Some(code), true) => code.to_string(),
+        (Some(code), false) => format!("{code}: {text}"),
+        (None, _) => text.to_string(),
     }
 }
 
@@ -385,7 +406,32 @@ mod tests {
     #[test]
     fn classify_fallback_network() {
         let e = classify_aws_code(Some("SlowDown"), "rate limited");
-        assert!(matches!(e, Error::General(_)));
+        assert!(matches!(e, Error::Network(message) if message == "SlowDown: rate limited"));
+    }
+
+    #[test]
+    fn classify_busy_preserves_service_context() {
+        let e = classify_aws_code(Some("Busy"), "The service is unavailable. Try again later.");
+        assert!(
+            matches!(e, Error::Network(message) if message.contains("Busy") && message.contains("unavailable"))
+        );
+    }
+
+    #[test]
+    fn classify_unsupported_scan_range_preserves_service_context() {
+        let e = classify_aws_code(
+            Some("UnsupportedScanRangeInput"),
+            "Scan range queries are not supported on this type of object.",
+        );
+        assert!(
+            matches!(e, Error::General(message) if message.contains("UnsupportedScanRangeInput") && message.contains("not supported"))
+        );
+    }
+
+    #[test]
+    fn classify_unsupported_scan_range_replaces_generic_service_text() {
+        let e = classify_aws_code(Some("UnsupportedScanRangeInput"), "service error");
+        assert!(matches!(e, Error::General(message) if message == "UnsupportedScanRangeInput"));
     }
 
     #[test]
