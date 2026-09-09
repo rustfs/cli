@@ -5,6 +5,7 @@
 //!
 //! PROTECTED FILE: Changes to schema_version require migration support.
 
+use std::io::Write;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -150,7 +151,7 @@ impl ConfigManager {
     /// Save configuration to disk
     ///
     /// Creates parent directories if they don't exist.
-    /// Sets file permissions to 600 (owner read/write only).
+    /// Sets Unix file permissions to 600 (owner read/write only) before writing.
     pub fn save(&self, config: &Config) -> Result<()> {
         // Ensure parent directory exists
         if let Some(parent) = self.config_path.parent() {
@@ -158,15 +159,27 @@ impl ConfigManager {
         }
 
         let content = toml::to_string_pretty(config)?;
-        std::fs::write(&self.config_path, content)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(false);
 
-        // Set restrictive permissions on Unix systems
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+
+        let mut file = options.open(&self.config_path)?;
+
+        // Existing files keep their mode when opened, so protect the opened file
+        // before truncating or writing credentials, and stop if that fails.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let permissions = std::fs::Permissions::from_mode(0o600);
-            std::fs::set_permissions(&self.config_path, permissions)?;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
+
+        file.set_len(0)?;
+        file.write_all(content.as_bytes())?;
 
         Ok(())
     }
@@ -246,8 +259,89 @@ mod tests {
         manager.save(&config).unwrap();
         let loaded = manager.load().unwrap();
 
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(manager.config_path())
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+
         assert_eq!(loaded.aliases.len(), 1);
         assert_eq!(loaded.aliases[0].name, "test");
+    }
+
+    #[test]
+    fn test_save_replaces_longer_config() {
+        let (manager, _temp_dir) = temp_config_manager();
+        let mut config = Config::default();
+        config.defaults.output = "a".repeat(1024);
+        manager.save(&config).unwrap();
+
+        let config = Config::default();
+        manager.save(&config).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(manager.config_path()).unwrap(),
+            toml::to_string_pretty(&config).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_save_permissions_before_write() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        const CHILD_CONFIG_PATH: &str = "RC_TEST_SAVE_PERMISSIONS_PATH";
+        if let Some(path) = std::env::var_os(CHILD_CONFIG_PATH) {
+            let manager = ConfigManager::with_path(PathBuf::from(path));
+            manager.save(&Config::default()).unwrap();
+            return;
+        }
+
+        for existing in [false, true] {
+            let (manager, _temp_dir) = temp_config_manager();
+            if existing {
+                std::fs::write(manager.config_path(), "old config").unwrap();
+                std::fs::set_permissions(
+                    manager.config_path(),
+                    std::fs::Permissions::from_mode(0o666),
+                )
+                .unwrap();
+            }
+
+            // Fail the first write in a child process, before a post-write chmod
+            // could run. Keep the umask and file-size limit out of other tests.
+            let output = Command::new("sh")
+                .args([
+                    "-c",
+                    "umask 000 && ulimit -c 0 && ulimit -f 0 && exec \"$@\"",
+                    "sh",
+                ])
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "config::tests::test_save_permissions_before_write",
+                ])
+                .env(CHILD_CONFIG_PATH, manager.config_path())
+                .output()
+                .unwrap();
+
+            assert!(
+                !output.status.success(),
+                "the file-size limit must reject writes"
+            );
+            let metadata = std::fs::metadata(manager.config_path()).unwrap();
+            assert_eq!(metadata.len(), 0);
+            assert_eq!(
+                metadata.permissions().mode() & 0o777,
+                0o600,
+                "config must already be private when writing fails (existing: {existing})"
+            );
+        }
     }
 
     #[test]
