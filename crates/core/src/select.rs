@@ -1,5 +1,7 @@
 //! S3 Select domain types (no AWS SDK types).
 
+use thiserror::Error;
+
 /// Object payload format for S3 Select input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SelectInputFormat {
@@ -90,6 +92,51 @@ pub struct SelectScanRangeOptions {
     pub end: Option<i64>,
 }
 
+/// Invalid combinations or values for an S3 Select scan range.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum SelectScanRangeError {
+    #[error("ScanRange is not supported for JSON document input")]
+    JsonDocument,
+    #[error("ScanRange is not supported for compressed input")]
+    CompressedInput,
+    #[error("ScanRange start and end must be non-negative")]
+    NegativeBounds,
+    #[error("ScanRange start must not be greater than end")]
+    ReversedBounds,
+}
+
+impl SelectScanRangeOptions {
+    /// Validate this range against the selected input serialization.
+    pub fn validate_for_input(
+        &self,
+        input_format: SelectInputFormat,
+        json_input_type: SelectJsonInputType,
+        compression: SelectCompression,
+    ) -> std::result::Result<(), SelectScanRangeError> {
+        if self.start.is_none() && self.end.is_none() {
+            return Ok(());
+        }
+        if matches!(input_format, SelectInputFormat::Json)
+            && matches!(json_input_type, SelectJsonInputType::Document)
+        {
+            return Err(SelectScanRangeError::JsonDocument);
+        }
+        let is_noop = self.start == Some(0) && self.end.is_none();
+        if !matches!(compression, SelectCompression::None) && !is_noop {
+            return Err(SelectScanRangeError::CompressedInput);
+        }
+        if self.start.is_some_and(|start| start < 0) || self.end.is_some_and(|end| end < 0) {
+            return Err(SelectScanRangeError::NegativeBounds);
+        }
+        if let (Some(start), Some(end)) = (self.start, self.end)
+            && start > end
+        {
+            return Err(SelectScanRangeError::ReversedBounds);
+        }
+        Ok(())
+    }
+}
+
 /// SSE-C parameters for encrypted objects.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SelectSseCustomerOptions {
@@ -128,5 +175,59 @@ impl Default for SelectOptions {
             scan_range: SelectScanRangeOptions::default(),
             sse_customer: SelectSseCustomerOptions::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_range_allows_parquet_input() {
+        let range = SelectScanRangeOptions {
+            start: Some(1024),
+            end: Some(2047),
+        };
+
+        range
+            .validate_for_input(
+                SelectInputFormat::Parquet,
+                SelectJsonInputType::Lines,
+                SelectCompression::None,
+            )
+            .expect("Parquet scan ranges should be supported");
+    }
+
+    #[test]
+    fn scan_range_rejects_compressed_input() {
+        let range = SelectScanRangeOptions {
+            start: Some(1),
+            end: None,
+        };
+
+        assert_eq!(
+            range.validate_for_input(
+                SelectInputFormat::Csv,
+                SelectJsonInputType::Lines,
+                SelectCompression::Gzip,
+            ),
+            Err(SelectScanRangeError::CompressedInput)
+        );
+    }
+
+    #[test]
+    fn scan_range_allows_noop_for_compressed_input() {
+        let range = SelectScanRangeOptions {
+            start: Some(0),
+            end: None,
+        };
+
+        range
+            .validate_for_input(
+                SelectInputFormat::Csv,
+                SelectJsonInputType::Lines,
+                SelectCompression::Bzip2,
+            )
+            .expect("RustFS accepts a no-op scan range for compressed input");
     }
 }

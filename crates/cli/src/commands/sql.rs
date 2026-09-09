@@ -343,26 +343,16 @@ fn validate_record_delimiter(name: &str, value: Option<&str>) -> std::result::Re
 }
 
 fn validate_scan_range_args(args: &SqlArgs) -> std::result::Result<(), String> {
-    if args.scan_start.is_none() && args.scan_end.is_none() {
-        return Ok(());
+    SelectScanRangeOptions {
+        start: args.scan_start,
+        end: args.scan_end,
     }
-    if matches!(args.input_format, InputFormatArg::Parquet) {
-        return Err("ScanRange is not supported for Parquet input".to_string());
-    }
-    if matches!(args.input_format, InputFormatArg::Json)
-        && matches!(args.json_type, JsonTypeArg::Document)
-    {
-        return Err("ScanRange is not supported for JSON document input".to_string());
-    }
-    if args.scan_start.is_some_and(|start| start < 0) || args.scan_end.is_some_and(|end| end < 0) {
-        return Err("ScanRange start and end must be non-negative".to_string());
-    }
-    if let (Some(start), Some(end)) = (args.scan_start, args.scan_end)
-        && start > end
-    {
-        return Err("ScanRange start must not be greater than end".to_string());
-    }
-    Ok(())
+    .validate_for_input(
+        args.input_format.into(),
+        args.json_type.into(),
+        args.compression.into(),
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn exit_code_from_error(error: &rc_core::Error) -> ExitCode {
@@ -441,6 +431,36 @@ mod tests {
         args.scan_end = Some(10);
         let code = execute(args, OutputConfig::default()).await;
         assert_eq!(code, ExitCode::UsageError);
+    }
+
+    #[test]
+    fn sql_allows_scan_range_for_parquet() {
+        let mut args = base_args("a/b/object.parquet", "SELECT * FROM S3Object");
+        args.input_format = InputFormatArg::Parquet;
+        args.scan_start = Some(1024);
+        args.scan_end = Some(2047);
+
+        assert!(validate_scan_range_args(&args).is_ok());
+    }
+
+    #[test]
+    fn sql_rejects_compressed_scan_range() {
+        let mut args = base_args("a/b/object.csv.gz", "SELECT * FROM S3Object");
+        args.compression = CompressionArg::Gzip;
+        args.scan_start = Some(1);
+
+        let error = validate_scan_range_args(&args)
+            .expect_err("compressed input should reject a non-noop scan range");
+        assert!(error.contains("compressed input"));
+    }
+
+    #[test]
+    fn sql_allows_noop_compressed_scan_range() {
+        let mut args = base_args("a/b/object.csv.bz2", "SELECT * FROM S3Object");
+        args.compression = CompressionArg::Bzip2;
+        args.scan_start = Some(0);
+
+        assert!(validate_scan_range_args(&args).is_ok());
     }
 
     #[test]

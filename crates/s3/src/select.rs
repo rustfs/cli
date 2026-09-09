@@ -101,31 +101,13 @@ fn build_scan_range(options: &SelectOptions) -> Result<Option<ScanRange>> {
     if scan_range.start.is_none() && scan_range.end.is_none() {
         return Ok(None);
     }
-    if matches!(options.input_format, SelectInputFormat::Parquet) {
-        return Err(Error::General(
-            "ScanRange is not supported for Parquet input.".to_string(),
-        ));
-    }
-    if matches!(options.input_format, SelectInputFormat::Json)
-        && matches!(options.json_input.input_type, SelectJsonInputType::Document)
-    {
-        return Err(Error::General(
-            "ScanRange is not supported for JSON document input.".to_string(),
-        ));
-    }
-    if scan_range.start.is_some_and(|start| start < 0) || scan_range.end.is_some_and(|end| end < 0)
-    {
-        return Err(Error::General(
-            "ScanRange start and end must be non-negative.".to_string(),
-        ));
-    }
-    if let (Some(start), Some(end)) = (scan_range.start, scan_range.end)
-        && start > end
-    {
-        return Err(Error::General(
-            "ScanRange start must not be greater than end.".to_string(),
-        ));
-    }
+    scan_range
+        .validate_for_input(
+            options.input_format,
+            options.json_input.input_type,
+            options.compression,
+        )
+        .map_err(|error| Error::General(error.to_string()))?;
     Ok(Some(
         ScanRange::builder()
             .set_start(scan_range.start)
@@ -628,6 +610,61 @@ mod tests {
         let error =
             build_scan_range(&options).expect_err("scan range should reject JSON document input");
         assert!(matches!(error, Error::General(msg) if msg.contains("JSON document")));
+    }
+
+    #[test]
+    fn scan_range_allows_parquet_input() {
+        let options = SelectOptions {
+            expression: "SELECT * FROM S3Object".to_string(),
+            input_format: SelectInputFormat::Parquet,
+            scan_range: SelectScanRangeOptions {
+                start: Some(1024),
+                end: Some(2047),
+            },
+            ..SelectOptions::default()
+        };
+
+        let scan_range = build_scan_range(&options)
+            .expect("Parquet scan range should be valid")
+            .expect("scan range should be configured");
+        assert_eq!(scan_range.start(), Some(1024));
+        assert_eq!(scan_range.end(), Some(2047));
+    }
+
+    #[test]
+    fn scan_range_rejects_compressed_input() {
+        let options = SelectOptions {
+            expression: "SELECT * FROM S3Object".to_string(),
+            compression: SelectCompression::Gzip,
+            scan_range: SelectScanRangeOptions {
+                start: Some(1),
+                end: None,
+            },
+            ..SelectOptions::default()
+        };
+
+        let error = build_scan_range(&options)
+            .expect_err("compressed input should reject a non-noop scan range");
+        assert!(matches!(error, Error::General(message) if message.contains("compressed input")));
+    }
+
+    #[test]
+    fn scan_range_allows_noop_for_compressed_input() {
+        let options = SelectOptions {
+            expression: "SELECT * FROM S3Object".to_string(),
+            compression: SelectCompression::Bzip2,
+            scan_range: SelectScanRangeOptions {
+                start: Some(0),
+                end: None,
+            },
+            ..SelectOptions::default()
+        };
+
+        assert!(
+            build_scan_range(&options)
+                .expect("no-op compressed scan range should be valid")
+                .is_some()
+        );
     }
 
     #[test]

@@ -70,8 +70,8 @@ pub use retry::{RetryBuilder, is_retryable_error, retry_with_backoff};
 pub use select::{
     SelectCompression, SelectCsvFileHeaderInfo, SelectCsvInputOptions, SelectCsvOutputOptions,
     SelectInputFormat, SelectJsonInputOptions, SelectJsonInputType, SelectJsonOutputOptions,
-    SelectOptions, SelectOutputFormat, SelectQuoteFields, SelectScanRangeOptions,
-    SelectSseCustomerOptions,
+    SelectOptions, SelectOutputFormat, SelectQuoteFields, SelectScanRangeError,
+    SelectScanRangeOptions, SelectSseCustomerOptions,
 };
 pub use traits::{
     AbortMultipartUploadRequest, BucketNotification, Capabilities, CopyObjectOptions,
