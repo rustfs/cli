@@ -42,6 +42,10 @@ pub struct SqlArgs {
     #[arg(long)]
     pub csv_input_field_delimiter: Option<String>,
 
+    /// CSV input record delimiter (one or two bytes)
+    #[arg(long)]
+    pub csv_input_record_delimiter: Option<String>,
+
     /// CSV input quote character
     #[arg(long)]
     pub csv_input_quote: Option<String>,
@@ -217,8 +221,9 @@ pub async fn execute(args: SqlArgs, output_config: OutputConfig) -> ExitCode {
         }
     };
 
-    if let Err(message) = validate_select_args(&args) {
-        formatter.error(&message);
+    let options = select_options_from_args(args);
+    if let Err(error) = options.validate() {
+        formatter.error(&error.to_string());
         return ExitCode::UsageError;
     }
 
@@ -246,7 +251,22 @@ pub async fn execute(args: SqlArgs, output_config: OutputConfig) -> ExitCode {
         }
     };
 
-    let options = SelectOptions {
+    let mut stdout = tokio::io::stdout();
+
+    match client
+        .select_object_content(&remote, &options, &mut stdout)
+        .await
+    {
+        Ok(()) => ExitCode::Success,
+        Err(e) => {
+            formatter.error(&e.to_string());
+            exit_code_from_error(&e)
+        }
+    }
+}
+
+fn select_options_from_args(args: SqlArgs) -> SelectOptions {
+    SelectOptions {
         expression: args.query,
         input_format: args.input_format.into(),
         output_format: args.output_format.into(),
@@ -254,6 +274,7 @@ pub async fn execute(args: SqlArgs, output_config: OutputConfig) -> ExitCode {
         csv_input: SelectCsvInputOptions {
             file_header_info: args.csv_file_header_info.into(),
             field_delimiter: args.csv_input_field_delimiter,
+            record_delimiter: args.csv_input_record_delimiter,
             quote_character: args.csv_input_quote,
             quote_escape_character: args.csv_input_quote_escape,
             comments: args.csv_input_comment,
@@ -280,89 +301,7 @@ pub async fn execute(args: SqlArgs, output_config: OutputConfig) -> ExitCode {
             key: args.sse_customer_key,
             key_md5: args.sse_customer_key_md5,
         },
-    };
-
-    let mut stdout = tokio::io::stdout();
-
-    match client
-        .select_object_content(&remote, &options, &mut stdout)
-        .await
-    {
-        Ok(()) => ExitCode::Success,
-        Err(e) => {
-            formatter.error(&e.to_string());
-            exit_code_from_error(&e)
-        }
     }
-}
-
-fn validate_select_args(args: &SqlArgs) -> std::result::Result<(), String> {
-    validate_single_byte(
-        "--csv-input-field-delimiter",
-        args.csv_input_field_delimiter.as_deref(),
-    )?;
-    validate_single_byte("--csv-input-quote", args.csv_input_quote.as_deref())?;
-    validate_single_byte(
-        "--csv-input-quote-escape",
-        args.csv_input_quote_escape.as_deref(),
-    )?;
-    validate_single_byte("--csv-input-comment", args.csv_input_comment.as_deref())?;
-    validate_single_byte(
-        "--csv-output-field-delimiter",
-        args.csv_output_field_delimiter.as_deref(),
-    )?;
-    validate_record_delimiter(
-        "--csv-output-record-delimiter",
-        args.csv_output_record_delimiter.as_deref(),
-    )?;
-    validate_single_byte("--csv-output-quote", args.csv_output_quote.as_deref())?;
-    validate_single_byte(
-        "--csv-output-quote-escape",
-        args.csv_output_quote_escape.as_deref(),
-    )?;
-    validate_scan_range_args(args)
-}
-
-fn validate_single_byte(name: &str, value: Option<&str>) -> std::result::Result<(), String> {
-    if let Some(value) = value
-        && value.len() != 1
-    {
-        return Err(format!("{name} must be exactly one byte"));
-    }
-    Ok(())
-}
-
-fn validate_record_delimiter(name: &str, value: Option<&str>) -> std::result::Result<(), String> {
-    if let Some(value) = value
-        && value.len() != 1
-        && value != "\r\n"
-    {
-        return Err(format!("{name} must be exactly one byte or CRLF"));
-    }
-    Ok(())
-}
-
-fn validate_scan_range_args(args: &SqlArgs) -> std::result::Result<(), String> {
-    if args.scan_start.is_none() && args.scan_end.is_none() {
-        return Ok(());
-    }
-    if matches!(args.input_format, InputFormatArg::Parquet) {
-        return Err("ScanRange is not supported for Parquet input".to_string());
-    }
-    if matches!(args.input_format, InputFormatArg::Json)
-        && matches!(args.json_type, JsonTypeArg::Document)
-    {
-        return Err("ScanRange is not supported for JSON document input".to_string());
-    }
-    if args.scan_start.is_some_and(|start| start < 0) || args.scan_end.is_some_and(|end| end < 0) {
-        return Err("ScanRange start and end must be non-negative".to_string());
-    }
-    if let (Some(start), Some(end)) = (args.scan_start, args.scan_end)
-        && start > end
-    {
-        return Err("ScanRange start must not be greater than end".to_string());
-    }
-    Ok(())
 }
 
 fn exit_code_from_error(error: &rc_core::Error) -> ExitCode {
@@ -384,6 +323,7 @@ mod tests {
             compression: CompressionArg::None,
             csv_file_header_info: CsvFileHeaderInfoArg::None,
             csv_input_field_delimiter: None,
+            csv_input_record_delimiter: None,
             csv_input_quote: None,
             csv_input_quote_escape: None,
             csv_input_comment: None,
@@ -441,6 +381,37 @@ mod tests {
         args.scan_end = Some(10);
         let code = execute(args, OutputConfig::default()).await;
         assert_eq!(code, ExitCode::UsageError);
+    }
+
+    #[test]
+    fn sql_allows_scan_range_for_parquet() {
+        let mut args = base_args("a/b/object.parquet", "SELECT * FROM S3Object");
+        args.input_format = InputFormatArg::Parquet;
+        args.scan_start = Some(1024);
+        args.scan_end = Some(2047);
+
+        assert!(select_options_from_args(args).validate().is_ok());
+    }
+
+    #[test]
+    fn sql_rejects_compressed_scan_range() {
+        let mut args = base_args("a/b/object.csv.gz", "SELECT * FROM S3Object");
+        args.compression = CompressionArg::Gzip;
+        args.scan_start = Some(1);
+
+        let error = select_options_from_args(args)
+            .validate()
+            .expect_err("compressed input should reject a non-noop scan range");
+        assert!(error.to_string().contains("compressed input"));
+    }
+
+    #[test]
+    fn sql_allows_noop_compressed_scan_range() {
+        let mut args = base_args("a/b/object.csv.bz2", "SELECT * FROM S3Object");
+        args.compression = CompressionArg::Bzip2;
+        args.scan_start = Some(0);
+
+        assert!(select_options_from_args(args).validate().is_ok());
     }
 
     #[test]

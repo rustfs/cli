@@ -406,10 +406,10 @@ fn properties(values: Vec<String>) -> Result<BTreeMap<String, String>> {
     Ok(result)
 }
 fn require_string(body: &Value, field: &str) -> Result<()> {
-    if !body
+    if body
         .get(field)
         .and_then(Value::as_str)
-        .is_some_and(|s| !s.trim().is_empty())
+        .is_none_or(|s| s.trim().is_empty())
     {
         return Err(Error::Config(format!("Request requires nonempty {field}")));
     }
@@ -577,10 +577,10 @@ fn prepare_table(command: TableCommands) -> Result<Prepared> {
                 {
                     return Err(Error::Config("Standard updates use Iceberg requirements; version/location guards require new-metadata-location".into()));
                 }
-                if !body
+                if body
                     .get("requirements")
                     .and_then(Value::as_array)
-                    .is_some_and(|v| !v.is_empty())
+                    .is_none_or(Vec::is_empty)
                 {
                     return Err(Error::Config(
                         "Standard commit requires explicit Iceberg requirements".into(),
