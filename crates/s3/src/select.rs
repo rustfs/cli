@@ -143,6 +143,15 @@ fn validate_single_byte(name: &str, value: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+fn validate_input_record_delimiter(value: Option<&str>) -> Result<()> {
+    if value.is_some_and(|value| !(1..=2).contains(&value.len())) {
+        return Err(Error::General(
+            "CSV input record delimiter must be one or two bytes.".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_record_delimiter(name: &str, value: Option<&str>) -> Result<()> {
     if let Some(value) = value
         && value.len() != 1
@@ -184,10 +193,14 @@ fn build_input_serialization(options: &SelectOptions) -> Result<InputSerializati
                 "CSV input comment character",
                 options.csv_input.comments.as_deref(),
             )?;
+            validate_input_record_delimiter(options.csv_input.record_delimiter.as_deref())?;
             let mut csv = CsvInput::builder()
                 .file_header_info(csv_file_header_info(options.csv_input.file_header_info));
             if let Some(delimiter) = options.csv_input.field_delimiter.as_deref() {
                 csv = csv.field_delimiter(delimiter);
+            }
+            if let Some(delimiter) = options.csv_input.record_delimiter.as_deref() {
+                csv = csv.record_delimiter(delimiter);
             }
             if let Some(quote) = options.csv_input.quote_character.as_deref() {
                 csv = csv.quote_character(quote);
@@ -499,6 +512,38 @@ mod tests {
         assert_eq!(csv.file_header_info(), Some(&FileHeaderInfo::None));
         assert!(input.json().is_none());
         assert!(input.parquet().is_none());
+    }
+
+    #[test]
+    fn csv_input_serialization_sets_record_delimiter() {
+        let options = SelectOptions {
+            expression: "SELECT * FROM S3Object".to_string(),
+            csv_input: SelectCsvInputOptions {
+                record_delimiter: Some("^Y".to_string()),
+                ..SelectCsvInputOptions::default()
+            },
+            ..SelectOptions::default()
+        };
+
+        let input = build_input_serialization(&options).expect("CSV input serialization");
+        let csv = input.csv().expect("CSV input is configured");
+        assert_eq!(csv.record_delimiter(), Some("^Y"));
+    }
+
+    #[test]
+    fn csv_input_rejects_invalid_record_delimiter() {
+        let options = SelectOptions {
+            expression: "SELECT * FROM S3Object".to_string(),
+            csv_input: SelectCsvInputOptions {
+                record_delimiter: Some("|||".to_string()),
+                ..SelectCsvInputOptions::default()
+            },
+            ..SelectOptions::default()
+        };
+
+        let error = build_input_serialization(&options)
+            .expect_err("three-byte CSV input record delimiter should be rejected");
+        assert!(matches!(error, Error::General(message) if message.contains("record delimiter")));
     }
 
     #[test]

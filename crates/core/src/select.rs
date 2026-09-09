@@ -56,6 +56,7 @@ pub enum SelectQuoteFields {
 pub struct SelectCsvInputOptions {
     pub file_header_info: SelectCsvFileHeaderInfo,
     pub field_delimiter: Option<String>,
+    pub record_delimiter: Option<String>,
     pub quote_character: Option<String>,
     pub quote_escape_character: Option<String>,
     pub comments: Option<String>,

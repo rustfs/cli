@@ -42,6 +42,10 @@ pub struct SqlArgs {
     #[arg(long)]
     pub csv_input_field_delimiter: Option<String>,
 
+    /// CSV input record delimiter (one or two bytes)
+    #[arg(long)]
+    pub csv_input_record_delimiter: Option<String>,
+
     /// CSV input quote character
     #[arg(long)]
     pub csv_input_quote: Option<String>,
@@ -254,6 +258,7 @@ pub async fn execute(args: SqlArgs, output_config: OutputConfig) -> ExitCode {
         csv_input: SelectCsvInputOptions {
             file_header_info: args.csv_file_header_info.into(),
             field_delimiter: args.csv_input_field_delimiter,
+            record_delimiter: args.csv_input_record_delimiter,
             quote_character: args.csv_input_quote,
             quote_escape_character: args.csv_input_quote_escape,
             comments: args.csv_input_comment,
@@ -301,6 +306,7 @@ fn validate_select_args(args: &SqlArgs) -> std::result::Result<(), String> {
         "--csv-input-field-delimiter",
         args.csv_input_field_delimiter.as_deref(),
     )?;
+    validate_input_record_delimiter(args.csv_input_record_delimiter.as_deref())?;
     validate_single_byte("--csv-input-quote", args.csv_input_quote.as_deref())?;
     validate_single_byte(
         "--csv-input-quote-escape",
@@ -328,6 +334,13 @@ fn validate_single_byte(name: &str, value: Option<&str>) -> std::result::Result<
         && value.len() != 1
     {
         return Err(format!("{name} must be exactly one byte"));
+    }
+    Ok(())
+}
+
+fn validate_input_record_delimiter(value: Option<&str>) -> std::result::Result<(), String> {
+    if value.is_some_and(|value| !(1..=2).contains(&value.len())) {
+        return Err("--csv-input-record-delimiter must be one or two bytes".to_string());
     }
     Ok(())
 }
@@ -384,6 +397,7 @@ mod tests {
             compression: CompressionArg::None,
             csv_file_header_info: CsvFileHeaderInfoArg::None,
             csv_input_field_delimiter: None,
+            csv_input_record_delimiter: None,
             csv_input_quote: None,
             csv_input_quote_escape: None,
             csv_input_comment: None,
@@ -420,6 +434,14 @@ mod tests {
     async fn sql_rejects_multi_byte_csv_delimiter() {
         let mut args = base_args("a/b/c", "SELECT * FROM S3Object");
         args.csv_input_field_delimiter = Some("||".to_string());
+        let code = execute(args, OutputConfig::default()).await;
+        assert_eq!(code, ExitCode::UsageError);
+    }
+
+    #[tokio::test]
+    async fn sql_rejects_invalid_csv_input_record_delimiter() {
+        let mut args = base_args("a/b/c", "SELECT * FROM S3Object");
+        args.csv_input_record_delimiter = Some(String::new());
         let code = execute(args, OutputConfig::default()).await;
         assert_eq!(code, ExitCode::UsageError);
     }
