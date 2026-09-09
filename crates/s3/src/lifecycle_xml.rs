@@ -544,6 +544,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn abort_only_rule_roundtrips_prefix_and_abort_action() {
+        let rules = vec![super::LifecycleRule {
+            id: "abort-only".to_string(),
+            status: super::LifecycleRuleStatus::Enabled,
+            prefix: Some("v1/".to_string()),
+            tags: None,
+            object_size_greater_than: None,
+            object_size_less_than: None,
+            expiration: None,
+            del_marker_expiration: None,
+            transition: None,
+            transitions: Vec::new(),
+            noncurrent_version_expiration: None,
+            noncurrent_version_transition: None,
+            noncurrent_version_transitions: Vec::new(),
+            abort_incomplete_multipart_upload_days: Some(1),
+            expired_object_delete_marker: None,
+        }];
+        let xml = super::build_lifecycle_configuration_xml(&rules);
+        assert!(
+            xml.contains("<AbortIncompleteMultipartUpload><DaysAfterInitiation>1</DaysAfterInitiation></AbortIncompleteMultipartUpload>"),
+            "abort action missing from XML: {xml}"
+        );
+        assert!(
+            xml.contains("<Prefix>v1/</Prefix>"),
+            "prefix missing from XML: {xml}"
+        );
+    }
+
+    #[test]
     fn lifecycle_xml_roundtrip_preserves_extension_fields_and_standard_actions() {
         let mut tags = HashMap::new();
         tags.insert("env".to_string(), "prod&blue".to_string());

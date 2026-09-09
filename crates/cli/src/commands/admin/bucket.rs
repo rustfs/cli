@@ -216,7 +216,7 @@ pub struct SetArgs {
     /// Source vendor family; drives addressing defaults
     #[arg(long, value_enum)]
     pub provider: ProviderArg,
-    /// Source endpoint as scheme://host[:port]; derived from --region for aws
+    /// Source endpoint as scheme://host\[:port\]; derived from --region for aws
     #[arg(long, value_name = "URL")]
     pub endpoint: Option<String>,
     /// Source signing region; 'auto' is accepted for r2, minio and rustfs

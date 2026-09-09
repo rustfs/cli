@@ -13,6 +13,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LifecycleConfiguration {
     /// Lifecycle rules
+    #[serde(alias = "Rules")]
     pub rules: Vec<LifecycleRule>,
 }
 
@@ -91,7 +92,7 @@ pub struct LifecycleRule {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct LifecycleRuleInput {
     #[serde(alias = "ID")]
     id: String,
@@ -109,6 +110,9 @@ struct LifecycleRuleInput {
     object_size_greater_than: Option<i64>,
     #[serde(default, alias = "ObjectSizeLessThan", alias = "object_size_less_than")]
     object_size_less_than: Option<i64>,
+    /// S3-shaped nested filter (`Filter.Prefix` / `Filter.Tag` / `Filter.And`).
+    #[serde(default, alias = "Filter")]
+    filter: Option<LifecycleFilterInput>,
     #[serde(default, alias = "Expiration")]
     expiration: Option<LifecycleExpirationInput>,
     #[serde(default, alias = "Transition")]
@@ -121,14 +125,27 @@ struct LifecycleRuleInput {
     noncurrent_version_transition: Option<NoncurrentVersionTransition>,
     #[serde(default, alias = "NoncurrentVersionTransitions")]
     noncurrent_version_transitions: Vec<NoncurrentVersionTransition>,
-    #[serde(default, alias = "AbortIncompleteMultipartUploadDays")]
+    #[serde(
+        default,
+        alias = "AbortIncompleteMultipartUploadDays",
+        alias = "abort_incomplete_multipart_upload_days"
+    )]
     abort_incomplete_multipart_upload_days: Option<i32>,
+    /// S3-shaped nested abort action (`AbortIncompleteMultipartUpload.DaysAfterInitiation`).
+    #[serde(
+        default,
+        alias = "AbortIncompleteMultipartUpload",
+        alias = "abort_incomplete_multipart_upload"
+    )]
+    abort_incomplete_multipart_upload: Option<AbortIncompleteMultipartUploadInput>,
+
     #[serde(
         default,
         alias = "ExpiredObjectDeleteMarker",
         alias = "expired_object_delete_marker"
     )]
     expired_object_delete_marker: Option<bool>,
+
     #[serde(
         default,
         alias = "DelMarkerExpiration",
@@ -137,8 +154,71 @@ struct LifecycleRuleInput {
     del_marker_expiration: Option<LifecycleDelMarkerInput>,
 }
 
+/// S3 `Filter` predicate: `Prefix`, a single `Tag`, an `And` combination, or a
+/// standalone object-size bound.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LifecycleFilterInput {
+    #[serde(default, alias = "Prefix")]
+    prefix: Option<String>,
+    #[serde(default, alias = "Tag")]
+    tag: Option<LifecycleTagInput>,
+    #[serde(default, alias = "And")]
+    and: Option<LifecycleFilterAndInput>,
+    #[serde(
+        default,
+        alias = "ObjectSizeGreaterThan",
+        alias = "object_size_greater_than"
+    )]
+    object_size_greater_than: Option<i64>,
+    #[serde(default, alias = "ObjectSizeLessThan", alias = "object_size_less_than")]
+    object_size_less_than: Option<i64>,
+}
+
+/// S3 `Filter.And` combination of prefix, tags, and object-size bounds.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LifecycleFilterAndInput {
+    #[serde(default, alias = "Prefix")]
+    prefix: Option<String>,
+    #[serde(default, alias = "Tag")]
+    tag: Option<LifecycleTagInput>,
+    #[serde(default, alias = "Tags")]
+    tags: Option<Vec<LifecycleTagInput>>,
+    #[serde(
+        default,
+        alias = "ObjectSizeGreaterThan",
+        alias = "object_size_greater_than"
+    )]
+    object_size_greater_than: Option<i64>,
+    #[serde(default, alias = "ObjectSizeLessThan", alias = "object_size_less_than")]
+    object_size_less_than: Option<i64>,
+}
+
+/// A single S3 tag predicate.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LifecycleTagInput {
+    #[serde(alias = "Key")]
+    key: String,
+    #[serde(alias = "Value")]
+    value: String,
+}
+
+/// S3-shaped `AbortIncompleteMultipartUpload` action.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AbortIncompleteMultipartUploadInput {
+    #[serde(
+        default,
+        alias = "DaysAfterInitiation",
+        alias = "days_after_initiation"
+    )]
+    days_after_initiation: Option<i32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct LifecycleExpirationInput {
     #[serde(default, alias = "Days")]
     days: Option<i32>,
@@ -156,6 +236,12 @@ struct LifecycleExpirationInput {
         alias = "del_marker_expiration"
     )]
     del_marker_expiration: Option<LifecycleDelMarkerInput>,
+    #[serde(
+        default,
+        alias = "ExpiredObjectDeleteMarker",
+        alias = "expired_object_delete_marker"
+    )]
+    expired_object_delete_marker: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -183,6 +269,7 @@ impl<'de> Deserialize<'de> for LifecycleRule {
             tags,
             object_size_greater_than,
             object_size_less_than,
+            filter,
             expiration: expiration_input,
             transition,
             transitions: mut transitions_input,
@@ -190,9 +277,47 @@ impl<'de> Deserialize<'de> for LifecycleRule {
             noncurrent_version_transition,
             noncurrent_version_transitions: mut noncurrent_version_transitions_input,
             abort_incomplete_multipart_upload_days,
+            abort_incomplete_multipart_upload,
             expired_object_delete_marker,
             del_marker_expiration: top_level_del_marker_input,
         } = LifecycleRuleInput::deserialize(deserializer)?;
+
+        let filter_fields = resolve_filter_fields(filter).map_err(D::Error::custom)?;
+        let prefix = merge_exclusive(prefix, filter_fields.prefix, "prefix", "Filter.Prefix")
+            .map_err(D::Error::custom)?;
+        let tags = merge_exclusive(tags, filter_fields.tags, "tags", "Filter tags")
+            .map_err(D::Error::custom)?;
+        let object_size_greater_than = merge_exclusive(
+            object_size_greater_than,
+            filter_fields.object_size_greater_than,
+            "objectSizeGreaterThan",
+            "Filter.ObjectSizeGreaterThan",
+        )
+        .map_err(D::Error::custom)?;
+        let object_size_less_than = merge_exclusive(
+            object_size_less_than,
+            filter_fields.object_size_less_than,
+            "objectSizeLessThan",
+            "Filter.ObjectSizeLessThan",
+        )
+        .map_err(D::Error::custom)?;
+
+        let nested_expired_object_delete_marker = expiration_input
+            .as_ref()
+            .and_then(|expiration| expiration.expired_object_delete_marker);
+        let expired_object_delete_marker = merge_equal_optional(
+            expired_object_delete_marker,
+            nested_expired_object_delete_marker,
+            "expiredObjectDeleteMarker",
+        )
+        .map_err(D::Error::custom)?;
+
+        let abort_incomplete_multipart_upload_days = merge_equal_optional(
+            abort_incomplete_multipart_upload_days,
+            abort_incomplete_multipart_upload.and_then(|action| action.days_after_initiation),
+            "abortIncompleteMultipartUploadDays",
+        )
+        .map_err(D::Error::custom)?;
 
         let (expiration, nested_del_marker) = match expiration_input {
             Some(expiration) => {
@@ -251,6 +376,109 @@ impl<'de> Deserialize<'de> for LifecycleRule {
             abort_incomplete_multipart_upload_days,
             expired_object_delete_marker,
         })
+    }
+}
+
+/// Filter predicates resolved from an S3-shaped `Filter` object.
+#[derive(Default)]
+struct FilterFields {
+    prefix: Option<String>,
+    tags: Option<HashMap<String, String>>,
+    object_size_greater_than: Option<i64>,
+    object_size_less_than: Option<i64>,
+}
+
+/// Flatten an S3 `Filter` (one of `Prefix`, `Tag`, `And`, or a standalone
+/// object-size bound) into rc's flat fields.
+///
+/// An empty `Filter` object stays valid: the server documents it as "applies to
+/// every object in the bucket".
+fn resolve_filter_fields(
+    filter: Option<LifecycleFilterInput>,
+) -> std::result::Result<FilterFields, String> {
+    let Some(filter) = filter else {
+        return Ok(FilterFields::default());
+    };
+    let predicate_count = usize::from(filter.prefix.is_some())
+        + usize::from(filter.tag.is_some())
+        + usize::from(filter.and.is_some())
+        + usize::from(filter.object_size_greater_than.is_some())
+        + usize::from(filter.object_size_less_than.is_some());
+    if predicate_count > 1 {
+        return Err(
+            "S3 Filter allows exactly one of Prefix, Tag, And, ObjectSizeGreaterThan, or ObjectSizeLessThan"
+                .to_string(),
+        );
+    }
+    if let Some(and) = filter.and {
+        let mut tags = HashMap::new();
+        if let Some(tag) = and.tag {
+            tags.insert(tag.key, tag.value);
+        }
+        if let Some(tag_list) = and.tags {
+            for tag in tag_list {
+                if tags.insert(tag.key.clone(), tag.value).is_some() {
+                    let key = tag.key;
+                    return Err(format!("duplicate tag key in Filter.And: {key}"));
+                }
+            }
+        }
+        return Ok(FilterFields {
+            prefix: and.prefix,
+            tags: if tags.is_empty() { None } else { Some(tags) },
+            object_size_greater_than: and.object_size_greater_than,
+            object_size_less_than: and.object_size_less_than,
+        });
+    }
+    if let Some(prefix) = filter.prefix {
+        return Ok(FilterFields {
+            prefix: Some(prefix),
+            ..FilterFields::default()
+        });
+    }
+    if let Some(tag) = filter.tag {
+        return Ok(FilterFields {
+            tags: Some(HashMap::from([(tag.key, tag.value)])),
+            ..FilterFields::default()
+        });
+    }
+    if filter.object_size_greater_than.is_some() || filter.object_size_less_than.is_some() {
+        return Ok(FilterFields {
+            object_size_greater_than: filter.object_size_greater_than,
+            object_size_less_than: filter.object_size_less_than,
+            ..FilterFields::default()
+        });
+    }
+    Ok(FilterFields::default())
+}
+
+/// Combine a flat field with its nested equivalent; both set at once is ambiguous.
+fn merge_exclusive<T>(
+    flat: Option<T>,
+    nested: Option<T>,
+    flat_name: &str,
+    nested_name: &str,
+) -> std::result::Result<Option<T>, String> {
+    match (flat, nested) {
+        (Some(_), Some(_)) => Err(format!(
+            "lifecycle rule sets both {flat_name} and {nested_name}; specify one"
+        )),
+        (value, None) | (None, value) => Ok(value),
+    }
+}
+
+/// Combine two optional spellings of the same value; equal duplicates are fine.
+fn merge_equal_optional<T: PartialEq>(
+    primary: Option<T>,
+    secondary: Option<T>,
+    field_name: &str,
+) -> std::result::Result<Option<T>, String> {
+    match (primary, secondary) {
+        (Some(primary_value), Some(secondary_value)) if primary_value != secondary_value => {
+            Err(format!("conflicting {field_name} values in lifecycle rule"))
+        }
+        (value, None) | (None, value) => Ok(value),
+        (Some(value), Some(_)) => Ok(Some(value)),
     }
 }
 
