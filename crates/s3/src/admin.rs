@@ -8,7 +8,8 @@ mod diagnostics;
 use async_trait::async_trait;
 use aws_credential_types::Credentials;
 use aws_sigv4::http_request::{
-    SignableBody, SignableRequest, SignatureLocation, SigningSettings, sign,
+    PercentEncodingMode, SignableBody, SignableRequest, SignatureLocation, SigningSettings,
+    UriPathNormalizationMode, sign,
 };
 use aws_sigv4::sign::v4;
 use bytes::Bytes;
@@ -194,6 +195,36 @@ static CAPABILITY_CACHE: OnceLock<Mutex<HashMap<CapabilityCacheKey, CapabilityRe
 
 const MAX_CONFIG_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_BUCKET_METADATA_MUTATION_RESPONSE_BYTES: usize = 64 * 1024;
+
+fn admin_signing_uri(url: &str) -> Result<http::Uri> {
+    let uri: http::Uri = url
+        .parse()
+        .map_err(|_| Error::Auth("Invalid Admin signing URI".to_string()))?;
+    let transport_url = reqwest::Url::parse(url)
+        .map_err(|_| Error::Auth("Invalid Admin request URL".to_string()))?;
+    if uri.path() != transport_url.path() {
+        return Err(Error::InvalidPath(
+            "Admin request URL would normalize its target path".to_string(),
+        ));
+    }
+
+    // MinIO signs EncodePath(URL.Path): decode the wire path once, then encode
+    // non-S3-safe bytes while retaining slashes. Never clean dot segments or
+    // decode a literal %2F twice. This URI is only for signing, not transport.
+    let decoded = urlencoding::decode_binary(uri.path().as_bytes());
+    let mut path_and_query = urlencoding::encode_binary(&decoded).replace("%2F", "/");
+    if let Some(query) = uri.query() {
+        path_and_query.push('?');
+        path_and_query.push_str(query);
+    }
+    let mut parts = uri.into_parts();
+    parts.path_and_query = Some(
+        path_and_query
+            .parse()
+            .map_err(|_| Error::Auth("Invalid Admin signing path".to_string()))?,
+    );
+    http::Uri::from_parts(parts).map_err(|_| Error::Auth("Invalid Admin signing URI".to_string()))
+}
 
 fn capability_cache() -> &'static Mutex<HashMap<CapabilityCacheKey, CapabilityReport>> {
     CAPABILITY_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -405,6 +436,8 @@ impl AdminClient {
         let identity = credentials.into();
         let mut signing_settings = SigningSettings::default();
         signing_settings.signature_location = SignatureLocation::Headers;
+        signing_settings.percent_encoding_mode = PercentEncodingMode::Single;
+        signing_settings.uri_path_normalization_mode = UriPathNormalizationMode::Disabled;
 
         let signing_params = v4::SigningParams::builder()
             .identity(&identity)
@@ -423,7 +456,7 @@ impl AdminClient {
 
         let signable_request = SignableRequest::new(
             method.as_str(),
-            url,
+            admin_signing_uri(url)?.to_string(),
             header_pairs.into_iter(),
             signable_body,
         )
@@ -5991,6 +6024,222 @@ mod tests {
         let mut alias = Alias::new("test", endpoint, "", "");
         alias.anonymous = true;
         AdminClient::new(&alias).expect("anonymous admin client should build")
+    }
+
+    fn assert_minio_admin_signature(
+        headers: &HeaderMap,
+        method: &str,
+        canonical_path: &str,
+        canonical_query: &str,
+        body: &[u8],
+        authority: &str,
+    ) {
+        // Build the canonical request independently of the request signer and
+        // its URL transformations; only the HMAC primitive is shared.
+        let timestamp = headers["x-amz-date"].to_str().expect("signing timestamp");
+        let date = &timestamp[..8];
+        let midnight: jiff::Timestamp =
+            format!("{}-{}-{}T00:00:00Z", &date[..4], &date[4..6], &date[6..8])
+                .parse()
+                .expect("valid signing date");
+        let payload_hash = hex::encode(Sha256::digest(body));
+        assert_eq!(headers["host"], authority);
+        assert_eq!(headers["x-amz-content-sha256"], payload_hash);
+        let (content_type, content_type_name) = if body.is_empty() {
+            ("", "")
+        } else {
+            assert_eq!(headers["content-type"], "application/json");
+            ("content-type:application/json\n", "content-type;")
+        };
+        let signed_names = format!("{content_type_name}host;x-amz-content-sha256;x-amz-date");
+        let canonical_request = format!(
+            "{method}\n{canonical_path}\n{canonical_query}\n{content_type}host:{authority}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{timestamp}\n\n{signed_names}\n{payload_hash}"
+        );
+        let scope = format!("{date}/us-east-1/s3/aws4_request");
+        let to_sign = format!(
+            "AWS4-HMAC-SHA256\n{timestamp}\n{scope}\n{}",
+            hex::encode(Sha256::digest(canonical_request.as_bytes()))
+        );
+        let key = v4::generate_signing_key("secret", midnight.into(), "us-east-1", "s3");
+        let signature = v4::calculate_signature(key, to_sign.as_bytes());
+        assert_eq!(
+            headers["authorization"],
+            format!(
+                "AWS4-HMAC-SHA256 Credential=access/{scope}, SignedHeaders={signed_names}, Signature={signature}"
+            ),
+            "canonical target: {canonical_path}?{canonical_query}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_admin_signing_preserves_minio_path_identity() {
+        let endpoint = "http://127.0.0.1:9300";
+        let client = admin_client_for_endpoint(endpoint);
+        let query = "forceStop=true&clientToken=task%2Btoken%252F%20x";
+        let canonical_query = "clientToken=task%2Btoken%252F%20x&forceStop=true";
+        let body = br#"{"dryRun":true}"#;
+        for (wire, canonical) in [
+            ("/rustfs/admin/v3/heal/", "/rustfs/admin/v3/heal/"),
+            ("/rustfs/admin/v3/info", "/rustfs/admin/v3/info"),
+            (
+                "/rustfs/admin/v4/capabilities",
+                "/rustfs/admin/v4/capabilities",
+            ),
+            ("/heal/bucket/dir/key", "/heal/bucket/dir/key"),
+            ("/heal/bucket/dir%2Fkey", "/heal/bucket/dir/key"),
+            ("/heal/bucket/dir%2fsub/key", "/heal/bucket/dir/sub/key"),
+            (
+                "/heal/bucket/literal%252Fkey",
+                "/heal/bucket/literal%252Fkey",
+            ),
+            ("/heal/bucket/%2Fkey", "/heal/bucket//key"),
+            ("/heal/bucket/dir%2F", "/heal/bucket/dir/"),
+            ("/heal/bucket/dir%2F%2e%2e%2Fkey", "/heal/bucket/dir/../key"),
+            ("/heal/bucket/dir%2F%2Fkey", "/heal/bucket/dir//key"),
+            (
+                "/heal/bucket/space%20%2Bkey%2F%E4%B8%AD%E6%96%87",
+                "/heal/bucket/space%20%2Bkey/%E4%B8%AD%E6%96%87",
+            ),
+            ("/heal/bucket/literal+plus", "/heal/bucket/literal%2Bplus"),
+            ("/heal/bucket/%41%7e%3F%23%25", "/heal/bucket/A~%3F%23%25"),
+            ("/heal/bucket/invalid%ff", "/heal/bucket/invalid%FF"),
+        ] {
+            let url = format!("{endpoint}{wire}?{query}");
+            let original = url.clone();
+            let headers = client.request_headers(body).expect("request headers");
+            let signed = client
+                .sign_request(&Method::POST, &url, &headers, body)
+                .await
+                .expect("sign Admin request");
+            assert_eq!(url, original, "signing must not rewrite the wire URL");
+            assert_minio_admin_signature(
+                &signed,
+                "POST",
+                canonical,
+                canonical_query,
+                body,
+                "127.0.0.1:9300",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_admin_signing_preserves_precomputed_payload_and_ipv6_authority() {
+        let client = admin_client_for_endpoint("http://[::1]:9300");
+        let body = b"";
+        let headers = client.request_headers(body).expect("request headers");
+        let signed = client
+            .sign_request_with_body(
+                &Method::GET,
+                "http://[::1]:9300/rustfs/admin/v3/heal/bucket/dir%2Fkey",
+                &headers,
+                SignableBody::Precomputed(hex::encode(Sha256::digest(body))),
+            )
+            .await
+            .expect("sign precomputed body");
+        assert_minio_admin_signature(
+            &signed,
+            "GET",
+            "/rustfs/admin/v3/heal/bucket/dir/key",
+            "",
+            body,
+            "[::1]:9300",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_admin_signing_rejects_transport_path_retargeting() {
+        let client = admin_client_for_endpoint("http://127.0.0.1:9300");
+        let headers = client.request_headers(b"").expect("request headers");
+        for suffix in [".", "..", "%2e", "%2e%2e", "dir/../key"] {
+            let error = client
+                .sign_request(
+                    &Method::POST,
+                    &format!("http://127.0.0.1:9300/rustfs/admin/v3/heal/bucket/{suffix}"),
+                    &headers,
+                    b"",
+                )
+                .await
+                .expect_err("transport normalization must not select a different target");
+            assert!(matches!(error, Error::InvalidPath(_)));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_heal_signed_start_status_stop_keep_exact_wire_target() {
+        for (object, wire, canonical) in [
+            ("dir/key", "dir%2Fkey", "dir/key"),
+            ("dir%2Fkey", "dir%252Fkey", "dir%252Fkey"),
+            (
+                "中文/space +percent%/key",
+                "%E4%B8%AD%E6%96%87%2Fspace%20%2Bpercent%25%2Fkey",
+                "%E4%B8%AD%E6%96%87/space%20%2Bpercent%25/key",
+            ),
+        ] {
+            let start_response = r#"{"clientToken":"task+token%2F x","clientAddress":"127.0.0.1:9000","startTime":"2026-09-10T00:00:00Z"}"#;
+            let status_response = r#"{"summary":"finished","detail":"","startTime":"2026-09-10T00:00:00Z","settings":{"recursive":false,"dryRun":true,"remove":false,"recreate":false,"scanMode":2,"updateParity":false,"nolock":false},"items":[]}"#;
+            let (endpoint, receiver, handle) = start_admin_sequence_server(vec![
+                ("200 OK", start_response),
+                ("200 OK", status_response),
+                ("200 OK", status_response),
+            ]);
+            let client = admin_client_for_endpoint(&endpoint);
+            let started = client
+                .heal_start(HealStartRequest {
+                    bucket: Some("bucket".to_string()),
+                    prefix: Some(object.to_string()),
+                    dry_run: true,
+                    ..Default::default()
+                })
+                .await
+                .expect("start Heal");
+            let task = HealTaskRequest {
+                bucket: "bucket".to_string(),
+                prefix: Some(object.to_string()),
+                client_token: started.heal_id.clone(),
+            };
+            client
+                .heal_task_status(task.clone())
+                .await
+                .expect("query Heal");
+            client.heal_task_stop(task).await.expect("stop Heal");
+            handle.join().expect("server thread should finish");
+            for query in [
+                "",
+                "?clientToken=task%2Btoken%252F%20x",
+                "?clientToken=task%2Btoken%252F%20x&forceStop=true",
+            ] {
+                let captured = receiver
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("captured signed request");
+                assert_eq!(captured.method, "POST");
+                assert_eq!(
+                    captured.target,
+                    format!("/rustfs/admin/v3/heal/bucket/{wire}{query}")
+                );
+                let mut headers = HeaderMap::new();
+                for line in captured
+                    .headers
+                    .lines()
+                    .skip(1)
+                    .filter(|line| !line.is_empty())
+                {
+                    let (name, value) = line.split_once(':').expect("HTTP header");
+                    headers.insert(
+                        HeaderName::from_bytes(name.as_bytes()).expect("header name"),
+                        HeaderValue::from_str(value.trim()).expect("header value"),
+                    );
+                }
+                assert_minio_admin_signature(
+                    &headers,
+                    "POST",
+                    &format!("/rustfs/admin/v3/heal/bucket/{canonical}"),
+                    query.trim_start_matches('?'),
+                    &captured.body,
+                    endpoint.strip_prefix("http://").expect("test authority"),
+                );
+            }
+        }
     }
 
     fn assert_heal_options_body(
