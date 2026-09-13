@@ -463,8 +463,22 @@ pub enum HealRuntimeState {
     Uninitialized,
     Idle,
     Active,
+    Degraded,
     #[serde(other)]
     Unknown,
+}
+
+/// Node coverage of a background heal snapshot; missing counts are unknown.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BackgroundHealCoverage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responded: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unknown: Option<u64>,
+    #[serde(default)]
+    pub reasons: Vec<String>,
 }
 
 /// Request to start a heal operation
@@ -598,6 +612,13 @@ pub struct HealStatus {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<HealRuntimeState>,
+
+    /// Absent on legacy servers and token-scoped task responses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_status_complete: Option<bool>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<BackgroundHealCoverage>,
 
     /// Task summary for token-scoped manual heal status
     #[serde(default, skip_serializing_if = "Option::is_none")]

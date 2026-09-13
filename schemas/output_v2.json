@@ -260,7 +260,7 @@
         },
         "healing": {
           "type": "boolean",
-          "description": "Whether a heal operation is active"
+          "description": "Whether heal work is known to be active. False does not prove cluster idleness when status is unknown or incomplete."
         },
         "state": {
           "type": "string",
@@ -269,9 +269,39 @@
             "uninitialized",
             "idle",
             "active",
+            "degraded",
             "unknown"
           ],
           "description": "Runtime state reported by the heal service"
+        },
+        "clusterStatusComplete": {
+          "type": "boolean",
+          "description": "Whether the server has complete cluster status. Absent on legacy servers and token-scoped responses."
+        },
+        "coverage": {
+          "type": "object",
+          "description": "Node coverage of the background heal snapshot. Missing counts mean unknown, not zero.",
+          "properties": {
+            "expected": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "responded": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "unknown": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "reasons": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Coverage reason codes, including codes from future servers."
+            }
+          }
         },
         "summary": {
           "type": "string",
