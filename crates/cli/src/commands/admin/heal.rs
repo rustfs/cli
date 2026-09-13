@@ -9,7 +9,8 @@ use super::get_admin_client;
 use crate::exit_code::ExitCode;
 use crate::output::Formatter;
 use rc_core::admin::{
-    AdminApi, HealRuntimeState, HealScanMode, HealStartRequest, HealStatus, HealTaskRequest,
+    AdminApi, BackgroundHealCoverage, HealRuntimeState, HealScanMode, HealStartRequest, HealStatus,
+    HealTaskRequest,
 };
 
 const HEAL_STOP_SUCCESS_MESSAGE: &str = "Heal operation stopped successfully";
@@ -104,6 +105,10 @@ struct HealStatusOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     state: Option<HealRuntimeState>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    cluster_status_complete: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    coverage: Option<BackgroundHealCoverage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     summary: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<String>,
@@ -131,6 +136,8 @@ impl From<&HealStatus> for HealStatusOutput {
             heal_id: status.heal_id.clone(),
             healing: status.healing,
             state: status.state,
+            cluster_status_complete: status.cluster_status_complete,
+            coverage: status.coverage.clone(),
             summary: status.summary.clone(),
             detail: status.detail.clone(),
             bucket: status.bucket.clone(),
@@ -153,6 +160,8 @@ impl From<&HealStatus> for HealStatusOutput {
 fn has_heal_status_details(status: &HealStatus) -> bool {
     status.healing
         || status.state.is_some()
+        || status.cluster_status_complete.is_some()
+        || status.coverage.is_some()
         || !status.heal_id.is_empty()
         || status.summary.is_some()
         || status.detail.is_some()
@@ -210,13 +219,29 @@ enum HealStatusIndicator {
     Date(&'static str),
 }
 
+fn cluster_heal_status_is_incomplete(status: &HealStatus) -> bool {
+    status.state == Some(HealRuntimeState::Degraded)
+        || status.cluster_status_complete == Some(false)
+        || status.coverage.as_ref().is_some_and(|coverage| {
+            coverage.unknown.is_some_and(|count| count > 0)
+                || !coverage.reasons.is_empty()
+                || matches!(
+                    (coverage.responded, coverage.expected),
+                    (Some(responded), Some(expected)) if responded < expected
+                )
+        })
+}
+
 fn heal_status_indicator(status: &HealStatus) -> HealStatusIndicator {
     match status.state {
+        Some(HealRuntimeState::Active) => HealStatusIndicator::Progress("In Progress"),
+        Some(HealRuntimeState::Degraded) => HealStatusIndicator::Date("Degraded"),
+        Some(HealRuntimeState::Unknown) => HealStatusIndicator::Date("Unknown"),
+        _ if cluster_heal_status_is_incomplete(status) => HealStatusIndicator::Date("Unknown"),
         Some(HealRuntimeState::Disabled) => HealStatusIndicator::Date("Disabled"),
         Some(HealRuntimeState::Uninitialized) => HealStatusIndicator::Date("Uninitialized"),
-        Some(HealRuntimeState::Active) => HealStatusIndicator::Progress("In Progress"),
         Some(HealRuntimeState::Idle) => HealStatusIndicator::Date("Idle"),
-        Some(HealRuntimeState::Unknown) | None => match status.summary.as_deref() {
+        None => match status.summary.as_deref() {
             Some("running") => HealStatusIndicator::Progress("In Progress"),
             Some("finished") => HealStatusIndicator::Progress("Finished"),
             Some("stopped") => HealStatusIndicator::Date("Stopped"),
@@ -287,6 +312,42 @@ fn print_heal_status(status: &HealStatus, formatter: &Formatter) {
     ));
     formatter.println("");
 
+    let incomplete = cluster_heal_status_is_incomplete(status);
+    let unknown = status.state == Some(HealRuntimeState::Unknown);
+    if incomplete {
+        formatter
+            .warning("Cluster heal status is incomplete; unavailable peers may still be healing.");
+    } else if unknown {
+        formatter.warning("Heal runtime state is unknown; cluster idleness cannot be confirmed.");
+    }
+
+    // Token responses describe one task, not the coverage of a cluster snapshot.
+    if status.summary.is_none() && status.heal_id.is_empty() {
+        let completeness = if incomplete {
+            "Incomplete"
+        } else if status.cluster_status_complete == Some(true) {
+            "Complete"
+        } else {
+            "Unknown (not reported by server)"
+        };
+        formatter.println(&format!("  Cluster status: {completeness}"));
+    }
+    if let Some(coverage) = &status.coverage {
+        let count = |value: Option<u64>| value.map_or_else(|| "?".to_string(), |n| n.to_string());
+        formatter.println(&format!(
+            "  Node coverage:  {}/{} responded, {} unknown",
+            count(coverage.responded),
+            count(coverage.expected),
+            count(coverage.unknown),
+        ));
+        if !coverage.reasons.is_empty() {
+            formatter.println(&format!(
+                "  Reasons:        {}",
+                formatter.sanitize_text(&coverage.reasons.join(", "))
+            ));
+        }
+    }
+
     if !status.heal_id.is_empty() {
         formatter.println(&format!("  Heal ID:       {}", status.heal_id));
     }
@@ -336,6 +397,12 @@ fn print_heal_status(status: &HealStatus, formatter: &Formatter) {
         if let Some(ref last_update) = status.last_update {
             formatter.println(&format!("  Last Update:   {}", last_update));
         }
+    } else if incomplete || unknown {
+        formatter.println("  Cluster idleness cannot be confirmed.");
+    } else if status.state == Some(HealRuntimeState::Disabled) {
+        formatter.println("  Heal service is disabled.");
+    } else if status.state == Some(HealRuntimeState::Uninitialized) {
+        formatter.println("  Heal service is not initialized.");
     } else {
         formatter.println("  No active heal operation.");
     }
@@ -713,5 +780,23 @@ mod tests {
             heal_status_indicator(&status),
             HealStatusIndicator::Date("Disabled")
         ));
+    }
+
+    #[test]
+    fn test_explicit_unknown_overrides_legacy_summary_and_healing() {
+        for summary in [None, Some("running"), Some("finished"), Some("stopped")] {
+            for healing in [false, true] {
+                let status = HealStatus {
+                    state: Some(HealRuntimeState::Unknown),
+                    summary: summary.map(str::to_string),
+                    healing,
+                    ..Default::default()
+                };
+                assert!(matches!(
+                    heal_status_indicator(&status),
+                    HealStatusIndicator::Date("Unknown")
+                ));
+            }
+        }
     }
 }

@@ -16,14 +16,14 @@ use bytes::Bytes;
 use futures::StreamExt;
 use rc_core::admin::{
     AccessKeyInfo, AccessKeyKind, AccessKeyProvider, AccessKeyRecord, AccountApi, AccountInfo,
-    AccountMfaApi, AdminApi, BucketMetadataApi, BucketMetadataArchive, BucketQuota,
-    BulkAccessKeyApi, BulkAccessKeyQuery, CapabilityApi, CapabilityAvailability, CapabilityEntry,
-    CapabilityReport, ClusterInfo, ClusterSnapshotDocument, ClusterSnapshotMetadata,
-    ClusterSnapshotSummary, ConfigApi, ConfigDocument, ConfigHelp, ConfigHistoryEntry,
-    ConfigMutationResult, CreateServiceAccountRequest, DecommissionPoolStatus, DecommissionStatus,
-    DetailedHealthSnapshot, DiagnosticCapability, DiagnosticReadApi, EncryptedInspectArchive,
-    ExtensionsCatalog, Group, GroupStatus, HealRuntimeState, HealScanMode, HealStartRequest,
-    HealStatus, HealTaskRequest, IAM_ACCESS_KEYS_BULK_CAPABILITY,
+    AccountMfaApi, AdminApi, BackgroundHealCoverage, BucketMetadataApi, BucketMetadataArchive,
+    BucketQuota, BulkAccessKeyApi, BulkAccessKeyQuery, CapabilityApi, CapabilityAvailability,
+    CapabilityEntry, CapabilityReport, ClusterInfo, ClusterSnapshotDocument,
+    ClusterSnapshotMetadata, ClusterSnapshotSummary, ConfigApi, ConfigDocument, ConfigHelp,
+    ConfigHistoryEntry, ConfigMutationResult, CreateServiceAccountRequest, DecommissionPoolStatus,
+    DecommissionStatus, DetailedHealthSnapshot, DiagnosticCapability, DiagnosticReadApi,
+    EncryptedInspectArchive, ExtensionsCatalog, Group, GroupStatus, HealRuntimeState, HealScanMode,
+    HealStartRequest, HealStatus, HealTaskRequest, IAM_ACCESS_KEYS_BULK_CAPABILITY,
     IAM_ACCESS_KEYS_BULK_LDAP_CAPABILITY, IAM_ACCESS_KEYS_BULK_OPENID_CAPABILITY,
     IAM_POLICY_DETACH_CAPABILITY, IAM_POLICY_ENTITIES_CAPABILITY, INSPECT_ARCHIVE_COMPLETION,
     INSPECT_ARCHIVE_CONTENT_TYPE, IamArchiveApi, IamArchiveImportResult, IamArchiveImportSection,
@@ -1964,6 +1964,10 @@ struct BackgroundHealStatusResponse {
     #[serde(default)]
     state: Option<HealRuntimeState>,
     #[serde(default)]
+    cluster_status_complete: Option<bool>,
+    #[serde(default)]
+    coverage: Option<BackgroundHealCoverage>,
+    #[serde(default)]
     bitrot_start_time: Option<String>,
     #[serde(default)]
     bitrot_start_cycle: u64,
@@ -2043,11 +2047,17 @@ impl From<BackgroundHealStatusResponse> for HealStatus {
                 | HealRuntimeState::Uninitialized
                 | HealRuntimeState::Idle,
             ) => false,
-            Some(HealRuntimeState::Unknown) | None => legacy_status_healing,
+            // Unknown runtime state does not make legacy scan timestamps authoritative.
+            Some(HealRuntimeState::Degraded | HealRuntimeState::Unknown) => {
+                queue_length > 0 || active_tasks > 0
+            }
+            None => legacy_status_healing,
         };
 
         let mut status = Self {
             healing,
+            cluster_status_complete: response.cluster_status_complete,
+            coverage: response.coverage,
             started: response.bitrot_start_time,
             scan_mode,
             scan_cycle: response.bitrot_start_cycle,
@@ -7854,6 +7864,8 @@ mod tests {
     fn test_background_heal_status_response_maps_to_heal_status() {
         let status = HealStatus::from(BackgroundHealStatusResponse {
             state: Some(HealRuntimeState::Active),
+            cluster_status_complete: None,
+            coverage: None,
             bitrot_start_time: Some("2026-04-19T10:00:00Z".to_string()),
             bitrot_start_cycle: 42,
             current_scan_mode: Some(2),
@@ -7873,6 +7885,8 @@ mod tests {
 
         let idle = HealStatus::from(BackgroundHealStatusResponse {
             state: Some(HealRuntimeState::Idle),
+            cluster_status_complete: None,
+            coverage: None,
             bitrot_start_time: None,
             bitrot_start_cycle: 0,
             current_scan_mode: Some(1),
@@ -7888,6 +7902,8 @@ mod tests {
 
         let active_without_legacy_counters = HealStatus::from(BackgroundHealStatusResponse {
             state: Some(HealRuntimeState::Active),
+            cluster_status_complete: None,
+            coverage: None,
             bitrot_start_time: None,
             bitrot_start_cycle: 0,
             current_scan_mode: Some(1),
@@ -7900,6 +7916,8 @@ mod tests {
 
         let disabled_with_stale_counters = HealStatus::from(BackgroundHealStatusResponse {
             state: Some(HealRuntimeState::Disabled),
+            cluster_status_complete: None,
+            coverage: None,
             bitrot_start_time: Some("2026-04-19T10:00:00Z".to_string()),
             bitrot_start_cycle: 42,
             current_scan_mode: Some(2),
@@ -7912,6 +7930,8 @@ mod tests {
 
         let completed = HealStatus::from(BackgroundHealStatusResponse {
             state: None,
+            cluster_status_complete: None,
+            coverage: None,
             bitrot_start_time: Some("2026-04-19T10:00:00Z".to_string()),
             bitrot_start_cycle: 42,
             current_scan_mode: Some(1),
@@ -7926,6 +7946,8 @@ mod tests {
 
         let legacy = HealStatus::from(BackgroundHealStatusResponse {
             state: None,
+            cluster_status_complete: None,
+            coverage: None,
             bitrot_start_time: Some("2026-04-19T10:00:00Z".to_string()),
             bitrot_start_cycle: 0,
             current_scan_mode: None,
@@ -7938,6 +7960,8 @@ mod tests {
 
         let active = HealStatus::from(BackgroundHealStatusResponse {
             state: None,
+            cluster_status_complete: None,
+            coverage: None,
             bitrot_start_time: None,
             bitrot_start_cycle: 0,
             current_scan_mode: None,
