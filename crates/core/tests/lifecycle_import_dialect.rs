@@ -85,6 +85,18 @@ fn s3_filter_and_combination_is_flattened() {
 }
 
 #[test]
+fn s3_filter_and_rejects_duplicate_tag_keys() {
+    let error = parse_error(
+        r#"{"rules":[{"id":"r","status":"Enabled","filter":{"And":{"Tag":{"Key":"env","Value":"prod"},"Tags":[{"Key":"env","Value":"staging"}]}}}]}"#,
+    );
+
+    assert!(
+        error.contains("duplicate tag key in Filter.And: env"),
+        "{error}"
+    );
+}
+
+#[test]
 fn s3_standalone_object_size_greater_than_filter_is_accepted() {
     let config = parse(
         r#"{"Rules":[{"ID":"size-filter","Status":"Enabled","Filter":{"ObjectSizeGreaterThan":1024},"Expiration":{"Days":30}}]}"#,
