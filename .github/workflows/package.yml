@@ -34,6 +34,11 @@ permissions:
   contents: write
   actions: read
 
+env:
+  # Self-hosted runner images may still bundle an older Node than current
+  # JavaScript actions require.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 concurrency:
   group: package-${{ inputs.tag || github.run_id }}
   cancel-in-progress: true
@@ -41,7 +46,7 @@ concurrency:
 jobs:
   resolve:
     name: Resolve Build
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 10
     permissions:
       contents: read
@@ -53,6 +58,11 @@ jobs:
       tag: ${{ steps.resolve.outputs.tag }}
       head_sha: ${{ steps.resolve.outputs.head_sha }}
     steps:
+      - name: Install GitHub CLI
+        uses: ./.github/actions/setup-self-hosted
+        with:
+          # gh is preinstalled on GitHub-hosted runners and missing on sm-standard images.
+          profile: github-cli
       - name: Resolve and validate build run
         id: resolve
         env:
@@ -169,7 +179,7 @@ jobs:
   package:
     name: Package (${{ matrix.arch }})
     needs: resolve
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 30
     permissions:
       contents: read
@@ -185,6 +195,11 @@ jobs:
             rpm_arch: aarch64
             artifact_name: rustfs-cli-linux-arm64
     steps:
+      - name: Install file(1)
+        uses: ./.github/actions/setup-self-hosted
+        with:
+          # Used to prove the packaged binary is statically linked.
+          profile: file
       - name: Checkout exact build source
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
@@ -363,12 +378,16 @@ jobs:
     name: Publish packages to GitHub Release
     needs: [resolve, package]
     if: needs.resolve.result == 'success' && needs.package.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 15
     permissions:
       contents: write
       actions: read
     steps:
+      - name: Install GitHub CLI
+        uses: ./.github/actions/setup-self-hosted
+        with:
+          profile: github-cli
       - name: Download package artifacts
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
@@ -445,11 +464,15 @@ jobs:
     needs: [resolve, package]
     if: needs.resolve.result == 'success' && needs.package.result == 'success'
     continue-on-error: true
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 15
     permissions:
       actions: read
     steps:
+      - name: Install AWS CLI
+        uses: ./.github/actions/setup-self-hosted
+        with:
+          profile: awscli
       - name: Download package artifacts
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
@@ -512,7 +535,7 @@ jobs:
     name: Summary
     needs: [resolve, package, publish-github, publish-r2]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
     timeout-minutes: 5
     permissions:
       contents: read
