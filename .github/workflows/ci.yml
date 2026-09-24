@@ -1,22 +1,43 @@
 name: CI
 
+# Linux jobs run on the org's self-hosted runners (sm-standard-2 / sm-standard-4).
+# cargo-deny-action is a container action, so Dependency Advisories uses the
+# Docker-capable dind-sm-standard-2 label.
+#
+# The org has no self-hosted macOS or Windows runners. Those lanes execute
+# `cargo test` / `cargo build` on the host OS; cross-compiling them on Linux
+# would not run the tests and would not exercise the same linker. They stay on
+# GitHub-hosted runners and are limited to workflow_dispatch.
+
 on:
   push:
     branches: [ main, develop ]
   pull_request:
     branches: [ main, develop ]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Self-hosted runner images may still bundle an older Node than current
+  # JavaScript actions require.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 permissions:
   contents: read
 
+# Cancel superseded PR runs. Push, schedule, and manual dispatch are left
+# running so a new commit on a PR cannot abort a main or release-related run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   advisories:
     name: Dependency Advisories
-    runs-on: ubuntu-latest
+    # Container action: the runner must have a Docker daemon. sm-standard-* does not.
+    runs-on: dind-sm-standard-2
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
       - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2
@@ -25,9 +46,15 @@ jobs:
 
   fmt:
     name: Format Check
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - name: Install host tools
+        uses: ./.github/actions/setup-self-hosted
+        with:
+          # rustup is fetched with curl. cargo fmt does not link.
+          profile: curl
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           components: rustfmt
@@ -36,9 +63,14 @@ jobs:
 
   clippy:
     name: Clippy
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-4
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - name: Install host tools
+        uses: ./.github/actions/setup-self-hosted
+        with:
+          profile: rust-build
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           components: clippy
@@ -47,14 +79,37 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
-    name: Test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    name: Test (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    # manual_only lanes are GitHub-hosted and must not run on push or pull_request.
+    # Compared as a string: a boolean false in a matrix is easy to misread as the
+    # truthy string "false" once it crosses an expression boundary.
+    if: ${{ matrix.manual_only != 'yes' || github.event_name == 'workflow_dispatch' }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ ubuntu-latest, macos-latest, windows-latest ]
+        include:
+          - name: linux
+            runner: sm-standard-4
+            manual_only: "no"
+          - name: macos-latest, manual
+            runner: macos-latest
+            manual_only: "yes"
+          - name: windows-latest, manual
+            runner: windows-latest
+            manual_only: "yes"
     steps:
+      - name: Flag billed GitHub-hosted runner
+        if: matrix.manual_only == 'yes'
+        shell: bash
+        run: echo "::warning title=GitHub-hosted runner::Manual dispatch only. This job uses billed ${{ matrix.runner }} because the org has no self-hosted macOS or Windows runners. It does not run on push, pull_request, or schedule."
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - name: Install host tools
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/setup-self-hosted
+        with:
+          profile: rust-build
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Run tests
@@ -63,14 +118,34 @@ jobs:
         run: cargo test --workspace
 
   build:
-    name: Build (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    name: Build (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    if: ${{ matrix.manual_only != 'yes' || github.event_name == 'workflow_dispatch' }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ ubuntu-latest, macos-latest, windows-latest ]
+        include:
+          - name: linux
+            runner: sm-standard-4
+            manual_only: "no"
+          - name: macos-latest, manual
+            runner: macos-latest
+            manual_only: "yes"
+          - name: windows-latest, manual
+            runner: windows-latest
+            manual_only: "yes"
     steps:
+      - name: Flag billed GitHub-hosted runner
+        if: matrix.manual_only == 'yes'
+        shell: bash
+        run: echo "::warning title=GitHub-hosted runner::Manual dispatch only. This job uses billed ${{ matrix.runner }} because the org has no self-hosted macOS or Windows runners. It does not run on push, pull_request, or schedule."
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - name: Install host tools
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/setup-self-hosted
+        with:
+          profile: rust-build
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Build
@@ -78,9 +153,14 @@ jobs:
 
   doc:
     name: Documentation
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-4
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - name: Install host tools
+        uses: ./.github/actions/setup-self-hosted
+        with:
+          profile: rust-build
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Build documentation
@@ -91,7 +171,8 @@ jobs:
   # Ensure protected files are not modified without proper process
   protected-files:
     name: Protected Files Check
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
+    timeout-minutes: 10
     if: github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -104,9 +185,14 @@ jobs:
 
   msrv:
     name: Minimum Supported Rust Version
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-4
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - name: Install host tools
+        uses: ./.github/actions/setup-self-hosted
+        with:
+          profile: rust-build
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
         with:
           toolchain: "1.92"

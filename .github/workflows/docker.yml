@@ -14,10 +14,20 @@ on:
 permissions:
   contents: read
 
+# workflow_run is an automatic trigger, so this job cannot use a GitHub-hosted
+# runner. Image builds need a Docker daemon, which only the dind label provides.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.workflow_run.head_sha || github.sha }}
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   build-and-push:
     if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
-    runs-on: ubuntu-latest
+    runs-on: dind-sm-standard-2
+    timeout-minutes: 60
 
     steps:
       - name: Checkout code

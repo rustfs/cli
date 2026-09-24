@@ -13,15 +13,24 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Self-hosted runner images may still bundle an older Node than current
+  # JavaScript actions require.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 permissions:
   contents: read
+
+# Do not cancel an in-progress release. A second run for the same ref waits.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   # Build strategy check - determine build type and version
   build-check:
     name: Build Strategy Check
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-2
+    timeout-minutes: 15
     permissions:
       contents: read
     outputs:
@@ -106,12 +115,17 @@ jobs:
   verify:
     name: Release Verification
     needs: build-check
-    runs-on: ubuntu-latest
+    runs-on: sm-standard-4
+    timeout-minutes: 90
     steps:
       - name: Checkout repository
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           ref: ${{ needs.build-check.outputs.source_ref }}
+      - name: Install host tools
+        uses: ./.github/actions/setup-self-hosted
+        with:
+          profile: rust-build
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
@@ -124,75 +138,89 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Run tests
         run: cargo test --workspace --locked
-      - name: Check dependency advisories
-        uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2
-        with:
-          command: check advisories
 
-  build:
-    name: Build (${{ matrix.os_name }}-${{ matrix.arch }})
-    needs: [build-check, verify]
-    runs-on: ${{ matrix.os }}
-    permissions:
-      contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # Linux
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            os_name: linux
-            arch: amd64-gnu
-            artifact_name: rc
-            cross: false
-
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            os_name: linux
-            arch: arm64-gnu
-            artifact_name: rc
-            cross: true
-
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            os_name: linux
-            arch: amd64
-            artifact_name: rc
-            cross: false
-
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-musl
-            os_name: linux
-            arch: arm64
-            artifact_name: rc
-            cross: true
-
-          # macOS (both targets built on ARM64 runner with cross-compilation)
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            os_name: macos
-            arch: amd64
-            artifact_name: rc
-
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            os_name: macos
-            arch: arm64
-            artifact_name: rc
-
-          # Windows
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            os_name: windows
-            arch: amd64
-            artifact_name: rc.exe
-
+  # cargo-deny-action is a container action. Kept as its own job so the
+  # compile/test lane can stay on sm-standard-4, which has no Docker daemon.
+  release-advisories:
+    name: Release Advisories
+    needs: build-check
+    runs-on: dind-sm-standard-2
+    timeout-minutes: 20
     steps:
       - name: Checkout repository
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           ref: ${{ needs.build-check.outputs.source_ref }}
+      - name: Check dependency advisories
+        uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2
+        with:
+          command: check advisories
+
+  # macOS and Windows release binaries are not cross-compiled. apple-darwin
+  # needs the Apple SDK, and the published Windows artifact is
+  # x86_64-pc-windows-msvc (the MSVC linker), which the Linux images do not
+  # have. A gnu or zig cross build would ship a different binary. Those
+  # targets are included only for workflow_dispatch, on GitHub-hosted runners.
+  prepare-build-matrix:
+    name: Select Build Targets
+    runs-on: sm-standard-2
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
+    steps:
+      - name: Select targets
+        id: select
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+
+          linux='{"os":"sm-standard-4","target":"x86_64-unknown-linux-gnu","os_name":"linux","arch":"amd64-gnu","artifact_name":"rc","cross":false,"manual_hosted":false},{"os":"dind-sm-standard-2","target":"aarch64-unknown-linux-gnu","os_name":"linux","arch":"arm64-gnu","artifact_name":"rc","cross":true,"manual_hosted":false},{"os":"sm-standard-4","target":"x86_64-unknown-linux-musl","os_name":"linux","arch":"amd64","artifact_name":"rc","cross":false,"manual_hosted":false},{"os":"dind-sm-standard-2","target":"aarch64-unknown-linux-musl","os_name":"linux","arch":"arm64","artifact_name":"rc","cross":true,"manual_hosted":false}'
+
+          hosted='{"os":"macos-latest","target":"x86_64-apple-darwin","os_name":"macos","arch":"amd64","artifact_name":"rc","cross":false,"manual_hosted":true},{"os":"macos-latest","target":"aarch64-apple-darwin","os_name":"macos","arch":"arm64","artifact_name":"rc","cross":false,"manual_hosted":true},{"os":"windows-latest","target":"x86_64-pc-windows-msvc","os_name":"windows","arch":"amd64","artifact_name":"rc.exe","cross":false,"manual_hosted":true}'
+
+          if [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
+            include="${linux},${hosted}"
+            echo "Including billed GitHub-hosted macOS and Windows targets because this run was dispatched manually."
+          else
+            include="${linux}"
+            echo "Automatic run: Linux self-hosted targets only. macOS and Windows stay on workflow_dispatch."
+          fi
+
+          {
+            echo "matrix<<EOF"
+            echo "{\"include\":[${include}]}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build (${{ matrix.os_name }}-${{ matrix.arch }})
+    needs: [build-check, verify, release-advisories, prepare-build-matrix]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare-build-matrix.outputs.matrix) }}
+    steps:
+      - name: Flag billed GitHub-hosted runner
+        if: matrix.manual_hosted == true
+        shell: bash
+        run: echo "::warning title=GitHub-hosted runner::Manual dispatch only. This ${{ matrix.os_name }} target uses billed ${{ matrix.os }} because the org has no self-hosted macOS or Windows runners. Tag pushes do not build it."
+
+      - name: Checkout repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ needs.build-check.outputs.source_ref }}
+
+      - name: Install host tools
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/setup-self-hosted
+        with:
+          # shasum is used when packaging Unix release archives.
+          profile: rust-build archive-tools
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
@@ -292,6 +320,14 @@ jobs:
           path: artifacts/*
           if-no-files-found: error
 
+      # GitHub-hosted images ship AWS CLI v2. The apt awscli package is v1 and
+      # does not honor the checksum settings these uploads rely on.
+      - name: Install AWS CLI
+        if: needs.build-check.outputs.is_release == 'true' && runner.os == 'Linux'
+        uses: ./.github/actions/setup-self-hosted
+        with:
+          profile: awscli
+
       # Upload to Cloudflare R2
       - name: Upload to Cloudflare R2
         if: needs.build-check.outputs.is_release == 'true'
@@ -334,13 +370,19 @@ jobs:
   # Generate shell completions
   completions:
     name: Generate Shell Completions
-    needs: [build-check, verify]
-    runs-on: ubuntu-latest
+    needs: [build-check, verify, release-advisories]
+    runs-on: sm-standard-4
+    timeout-minutes: 60
     steps:
       - name: Checkout repository
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           ref: ${{ needs.build-check.outputs.source_ref }}
+
+      - name: Install host tools
+        uses: ./.github/actions/setup-self-hosted
+        with:
+          profile: rust-build
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
@@ -370,12 +412,17 @@ jobs:
   # Upload release assets to GitHub Release
   upload-release-assets:
     name: Upload Release Assets
-    needs: [ build-check, build, completions ]
-    runs-on: ubuntu-latest
+    needs: [ build-check, verify, release-advisories, build, completions ]
+    runs-on: sm-standard-2
+    timeout-minutes: 20
     if: needs.build-check.outputs.is_release == 'true'
     permissions:
       contents: write
     steps:
+      - name: Install AWS CLI
+        uses: ./.github/actions/setup-self-hosted
+        with:
+          profile: awscli
       - name: Download all artifacts
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
@@ -481,6 +528,7 @@ jobs:
   package-deb-rpm:
     name: Package DEB/RPM
     needs: [build-check, upload-release-assets]
+    timeout-minutes: 90
     if: needs.build-check.outputs.is_release == 'true'
     uses: ./.github/workflows/package.yml
     with:
@@ -495,8 +543,9 @@ jobs:
   # Publish to crates.io
   publish-crates:
     name: Publish to crates.io
-    needs: [build-check, verify, build]
-    runs-on: ubuntu-latest
+    needs: [build-check, verify, release-advisories, build]
+    runs-on: sm-standard-4
+    timeout-minutes: 90
     if: needs.build-check.outputs.is_release == 'true' && needs.build-check.outputs.has_token == 'true'
     env:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
@@ -505,6 +554,11 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           ref: ${{ needs.build-check.outputs.source_ref }}
+
+      - name: Install host tools
+        uses: ./.github/actions/setup-self-hosted
+        with:
+          profile: rust-build
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
