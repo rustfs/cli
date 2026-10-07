@@ -7974,6 +7974,29 @@ mod tests {
     }
 
     #[test]
+    fn test_unknown_background_heal_states_ignore_stale_legacy_activity() {
+        for state in [HealRuntimeState::Degraded, HealRuntimeState::Unknown] {
+            let status = HealStatus::from(BackgroundHealStatusResponse {
+                state: Some(state),
+                cluster_status_complete: None,
+                coverage: None,
+                bitrot_start_time: Some("2026-04-19T10:00:00Z".to_string()),
+                bitrot_start_cycle: 42,
+                current_scan_mode: Some(2),
+                heal_queue_length: 0,
+                heal_active_tasks: 0,
+                heal_operations: None,
+                progress: None,
+            });
+
+            assert!(!status.healing, "{state:?} must not trust stale scan data");
+            assert_eq!(status.state, Some(state));
+            assert_eq!(status.started.as_deref(), Some("2026-04-19T10:00:00Z"));
+            assert_eq!(status.scan_mode, Some(HealScanMode::Deep));
+        }
+    }
+
+    #[test]
     fn test_background_heal_status_response_maps_nested_heal_operations() {
         let response: BackgroundHealStatusResponse = serde_json::from_str(
             r#"{"healOperations":{"queueLength":4,"activeTasks":1,"queuedBySource":{"admin":4}}}"#,
