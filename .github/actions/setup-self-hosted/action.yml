@@ -1,0 +1,144 @@
+name: Setup self-hosted Linux runner
+description: >-
+  Install host tools that GitHub-hosted Ubuntu images include and the org
+  sm-standard runner images do not. Rust still invokes the system linker, and
+  aws-lc-sys (pulled in by the AWS SDK) builds with CMake. Docker is not
+  installed here: jobs that need a daemon use the dind-sm-standard-2 label.
+
+inputs:
+  profile:
+    description: >-
+      Space-separated profiles: rust-build, python, openssl, curl, file,
+      archive-tools, github-cli, awscli.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Install host tools
+      shell: bash
+      env:
+        PROFILE: ${{ inputs.profile }}
+      run: |
+        set -euo pipefail
+
+        if ! command -v sudo >/dev/null 2>&1; then
+          echo "sudo is required to install host packages on the self-hosted runner" >&2
+          exit 1
+        fi
+
+        if [[ -z "${PROFILE// /}" ]]; then
+          echo "setup-self-hosted requires a profile" >&2
+          exit 1
+        fi
+
+        has() {
+          [[ " ${PROFILE} " == *" $1 "* ]]
+        }
+
+        for token in ${PROFILE}; do
+          case "${token}" in
+            rust-build|python|openssl|curl|file|archive-tools|github-cli|awscli) ;;
+            *)
+              echo "Unknown setup profile: ${token}" >&2
+              exit 1
+              ;;
+          esac
+        done
+
+        packages=()
+        add_pkg() {
+          local pkg="$1"
+          local existing
+          if ((${#packages[@]} > 0)); then
+            for existing in "${packages[@]}"; do
+              if [[ "${existing}" == "${pkg}" ]]; then
+                return
+              fi
+            done
+          fi
+          packages+=("${pkg}")
+        }
+
+        # curl and CA certificates are how rustup and the GitHub CLI apt repo
+        # are fetched. GitHub-hosted images already have both.
+        if has rust-build || has curl || has github-cli; then
+          add_pkg ca-certificates
+          add_pkg curl
+        fi
+
+        # sm-standard images ship no C toolchain. rustc needs cc, and
+        # aws-lc-sys builds its C library with CMake. libssl-dev matches the
+        # org's other self-hosted lanes (git2/openssl build scripts).
+        if has rust-build; then
+          add_pkg build-essential
+          add_pkg cmake
+          add_pkg pkg-config
+          add_pkg libssl-dev
+          add_pkg perl
+          add_pkg git
+        fi
+
+        if has python; then
+          add_pkg python3
+        fi
+
+        if has openssl; then
+          add_pkg openssl
+        fi
+
+        # `file` is preinstalled on GitHub-hosted Ubuntu and is how the
+        # package job checks that release binaries are statically linked.
+        if has file; then
+          add_pkg file
+        fi
+
+        # Release archives are checksummed with shasum, which GitHub-hosted
+        # images provide via Perl. coreutils sha256sum is not a drop-in: the
+        # existing release script calls shasum.
+        if has archive-tools; then
+          add_pkg libdigest-sha-perl
+        fi
+
+        # Official AWS CLI v2, matching GitHub-hosted images. The Ubuntu awscli
+        # apt package is v1 and ignores AWS_REQUEST_CHECKSUM_CALCULATION, which
+        # the R2 upload steps set for CLI v2.23+.
+        if has awscli && ! command -v aws >/dev/null 2>&1; then
+          add_pkg ca-certificates
+          add_pkg curl
+          add_pkg unzip
+        fi
+
+        if ((${#packages[@]} > 0)); then
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}"
+        fi
+
+        if has awscli && ! command -v aws >/dev/null 2>&1; then
+          case "$(dpkg --print-architecture)" in
+            amd64) aws_url="https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" ;;
+            arm64) aws_url="https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip" ;;
+            *)
+              echo "No AWS CLI v2 build for $(dpkg --print-architecture)" >&2
+              exit 1
+              ;;
+          esac
+          aws_tmp="$(mktemp -d)"
+          curl -fsSL "${aws_url}" -o "${aws_tmp}/awscliv2.zip"
+          unzip -q "${aws_tmp}/awscliv2.zip" -d "${aws_tmp}"
+          sudo "${aws_tmp}/aws/install"
+          rm -rf "${aws_tmp}"
+        fi
+
+        if has github-cli && ! command -v gh >/dev/null 2>&1; then
+          # Ubuntu's own gh package is not always present on the minimal
+          # runner image. Use the upstream GitHub CLI apt repository.
+          sudo mkdir -p -m 755 /etc/apt/keyrings
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+            | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg >/dev/null
+          sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+            | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y gh
+        fi
