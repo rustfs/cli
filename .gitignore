@@ -27,3 +27,7 @@ coverage/
 # Cargo lock for library crates (keep for binary)
 # Cargo.lock
 CLAUDE.md
+
+# The independent opt-in build owns its artifacts and lockfile.
+/rdma/target/
+/rdma/Cargo.lock
