@@ -6,6 +6,7 @@
 
 pub mod admin;
 pub mod client;
+pub mod data_transport;
 mod lifecycle_xml;
 pub mod multipart;
 mod ops;

@@ -862,6 +862,9 @@ fn bucket_delete_message(error: &Error, bucket: &str) -> String {
 
 fn exit_code_for_error(error: &Error) -> ExitCode {
     match error {
+        Error::DataTransfer { .. } => {
+            ExitCode::from_i32(error.exit_code()).unwrap_or(ExitCode::GeneralError)
+        }
         Error::InvalidPath(_) | Error::Config(_) => ExitCode::UsageError,
         Error::Network(_) => ExitCode::NetworkError,
         Error::Auth(_) => ExitCode::AuthError,
