@@ -36,6 +36,16 @@ fn build_env_filter(debug: bool, env_is_set: bool) -> EnvFilter {
 
 /// Run the shared CLI launcher, preserving its worker-thread and exit behavior.
 pub fn run() {
+    run_with_shutdown(|| async {});
+}
+
+/// Runs host cleanup after the command while its async runtime is still available.
+/// The host bounds its own cleanup and reports retained resources as appropriate.
+pub fn run_with_shutdown<S, F>(shutdown: S)
+where
+    S: FnOnce() -> F + Send + 'static,
+    F: Future<Output = ()> + 'static,
+{
     let cli = Cli::parse();
     let env_is_set = std::env::var_os(EnvFilter::DEFAULT_ENV).is_some();
     let env_filter = build_env_filter(cli.debug, env_is_set);
@@ -46,7 +56,7 @@ pub fn run() {
         .with(env_filter)
         .init();
 
-    let exit_code = match run_command(cli) {
+    let exit_code = match run_command(cli, shutdown) {
         Ok(exit_code) => exit_code,
         Err(error) => {
             eprintln!("{error}");
@@ -57,8 +67,30 @@ pub fn run() {
     std::process::exit(exit_code.as_i32());
 }
 
-fn run_command(cli: Cli) -> Result<ExitCode, LauncherError> {
-    run_async_command(move || commands::execute(cli), command_runtime)
+fn run_command<S, F>(cli: Cli, shutdown: S) -> Result<ExitCode, LauncherError>
+where
+    S: FnOnce() -> F + Send + 'static,
+    F: Future<Output = ()> + 'static,
+{
+    run_async_command(
+        move || finish_with_shutdown(commands::execute(cli), shutdown),
+        command_runtime,
+    )
+}
+
+fn finish_with_shutdown<C, S, F>(command: C, shutdown: S) -> impl Future<Output = C::Output>
+where
+    C: Future,
+    S: FnOnce() -> F,
+    F: Future<Output = ()>,
+{
+    // Keep the cleanup future small even when an SDK command has a large state.
+    let command = Box::pin(command);
+    async move {
+        let output = command.await;
+        shutdown().await;
+        output
+    }
 }
 
 fn command_runtime() -> std::io::Result<tokio::runtime::Runtime> {
@@ -135,6 +167,37 @@ mod tests {
     }
 
     #[test]
+    fn host_cleanup_runs_after_a_failed_command_before_runtime_shutdown() {
+        let state = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&state);
+        let exit_code = run_async_command(
+            move || {
+                let shutdown_state = Arc::clone(&state);
+                finish_with_shutdown(
+                    async move {
+                        state.store(1, Ordering::Release);
+                        ExitCode::GeneralError
+                    },
+                    move || async move {
+                        assert_eq!(shutdown_state.load(Ordering::Acquire), 1);
+                        assert_eq!(std::thread::current().name(), Some(COMMAND_THREAD_NAME));
+                        tokio::spawn(async move {
+                            tokio::task::yield_now().await;
+                            shutdown_state.store(2, Ordering::Release);
+                        })
+                        .await
+                        .expect("cleanup task completes in the command runtime");
+                    },
+                )
+            },
+            test_runtime,
+        )
+        .expect("host cleanup completes");
+        assert_eq!(exit_code, ExitCode::GeneralError);
+        assert_eq!(observed.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
     fn command_launcher_uses_the_named_worker_thread() {
         let thread_name = run_async_command(
             || async { std::thread::current().name().map(str::to_string) },
@@ -158,8 +221,11 @@ mod tests {
             usize::from(payload[0]) + usize::from(payload[LARGE_FUTURE_SIZE - 1])
         }
 
-        let result = run_async_command(large_future, test_runtime)
-            .expect("large command future should complete on the sized worker stack");
+        let result = run_async_command(
+            || finish_with_shutdown(large_future(), || async {}),
+            test_runtime,
+        )
+        .expect("large command future should complete on the sized worker stack");
 
         assert_eq!(result, 14);
     }

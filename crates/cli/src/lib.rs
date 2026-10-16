@@ -6,7 +6,7 @@ pub mod commands;
 pub(crate) mod confirm;
 pub mod exit_code;
 mod launcher;
-pub use launcher::run;
+pub use launcher::{run, run_with_shutdown};
 pub mod output;
 pub(crate) mod private_file;
 pub(crate) mod secret_input;
