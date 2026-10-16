@@ -20,8 +20,13 @@ git submodule update --init vendor/rustfs-ucx
 The equivalent Cargo command is:
 
 ```sh
+source vendor/rustfs-ucx/scripts/build-env.sh
+cp -n Cargo.lock rdma/Cargo.lock
 cargo +1.98.1 build --manifest-path rdma/Cargo.toml --features rdma --release -j 2
 ```
+
+The helper seeds a missing opt-in lockfile from the reviewed public CLI lockfile.
+Cargo then adds private dependencies; an existing opt-in lockfile is preserved.
 
 The default output is `rdma/target/release/rc`. `RUSTFS_RDMA_TOOLCHAIN` selects
 another installed toolchain satisfying the private dependency's MSRV, and
