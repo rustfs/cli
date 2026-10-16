@@ -23,7 +23,7 @@ class RdmaBuildTests(unittest.TestCase):
         fake_bin = self.root / "bin"
         fake_bin.mkdir()
         cargo = fake_bin / "cargo"
-        cargo.write_text("#!/bin/sh\nprintf '%s\\n' \"$@\"\n")
+        cargo.write_text("#!/bin/sh\n[ \"${RUSTFS_PRIVATE_BUILD_PROBE:-}\" = enabled ] || exit 7\nprintf '%s\\n' \"$@\"\n")
         cargo.chmod(0o755)
         self.env["PATH"] = str(fake_bin) + os.pathsep + self.env["PATH"]
 
@@ -39,6 +39,8 @@ class RdmaBuildTests(unittest.TestCase):
         entry.parent.mkdir(parents=True)
         entry.write_text("// Fixture: only the build preflight reads this path.\n")
         (entry.parent / "lib.rs").touch()
+        (private / "scripts").mkdir()
+        (private / "scripts/build-env.sh").write_text("export RUSTFS_PRIVATE_BUILD_PROBE=enabled\n")
 
     def test_missing_private_source_fails_before_cargo(self):
         result = self.run_build()
@@ -58,6 +60,13 @@ class RdmaBuildTests(unittest.TestCase):
     def test_entry_without_manifest_is_rejected(self):
         self.prepare_private()
         (self.root / "vendor/rustfs-ucx/Cargo.toml").unlink()
+        result = self.run_build()
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+
+    def test_missing_private_build_environment_is_rejected(self):
+        self.prepare_private()
+        (self.root / "vendor/rustfs-ucx/scripts/build-env.sh").unlink()
         result = self.run_build()
         self.assertEqual(result.returncode, 2)
         self.assertEqual(result.stdout, "")

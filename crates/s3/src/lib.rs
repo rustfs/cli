@@ -10,6 +10,7 @@ pub mod data_transport;
 mod lifecycle_xml;
 pub mod multipart;
 mod ops;
+mod payload_checksum;
 mod select;
 mod watch;
 

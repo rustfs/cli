@@ -11,7 +11,7 @@ resolver = "3"
 
 [features]
 default = []
-rdma = ["rustfs-ucx/object"]
+rdma = ["rustfs-ucx/object", "rustfs-ucx/native"]
 
 [lib]
 path = "../vendor/rustfs-ucx/integrations/cli/src/lib.rs"
@@ -27,7 +27,10 @@ rc-core = { path = "../crates/core" }
 rc-s3 = { path = "../crates/s3" }
 rustfs-ucx = { path = "../vendor/rustfs-ucx", default-features = false }
 async-trait = "0.1"
+base64 = "0.22"
 bytes = "1"
 http = "1"
+md-5 = "0.10"
 thiserror = "2"
-tokio = { version = "1", features = ["io-util", "rt", "sync", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "rt", "sync", "time"] }
+zeroize = "1"
