@@ -18,6 +18,8 @@ use rc_core::{
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+pub use crate::payload_checksum::{PayloadChecksumStatus, PayloadChecksumVerifier};
+
 /// A bounded signed control exchange. It is executed once without HTTP retries.
 pub struct ControlRequest {
     pub method: Method,
@@ -25,7 +27,20 @@ pub struct ControlRequest {
     pub query: Vec<(String, String)>,
     pub headers: HeaderMap,
     pub body: Bytes,
+    pub payload: ControlPayload,
     pub response_limit: usize,
+}
+
+/// Signing policy for a bounded control body or separately delivered payload.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ControlPayload {
+    /// Sign the exact HTTPS control body with SHA256.
+    #[default]
+    Body,
+    /// Use S3 UNSIGNED-PAYLOAD for a logical payload delivered by the provider.
+    /// The HTTPS request body must be empty; logical integrity is verified by
+    /// the provider and the authenticated S3 operation before publication.
+    External { deadline: std::time::Instant },
 }
 
 /// Uninterpreted control response; duplicate and binary headers are preserved.

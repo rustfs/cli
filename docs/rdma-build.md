@@ -41,8 +41,20 @@ file publication and retry decisions. `rc-s3::data_transport` exposes the typed
 provider and bounded signed-control interfaces. Transport implementation source
 is compiled from the private submodule.
 
-The current provider reports a typed pre-admission unavailability error because
-the data engine is not connected. HTTP remains the default. Automatic selection
-may use HTTP only before any request is accepted or supplied IO is polled;
-explicit RDMA selection reports the error. Successful port tests do not establish
-device transfer, an operational S3 extension or a throughput result.
+The private provider discovers a matching gateway through a signed HTTPS HEAD
+request before allocating transport resources or submitting an object write.
+An endpoint which does not advertise the supported protocol version receives no
+external-payload write. The provider then coordinates one signed S3 operation,
+its external data, and its verified final result.
+
+Automatic selection may use HTTP only before the data operation is accepted or
+supplied IO is polled. Explicit RDMA selection reports unavailable capability.
+An unknown upload outcome cannot trigger a generic business retry. Multipart
+creation, completion, and abort retain their existing S3 HTTPS implementation.
+
+The optional executable also defaults to HTTP. Use `--data-transport rdma` to
+require the provider, or `--data-transport auto` to allow pre-admission fallback.
+`RUSTFS_RDMA_OPERATION_TIMEOUT_SECONDS` sets the finite external operation
+deadline, with a default of 3600 seconds. The private repository documents its
+platform and runtime installation requirements. Successful interface tests do
+not establish hardware throughput or latency.

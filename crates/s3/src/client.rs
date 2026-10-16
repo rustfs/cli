@@ -62,9 +62,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::data_transport::{
-    self, ControlExecutor, ControlRequest, ControlResponse, DataTransportContext, DownloadRequest,
-    ObjectDataTransport, ObservedReader, ObservedWriter, UploadOperation, UploadRequest,
-    UploadResult, WriteCondition,
+    self, ControlExecutor, ControlPayload, ControlRequest, ControlResponse, DataTransportContext,
+    DownloadRequest, ObjectDataTransport, ObservedReader, ObservedWriter, UploadOperation,
+    UploadRequest, UploadResult, WriteCondition,
 };
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWrite;
@@ -218,6 +218,25 @@ async fn build_reqwest_client(
     client_key: Option<&str>,
     timeout: Option<&rc_core::alias::TimeoutConfig>,
 ) -> Result<reqwest::Client> {
+    build_reqwest_client_with_read_policy(
+        insecure,
+        ca_bundle,
+        client_cert,
+        client_key,
+        timeout,
+        true,
+    )
+    .await
+}
+
+async fn build_reqwest_client_with_read_policy(
+    insecure: bool,
+    ca_bundle: Option<&str>,
+    client_cert: Option<&str>,
+    client_key: Option<&str>,
+    timeout: Option<&rc_core::alias::TimeoutConfig>,
+    apply_read_timeout: bool,
+) -> Result<reqwest::Client> {
     // NOTE: When `insecure = true`, `danger_accept_invalid_certs` disables all TLS
     // certificate verification. Any CA bundle provided will still be added to the
     // trust store but is rendered ineffective for this connection.
@@ -226,9 +245,10 @@ async fn build_reqwest_client(
         .redirect(reqwest::redirect::Policy::none());
 
     if let Some(timeout) = timeout {
-        builder = builder
-            .connect_timeout(Duration::from_millis(timeout.connect_ms))
-            .read_timeout(Duration::from_millis(timeout.read_ms));
+        builder = builder.connect_timeout(Duration::from_millis(timeout.connect_ms));
+        if apply_read_timeout {
+            builder = builder.read_timeout(Duration::from_millis(timeout.read_ms));
+        }
     }
 
     if let Some(bundle_path) = ca_bundle {
@@ -1662,6 +1682,7 @@ pub struct S3Client {
     inner: aws_sdk_s3::Client,
     presign_inner: aws_sdk_s3::Client,
     xml_http_client: reqwest::Client,
+    external_http_client: Arc<tokio::sync::OnceCell<reqwest::Client>>,
     alias: Alias,
     request_headers: Vec<RequestHeader>,
     data_transport_mode: rc_core::DataTransportMode,
@@ -1785,6 +1806,7 @@ impl S3Client {
             inner: client,
             presign_inner: presign_client,
             xml_http_client,
+            external_http_client: Arc::new(tokio::sync::OnceCell::new()),
             alias,
             request_headers,
             data_transport_mode: rc_core::global_data_transport_mode(),
@@ -3621,17 +3643,21 @@ impl S3Client {
         url: &str,
         headers: &HeaderMap,
         body: &[u8],
+        payload: ControlPayload,
         time: std::time::SystemTime,
     ) -> Result<HeaderMap> {
         let mut settings = SigningSettings::default();
         settings.percent_encoding_mode = PercentEncodingMode::Single;
         settings.uri_path_normalization_mode = UriPathNormalizationMode::Disabled;
         settings.payload_checksum_kind = PayloadChecksumKind::XAmzSha256;
-        self.sign_request_with_settings(
+        self.sign_request_with_body(
             method,
             url,
             headers,
-            body,
+            match payload {
+                ControlPayload::Body => SignableBody::Bytes(body),
+                ControlPayload::External { .. } => SignableBody::UnsignedPayload,
+            },
             RequestSigningOptions {
                 region: &self.alias.region,
                 settings,
@@ -3647,6 +3673,18 @@ impl S3Client {
         url: &str,
         headers: &HeaderMap,
         body: &[u8],
+        options: RequestSigningOptions<'_>,
+    ) -> Result<HeaderMap> {
+        self.sign_request_with_body(method, url, headers, SignableBody::Bytes(body), options)
+            .await
+    }
+
+    async fn sign_request_with_body(
+        &self,
+        method: &Method,
+        url: &str,
+        headers: &HeaderMap,
+        body: SignableBody<'_>,
         options: RequestSigningOptions<'_>,
     ) -> Result<HeaderMap> {
         if self.alias.anonymous {
@@ -3679,13 +3717,9 @@ impl S3Client {
             .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.as_str(), v)))
             .collect();
 
-        let signable_request = SignableRequest::new(
-            method.as_str(),
-            url,
-            header_pairs.into_iter(),
-            SignableBody::Bytes(body),
-        )
-        .map_err(|e| Error::Auth(format!("Failed to create signable request: {e}")))?;
+        let signable_request =
+            SignableRequest::new(method.as_str(), url, header_pairs.into_iter(), body)
+                .map_err(|e| Error::Auth(format!("Failed to create signable request: {e}")))?;
 
         let (signing_instructions, _) = sign(signable_request, &signing_params.into())
             .map_err(|e| Error::Auth(format!("Failed to sign request: {e}")))?
@@ -7344,6 +7378,22 @@ impl ControlExecutor for S3Client {
                 "Control envelope exceeds the bounded exchange policy".to_string(),
             ));
         }
+        if matches!(request.payload, ControlPayload::External { .. }) && !request.body.is_empty() {
+            return Err(Error::RequestRejected(
+                "An external payload control request must have an empty HTTPS body".to_string(),
+            ));
+        }
+        let operation_deadline = match request.payload {
+            ControlPayload::Body => None,
+            ControlPayload::External { deadline } => {
+                if deadline <= std::time::Instant::now() {
+                    return Err(Error::RequestRejected(
+                        "The external control operation deadline has elapsed".to_string(),
+                    ));
+                }
+                Some(deadline)
+            }
+        };
         let url = self.external_control_url(&request.path, &request.query)?;
         let mut headers = request.headers;
         for name in [
@@ -7381,8 +7431,11 @@ impl ControlExecutor for S3Client {
         );
         headers.insert(
             "x-amz-content-sha256",
-            HeaderValue::from_str(&Self::sha256_hash(&request.body))
-                .map_err(|_| Error::RequestRejected("Invalid payload digest".to_string()))?,
+            HeaderValue::from_str(&match request.payload {
+                ControlPayload::Body => Self::sha256_hash(&request.body),
+                ControlPayload::External { .. } => "UNSIGNED-PAYLOAD".to_string(),
+            })
+            .map_err(|_| Error::RequestRejected("Invalid payload digest".to_string()))?,
         );
         if headers.values().any(|value| value.to_str().is_err()) {
             return Err(Error::RequestRejected(
@@ -7395,14 +7448,43 @@ impl ControlExecutor for S3Client {
                 url.as_str(),
                 &headers,
                 &request.body,
+                request.payload,
                 std::time::SystemTime::now(),
             )
             .await?;
-        let response = self
-            .xml_http_client
+        let client = if operation_deadline.is_some() {
+            self.external_http_client
+                .get_or_try_init(|| async {
+                    build_reqwest_client_with_read_policy(
+                        self.alias.insecure,
+                        self.alias.ca_bundle.as_deref(),
+                        self.alias.client_cert.as_deref(),
+                        self.alias.client_key.as_deref(),
+                        self.alias.timeout.as_ref(),
+                        false,
+                    )
+                    .await
+                })
+                .await?
+        } else {
+            &self.xml_http_client
+        };
+        let mut outgoing = client
             .request(request.method, url)
             .headers(signed)
-            .body(request.body)
+            .body(request.body);
+        if let Some(deadline) = operation_deadline {
+            let remaining = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or_else(|| {
+                    Error::RequestRejected(
+                        "The external control operation deadline has elapsed".to_string(),
+                    )
+                })?;
+            outgoing = outgoing.timeout(remaining);
+        }
+        let response = outgoing
             .send()
             .await
             .map_err(|_| Error::Network("External control exchange failed".to_string()))?;
@@ -7522,6 +7604,7 @@ mod tests {
             inner: aws_sdk_s3::Client::from_conf(config),
             presign_inner: aws_sdk_s3::Client::from_conf(presign_config),
             xml_http_client,
+            external_http_client: Arc::new(tokio::sync::OnceCell::new()),
             alias,
             request_headers,
             data_transport_mode: rc_core::DataTransportMode::Http,
@@ -7580,6 +7663,7 @@ mod tests {
             inner: aws_sdk_s3::Client::from_conf(config),
             presign_inner: aws_sdk_s3::Client::from_conf(presign_config),
             xml_http_client: reqwest::Client::new(),
+            external_http_client: Arc::new(tokio::sync::OnceCell::new()),
             alias,
             request_headers,
             data_transport_mode: rc_core::DataTransportMode::Http,
@@ -7711,6 +7795,7 @@ mod tests {
             inner: aws_sdk_s3::Client::from_conf(config.clone()),
             presign_inner: aws_sdk_s3::Client::from_conf(config),
             xml_http_client: reqwest::Client::new(),
+            external_http_client: Arc::new(tokio::sync::OnceCell::new()),
             alias,
             request_headers: Vec::new(),
             data_transport_mode: rc_core::DataTransportMode::Http,
@@ -14529,6 +14614,7 @@ mod tests {
                     sdk_request.uri(),
                     &headers,
                     &[],
+                    ControlPayload::Body,
                     time,
                 )
                 .await
@@ -14558,6 +14644,7 @@ mod tests {
             query: Vec::new(),
             headers: HeaderMap::new(),
             body: Bytes::new(),
+            payload: ControlPayload::Body,
             response_limit: 1024,
         };
         assert!(matches!(
@@ -14565,5 +14652,81 @@ mod tests {
             Err(Error::RequestRejected(_))
         ));
         assert_eq!(replay.actual_requests().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn external_control_rejects_a_body_with_separately_delivered_payload() {
+        let (client, replay) = test_s3_client_with_response_sequence(Vec::new());
+        let request = ControlRequest {
+            method: Method::PUT,
+            path: RemotePath::new("test", "bucket", "key"),
+            query: Vec::new(),
+            headers: HeaderMap::new(),
+            body: Bytes::from_static(b"unexpected control body"),
+            payload: ControlPayload::External {
+                deadline: Instant::now() + Duration::from_secs(30),
+            },
+            response_limit: 1024,
+        };
+        assert!(matches!(
+            ControlExecutor::execute(&client, request).await,
+            Err(Error::RequestRejected(_))
+        ));
+        assert_eq!(replay.actual_requests().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn external_control_rejects_an_elapsed_operation_deadline_before_network_io() {
+        let (client, replay) = test_s3_client_with_response_sequence(Vec::new());
+        let request = ControlRequest {
+            method: Method::PUT,
+            path: RemotePath::new("test", "bucket", "key"),
+            query: Vec::new(),
+            headers: HeaderMap::new(),
+            body: Bytes::new(),
+            payload: ControlPayload::External {
+                deadline: Instant::now(),
+            },
+            response_limit: 1024,
+        };
+        assert!(matches!(
+            ControlExecutor::execute(&client, request).await,
+            Err(Error::RequestRejected(_))
+        ));
+        assert_eq!(replay.actual_requests().count(), 0);
+        assert!(client.external_http_client.get().is_none());
+    }
+
+    #[tokio::test]
+    async fn external_control_signs_external_payload_and_all_binding_headers() {
+        let (client, _) = test_s3_client_with_response_sequence(Vec::new());
+        let mut headers = HeaderMap::new();
+        headers.insert("x-payload-session", HeaderValue::from_static("session-a"));
+        headers.insert("x-payload-length", HeaderValue::from_static("17"));
+        let sign = |headers: HeaderMap| {
+            let client = &client;
+            async move {
+                client
+                    .sign_external_control_request_at(
+                        &Method::PUT,
+                        "https://objects.example.test/bucket/key",
+                        &headers,
+                        &[],
+                        ControlPayload::External {
+                            deadline: Instant::now() + Duration::from_secs(30),
+                        },
+                        std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+                    )
+                    .await
+                    .expect("signed control request")
+            }
+        };
+        let first = sign(headers.clone()).await;
+        assert_eq!(first["x-amz-content-sha256"], "UNSIGNED-PAYLOAD");
+        let authorization = first["authorization"].to_str().expect("authorization text");
+        assert!(authorization.contains("x-payload-length;x-payload-session"));
+        headers.insert("x-payload-session", HeaderValue::from_static("session-b"));
+        let second = sign(headers).await;
+        assert_ne!(first["authorization"], second["authorization"]);
     }
 }
