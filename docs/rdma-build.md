@@ -63,3 +63,8 @@ require the provider, or `--data-transport auto` to allow pre-admission fallback
 deadline, with a default of 3600 seconds. The private repository documents its
 platform and runtime installation requirements. Successful interface tests do
 not establish hardware throughput or latency.
+
+Install the matching native dependencies from the pinned private engine's
+guide on both endpoints. Capability negotiation precedes external transfer
+admission. Ambiguous write results use authenticated queries for the original
+operation within its deadline; they do not resubmit the object or part.
