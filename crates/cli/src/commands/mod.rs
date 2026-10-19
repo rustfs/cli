@@ -8,7 +8,10 @@ use std::io::{IsTerminal, stderr, stdout};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use rc_core::config::Defaults;
-use rc_core::{ConfigManager, RequestHeader, set_global_request_headers};
+use rc_core::{
+    ConfigManager, DataTransportMode, RequestHeader, set_global_data_transport_mode,
+    set_global_request_headers,
+};
 
 use crate::exit_code::ExitCode;
 use crate::output::{Formatter, OutputConfig};
@@ -90,6 +93,10 @@ fn validate_version_selector(version_id: Option<&str>, rewind: Option<&str>) -> 
 #[command(after_help = COMPATIBILITY_AFTER_HELP)]
 #[command(propagate_version = true)]
 pub struct Cli {
+    /// Object data transport: http, auto, or rdma (requires an installed provider)
+    #[arg(long, global = true, default_value = "http")]
+    pub data_transport: DataTransportMode,
+
     /// Output format: auto-detect, human-readable, or JSON
     #[arg(long, global = true, value_enum)]
     pub format: Option<OutputFormat>,
@@ -357,6 +364,7 @@ pub enum Commands {
 
 /// Execute the CLI command and return an exit code
 pub async fn execute(cli: Cli) -> ExitCode {
+    set_global_data_transport_mode(cli.data_transport);
     set_global_request_headers(cli.request_headers.clone());
     let cli_output_options = GlobalOutputOptions::from_cli(&cli);
     let defaults = match ConfigManager::new() {
@@ -564,6 +572,16 @@ pub async fn execute(cli: Cli) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn data_transport_selection_is_explicit_and_http_is_default() {
+        let cli = Cli::try_parse_from(["rc", "alias", "list"]).expect("default CLI");
+        assert_eq!(cli.data_transport, DataTransportMode::Http);
+        let cli = Cli::try_parse_from(["rc", "--data-transport", "rdma", "alias", "list"])
+            .expect("explicit external data transport");
+        assert_eq!(cli.data_transport, DataTransportMode::Rdma);
+        assert!(Cli::try_parse_from(["rc", "--data-transport", "udp", "alias", "list"]).is_err());
+    }
     use clap::Parser;
 
     #[test]

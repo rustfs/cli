@@ -1,0 +1,4 @@
+[submodule "vendor/rustfs-ucx"]
+	path = vendor/rustfs-ucx
+	url = git@github.com:rustfs/rustfs-ucx.git
+	branch = s3-rdma
