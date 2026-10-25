@@ -32,6 +32,8 @@ class RdmaBuildTests(unittest.TestCase):
                               capture_output=True, text=True, check=False)
 
     def prepare_private(self):
+        (self.root / "rdma").mkdir()
+        (self.root / "Cargo.lock").write_text("version = 4\n")
         private = self.root / "vendor/rustfs-ucx"
         private.mkdir(parents=True)
         (private / "Cargo.toml").write_text('[package]\nname = "rustfs-ucx"\n')
@@ -87,6 +89,14 @@ class RdmaBuildTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines()[0], "+stable")
         self.assertEqual(result.stdout.splitlines()[-2:], ["-j", "3"])
+
+    def test_existing_rdma_lock_is_preserved(self):
+        self.prepare_private()
+        lock = self.root / "rdma/Cargo.lock"
+        lock.write_text("version = 4\n# independent resolution\n")
+        result = self.run_build()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(lock.read_text(), "version = 4\n# independent resolution\n")
 
 
 if __name__ == "__main__":
