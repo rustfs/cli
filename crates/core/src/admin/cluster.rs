@@ -739,6 +739,30 @@ pub struct PoolStatus {
     /// Decommission status and progress for this pool.
     #[serde(default, rename = "decommissionInfo")]
     pub decommission: Option<PoolDecommissionInfo>,
+
+    /// Current storage availability derived from runtime disk/set observations.
+    #[serde(default = "unknown_pool_state")]
+    pub availability: String,
+
+    /// Freshness/health of the pool metadata used for lifecycle fields.
+    #[serde(default = "unknown_pool_state", rename = "poolMetadataStatus")]
+    pub pool_metadata_status: String,
+
+    /// Freshness/health of the rebalance metadata used for rebalance fields.
+    #[serde(default = "unknown_pool_state", rename = "rebalanceMetadataStatus")]
+    pub rebalance_metadata_status: String,
+
+    /// Source quality of the capacity observation.
+    #[serde(default = "unknown_pool_state", rename = "capacityStatus")]
+    pub capacity_status: String,
+
+    /// Time at which the diagnostic observation was captured.
+    #[serde(default, rename = "observedAt")]
+    pub observed_at: Option<String>,
+}
+
+fn unknown_pool_state() -> String {
+    "unknown".to_string()
 }
 
 /// Decommission status response.
@@ -1112,7 +1136,7 @@ mod tests {
 
     #[test]
     fn test_pool_status_deserialization() {
-        let json = r#"{"id":1,"cmdline":"/data/pool1/disk{1...4}","lastUpdate":"2026-05-06T00:00:00Z","status":"decommissioning","decommissionStatus":"running","rebalanceStatus":"none","totalSize":1000,"currentSize":600,"usedSize":400,"used":0.4,"decommissionInfo":{"startTime":"2026-05-06T00:00:01Z","startSize":100,"totalSize":1000,"currentSize":600,"complete":false,"failed":false,"canceled":false,"queued":true,"queuedBuckets":["bucket-a"],"decommissionedBuckets":["bucket-b"],"bucket":"bucket-a","prefix":"","object":"object.txt","stage":"migrate_object","objectsDecommissioned":2,"objectsDecommissionedFailed":1,"bytesDecommissioned":128,"bytesDecommissionedFailed":64,"waitingReason":"queued"}}"#;
+        let json = r#"{"id":1,"cmdline":"/data/pool1/disk{1...4}","lastUpdate":"2026-05-06T00:00:00Z","status":"decommissioning","decommissionStatus":"running","rebalanceStatus":"none","totalSize":1000,"currentSize":600,"usedSize":400,"used":0.4,"decommissionInfo":{"startTime":"2026-05-06T00:00:01Z","startSize":100,"totalSize":1000,"currentSize":600,"complete":false,"failed":false,"canceled":false,"queued":true,"queuedBuckets":["bucket-a"],"decommissionedBuckets":["bucket-b"],"bucket":"bucket-a","prefix":"","object":"object.txt","stage":"migrate_object","objectsDecommissioned":2,"objectsDecommissionedFailed":1,"bytesDecommissioned":128,"bytesDecommissionedFailed":64,"waitingReason":"queued"},"availability":"offline","poolMetadataStatus":"stale","rebalanceMetadataStatus":"unknown","capacityStatus":"cached","observedAt":"2026-05-06T00:00:02Z"}"#;
 
         let status: PoolStatus = serde_json::from_str(json).unwrap();
 
@@ -1122,6 +1146,11 @@ mod tests {
         assert_eq!(status.decommission_status, "running");
         assert_eq!(status.rebalance_status, "none");
         assert_eq!(status.used_size, 400);
+        assert_eq!(status.availability, "offline");
+        assert_eq!(status.pool_metadata_status, "stale");
+        assert_eq!(status.rebalance_metadata_status, "unknown");
+        assert_eq!(status.capacity_status, "cached");
+        assert_eq!(status.observed_at.as_deref(), Some("2026-05-06T00:00:02Z"));
         let info = status.decommission.expect("decommission info exists");
         assert!(info.queued);
         assert_eq!(info.queued_buckets, vec!["bucket-a"]);

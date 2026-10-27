@@ -132,6 +132,10 @@ pub(super) fn print_pool_status(pool: &PoolStatus, formatter: &Formatter) {
     let lifecycle_state = pool_lifecycle_state(pool);
     let decommission_state = pool_decommission_state(pool);
     let rebalance_state = status_or_default(&pool.rebalance_status, "none");
+    let availability = status_or_default(&pool.availability, "unknown");
+    let pool_metadata = status_or_default(&pool.pool_metadata_status, "unknown");
+    let rebalance_metadata = status_or_default(&pool.rebalance_metadata_status, "unknown");
+    let capacity_status = status_or_default(&pool.capacity_status, "unknown");
     let used = decommission
         .map(|info| info.total_size.saturating_sub(info.current_size))
         .or_else(|| (pool.total_size > 0).then_some(pool.used_size))
@@ -149,6 +153,19 @@ pub(super) fn print_pool_status(pool: &PoolStatus, formatter: &Formatter) {
     formatter.println(&format!(
         "    Status:       {}",
         style_state(lifecycle_state, formatter)
+    ));
+    formatter.println(&format!(
+        "    Availability: {}",
+        style_state(availability, formatter)
+    ));
+    formatter.println(&format!(
+        "    Metadata:     pool={}, rebalance={}",
+        style_state(pool_metadata, formatter),
+        style_state(rebalance_metadata, formatter)
+    ));
+    formatter.println(&format!(
+        "    Capacity:     {}",
+        style_state(capacity_status, formatter)
     ));
     formatter.println(&format!(
         "    Decommission: {}",
@@ -227,7 +244,8 @@ pub(super) fn style_state(state: &str, formatter: &Formatter) -> String {
     match state {
         "active" | "complete" | "completed" | "decommissioned" => formatter.style_size(state),
         "blocked" | "failed" => formatter.theme().error.apply_to(state).to_string(),
-        "canceled" | "queued" | "stopping" | "stopped" => {
+        "offline" => formatter.theme().error.apply_to(state).to_string(),
+        "degraded" | "unknown" | "canceled" | "queued" | "stopping" | "stopped" => {
             formatter.theme().warning.apply_to(state).to_string()
         }
         "decommissioning" | "running" | "started" => formatter.style_name(state),

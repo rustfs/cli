@@ -37,6 +37,10 @@ fn pool_list_dispatches_to_pool_list_json() {
     assert_eq!(pools[0]["decommissionStatus"], "none");
     assert_eq!(pools[0]["rebalanceStatus"], "completed");
     assert_eq!(pools[0]["usedSize"], 20);
+    assert_eq!(pools[0]["availability"], "unknown");
+    assert_eq!(pools[0]["poolMetadataStatus"], "unknown");
+    assert_eq!(pools[0]["rebalanceMetadataStatus"], "unknown");
+    assert_eq!(pools[0]["capacityStatus"], "unknown");
 
     let request = receiver
         .recv_timeout(Duration::from_secs(5))
@@ -78,6 +82,7 @@ fn pool_status_without_target_dispatches_to_pool_list_json() {
     assert_eq!(pools[0]["rebalanceStatus"], "none");
     assert_eq!(pools[0]["decommissionInfo"]["totalSize"], 100);
     assert_eq!(pools[0]["decommissionInfo"]["currentSize"], 90);
+    assert_eq!(pools[0]["availability"], "unknown");
 
     let request = receiver
         .recv_timeout(Duration::from_secs(5))
@@ -117,6 +122,7 @@ fn pool_status_dispatches_by_id_pool_json() {
     assert_eq!(payload["status"], "active");
     assert_eq!(payload["decommissionStatus"], "none");
     assert_eq!(payload["rebalanceStatus"], "failed");
+    assert_eq!(payload["availability"], "unknown");
 
     let request = receiver
         .recv_timeout(Duration::from_secs(5))

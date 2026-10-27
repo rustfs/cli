@@ -534,6 +534,33 @@
             }
           ],
           "description": "Decommission state and progress for this pool"
+        },
+        "availability": {
+          "type": "string",
+          "description": "Current storage availability: online, degraded, offline, or unknown"
+        },
+        "poolMetadataStatus": {
+          "type": "string",
+          "description": "Freshness or recovery state of pool metadata"
+        },
+        "rebalanceMetadataStatus": {
+          "type": "string",
+          "description": "Freshness or recovery state of rebalance metadata"
+        },
+        "capacityStatus": {
+          "type": "string",
+          "description": "Source quality of the capacity observation"
+        },
+        "observedAt": {
+          "oneOf": [
+            {
+              "$ref": "#/definitions/timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Time at which the diagnostic observation was captured"
         }
       }
     },
