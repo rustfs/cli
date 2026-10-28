@@ -228,6 +228,15 @@ fn classify_and_discard_error(mut error: Error) -> KmsRoundTripErrorClass {
             message.zeroize();
             KmsRoundTripErrorClass::Network
         }
+        Error::DataTransfer {
+            message, source, ..
+        } => {
+            message.zeroize();
+            if let Some(source) = source.take() {
+                classify_and_discard_error(*source);
+            }
+            KmsRoundTripErrorClass::General
+        }
         Error::Conflict(message) | Error::AliasExists(message) => {
             message.zeroize();
             KmsRoundTripErrorClass::Conflict

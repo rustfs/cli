@@ -103,6 +103,17 @@ pub enum Error {
     #[error("Network error: {0}")]
     Network(String),
 
+    /// An external data operation with explicit acceptance and outcome state.
+    #[error("Object data transfer {state}: {message}")]
+    DataTransfer {
+        /// Acceptance and business outcome classification.
+        state: crate::DataTransferState,
+        /// A safe diagnostic that excludes credentials and protocol envelopes.
+        message: String,
+        /// Authoritative S3 error, when one was received.
+        source: Option<Box<Error>>,
+    },
+
     /// Conflict error
     #[error("Conflict: {0}")]
     Conflict(String),
@@ -139,8 +150,12 @@ impl Error {
             Error::Conflict(_) | Error::GovernanceDenied { .. } | Error::AliasExists(_) => 6, // Conflict
             Error::UnsupportedFeature(_) => 7, // UnsupportedFeature
             Error::Interrupted(_) => 130,      // Interrupted
-            Error::RequestRejected(_) => 1,    // GeneralError
-            _ => 1,                            // GeneralError
+            Error::DataTransfer {
+                source: Some(source),
+                ..
+            } => source.exit_code(),
+            Error::RequestRejected(_) => 1, // GeneralError
+            _ => 1,                         // GeneralError
         }
     }
 
@@ -161,6 +176,15 @@ impl Error {
         match self {
             Self::Auth(message) => Self::Auth(format!("{message}; {context}")),
             Self::Network(message) => Self::Network(format!("{message}; {context}")),
+            Self::DataTransfer {
+                state,
+                message,
+                source,
+            } => Self::DataTransfer {
+                state,
+                message: format!("{message}; {context}"),
+                source,
+            },
             Self::NotFound(message) => Self::NotFound(format!("{message}; {context}")),
             Self::VersionNotFound { path, version_id } => Self::VersionNotFound {
                 path: format!("{path} ({context})"),

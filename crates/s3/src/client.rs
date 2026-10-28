@@ -6,7 +6,8 @@ use async_trait::async_trait;
 use aws_credential_types::Credentials;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sigv4::http_request::{
-    SignableBody, SignableRequest, SignatureLocation, SigningSettings, sign,
+    PayloadChecksumKind, PercentEncodingMode, SignableBody, SignableRequest, SignatureLocation,
+    SigningSettings, UriPathNormalizationMode, sign,
 };
 use aws_sigv4::sign::v4;
 use aws_smithy_runtime_api::box_error::BoxError;
@@ -57,7 +58,14 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
+
+use crate::data_transport::{
+    self, ControlExecutor, ControlPayload, ControlRequest, ControlResponse, DataTransportContext,
+    DownloadRequest, ObjectDataTransport, ObservedReader, ObservedWriter, UploadOperation,
+    UploadRequest, UploadResult, WriteCondition,
+};
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
@@ -210,6 +218,25 @@ async fn build_reqwest_client(
     client_key: Option<&str>,
     timeout: Option<&rc_core::alias::TimeoutConfig>,
 ) -> Result<reqwest::Client> {
+    build_reqwest_client_with_read_policy(
+        insecure,
+        ca_bundle,
+        client_cert,
+        client_key,
+        timeout,
+        true,
+    )
+    .await
+}
+
+async fn build_reqwest_client_with_read_policy(
+    insecure: bool,
+    ca_bundle: Option<&str>,
+    client_cert: Option<&str>,
+    client_key: Option<&str>,
+    timeout: Option<&rc_core::alias::TimeoutConfig>,
+    apply_read_timeout: bool,
+) -> Result<reqwest::Client> {
     // NOTE: When `insecure = true`, `danger_accept_invalid_certs` disables all TLS
     // certificate verification. Any CA bundle provided will still be added to the
     // trust store but is rendered ineffective for this connection.
@@ -218,9 +245,10 @@ async fn build_reqwest_client(
         .redirect(reqwest::redirect::Policy::none());
 
     if let Some(timeout) = timeout {
-        builder = builder
-            .connect_timeout(Duration::from_millis(timeout.connect_ms))
-            .read_timeout(Duration::from_millis(timeout.read_ms));
+        builder = builder.connect_timeout(Duration::from_millis(timeout.connect_ms));
+        if apply_read_timeout {
+            builder = builder.read_timeout(Duration::from_millis(timeout.read_ms));
+        }
     }
 
     if let Some(bundle_path) = ca_bundle {
@@ -1642,13 +1670,23 @@ impl HttpClient for ReqwestConnector {
     }
 }
 
+struct RequestSigningOptions<'a> {
+    region: &'a str,
+    settings: SigningSettings,
+    time: std::time::SystemTime,
+}
+
 /// S3 client wrapper
+#[derive(Clone)]
 pub struct S3Client {
     inner: aws_sdk_s3::Client,
     presign_inner: aws_sdk_s3::Client,
     xml_http_client: reqwest::Client,
+    external_http_client: Arc<tokio::sync::OnceCell<reqwest::Client>>,
     alias: Alias,
     request_headers: Vec<RequestHeader>,
+    data_transport_mode: rc_core::DataTransportMode,
+    data_transport: Option<Arc<dyn ObjectDataTransport>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1764,13 +1802,154 @@ impl S3Client {
         let client = aws_sdk_s3::Client::from_conf(s3_config);
         let presign_client = aws_sdk_s3::Client::from_conf(presign_s3_config);
 
-        Ok(Self {
+        let mut client = Self {
             inner: client,
             presign_inner: presign_client,
             xml_http_client,
+            external_http_client: Arc::new(tokio::sync::OnceCell::new()),
             alias,
             request_headers,
-        })
+            data_transport_mode: rc_core::global_data_transport_mode(),
+            data_transport: None,
+        };
+        if client.data_transport_mode != rc_core::DataTransportMode::Http
+            && let Some(factory) = data_transport::installed_factory()
+        {
+            client.data_transport = Some(factory.create(DataTransportContext {
+                endpoint: client.alias.endpoint.clone(),
+                control: Arc::new(client.clone()),
+            })?);
+        }
+        Ok(client)
+    }
+
+    /// Inject a transport into this client without changing ObjectStore signatures.
+    pub fn with_object_data_transport(
+        mut self,
+        mode: rc_core::DataTransportMode,
+        transport: Arc<dyn ObjectDataTransport>,
+    ) -> Self {
+        self.data_transport_mode = mode;
+        self.data_transport = Some(transport);
+        self
+    }
+
+    fn selected_data_transport(&self) -> Result<Option<&Arc<dyn ObjectDataTransport>>> {
+        use rc_core::DataTransportMode;
+        match (self.data_transport_mode, self.data_transport.as_ref()) {
+            (DataTransportMode::Http, _) | (DataTransportMode::Auto, None) => Ok(None),
+            (_, Some(transport)) => Ok(Some(transport)),
+            (DataTransportMode::Rdma, None) => Err(Error::DataTransfer {
+                state: rc_core::DataTransferState::NotAccepted,
+                message: "This executable has no external object data provider".to_string(),
+                source: None,
+            }),
+        }
+    }
+
+    async fn try_external_download<W: AsyncWrite + Unpin + Send + ?Sized>(
+        &self,
+        path: &RemotePath,
+        options: &TransferReadOptions,
+        writer: &mut W,
+        max_bytes: Option<u64>,
+        on_progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
+    ) -> Result<Option<u64>> {
+        let Some(transport) = self.selected_data_transport()? else {
+            return Ok(None);
+        };
+        let limit = max_bytes.unwrap_or(rc_core::S3_MAX_OBJECT_SIZE);
+        let mut observed = ObservedWriter {
+            inner: writer,
+            polled: false,
+            bytes: 0,
+            limit,
+            flushed: false,
+        };
+        let result = transport
+            .download(
+                DownloadRequest {
+                    path,
+                    options,
+                    max_bytes,
+                    max_receive_bytes: limit,
+                    on_progress,
+                },
+                &mut observed,
+            )
+            .await;
+        match result {
+            Ok(result)
+                if result.bytes_transferred == observed.bytes
+                    && result.content_length == observed.bytes
+                    && observed.flushed =>
+            {
+                Ok(Some(observed.bytes))
+            }
+            Ok(_) => Err(Error::DataTransfer {
+                state: rc_core::DataTransferState::ConfirmedFailure,
+                message: "External download did not complete its declared length and writer flush"
+                    .to_string(),
+                source: None,
+            }),
+            Err(error)
+                if error.state == rc_core::DataTransferState::NotAccepted
+                    && !observed.polled
+                    && self.data_transport_mode == rc_core::DataTransportMode::Auto =>
+            {
+                Ok(None)
+            }
+            Err(mut error) => {
+                if error.state == rc_core::DataTransferState::NotAccepted && observed.polled {
+                    error.state = rc_core::DataTransferState::OutcomeUnknown;
+                }
+                Err(self.redact_sse_customer_error(error.into(), options.customer_key.as_ref()))
+            }
+        }
+    }
+
+    async fn try_external_upload(
+        &self,
+        request: UploadRequest<'_>,
+        data: &[u8],
+    ) -> Result<Option<UploadResult>> {
+        let Some(transport) = self.selected_data_transport()? else {
+            return Ok(None);
+        };
+        let length = request.content_length;
+        let customer_key =
+            destination_sse_customer_key(request.options.encryption.as_ref()).cloned();
+        let mut source = data;
+        let mut observed = ObservedReader {
+            inner: &mut source,
+            polled: false,
+            bytes: 0,
+            eof: false,
+        };
+        let result = transport.upload(request, &mut observed).await;
+        match result {
+            Ok(result) if observed.bytes == length && observed.eof => Ok(Some(result)),
+            Ok(_) => Err(Error::DataTransfer {
+                state: rc_core::DataTransferState::OutcomeUnknown,
+                message:
+                    "External upload returned success without consuming the exact source and EOF"
+                        .to_string(),
+                source: None,
+            }),
+            Err(error)
+                if error.state == rc_core::DataTransferState::NotAccepted
+                    && !observed.polled
+                    && self.data_transport_mode == rc_core::DataTransportMode::Auto =>
+            {
+                Ok(None)
+            }
+            Err(mut error) => {
+                if error.state == rc_core::DataTransferState::NotAccepted && observed.polled {
+                    error.state = rc_core::DataTransferState::OutcomeUnknown;
+                }
+                Err(self.redact_sse_customer_error(error.into(), customer_key.as_ref()))
+            }
+        }
     }
 
     fn ensure_sse_customer_transport(&self, key: Option<&SseCustomerKey>) -> Result<()> {
@@ -1952,6 +2131,24 @@ impl S3Client {
         options: &ObjectReadOptions,
         mut on_progress: impl FnMut(u64, Option<u64>) + Send,
     ) -> Result<Vec<u8>> {
+        let mut external_data = Vec::new();
+        let external_options = TransferReadOptions {
+            version_id: options.version_id.clone(),
+            ..TransferReadOptions::default()
+        };
+        if self
+            .try_external_download(
+                path,
+                &external_options,
+                &mut external_data,
+                None,
+                &mut on_progress,
+            )
+            .await?
+            .is_some()
+        {
+            return Ok(external_data);
+        }
         let mut request = self.inner.get_object().bucket(&path.bucket).key(&path.key);
         if let Some(version_id) = &options.version_id {
             request = request.version_id(version_id);
@@ -2017,6 +2214,23 @@ impl S3Client {
     ) -> Result<u64> {
         options.validate()?;
         self.ensure_sse_customer_transport(options.customer_key.as_ref())?;
+        if self.selected_data_transport()?.is_some() {
+            let (mut file, temporary) = Self::temporary_download_file(destination)?;
+            if let Some(bytes) = self
+                .try_external_download(path, options, &mut file, None, &mut on_progress)
+                .await?
+            {
+                drop(file);
+                temporary.persist(destination).map_err(|error| {
+                    Error::General(format!(
+                        "atomically replace download destination '{}': {}",
+                        destination.display(),
+                        error.error
+                    ))
+                })?;
+                return Ok(bytes);
+            }
+        }
         let mut request = apply_sse_customer_to_get_request(
             self.inner.get_object().bucket(&path.bucket).key(&path.key),
             options.customer_key.as_ref(),
@@ -2036,29 +2250,7 @@ impl S3Client {
         let content_length = response
             .content_length()
             .and_then(|length| u64::try_from(length).ok());
-        let parent = destination.parent().ok_or_else(|| {
-            Error::General(format!(
-                "download destination '{}' has no parent directory",
-                destination.display()
-            ))
-        })?;
-        let file_name = destination.file_name().ok_or_else(|| {
-            Error::General(format!(
-                "download destination '{}' has no file name",
-                destination.display()
-            ))
-        })?;
-        let temporary_file = tempfile::Builder::new()
-            .prefix(&format!(".{}.rc-part-", file_name.to_string_lossy()))
-            .tempfile_in(parent)
-            .map_err(|error| {
-                Error::General(format!(
-                    "create temporary download in '{}': {error}",
-                    parent.display()
-                ))
-            })?;
-        let (file, temporary) = temporary_file.into_parts();
-        let mut file = tokio::fs::File::from_std(file);
+        let (mut file, temporary) = Self::temporary_download_file(destination)?;
         let mut body = response.body;
         let mut bytes_downloaded = 0u64;
 
@@ -2100,6 +2292,35 @@ impl S3Client {
         Ok(bytes_downloaded)
     }
 
+    fn temporary_download_file(
+        destination: &std::path::Path,
+    ) -> Result<(tokio::fs::File, tempfile::TempPath)> {
+        let parent = destination.parent().ok_or_else(|| {
+            Error::General(format!(
+                "download destination '{}' has no parent directory",
+                destination.display()
+            ))
+        })?;
+        let file_name = destination.file_name().ok_or_else(|| {
+            Error::General(format!(
+                "download destination '{}' has no file name",
+                destination.display()
+            ))
+        })?;
+        let temporary_file = tempfile::Builder::new()
+            .prefix(&format!(".{}.rc-part-", file_name.to_string_lossy()))
+            .tempfile_in(parent)
+            .map_err(|error| {
+                Error::General(format!(
+                    "create temporary download in '{}': {error}",
+                    parent.display()
+                ))
+            })?;
+        let (file, temporary) = temporary_file.into_parts();
+        let file = tokio::fs::File::from_std(file);
+        Ok((file, temporary))
+    }
+
     pub async fn write_object_to<W>(
         &self,
         path: &RemotePath,
@@ -2129,6 +2350,17 @@ impl S3Client {
                 self.head_object_with_options(path, options).await?;
             }
             return Ok(0);
+        }
+
+        let external_options = TransferReadOptions {
+            version_id: options.version_id.clone(),
+            ..TransferReadOptions::default()
+        };
+        if let Some(bytes) = self
+            .try_external_download(path, &external_options, writer, max_bytes, &mut |_, _| {})
+            .await?
+        {
+            return Ok(bytes);
         }
 
         let mut request = self.inner.get_object().bucket(&path.bucket).key(&path.key);
@@ -2180,6 +2412,30 @@ impl S3Client {
         data: Vec<u8>,
         content_type: Option<&str>,
     ) -> Result<ObjectInfo> {
+        let options = ObjectWriteOptions {
+            attributes: Some(ObjectAttributes {
+                content_type: content_type.map(ToString::to_string),
+                ..ObjectAttributes::default()
+            }),
+            ..ObjectWriteOptions::default()
+        };
+        if let Some(result) = self
+            .try_external_upload(
+                UploadRequest {
+                    path,
+                    operation: UploadOperation::PutObject {
+                        condition: WriteCondition::IfAbsent,
+                    },
+                    options: &options,
+                    content_length: data.len() as u64,
+                    checksum_sha256: None,
+                },
+                &data,
+            )
+            .await?
+        {
+            return Ok(result.object);
+        }
         let size = data.len() as i64;
         let mut request = self
             .inner
@@ -2713,6 +2969,15 @@ impl S3Client {
                 version_id: version_id.map(|value| self.redact_sensitive_text(value)),
             },
             Error::Network(message) => Error::Network(self.redact_sensitive_text(message)),
+            Error::DataTransfer {
+                state,
+                message,
+                source,
+            } => Error::DataTransfer {
+                state,
+                message: self.redact_sensitive_text(message),
+                source: source.map(|error| Box::new(self.redact_sensitive_error(*error))),
+            },
             Error::Conflict(message) => Error::Conflict(self.redact_sensitive_text(message)),
             Error::UnsupportedFeature(message) => {
                 Error::UnsupportedFeature(self.redact_sensitive_text(message))
@@ -2764,6 +3029,17 @@ impl S3Client {
                 version_id: version_id.map(redact),
             },
             Error::Network(message) => Error::Network(redact(message)),
+            Error::DataTransfer {
+                state,
+                message,
+                source,
+            } => Error::DataTransfer {
+                state,
+                message: redact(message),
+                source: source.map(|error| {
+                    Box::new(self.redact_sse_customer_error(*error, Some(customer_key)))
+                }),
+            },
             Error::Conflict(message) => Error::Conflict(redact(message)),
             Error::UnsupportedFeature(message) => Error::UnsupportedFeature(redact(message)),
             Error::General(message) => Error::General(redact(message)),
@@ -3287,6 +3563,130 @@ impl S3Client {
         body: &[u8],
         region: &str,
     ) -> Result<HeaderMap> {
+        self.sign_request_with_settings(
+            method,
+            url,
+            headers,
+            body,
+            RequestSigningOptions {
+                region,
+                settings: SigningSettings::default(),
+                time: std::time::SystemTime::now(),
+            },
+        )
+        .await
+    }
+
+    fn external_control_url(
+        &self,
+        path: &RemotePath,
+        query: &[(String, String)],
+    ) -> Result<reqwest::Url> {
+        let mut url = reqwest::Url::parse(&self.alias.endpoint)?;
+        if url.scheme() != "https" || self.alias.insecure {
+            return Err(Error::RequestRejected(
+                "External object control requires verified HTTPS".to_string(),
+            ));
+        }
+        if path
+            .key
+            .split('/')
+            .any(|segment| matches!(segment, "." | ".."))
+        {
+            return Err(Error::UnsupportedFeature(
+                "External control does not support dot path segments".to_string(),
+            ));
+        }
+        let mut object_path = url
+            .path()
+            .strip_suffix('/')
+            .unwrap_or(url.path())
+            .to_string();
+        if force_path_style_for_alias(&self.alias) {
+            object_path.push('/');
+            object_path.push_str(&urlencoding::encode(&path.bucket));
+        } else {
+            let host = url
+                .host_str()
+                .ok_or_else(|| Error::InvalidPath("Object endpoint has no host".to_string()))?;
+            url.set_host(Some(&format!("{}.{}", path.bucket, host)))
+                .map_err(|_| Error::InvalidPath("Invalid DNS-style bucket name".to_string()))?;
+        }
+        object_path.push('/');
+        object_path.push_str(
+            &path
+                .key
+                .split('/')
+                .map(|segment| urlencoding::encode(segment).into_owned())
+                .collect::<Vec<_>>()
+                .join("/"),
+        );
+        url.set_path(&object_path);
+        let encoded_query = query
+            .iter()
+            .map(|(name, value)| {
+                format!(
+                    "{}={}",
+                    urlencoding::encode(name),
+                    urlencoding::encode(value)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("&");
+        url.set_query((!encoded_query.is_empty()).then_some(encoded_query.as_str()));
+        Ok(url)
+    }
+
+    async fn sign_external_control_request_at(
+        &self,
+        method: &Method,
+        url: &str,
+        headers: &HeaderMap,
+        body: &[u8],
+        payload: ControlPayload,
+        time: std::time::SystemTime,
+    ) -> Result<HeaderMap> {
+        let mut settings = SigningSettings::default();
+        settings.percent_encoding_mode = PercentEncodingMode::Single;
+        settings.uri_path_normalization_mode = UriPathNormalizationMode::Disabled;
+        settings.payload_checksum_kind = PayloadChecksumKind::XAmzSha256;
+        self.sign_request_with_body(
+            method,
+            url,
+            headers,
+            match payload {
+                ControlPayload::Body => SignableBody::Bytes(body),
+                ControlPayload::External { .. } => SignableBody::UnsignedPayload,
+            },
+            RequestSigningOptions {
+                region: &self.alias.region,
+                settings,
+                time,
+            },
+        )
+        .await
+    }
+
+    async fn sign_request_with_settings(
+        &self,
+        method: &Method,
+        url: &str,
+        headers: &HeaderMap,
+        body: &[u8],
+        options: RequestSigningOptions<'_>,
+    ) -> Result<HeaderMap> {
+        self.sign_request_with_body(method, url, headers, SignableBody::Bytes(body), options)
+            .await
+    }
+
+    async fn sign_request_with_body(
+        &self,
+        method: &Method,
+        url: &str,
+        headers: &HeaderMap,
+        body: SignableBody<'_>,
+        options: RequestSigningOptions<'_>,
+    ) -> Result<HeaderMap> {
         if self.alias.anonymous {
             return Ok(headers.clone());
         }
@@ -3300,14 +3700,14 @@ impl S3Client {
         );
 
         let identity = credentials.into();
-        let mut signing_settings = SigningSettings::default();
+        let mut signing_settings = options.settings;
         signing_settings.signature_location = SignatureLocation::Headers;
 
         let signing_params = v4::SigningParams::builder()
             .identity(&identity)
-            .region(region)
+            .region(options.region)
             .name(S3_SERVICE_NAME)
-            .time(std::time::SystemTime::now())
+            .time(options.time)
             .settings(signing_settings)
             .build()
             .map_err(|e| Error::Auth(format!("Failed to build signing params: {e}")))?;
@@ -3317,13 +3717,9 @@ impl S3Client {
             .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.as_str(), v)))
             .collect();
 
-        let signable_request = SignableRequest::new(
-            method.as_str(),
-            url,
-            header_pairs.into_iter(),
-            SignableBody::Bytes(body),
-        )
-        .map_err(|e| Error::Auth(format!("Failed to create signable request: {e}")))?;
+        let signable_request =
+            SignableRequest::new(method.as_str(), url, header_pairs.into_iter(), body)
+                .map_err(|e| Error::Auth(format!("Failed to create signable request: {e}")))?;
 
         let (signing_instructions, _) = sign(signable_request, &signing_params.into())
             .map_err(|e| Error::Auth(format!("Failed to sign request: {e}")))?
@@ -3784,6 +4180,36 @@ impl S3Client {
             .await
             .map_err(|e| Error::General(format!("read file '{}': {e}", file_path.display())))?;
         let requested_checksum = requested_sha256_checksum(&data, options.write.checksum.as_ref())?;
+        let condition = match options.precondition {
+            ObjectWritePrecondition::None => WriteCondition::None,
+            ObjectWritePrecondition::IfAbsent => WriteCondition::IfAbsent,
+            ObjectWritePrecondition::IfMatch(etag) => WriteCondition::IfMatch(etag),
+        };
+        if let Some(result) = self
+            .try_external_upload(
+                UploadRequest {
+                    path,
+                    operation: UploadOperation::PutObject { condition },
+                    options: options.write,
+                    content_length: file_size,
+                    checksum_sha256: requested_checksum.as_deref(),
+                },
+                &data,
+            )
+            .await?
+        {
+            if let Some(checksum) = &requested_checksum {
+                self.verify_persisted_sha256(
+                    path,
+                    result.object.version_id.clone(),
+                    checksum,
+                    destination_sse_customer_key(options.write.encryption.as_ref()),
+                )
+                .await
+                .map_err(data_transport::committed_verification_failure)?;
+            }
+            return Ok(result.object);
+        }
         let body = aws_sdk_s3::primitives::ByteStream::from(data);
         let storage_class = rustfs_storage_class(options.write.storage_class.as_deref())?;
 
@@ -3954,6 +4380,7 @@ impl S3Client {
         tracing::debug!(upload_id = %upload_id, "Multipart upload initiated");
 
         let mut completed_parts = Vec::new();
+        let mut has_external_parts = false;
         let mut part_number: i32 = 1;
         let mut bytes_uploaded: u64 = 0;
         let mut part_digests = Vec::new();
@@ -3981,43 +4408,72 @@ impl S3Client {
                 part_digests.push(digest);
                 BASE64_STANDARD.encode(digest)
             });
-            let body = aws_sdk_s3::primitives::ByteStream::from(chunk[..bytes_read].to_vec());
-            let mut upload_part_request = apply_sse_customer_to_upload_part_request(
-                self.inner
-                    .upload_part()
-                    .bucket(&path.bucket)
-                    .key(&path.key)
-                    .upload_id(&upload_id)
-                    .part_number(part_number)
-                    .body(body),
-                destination_sse_customer_key(options.write.encryption.as_ref()),
-            );
-            if let Some(checksum) = &part_checksum {
-                upload_part_request = upload_part_request
-                    .checksum_algorithm(aws_sdk_s3::types::ChecksumAlgorithm::Sha256)
-                    .checksum_sha256(checksum);
-            }
-            let upload_part_result = upload_part_request.send().await;
-
-            let upload_part_response = match upload_part_result {
-                Ok(response) => response,
-                Err(e) => {
-                    tracing::debug!(
-                        upload_id = %upload_id,
-                        part_number,
-                        "Aborting multipart upload due to error"
-                    );
-                    let primary = self.redact_sse_customer_error(
-                        Self::map_object_request_error(&e, path, None),
+            let upload_part_result: Result<(Option<String>, Option<String>)> = match self
+                .try_external_upload(
+                    UploadRequest {
+                        path,
+                        operation: UploadOperation::UploadPart {
+                            upload_id: &upload_id,
+                            part_number,
+                        },
+                        options: options.write,
+                        content_length: bytes_read as u64,
+                        checksum_sha256: part_checksum.as_deref(),
+                    },
+                    &chunk[..bytes_read],
+                )
+                .await
+            {
+                Ok(Some(result)) => {
+                    has_external_parts = true;
+                    Ok((result.object.etag, result.checksum_sha256))
+                }
+                Err(error) => Err(error),
+                Ok(None) => {
+                    let body =
+                        aws_sdk_s3::primitives::ByteStream::from(chunk[..bytes_read].to_vec());
+                    let mut upload_part_request = apply_sse_customer_to_upload_part_request(
+                        self.inner
+                            .upload_part()
+                            .bucket(&path.bucket)
+                            .key(&path.key)
+                            .upload_id(&upload_id)
+                            .part_number(part_number)
+                            .body(body),
                         destination_sse_customer_key(options.write.encryption.as_ref()),
                     );
+                    if let Some(checksum) = &part_checksum {
+                        upload_part_request = upload_part_request
+                            .checksum_algorithm(aws_sdk_s3::types::ChecksumAlgorithm::Sha256)
+                            .checksum_sha256(checksum);
+                    }
+                    upload_part_request
+                        .send()
+                        .await
+                        .map(|response| {
+                            (
+                                response.e_tag().map(ToString::to_string),
+                                response.checksum_sha256().map(ToString::to_string),
+                            )
+                        })
+                        .map_err(|error| {
+                            self.redact_sse_customer_error(
+                                Self::map_object_request_error(&error, path, None),
+                                destination_sse_customer_key(options.write.encryption.as_ref()),
+                            )
+                        })
+                }
+            };
+            let (part_etag, persisted_part_checksum) = match upload_part_result {
+                Ok(response) => response,
+                Err(primary) => {
                     return Err(self
                         .abort_multipart_upload_with_error(path, &upload_id, primary)
                         .await);
                 }
             };
             if let Some(expected) = &part_checksum {
-                match upload_part_response.checksum_sha256() {
+                match persisted_part_checksum.as_deref() {
                     Some(actual) if actual == expected => {}
                     Some(_) => {
                         let primary = Error::Conflict(format!(
@@ -4038,7 +4494,7 @@ impl S3Client {
                 }
             }
 
-            let etag = match upload_part_response.e_tag() {
+            let etag = match part_etag.as_deref() {
                 Some(value) => value.trim_matches('"').to_string(),
                 None => {
                     let primary =
@@ -4098,6 +4554,24 @@ impl S3Client {
                         destination_sse_customer_key(options.write.encryption.as_ref()),
                     )
                 };
+                let primary = if has_external_parts {
+                    let state = match &error {
+                        aws_sdk_s3::error::SdkError::ServiceError(service_error)
+                            if matches!(service_error.raw().status().as_u16(), 409 | 412) =>
+                        {
+                            rc_core::DataTransferState::ConfirmedFailure
+                        }
+                        _ => rc_core::DataTransferState::OutcomeUnknown,
+                    };
+                    Error::DataTransfer {
+                        state,
+                        message: "Multipart completion did not return a usable success result"
+                            .to_string(),
+                        source: Some(Box::new(primary)),
+                    }
+                } else {
+                    primary
+                };
                 return Err(self
                     .abort_multipart_upload_with_error(path, &upload_id, primary)
                     .await);
@@ -4121,7 +4595,14 @@ impl S3Client {
                 &expected_checksum,
                 destination_sse_customer_key(options.write.encryption.as_ref()),
             )
-            .await?;
+            .await
+            .map_err(|error| {
+                if has_external_parts {
+                    data_transport::committed_verification_failure(error)
+                } else {
+                    error
+                }
+            })?;
         }
         Ok(info)
     }
@@ -5251,6 +5732,14 @@ impl ObjectStore for S3Client {
     ) -> Result<Vec<u8>> {
         options.validate()?;
         self.ensure_sse_customer_transport(options.customer_key.as_ref())?;
+        let mut external_data = Vec::new();
+        if self
+            .try_external_download(path, options, &mut external_data, None, &mut |_, _| {})
+            .await?
+            .is_some()
+        {
+            return Ok(external_data);
+        }
         let mut request = apply_sse_customer_to_get_request(
             self.inner.get_object().bucket(&path.bucket).key(&path.key),
             options.customer_key.as_ref(),
@@ -5314,6 +5803,12 @@ impl ObjectStore for S3Client {
                 .await?;
             return Ok(0);
         }
+        if let Some(bytes) = self
+            .try_external_download(path, options, writer, max_bytes, &mut |_, _| {})
+            .await?
+        {
+            return Ok(bytes);
+        }
         let mut request = apply_sse_customer_to_get_request(
             self.inner.get_object().bucket(&path.bucket).key(&path.key),
             options.customer_key.as_ref(),
@@ -5362,6 +5857,31 @@ impl ObjectStore for S3Client {
         content_type: Option<&str>,
         encryption: Option<&ObjectEncryptionRequest>,
     ) -> Result<ObjectInfo> {
+        let external_options = ObjectWriteOptions {
+            attributes: Some(ObjectAttributes {
+                content_type: content_type.map(ToString::to_string),
+                ..ObjectAttributes::default()
+            }),
+            encryption: encryption.cloned().map(ObjectWriteEncryption::Managed),
+            ..ObjectWriteOptions::default()
+        };
+        if let Some(result) = self
+            .try_external_upload(
+                UploadRequest {
+                    path,
+                    operation: UploadOperation::PutObject {
+                        condition: WriteCondition::None,
+                    },
+                    options: &external_options,
+                    content_length: data.len() as u64,
+                    checksum_sha256: None,
+                },
+                &data,
+            )
+            .await?
+        {
+            return Ok(result.object);
+        }
         let size = data.len() as i64;
         let body = aws_sdk_s3::primitives::ByteStream::from(data);
 
@@ -5403,6 +5923,33 @@ impl ObjectStore for S3Client {
         self.ensure_write_sse_customer_transport(options.encryption.as_ref())?;
         let size = data.len() as i64;
         let requested_checksum = requested_sha256_checksum(&data, options.checksum.as_ref())?;
+        if let Some(result) = self
+            .try_external_upload(
+                UploadRequest {
+                    path,
+                    operation: UploadOperation::PutObject {
+                        condition: WriteCondition::None,
+                    },
+                    options,
+                    content_length: data.len() as u64,
+                    checksum_sha256: requested_checksum.as_deref(),
+                },
+                &data,
+            )
+            .await?
+        {
+            if let Some(checksum) = &requested_checksum {
+                self.verify_persisted_sha256(
+                    path,
+                    result.object.version_id.clone(),
+                    checksum,
+                    destination_sse_customer_key(options.encryption.as_ref()),
+                )
+                .await
+                .map_err(data_transport::committed_verification_failure)?;
+            }
+            return Ok(result.object);
+        }
         let body = aws_sdk_s3::primitives::ByteStream::from(data);
         let storage_class = rustfs_storage_class(options.storage_class.as_deref())?;
         let request = apply_object_write_encryption_to_put_request(
@@ -6813,6 +7360,166 @@ impl ObjectStore for S3Client {
     }
 }
 
+/// External control exchanges retain the host client's TLS and signing policy.
+#[async_trait]
+impl ControlExecutor for S3Client {
+    async fn execute(&self, request: ControlRequest) -> Result<ControlResponse> {
+        if self.alias.anonymous {
+            return Err(Error::RequestRejected(
+                "External object control requires an authenticated S3 principal".to_string(),
+            ));
+        }
+        const MAX_CONTROL_BYTES: usize = 1024 * 1024;
+        if request.body.len() > MAX_CONTROL_BYTES
+            || request.response_limit == 0
+            || request.response_limit > MAX_CONTROL_BYTES
+        {
+            return Err(Error::RequestRejected(
+                "Control envelope exceeds the bounded exchange policy".to_string(),
+            ));
+        }
+        if matches!(request.payload, ControlPayload::External { .. }) && !request.body.is_empty() {
+            return Err(Error::RequestRejected(
+                "An external payload control request must have an empty HTTPS body".to_string(),
+            ));
+        }
+        let operation_deadline = match request.payload {
+            ControlPayload::Body => None,
+            ControlPayload::External { deadline } => {
+                if deadline <= std::time::Instant::now() {
+                    return Err(Error::RequestRejected(
+                        "The external control operation deadline has elapsed".to_string(),
+                    ));
+                }
+                Some(deadline)
+            }
+        };
+        let url = self.external_control_url(&request.path, &request.query)?;
+        let mut headers = request.headers;
+        for name in [
+            "authorization",
+            "host",
+            "content-length",
+            "x-amz-date",
+            "x-amz-content-sha256",
+        ] {
+            if headers.contains_key(name) {
+                return Err(Error::RequestRejected(
+                    "Control requests cannot override signing headers".to_string(),
+                ));
+            }
+        }
+        for header in &self.request_headers {
+            if headers.contains_key(&header.name) {
+                return Err(Error::RequestRejected(
+                    "A custom header conflicts with the external control request".to_string(),
+                ));
+            }
+            headers.insert(
+                HeaderName::from_bytes(header.name.as_bytes()).map_err(|_| {
+                    Error::RequestRejected("Invalid custom header name".to_string())
+                })?,
+                HeaderValue::from_str(&header.value).map_err(|_| {
+                    Error::RequestRejected("Invalid custom header value".to_string())
+                })?,
+            );
+        }
+        headers.insert(
+            "host",
+            HeaderValue::from_str(&self.request_host(&url)?)
+                .map_err(|_| Error::RequestRejected("Invalid object host".to_string()))?,
+        );
+        headers.insert(
+            "x-amz-content-sha256",
+            HeaderValue::from_str(&match request.payload {
+                ControlPayload::Body => Self::sha256_hash(&request.body),
+                ControlPayload::External { .. } => "UNSIGNED-PAYLOAD".to_string(),
+            })
+            .map_err(|_| Error::RequestRejected("Invalid payload digest".to_string()))?,
+        );
+        if headers.values().any(|value| value.to_str().is_err()) {
+            return Err(Error::RequestRejected(
+                "Control request headers must have UTF-8 values".to_string(),
+            ));
+        }
+        let signed = self
+            .sign_external_control_request_at(
+                &request.method,
+                url.as_str(),
+                &headers,
+                &request.body,
+                request.payload,
+                std::time::SystemTime::now(),
+            )
+            .await?;
+        let client = if operation_deadline.is_some() {
+            self.external_http_client
+                .get_or_try_init(|| async {
+                    build_reqwest_client_with_read_policy(
+                        self.alias.insecure,
+                        self.alias.ca_bundle.as_deref(),
+                        self.alias.client_cert.as_deref(),
+                        self.alias.client_key.as_deref(),
+                        self.alias.timeout.as_ref(),
+                        false,
+                    )
+                    .await
+                })
+                .await?
+        } else {
+            &self.xml_http_client
+        };
+        let mut outgoing = client
+            .request(request.method, url)
+            .headers(signed)
+            .body(request.body);
+        if let Some(deadline) = operation_deadline {
+            let remaining = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or_else(|| {
+                    Error::RequestRejected(
+                        "The external control operation deadline has elapsed".to_string(),
+                    )
+                })?;
+            outgoing = outgoing.timeout(remaining);
+        }
+        let response = outgoing
+            .send()
+            .await
+            .map_err(|_| Error::Network("External control exchange failed".to_string()))?;
+        let status = response.status();
+        let headers = response.headers().clone();
+        if response
+            .content_length()
+            .is_some_and(|length| length > request.response_limit as u64)
+        {
+            return Err(Error::Network(
+                "External control response exceeds its bound".to_string(),
+            ));
+        }
+        let mut body = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream
+            .try_next()
+            .await
+            .map_err(|_| Error::Network("External control response was interrupted".to_string()))?
+        {
+            if chunk.len() > request.response_limit.saturating_sub(body.len()) {
+                return Err(Error::Network(
+                    "External control response exceeds its bound".to_string(),
+                ));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(ControlResponse {
+            status,
+            headers,
+            body: Bytes::from(body),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6897,8 +7604,11 @@ mod tests {
             inner: aws_sdk_s3::Client::from_conf(config),
             presign_inner: aws_sdk_s3::Client::from_conf(presign_config),
             xml_http_client,
+            external_http_client: Arc::new(tokio::sync::OnceCell::new()),
             alias,
             request_headers,
+            data_transport_mode: rc_core::DataTransportMode::Http,
+            data_transport: None,
         };
 
         (client, request_receiver)
@@ -6953,8 +7663,11 @@ mod tests {
             inner: aws_sdk_s3::Client::from_conf(config),
             presign_inner: aws_sdk_s3::Client::from_conf(presign_config),
             xml_http_client: reqwest::Client::new(),
+            external_http_client: Arc::new(tokio::sync::OnceCell::new()),
             alias,
             request_headers,
+            data_transport_mode: rc_core::DataTransportMode::Http,
+            data_transport: None,
         };
         (client, replay)
     }
@@ -7082,8 +7795,11 @@ mod tests {
             inner: aws_sdk_s3::Client::from_conf(config.clone()),
             presign_inner: aws_sdk_s3::Client::from_conf(config),
             xml_http_client: reqwest::Client::new(),
+            external_http_client: Arc::new(tokio::sync::OnceCell::new()),
             alias,
             request_headers: Vec::new(),
+            data_transport_mode: rc_core::DataTransportMode::Http,
+            data_transport: None,
         };
         (client, replay)
     }
@@ -13380,5 +14096,637 @@ mod tests {
             .await
             .expect("third read");
         assert_eq!(third, 0);
+    }
+
+    #[derive(Clone, Copy)]
+    enum ExternalBehavior {
+        Reject,
+        PartialReject,
+        Success,
+        Unknown,
+    }
+
+    struct TestExternalTransport {
+        behavior: ExternalBehavior,
+        operations: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl ObjectDataTransport for TestExternalTransport {
+        async fn download(
+            &self,
+            request: DownloadRequest<'_>,
+            target: &mut (dyn AsyncWrite + Unpin + Send),
+        ) -> data_transport::DataTransportResult<data_transport::DownloadResult> {
+            self.operations.lock().expect("record GET").push(format!(
+                "get:{:?}:{:?}",
+                request.options.version_id, request.max_bytes
+            ));
+            assert!(request.max_receive_bytes <= rc_core::S3_MAX_OBJECT_SIZE);
+            if matches!(self.behavior, ExternalBehavior::Reject) {
+                return Err(data_transport::DataTransportError {
+                    state: rc_core::DataTransferState::NotAccepted,
+                    message: "provider unavailable".to_string(),
+                    source: None,
+                });
+            }
+            target
+                .write_all(b"data")
+                .await
+                .expect("write external data");
+            if matches!(self.behavior, ExternalBehavior::PartialReject) {
+                return Err(data_transport::DataTransportError {
+                    state: rc_core::DataTransferState::NotAccepted,
+                    message: "provider unavailable".to_string(),
+                    source: None,
+                });
+            }
+            target.flush().await.expect("flush external data");
+            (request.on_progress)(4, Some(4));
+            Ok(data_transport::DownloadResult {
+                bytes_transferred: 4,
+                content_length: 4,
+            })
+        }
+
+        async fn upload(
+            &self,
+            request: UploadRequest<'_>,
+            source: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+        ) -> data_transport::DataTransportResult<UploadResult> {
+            self.operations
+                .lock()
+                .expect("record upload")
+                .push(format!("{:?}", request.operation));
+            if matches!(self.behavior, ExternalBehavior::Reject) {
+                return Err(data_transport::DataTransportError {
+                    state: rc_core::DataTransferState::NotAccepted,
+                    message: "provider unavailable".to_string(),
+                    source: None,
+                });
+            }
+            let mut payload = Vec::new();
+            source
+                .read_to_end(&mut payload)
+                .await
+                .expect("read external source");
+            assert_eq!(payload.len() as u64, request.content_length);
+            if matches!(self.behavior, ExternalBehavior::Unknown) {
+                return Err(data_transport::DataTransportError {
+                    state: rc_core::DataTransferState::OutcomeUnknown,
+                    message: "temporary timeout".to_string(),
+                    source: None,
+                });
+            }
+            let mut object = ObjectInfo::file(&request.path.key, request.content_length as i64);
+            object.etag = Some("external-etag".to_string());
+            object.content_type = request
+                .options
+                .attributes
+                .as_ref()
+                .and_then(|value| value.content_type.clone());
+            Ok(UploadResult {
+                object,
+                checksum_sha256: request.checksum_sha256.map(ToString::to_string),
+            })
+        }
+    }
+
+    fn external_transport(behavior: ExternalBehavior) -> Arc<TestExternalTransport> {
+        Arc::new(TestExternalTransport {
+            behavior,
+            operations: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    #[tokio::test]
+    async fn external_auto_rejection_preserves_http_get_selection() {
+        let response = http::Response::builder()
+            .status(200)
+            .header("content-length", "4")
+            .body(SdkBody::from("http"))
+            .expect("HTTP GET response");
+        let (client, receiver) = test_s3_client(Some(response));
+        let provider = external_transport(ExternalBehavior::Reject);
+        let client =
+            client.with_object_data_transport(rc_core::DataTransportMode::Auto, provider.clone());
+        let options = ObjectReadOptions {
+            version_id: Some("v1".to_string()),
+        };
+        let result = client
+            .get_object_with_options(&RemotePath::new("test", "bucket", "key"), &options)
+            .await
+            .expect("safe HTTP fallback");
+        assert_eq!(result, b"http");
+        assert!(receiver.expect_request().uri().contains("versionId=v1"));
+        assert_eq!(
+            provider.operations.lock().expect("GET record")[0],
+            "get:Some(\"v1\"):None"
+        );
+    }
+
+    #[tokio::test]
+    async fn external_download_cannot_fallback_after_writer_poll() {
+        let (client, replay) = test_s3_client_with_response_sequence(Vec::new());
+        let client = client.with_object_data_transport(
+            rc_core::DataTransportMode::Auto,
+            external_transport(ExternalBehavior::PartialReject),
+        );
+        let mut target = Vec::new();
+        let error = client
+            .write_object_to(&RemotePath::new("test", "bucket", "key"), &mut target, None)
+            .await
+            .expect_err("partial output cannot replay");
+        assert!(matches!(
+            error,
+            Error::DataTransfer {
+                state: rc_core::DataTransferState::OutcomeUnknown,
+                ..
+            }
+        ));
+        assert_eq!(target, b"data");
+        assert_eq!(replay.actual_requests().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn external_file_download_keeps_atomic_replacement() {
+        let (client, replay) = test_s3_client_with_response_sequence(Vec::new());
+        let client = client.with_object_data_transport(
+            rc_core::DataTransportMode::Rdma,
+            external_transport(ExternalBehavior::PartialReject),
+        );
+        let directory = tempfile::tempdir().expect("destination directory");
+        let destination = directory.path().join("object");
+        std::fs::write(&destination, b"original").expect("existing destination");
+        assert!(
+            client
+                .download_object_to_path(
+                    &RemotePath::new("test", "bucket", "key"),
+                    &destination,
+                    |_, _| {}
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read(&destination).expect("read destination"),
+            b"original"
+        );
+        assert_eq!(
+            std::fs::read_dir(directory.path())
+                .expect("list directory")
+                .count(),
+            1
+        );
+        assert_eq!(replay.actual_requests().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn external_put_retains_options_and_unknown_outcome_classification() {
+        let (client, replay) = test_s3_client_with_response_sequence(Vec::new());
+        let client = client.with_object_data_transport(
+            rc_core::DataTransportMode::Auto,
+            external_transport(ExternalBehavior::Unknown),
+        );
+        let error = client
+            .put_object(
+                &RemotePath::new("test", "bucket", "key"),
+                b"data".to_vec(),
+                Some("application/test"),
+                None,
+            )
+            .await
+            .expect_err("unknown write cannot replay");
+        assert!(matches!(
+            error,
+            Error::DataTransfer {
+                state: rc_core::DataTransferState::OutcomeUnknown,
+                ..
+            }
+        ));
+        assert!(!rc_core::is_retryable_error(&error));
+        assert_eq!(replay.actual_requests().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn external_conditional_file_upload_keeps_http_multipart_completion() {
+        let complete = http::Response::builder().status(200).header("content-type", "application/xml")
+            .body(SdkBody::from(r#"<CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>bucket</Bucket><Key>key</Key><ETag>"final-etag"</ETag></CompleteMultipartUploadResult>"#))
+            .expect("multipart complete response");
+        let (client, replay) =
+            test_s3_client_with_response_sequence(vec![multipart_create_response(), complete]);
+        let provider = external_transport(ExternalBehavior::Success);
+        let client =
+            client.with_object_data_transport(rc_core::DataTransportMode::Rdma, provider.clone());
+        let mut source = tempfile::NamedTempFile::new().expect("file source");
+        source.write_all(b"part data").expect("write source");
+        client
+            .put_object_from_path_if_absent(
+                &RemotePath::new("test", "bucket", "key"),
+                source.path(),
+                None,
+                None,
+                |_| {},
+            )
+            .await
+            .expect("external part with HTTP completion");
+        let requests = replay.actual_requests().collect::<Vec<_>>();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].headers().get("if-none-match"), Some("*"));
+        assert!(provider.operations.lock().expect("part record")[0].starts_with("UploadPart"));
+    }
+
+    #[tokio::test]
+    async fn external_rdmamode_without_provider_fails_only_data_operations() {
+        let (mut client, replay) = test_s3_client_with_response_sequence(Vec::new());
+        client.data_transport_mode = rc_core::DataTransportMode::Rdma;
+        let error = client
+            .get_object(&RemotePath::new("test", "bucket", "key"))
+            .await
+            .expect_err("required provider missing");
+        assert!(matches!(
+            error,
+            Error::DataTransfer {
+                state: rc_core::DataTransferState::NotAccepted,
+                ..
+            }
+        ));
+        assert_eq!(replay.actual_requests().count(), 0);
+    }
+    #[test]
+    fn external_error_source_is_redacted_without_losing_business_class() {
+        let (client, _) = test_s3_client(None);
+        let error = Error::DataTransfer {
+            state: rc_core::DataTransferState::ConfirmedFailure,
+            message: "secret-key in response".to_string(),
+            source: Some(Box::new(Error::Auth("access-key secret-key".to_string()))),
+        };
+        let error = client.redact_sensitive_error(error);
+        assert_eq!(error.exit_code(), 4);
+        let diagnostic = format!("{error:?}");
+        assert!(!diagnostic.contains("secret-key"));
+        assert!(!diagnostic.contains("access-key"));
+        assert!(std::error::Error::source(&error).is_some());
+        assert!(!rc_core::is_retryable_error(&error));
+    }
+
+    #[tokio::test]
+    async fn external_http_policy_does_not_invoke_installed_provider() {
+        let response = http::Response::builder()
+            .status(200)
+            .header("content-length", "4")
+            .body(SdkBody::from("http"))
+            .expect("HTTP GET response");
+        let (client, receiver) = test_s3_client(Some(response));
+        let provider = external_transport(ExternalBehavior::PartialReject);
+        let client =
+            client.with_object_data_transport(rc_core::DataTransportMode::Http, provider.clone());
+        assert_eq!(
+            client
+                .get_object(&RemotePath::new("test", "bucket", "key"))
+                .await
+                .expect("unchanged HTTP path"),
+            b"http"
+        );
+        assert!(
+            provider
+                .operations
+                .lock()
+                .expect("no provider calls")
+                .is_empty()
+        );
+        receiver.expect_request();
+    }
+    #[tokio::test]
+    async fn external_committed_put_checksum_failure_never_replays_upload() {
+        let response = http::Response::builder().status(503)
+            .header("x-amz-error-code", "ServiceUnavailable")
+            .body(SdkBody::from("<Error><Code>ServiceUnavailable</Code><Message>temporary timeout</Message></Error>"))
+            .expect("post-write HEAD failure");
+        let (client, receiver) = test_s3_client(Some(response));
+        let client = client.with_object_data_transport(
+            rc_core::DataTransportMode::Auto,
+            external_transport(ExternalBehavior::Success),
+        );
+        let options = ObjectWriteOptions {
+            checksum: Some(ChecksumRequest::Calculate(ChecksumAlgorithm::Sha256)),
+            ..ObjectWriteOptions::default()
+        };
+        let error = client
+            .put_object_with_options(
+                &RemotePath::new("test", "bucket", "key"),
+                b"data".to_vec(),
+                &options,
+            )
+            .await
+            .expect_err("post-write verification failed");
+        assert!(matches!(
+            error,
+            Error::DataTransfer {
+                state: rc_core::DataTransferState::ConfirmedFailure,
+                ..
+            }
+        ));
+        assert!(!rc_core::is_retryable_error(&error));
+        assert_eq!(receiver.expect_request().method(), "HEAD");
+    }
+    #[tokio::test]
+    async fn external_multipart_completion_failure_does_not_replay_the_file() {
+        let complete = http::Response::builder().status(503)
+            .header("x-amz-error-code", "ServiceUnavailable")
+            .body(SdkBody::from("<Error><Code>ServiceUnavailable</Code><Message>temporary timeout</Message></Error>"))
+            .expect("uncertain completion response");
+        let abort = http::Response::builder()
+            .status(204)
+            .body(SdkBody::empty())
+            .expect("abort response");
+        let (client, replay) = test_s3_client_with_response_sequence(vec![
+            multipart_create_response(),
+            complete,
+            abort,
+        ]);
+        let client = client.with_object_data_transport(
+            rc_core::DataTransportMode::Auto,
+            external_transport(ExternalBehavior::Success),
+        );
+        let mut source = tempfile::NamedTempFile::new().expect("file source");
+        source.write_all(b"data").expect("write source");
+        let error = client
+            .put_object_from_path_if_absent(
+                &RemotePath::new("test", "bucket", "key"),
+                source.path(),
+                None,
+                None,
+                |_| {},
+            )
+            .await
+            .expect_err("uncertain completion");
+        assert!(matches!(
+            error,
+            Error::DataTransfer {
+                state: rc_core::DataTransferState::OutcomeUnknown,
+                ..
+            }
+        ));
+        assert!(!rc_core::is_retryable_error(&error));
+        assert!(error.to_string().contains("upload-id"));
+        assert_eq!(replay.actual_requests().count(), 3);
+    }
+
+    #[tokio::test]
+    async fn external_multipart_post_commit_checksum_failure_never_replays_the_file() {
+        let complete = http::Response::builder().status(200).header("content-type", "application/xml")
+            .body(SdkBody::from(r#"<CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>bucket</Bucket><Key>key</Key><ETag>"final-etag"</ETag></CompleteMultipartUploadResult>"#))
+            .expect("multipart completion");
+        let head = http::Response::builder().status(503).header("x-amz-error-code", "ServiceUnavailable")
+            .body(SdkBody::from("<Error><Code>ServiceUnavailable</Code><Message>temporary timeout</Message></Error>"))
+            .expect("post-completion HEAD failure");
+        let (client, replay) = test_s3_client_with_response_sequence(vec![
+            multipart_create_response(),
+            complete,
+            head,
+        ]);
+        let client = client.with_object_data_transport(
+            rc_core::DataTransportMode::Auto,
+            external_transport(ExternalBehavior::Success),
+        );
+        let mut source = tempfile::NamedTempFile::new().expect("file source");
+        source.write_all(b"data").expect("write source");
+        let options = ObjectWriteOptions {
+            checksum: Some(ChecksumRequest::Calculate(ChecksumAlgorithm::Sha256)),
+            ..ObjectWriteOptions::default()
+        };
+        let error = client
+            .put_object_multipart_from_path(
+                &RemotePath::new("test", "bucket", "key"),
+                source.path(),
+                4,
+                PathUploadOptions {
+                    write: &options,
+                    precondition: ObjectWritePrecondition::None,
+                },
+                |_| {},
+            )
+            .await
+            .expect_err("post-commit checksum failure");
+        assert!(matches!(
+            error,
+            Error::DataTransfer {
+                state: rc_core::DataTransferState::ConfirmedFailure,
+                ..
+            }
+        ));
+        assert!(!rc_core::is_retryable_error(&error));
+        assert_eq!(replay.actual_requests().count(), 3);
+    }
+    #[tokio::test]
+    async fn external_control_object_signing_matches_sdk_for_encoded_keys() {
+        for key in [
+            "space key",
+            "percent%key",
+            "unicode-\u{1f680}",
+            "nested//key",
+            "symbols-:@!$&'()*+,;=[]",
+        ] {
+            let response = http::Response::builder()
+                .status(200)
+                .header("content-length", "0")
+                .body(SdkBody::empty())
+                .expect("GET response");
+            let (client, receiver) =
+                test_s3_client_with_endpoint("https://objects.example.test", Some(response));
+            let version = "version +/% test";
+            client
+                .get_object_with_options(
+                    &RemotePath::new("test", "bucket", key),
+                    &ObjectReadOptions {
+                        version_id: Some(version.to_string()),
+                    },
+                )
+                .await
+                .expect("capture SDK signature");
+            let sdk_request = receiver.expect_request();
+            let url = client
+                .external_control_url(
+                    &RemotePath::new("test", "bucket", key),
+                    &[
+                        ("versionId".to_string(), version.to_string()),
+                        ("x-id".to_string(), "GetObject".to_string()),
+                    ],
+                )
+                .expect("control object URL");
+            let sdk_url = reqwest::Url::parse(sdk_request.uri()).expect("SDK object URL");
+            assert_eq!(url.path(), sdk_url.path(), "S3 object URL for {key}");
+            let mut actual_query = url
+                .query()
+                .expect("control query")
+                .split('&')
+                .collect::<Vec<_>>();
+            let mut expected_query = sdk_url
+                .query()
+                .expect("SDK query")
+                .split('&')
+                .collect::<Vec<_>>();
+            actual_query.sort();
+            expected_query.sort();
+            assert_eq!(actual_query, expected_query, "S3 query escaping for {key}");
+            let sdk_date = sdk_request
+                .headers()
+                .get("x-amz-date")
+                .expect("SDK signing date");
+            let instant: Timestamp = format!(
+                "{}-{}-{}T{}:{}:{}Z",
+                &sdk_date[..4],
+                &sdk_date[4..6],
+                &sdk_date[6..8],
+                &sdk_date[9..11],
+                &sdk_date[11..13],
+                &sdk_date[13..15]
+            )
+            .parse()
+            .expect("parse SDK signing instant");
+            let time = std::time::UNIX_EPOCH + Duration::from_secs(instant.as_second() as u64);
+            let authorization = sdk_request
+                .headers()
+                .get("authorization")
+                .expect("SDK authorization");
+            let signed_names = authorization
+                .split("SignedHeaders=")
+                .nth(1)
+                .expect("SDK signed header list")
+                .split(',')
+                .next()
+                .expect("SDK signed headers")
+                .split(';')
+                .collect::<Vec<_>>();
+            let mut headers = HeaderMap::new();
+            for (name, value) in sdk_request.headers().iter() {
+                if signed_names.contains(&name) {
+                    headers.insert(
+                        HeaderName::from_bytes(name.as_bytes()).expect("SDK header name"),
+                        HeaderValue::from_str(value).expect("SDK header value"),
+                    );
+                }
+            }
+            let signed = client
+                .sign_external_control_request_at(
+                    &Method::GET,
+                    sdk_request.uri(),
+                    &headers,
+                    &[],
+                    ControlPayload::Body,
+                    time,
+                )
+                .await
+                .expect("S3 control signature");
+            assert_eq!(
+                signed
+                    .get("authorization")
+                    .expect("control authorization")
+                    .to_str()
+                    .expect("UTF-8 authorization"),
+                sdk_request
+                    .headers()
+                    .get("authorization")
+                    .expect("SDK authorization"),
+                "S3 signature for {key}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn external_control_rejects_anonymous_principal_before_network_io() {
+        let (mut client, replay) = test_s3_client_with_response_sequence(Vec::new());
+        client.alias.anonymous = true;
+        let request = ControlRequest {
+            method: Method::GET,
+            path: RemotePath::new("test", "bucket", "key"),
+            query: Vec::new(),
+            headers: HeaderMap::new(),
+            body: Bytes::new(),
+            payload: ControlPayload::Body,
+            response_limit: 1024,
+        };
+        assert!(matches!(
+            ControlExecutor::execute(&client, request).await,
+            Err(Error::RequestRejected(_))
+        ));
+        assert_eq!(replay.actual_requests().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn external_control_rejects_a_body_with_separately_delivered_payload() {
+        let (client, replay) = test_s3_client_with_response_sequence(Vec::new());
+        let request = ControlRequest {
+            method: Method::PUT,
+            path: RemotePath::new("test", "bucket", "key"),
+            query: Vec::new(),
+            headers: HeaderMap::new(),
+            body: Bytes::from_static(b"unexpected control body"),
+            payload: ControlPayload::External {
+                deadline: Instant::now() + Duration::from_secs(30),
+            },
+            response_limit: 1024,
+        };
+        assert!(matches!(
+            ControlExecutor::execute(&client, request).await,
+            Err(Error::RequestRejected(_))
+        ));
+        assert_eq!(replay.actual_requests().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn external_control_rejects_an_elapsed_operation_deadline_before_network_io() {
+        let (client, replay) = test_s3_client_with_response_sequence(Vec::new());
+        let request = ControlRequest {
+            method: Method::PUT,
+            path: RemotePath::new("test", "bucket", "key"),
+            query: Vec::new(),
+            headers: HeaderMap::new(),
+            body: Bytes::new(),
+            payload: ControlPayload::External {
+                deadline: Instant::now(),
+            },
+            response_limit: 1024,
+        };
+        assert!(matches!(
+            ControlExecutor::execute(&client, request).await,
+            Err(Error::RequestRejected(_))
+        ));
+        assert_eq!(replay.actual_requests().count(), 0);
+        assert!(client.external_http_client.get().is_none());
+    }
+
+    #[tokio::test]
+    async fn external_control_signs_external_payload_and_all_binding_headers() {
+        let (client, _) = test_s3_client_with_response_sequence(Vec::new());
+        let mut headers = HeaderMap::new();
+        headers.insert("x-payload-session", HeaderValue::from_static("session-a"));
+        headers.insert("x-payload-length", HeaderValue::from_static("17"));
+        let sign = |headers: HeaderMap| {
+            let client = &client;
+            async move {
+                client
+                    .sign_external_control_request_at(
+                        &Method::PUT,
+                        "https://objects.example.test/bucket/key",
+                        &headers,
+                        &[],
+                        ControlPayload::External {
+                            deadline: Instant::now() + Duration::from_secs(30),
+                        },
+                        std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+                    )
+                    .await
+                    .expect("signed control request")
+            }
+        };
+        let first = sign(headers.clone()).await;
+        assert_eq!(first["x-amz-content-sha256"], "UNSIGNED-PAYLOAD");
+        let authorization = first["authorization"].to_str().expect("authorization text");
+        assert!(authorization.contains("x-payload-length;x-payload-session"));
+        headers.insert("x-payload-session", HeaderValue::from_static("session-b"));
+        let second = sign(headers).await;
+        assert_ne!(first["authorization"], second["authorization"]);
     }
 }

@@ -1,4 +1,5 @@
 [workspace]
+exclude = ["rdma", "vendor/rustfs-ucx"]
 resolver = "3"
 members = ["crates/cli", "crates/core", "crates/s3"]
 
