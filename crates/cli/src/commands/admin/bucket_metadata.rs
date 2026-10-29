@@ -376,7 +376,14 @@ impl ValidatedArchive {
                     "Bucket metadata archive expands beyond the 128 MiB limit".to_string(),
                 ));
             }
-            let name = file.name().to_string();
+            let name = file
+                .name()
+                .map_err(|_| {
+                    Error::Config(
+                        "Bucket metadata archive contains an unreadable entry".to_string(),
+                    )
+                })?
+                .into_owned();
             let mut parts = name.split('/');
             let bucket = parts.next().unwrap_or_default();
             let config = parts.next().unwrap_or_default();
