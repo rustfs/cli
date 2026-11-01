@@ -6036,6 +6036,33 @@ mod tests {
         AdminClient::new(&alias).expect("anonymous admin client should build")
     }
 
+    #[tokio::test]
+    async fn bucket_quota_operations_accept_unknown_usage() {
+        let body = r#"{"bucket":"quota-test","quota":1024,"size":null,"quotaType":"HARD"}"#;
+        let cleared = r#"{"bucket":"quota-test","quota":null,"size":null,"quotaType":"HARD"}"#;
+        let (endpoint, receiver, handle) = start_admin_sequence_server(vec![
+            ("200 OK", body),
+            ("200 OK", body),
+            ("200 OK", cleared),
+        ]);
+        let client = admin_client_for_endpoint(&endpoint);
+        let responses = [
+            client.set_bucket_quota("quota-test", 1024).await,
+            client.get_bucket_quota("quota-test").await,
+            client.clear_bucket_quota("quota-test").await,
+        ];
+        for (response, method) in responses.into_iter().zip(["PUT", "GET", "DELETE"]) {
+            let quota = response.expect("quota operation accepts unavailable usage");
+            assert_eq!(quota.bucket, "quota-test");
+            assert_eq!(quota.quota, (method != "DELETE").then_some(1024));
+            assert_eq!(quota.size, None);
+            let request = receiver.recv().expect("capture quota request");
+            assert_eq!(request.method, method);
+            assert_eq!(request.target, "/rustfs/admin/v3/quota/quota-test");
+        }
+        handle.join().expect("quota server thread");
+    }
+
     fn assert_minio_admin_signature(
         headers: &HeaderMap,
         method: &str,

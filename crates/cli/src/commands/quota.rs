@@ -51,8 +51,8 @@ struct QuotaOutput {
     bucket: String,
     quota: Option<u64>,
     quota_human: Option<String>,
-    usage: u64,
-    usage_human: String,
+    usage: Option<u64>,
+    usage_human: Option<String>,
     quota_type: String,
 }
 
@@ -157,16 +157,23 @@ async fn execute_clear(args: BucketArg, output_config: OutputConfig) -> ExitCode
     }
 }
 
-fn print_quota_result(formatter: &Formatter, quota: &BucketQuota) {
-    if formatter.is_json() {
-        formatter.json(&QuotaOutput {
+impl From<&BucketQuota> for QuotaOutput {
+    fn from(quota: &BucketQuota) -> Self {
+        Self {
             bucket: quota.bucket.clone(),
             quota: quota.quota,
             quota_human: quota.quota.map(format_human_size),
             usage: quota.size,
-            usage_human: format_human_size(quota.size),
+            usage_human: quota.size.map(format_human_size),
             quota_type: quota.quota_type.clone(),
-        });
+        }
+    }
+}
+
+fn print_quota_result(formatter: &Formatter, quota: &BucketQuota) {
+    let output = QuotaOutput::from(quota);
+    if formatter.is_json() {
+        formatter.json(&output);
         return;
     }
 
@@ -176,7 +183,10 @@ fn print_quota_result(formatter: &Formatter, quota: &BucketQuota) {
         .map(format_human_size)
         .unwrap_or_else(|| "unlimited".to_string());
     formatter.println(&format!("Quota: {limit_text}"));
-    formatter.println(&format!("Usage: {}", format_human_size(quota.size)));
+    formatter.println(&format!(
+        "Usage: {}",
+        output.usage_human.as_deref().unwrap_or("unknown")
+    ));
     formatter.println(&format!("Type:  {}", quota.quota_type));
 }
 
@@ -243,6 +253,20 @@ fn exit_code_from_error(error: &rc_core::Error) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_quota_output_preserves_unknown_and_zero_usage() {
+        for size in [None, Some(0), Some(512)] {
+            let quota: BucketQuota = serde_json::from_value(serde_json::json!({
+                "bucket": "my-bucket", "quota": 1024, "size": size,
+            }))
+            .expect("decode server quota response");
+            let output = QuotaOutput::from(&quota);
+            let json = serde_json::to_value(&output).expect("serialize quota output");
+            assert_eq!(json["usage"], serde_json::json!(size));
+            assert_eq!(output.usage_human, size.map(format_human_size));
+        }
+    }
 
     #[test]
     fn test_parse_bucket_path() {
