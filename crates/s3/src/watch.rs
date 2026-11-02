@@ -136,7 +136,11 @@ impl S3Client {
 
         {
             let mut query = url.query_pairs_mut();
-            for event in &request.events {
+            // RustFS preserves repeated query values during verification, so their
+            // wire order must match SigV4's encoded value order.
+            let mut events = request.events.iter().collect::<Vec<_>>();
+            events.sort_unstable_by_key(|event| urlencoding::encode(event).into_owned());
+            for event in events {
                 query.append_pair("events", event);
             }
             if let Some(prefix) = &request.prefix {
@@ -611,6 +615,36 @@ mod tests {
             headers.get(HOST).and_then(|value| value.to_str().ok()),
             Some("example.com")
         );
+    }
+
+    #[test]
+    fn watch_url_sorts_repeated_events_to_match_sigv4_canonical_order() {
+        let client = test_client("https://example.com");
+        let mut watch = request(Some("photos"));
+        watch.events = vec![
+            "s3:ObjectCreated:*".to_string(),
+            "s3:ObjectRemoved:*".to_string(),
+            "s3:ObjectAccessed:*".to_string(),
+        ];
+
+        for bucket in [None, Some("photos".to_string())] {
+            watch.bucket = bucket;
+            let url = client.watch_url(&watch).expect("watch URL should build");
+            let events = url
+                .query_pairs()
+                .filter(|(name, _)| name == "events")
+                .map(|(_, value)| value.into_owned())
+                .collect::<Vec<_>>();
+
+            assert_eq!(
+                events,
+                [
+                    "s3:ObjectAccessed:*",
+                    "s3:ObjectCreated:*",
+                    "s3:ObjectRemoved:*",
+                ]
+            );
+        }
     }
 
     #[test]
