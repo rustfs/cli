@@ -4778,18 +4778,15 @@ impl S3Client {
             write,
             precondition,
         };
-        // RustFS evaluates write preconditions for multipart completion. Keep
-        // ordinary small uploads on PutObject, but route conditional path writes
-        // through multipart so mirror retains compare-and-swap semantics on the
-        // currently deployed service.
-        if Self::should_use_multipart(file_size)
-            || !matches!(precondition, ObjectWritePrecondition::None)
-        {
+        if Self::should_use_multipart(file_size) {
             self.put_object_multipart_from_path(path, file_path, file_size, options, on_progress)
                 .await
         } else {
-            self.put_object_single_part_from_path(path, file_path, file_size, options)
-                .await
+            let result = self
+                .put_object_single_part_from_path(path, file_path, file_size, options)
+                .await?;
+            on_progress(file_size);
+            Ok(result)
         }
     }
 
@@ -9705,42 +9702,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn conditional_path_writes_complete_with_precondition_headers() {
-        let complete_response = || {
+    async fn conditional_path_writes_use_single_put_with_precondition_headers() {
+        let put_response = || {
             http::Response::builder()
                 .status(200)
-                .header("content-type", "application/xml")
-                .body(SdkBody::from(
-                    r#"<CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>bucket</Bucket><Key>key.txt</Key><ETag>"final-etag"</ETag></CompleteMultipartUploadResult>"#,
-                ))
-                .expect("build multipart complete response")
+                .header("etag", "\"final-etag\"")
+                .body(SdkBody::empty())
+                .expect("build put response")
         };
         let path = RemotePath::new("test", "bucket", "key.txt");
         let mut source = tempfile::NamedTempFile::new().expect("create upload source");
         source.write_all(b"path-data").expect("write upload source");
+        let progress = std::sync::Mutex::new(Vec::new());
 
-        let (path_upload_client, path_upload_replay) = test_s3_client_with_response_sequence(vec![
-            multipart_create_response(),
-            multipart_part_response(),
-            complete_response(),
-        ]);
+        let (path_upload_client, path_upload_replay) =
+            test_s3_client_with_response_sequence(vec![put_response()]);
         path_upload_client
-            .put_object_from_path_if_absent(&path, source.path(), None, None, |_| {})
+            .put_object_from_path_if_absent(&path, source.path(), None, None, |bytes| {
+                progress.lock().expect("progress record").push(bytes);
+            })
             .await
             .expect("conditional path upload");
         let path_upload_requests = path_upload_replay.actual_requests().collect::<Vec<_>>();
-        assert_eq!(path_upload_requests.len(), 3);
+        assert_eq!(path_upload_requests.len(), 1);
+        assert_eq!(path_upload_requests[0].method(), "PUT");
+        assert_eq!(*progress.lock().expect("progress record"), vec![9]);
         assert_eq!(
-            path_upload_requests[2].headers().get("if-none-match"),
+            path_upload_requests[0].headers().get("if-none-match"),
             Some("*")
         );
 
         let (matched_upload_client, matched_upload_replay) =
-            test_s3_client_with_response_sequence(vec![
-                multipart_create_response(),
-                multipart_part_response(),
-                complete_response(),
-            ]);
+            test_s3_client_with_response_sequence(vec![put_response()]);
         matched_upload_client
             .put_object_from_path_if_match(
                 &path,
@@ -9753,27 +9746,21 @@ mod tests {
             .await
             .expect("matched path upload");
         let matched_upload_requests = matched_upload_replay.actual_requests().collect::<Vec<_>>();
-        assert_eq!(matched_upload_requests.len(), 3);
+        assert_eq!(matched_upload_requests.len(), 1);
+        assert_eq!(matched_upload_requests[0].method(), "PUT");
         assert_eq!(
-            matched_upload_requests[2].headers().get("if-match"),
+            matched_upload_requests[0].headers().get("if-match"),
             Some("expected-etag")
         );
     }
 
     #[tokio::test]
-    async fn conditional_empty_path_write_uploads_one_empty_part() {
-        let complete_response = http::Response::builder()
+    async fn conditional_empty_path_write_uses_one_empty_put() {
+        let put_response = http::Response::builder()
             .status(200)
-            .header("content-type", "application/xml")
-            .body(SdkBody::from(
-                r#"<CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>bucket</Bucket><Key>empty.txt</Key><ETag>"final-etag"</ETag></CompleteMultipartUploadResult>"#,
-            ))
-            .expect("build multipart complete response");
-        let (client, replay) = test_s3_client_with_response_sequence(vec![
-            multipart_create_response(),
-            multipart_part_response(),
-            complete_response,
-        ]);
+            .body(SdkBody::empty())
+            .expect("build put response");
+        let (client, replay) = test_s3_client_with_response_sequence(vec![put_response]);
         let path = RemotePath::new("test", "bucket", "empty.txt");
         let source = tempfile::NamedTempFile::new().expect("create empty upload source");
 
@@ -9783,9 +9770,50 @@ mod tests {
             .expect("conditional empty path upload");
 
         let requests = replay.actual_requests().collect::<Vec<_>>();
-        assert_eq!(requests.len(), 3);
-        assert!(requests[1].uri().contains("partNumber=1"));
-        assert_eq!(requests[2].headers().get("if-none-match"), Some("*"));
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method(), "PUT");
+        assert_eq!(requests[0].body().bytes(), Some(b"".as_slice()));
+        assert_eq!(requests[0].headers().get("if-none-match"), Some("*"));
+    }
+
+    #[tokio::test]
+    async fn conditional_small_path_conflicts_never_retry_without_the_precondition() {
+        let mut source = tempfile::NamedTempFile::new().expect("upload source");
+        source.write_all(b"small-file").expect("write source");
+        let path = RemotePath::new("test", "bucket", "key");
+        for status in [409, 412] {
+            for condition in [
+                ObjectWritePrecondition::IfAbsent,
+                ObjectWritePrecondition::IfMatch("stale-etag"),
+            ] {
+                let response = http::Response::builder()
+                    .status(status)
+                    .header("content-type", "application/xml")
+                    .body(SdkBody::from(
+                        "<Error><Code>PreconditionFailed</Code></Error>",
+                    ))
+                    .expect("conflict response");
+                let (client, replay) = test_s3_client_with_response_sequence(vec![response]);
+                let error = client
+                    .put_object_from_path_with_condition(
+                        &path,
+                        source.path(),
+                        &ObjectWriteOptions::default(),
+                        condition,
+                        |_| {},
+                    )
+                    .await
+                    .expect_err("write conflict");
+                assert!(matches!(error, Error::Conflict(_)), "{error}");
+                let requests = replay.actual_requests().collect::<Vec<_>>();
+                assert_eq!(requests.len(), 1);
+                assert_eq!(requests[0].method(), "PUT");
+                assert!(
+                    requests[0].headers().get("if-none-match").is_some()
+                        || requests[0].headers().get("if-match").is_some()
+                );
+            }
+        }
     }
 
     fn multipart_create_response() -> http::Response<SdkBody> {
@@ -14309,12 +14337,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn external_conditional_file_upload_keeps_http_multipart_completion() {
-        let complete = http::Response::builder().status(200).header("content-type", "application/xml")
-            .body(SdkBody::from(r#"<CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>bucket</Bucket><Key>key</Key><ETag>"final-etag"</ETag></CompleteMultipartUploadResult>"#))
-            .expect("multipart complete response");
-        let (client, replay) =
-            test_s3_client_with_response_sequence(vec![multipart_create_response(), complete]);
+    async fn external_conditional_file_upload_preserves_the_put_precondition() {
+        let (client, replay) = test_s3_client_with_response_sequence(Vec::new());
         let provider = external_transport(ExternalBehavior::Success);
         let client =
             client.with_object_data_transport(rc_core::DataTransportMode::Rdma, provider.clone());
@@ -14329,11 +14353,13 @@ mod tests {
                 |_| {},
             )
             .await
-            .expect("external part with HTTP completion");
+            .expect("external conditional put");
         let requests = replay.actual_requests().collect::<Vec<_>>();
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[1].headers().get("if-none-match"), Some("*"));
-        assert!(provider.operations.lock().expect("part record")[0].starts_with("UploadPart"));
+        assert!(requests.is_empty());
+        assert_eq!(
+            provider.operations.lock().expect("put record").as_slice(),
+            ["PutObject { condition: IfAbsent }"]
+        );
     }
 
     #[tokio::test]
@@ -14452,11 +14478,14 @@ mod tests {
         let mut source = tempfile::NamedTempFile::new().expect("file source");
         source.write_all(b"data").expect("write source");
         let error = client
-            .put_object_from_path_if_absent(
+            .put_object_multipart_from_path(
                 &RemotePath::new("test", "bucket", "key"),
                 source.path(),
-                None,
-                None,
+                4,
+                PathUploadOptions {
+                    write: &ObjectWriteOptions::default(),
+                    precondition: ObjectWritePrecondition::IfAbsent,
+                },
                 |_| {},
             )
             .await
