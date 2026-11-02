@@ -91,6 +91,17 @@ rc alias list
 
 ### Basic Operations
 
+Temporary credentials can be supplied for one process through an environment alias:
+
+```bash
+RC_HOST_session='https://ACCESS_KEY:SECRET_KEY@s3.example.com?session_token=URL_ENCODED_TOKEN' rc ls session/
+```
+
+URL-encode the credentials and token, including `+`, `/`, and `=`. The same
+credential set signs S3 and Admin requests. The token is not stored in the alias
+configuration or included in alias output. Renew the whole credential set when
+an expired or invalid token is reported; saved aliases are retained.
+
 ```bash
 # List buckets
 rc ls local/

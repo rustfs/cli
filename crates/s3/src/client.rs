@@ -1684,6 +1684,7 @@ pub struct S3Client {
     xml_http_client: reqwest::Client,
     external_http_client: Arc<tokio::sync::OnceCell<reqwest::Client>>,
     alias: Alias,
+    session_token: Option<String>,
     request_headers: Vec<RequestHeader>,
     data_transport_mode: rc_core::DataTransportMode,
     data_transport: Option<Arc<dyn ObjectDataTransport>>,
@@ -1723,6 +1724,7 @@ impl S3Client {
         let region = alias.region.clone();
         let access_key = alias.access_key.clone();
         let secret_key = alias.secret_key.clone();
+        let session_token = alias.session_token()?;
 
         // Build SDK config loader
         let mut config_loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
@@ -1735,7 +1737,7 @@ impl S3Client {
             let credentials = aws_credential_types::Credentials::new(
                 access_key,
                 secret_key,
-                None, // session token
+                session_token.clone(),
                 None, // expiry
                 "rc-static-credentials",
             );
@@ -1808,6 +1810,7 @@ impl S3Client {
             xml_http_client,
             external_http_client: Arc::new(tokio::sync::OnceCell::new()),
             alias,
+            session_token,
             request_headers,
             data_transport_mode: rc_core::global_data_transport_mode(),
             data_transport: None,
@@ -2042,32 +2045,34 @@ impl S3Client {
         }
 
         let response = builder.send().await.map_err(|error| {
-            let formatted = Self::format_sdk_error(&error);
-            if let aws_sdk_s3::error::SdkError::ServiceError(service_error) = &error {
-                let status = service_error.raw().status().as_u16();
-                let code = service_error.err().code();
-                if matches!(status, 401 | 403)
-                    || matches!(
-                        code,
-                        Some("AccessDenied") | Some("Forbidden") | Some("Unauthorized")
-                    )
+            self.map_sdk_failure(&error, || {
+                let formatted = Self::format_sdk_error(&error);
+                if let aws_sdk_s3::error::SdkError::ServiceError(service_error) = &error {
+                    let status = service_error.raw().status().as_u16();
+                    let code = service_error.err().code();
+                    if matches!(status, 401 | 403)
+                        || matches!(
+                            code,
+                            Some("AccessDenied") | Some("Forbidden") | Some("Unauthorized")
+                        )
+                    {
+                        return Error::Auth(formatted);
+                    }
+                    if status == 404 || matches!(code, Some("NotFound") | Some("NoSuchBucket")) {
+                        return Error::NotFound(format!("Bucket not found: {}", path.bucket));
+                    }
+                }
+                if formatted.contains("AccessDenied")
+                    || formatted.contains("Forbidden")
+                    || formatted.contains("Unauthorized")
                 {
-                    return Error::Auth(formatted);
+                    Error::Auth(formatted)
+                } else if formatted.contains("NotFound") || formatted.contains("NoSuchBucket") {
+                    Error::NotFound(format!("Bucket not found: {}", path.bucket))
+                } else {
+                    Error::Network(formatted)
                 }
-                if status == 404 || matches!(code, Some("NotFound") | Some("NoSuchBucket")) {
-                    return Error::NotFound(format!("Bucket not found: {}", path.bucket));
-                }
-            }
-            if formatted.contains("AccessDenied")
-                || formatted.contains("Forbidden")
-                || formatted.contains("Unauthorized")
-            {
-                Error::Auth(formatted)
-            } else if formatted.contains("NotFound") || formatted.contains("NoSuchBucket") {
-                Error::NotFound(format!("Bucket not found: {}", path.bucket))
-            } else {
-                Error::Network(formatted)
-            }
+            })
         })?;
 
         let mut items = Vec::new();
@@ -2154,7 +2159,9 @@ impl S3Client {
             request = request.version_id(version_id);
         }
         let response = request.send().await.map_err(|error| {
-            Self::map_object_request_error(&error, path, options.version_id.as_deref())
+            self.map_sdk_failure(&error, || {
+                Self::map_object_request_error(&error, path, options.version_id.as_deref())
+            })
         })?;
 
         if response.delete_marker().unwrap_or(false) {
@@ -2242,10 +2249,12 @@ impl S3Client {
             request = request.checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled);
         }
         let response = request.send().await.map_err(|error| {
-            self.redact_sse_customer_error(
-                Self::map_object_request_error(&error, path, options.version_id.as_deref()),
-                options.customer_key.as_ref(),
-            )
+            self.map_sdk_failure(&error, || {
+                self.redact_sse_customer_error(
+                    Self::map_object_request_error(&error, path, options.version_id.as_deref()),
+                    options.customer_key.as_ref(),
+                )
+            })
         })?;
         let content_length = response
             .content_length()
@@ -2371,7 +2380,9 @@ impl S3Client {
             request = request.range(format!("bytes=0-{}", max_bytes - 1));
         }
         let response = request.send().await.map_err(|error| {
-            Self::map_object_request_error(&error, path, options.version_id.as_deref())
+            self.map_sdk_failure(&error, || {
+                Self::map_object_request_error(&error, path, options.version_id.as_deref())
+            })
         })?;
         if response.delete_marker().unwrap_or(false) {
             return Err(Error::DeleteMarker {
@@ -2449,13 +2460,15 @@ impl S3Client {
         }
 
         let response = request.send().await.map_err(|error| {
-            if let aws_sdk_s3::error::SdkError::ServiceError(service_error) = &error
-                && service_error.raw().status().as_u16() == 412
-            {
-                Error::Conflict(format!("Object already exists: {path}"))
-            } else {
-                Error::Network(Self::format_sdk_error(&error))
-            }
+            self.map_sdk_failure(&error, || {
+                if let aws_sdk_s3::error::SdkError::ServiceError(service_error) = &error
+                    && service_error.raw().status().as_u16() == 412
+                {
+                    Error::Conflict(format!("Object already exists: {path}"))
+                } else {
+                    Error::Network(Self::format_sdk_error(&error))
+                }
+            })
         })?;
         let mut info = ObjectInfo::file(&path.key, size);
         info.etag = response
@@ -2475,13 +2488,15 @@ impl S3Client {
             .send()
             .await
             .map_err(|error| {
-                if let aws_sdk_s3::error::SdkError::ServiceError(service_error) = &error
-                    && service_error.raw().status().as_u16() == 412
-                {
-                    Error::Conflict(format!("Object changed before deletion: {path}"))
-                } else {
-                    Error::Network(Self::format_sdk_error(&error))
-                }
+                self.map_sdk_failure(&error, || {
+                    if let aws_sdk_s3::error::SdkError::ServiceError(service_error) = &error
+                        && service_error.raw().status().as_u16() == 412
+                    {
+                        Error::Conflict(format!("Object changed before deletion: {path}"))
+                    } else {
+                        Error::Network(Self::format_sdk_error(&error))
+                    }
+                })
             })?;
         Ok(())
     }
@@ -2526,7 +2541,9 @@ impl S3Client {
             });
         }
         let response = request.send().await.map_err(|error| {
-            Self::map_object_request_error(&error, path, options.version_id.as_deref())
+            self.map_sdk_failure(&error, || {
+                Self::map_object_request_error(&error, path, options.version_id.as_deref())
+            })
         })?;
 
         Ok(DeletedObject {
@@ -2634,7 +2651,9 @@ impl S3Client {
         let first = &objects[0];
         let error_path = RemotePath::new(&self.alias.name, bucket, &first.key);
         let response = request.send().await.map_err(|error| {
-            Self::map_object_request_error(&error, &error_path, first.version_id.as_deref())
+            self.map_sdk_failure(&error, || {
+                Self::map_object_request_error(&error, &error_path, first.version_id.as_deref())
+            })
         })?;
 
         let deleted = response
@@ -2668,6 +2687,16 @@ impl S3Client {
             .collect();
 
         Ok(DeleteObjectsResult { deleted, failures })
+    }
+
+    fn map_sdk_failure<E: ProvideErrorMetadata>(
+        &self,
+        error: &aws_sdk_s3::error::SdkError<E>,
+        fallback: impl FnOnce() -> Error,
+    ) -> Error {
+        self.redact_sensitive_error(
+            crate::auth::sdk_temporary_credential_error(error).unwrap_or_else(fallback),
+        )
     }
 
     /// Format AWS SDK error into a detailed error message
@@ -2712,6 +2741,9 @@ impl S3Client {
     where
         E: ProvideErrorMetadata + std::fmt::Display,
     {
+        if let Some(error) = crate::auth::sdk_temporary_credential_error(error) {
+            return error;
+        }
         let formatted = Self::format_sdk_error(error);
 
         if let aws_sdk_s3::error::SdkError::ServiceError(service_error) = error {
@@ -2827,6 +2859,9 @@ impl S3Client {
     where
         E: ProvideErrorMetadata + std::fmt::Display,
     {
+        if let Some(error) = crate::auth::sdk_temporary_credential_error(error) {
+            return error;
+        }
         if let aws_sdk_s3::error::SdkError::ServiceError(service_error) = error {
             let raw = service_error.raw();
             let code = service_error.err().code().or_else(|| {
@@ -2907,6 +2942,9 @@ impl S3Client {
     where
         E: ProvideErrorMetadata + std::fmt::Display,
     {
+        if let Some(error) = crate::auth::sdk_temporary_credential_error(error) {
+            return error;
+        }
         let formatted = Self::format_sdk_error(error);
         if let aws_sdk_s3::error::SdkError::ServiceError(service_error) = error {
             let raw = service_error.raw();
@@ -2947,7 +2985,7 @@ impl S3Client {
         }
     }
 
-    fn redact_sensitive_error(&self, error: Error) -> Error {
+    pub(crate) fn redact_sensitive_error(&self, error: Error) -> Error {
         match error {
             Error::Config(message) => Error::Config(self.redact_sensitive_text(message)),
             Error::InvalidPath(message) => Error::InvalidPath(self.redact_sensitive_text(message)),
@@ -3123,12 +3161,18 @@ impl S3Client {
     }
 
     fn redact_sensitive_text(&self, mut message: String) -> String {
-        for header in &self.request_headers {
-            if !header.value.is_empty() {
-                message = message.replace(&header.value, "[REDACTED]");
-            }
-        }
-        for value in [&self.alias.access_key, &self.alias.secret_key] {
+        let mut values: Vec<&str> = self
+            .request_headers
+            .iter()
+            .map(|header| header.value.as_str())
+            .collect();
+        values.extend([
+            self.alias.access_key.as_str(),
+            self.alias.secret_key.as_str(),
+        ]);
+        values.extend(self.session_token.as_deref());
+        values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+        for value in values {
             if !value.is_empty() {
                 message = message.replace(value, "[REDACTED]");
             }
@@ -3321,6 +3365,9 @@ impl S3Client {
 
     fn map_replication_extension_error(&self, status: reqwest::StatusCode, body: &[u8]) -> Error {
         let text = String::from_utf8_lossy(body);
+        if let Some(error) = crate::auth::temporary_credential_body_error(&text) {
+            return error;
+        }
         let parsed = from_xml_str::<S3ExtensionErrorDto>(&text).ok();
         let code = parsed.as_ref().map(|error| error.code.as_str());
         let detail = parsed
@@ -3335,11 +3382,7 @@ impl S3Client {
         } else {
             format!("HTTP {}: {detail}", status.as_u16())
         };
-        for sensitive in [&self.alias.access_key, &self.alias.secret_key] {
-            if !sensitive.is_empty() {
-                message = message.replace(sensitive, "[REDACTED]");
-            }
-        }
+        message = self.redact_sensitive_text(message);
 
         if status == reqwest::StatusCode::UNAUTHORIZED
             || status == reqwest::StatusCode::FORBIDDEN
@@ -3694,7 +3737,7 @@ impl S3Client {
         let credentials = Credentials::new(
             &self.alias.access_key,
             &self.alias.secret_key,
-            None,
+            self.session_token.clone(),
             None,
             "s3-xml-client",
         );
@@ -3729,8 +3772,13 @@ impl S3Client {
         for (name, value) in signing_instructions.headers() {
             let header_name = HeaderName::try_from(name.to_string())
                 .map_err(|e| Error::Auth(format!("Invalid header name: {e}")))?;
-            let header_value = HeaderValue::try_from(value.to_string())
+            let mut header_value = HeaderValue::try_from(value.to_string())
                 .map_err(|e| Error::Auth(format!("Invalid header value: {e}")))?;
+            if name.eq_ignore_ascii_case("authorization")
+                || name.eq_ignore_ascii_case("x-amz-security-token")
+            {
+                header_value.set_sensitive(true);
+            }
             signed_headers.insert(header_name, header_value);
         }
 
@@ -3939,6 +3987,9 @@ impl S3Client {
     }
 
     fn xml_response_error(&self, response: &XmlResponse) -> Error {
+        if let Some(error) = crate::auth::temporary_credential_body_error(&response.body) {
+            return error;
+        }
         Error::Network(self.redact_sensitive_text(format!(
             "HTTP {}: {}",
             response.status.as_u16(),
@@ -4242,18 +4293,20 @@ impl S3Client {
         };
 
         let response = request.send().await.map_err(|error| {
-            let mapped = if !matches!(options.precondition, ObjectWritePrecondition::None)
-                && let aws_sdk_s3::error::SdkError::ServiceError(service_error) = &error
-                && matches!(service_error.raw().status().as_u16(), 409 | 412)
-            {
-                Error::Conflict(format!("Object changed before upload: {path}"))
-            } else {
-                Self::map_transfer_write_error(&error, path, options.write)
-            };
-            self.redact_sse_customer_error(
-                mapped,
-                destination_sse_customer_key(options.write.encryption.as_ref()),
-            )
+            self.map_sdk_failure(&error, || {
+                let mapped = if !matches!(options.precondition, ObjectWritePrecondition::None)
+                    && let aws_sdk_s3::error::SdkError::ServiceError(service_error) = &error
+                    && matches!(service_error.raw().status().as_u16(), 409 | 412)
+                {
+                    Error::Conflict(format!("Object changed before upload: {path}"))
+                } else {
+                    Self::map_transfer_write_error(&error, path, options.write)
+                };
+                self.redact_sse_customer_error(
+                    mapped,
+                    destination_sse_customer_key(options.write.encryption.as_ref()),
+                )
+            })
         })?;
 
         let mut info = ObjectInfo::file(&path.key, file_size as i64);
@@ -4366,10 +4419,12 @@ impl S3Client {
             apply_object_lock_to_multipart_create_request(create_request, options.write)?;
 
         let create_response = create_request.send().await.map_err(|error| {
-            self.redact_sse_customer_error(
-                Self::map_transfer_write_error(&error, path, options.write),
-                destination_sse_customer_key(options.write.encryption.as_ref()),
-            )
+            self.map_sdk_failure(&error, || {
+                self.redact_sse_customer_error(
+                    Self::map_transfer_write_error(&error, path, options.write),
+                    destination_sse_customer_key(options.write.encryption.as_ref()),
+                )
+            })
         })?;
 
         let upload_id = create_response
@@ -5043,7 +5098,7 @@ impl KmsDiagnosticStore for S3Client {
             .ssekms_key_id(key_id)
             .send()
             .await
-            .map_err(|error| kms_diagnostic_sdk_error(&error))?;
+            .map_err(|error| self.map_sdk_failure(&error, || kms_diagnostic_sdk_error(&error)))?;
         Ok(())
     }
 
@@ -5059,7 +5114,7 @@ impl KmsDiagnosticStore for S3Client {
             .key(&path.key)
             .send()
             .await
-            .map_err(|error| kms_diagnostic_sdk_error(&error))?;
+            .map_err(|error| self.map_sdk_failure(&error, || kms_diagnostic_sdk_error(&error)))?;
         if response
             .content_length()
             .and_then(|length| usize::try_from(length).ok())
@@ -5100,7 +5155,7 @@ impl KmsDiagnosticStore for S3Client {
             })
             .send()
             .await
-            .map_err(|error| kms_diagnostic_sdk_error(&error))?;
+            .map_err(|error| self.map_sdk_failure(&error, || kms_diagnostic_sdk_error(&error)))?;
         Ok(())
     }
 }
@@ -5109,14 +5164,16 @@ impl KmsDiagnosticStore for S3Client {
 impl ObjectStore for S3Client {
     async fn list_buckets(&self) -> Result<Vec<ObjectInfo>> {
         let response = self.inner.list_buckets().send().await.map_err(|e| {
-            let message = Self::format_sdk_error(&e);
-            if let aws_sdk_s3::error::SdkError::ServiceError(service_error) = &e
-                && matches!(service_error.raw().status().as_u16(), 401 | 403)
-            {
-                Error::Auth(message)
-            } else {
-                Error::Network(message)
-            }
+            self.map_sdk_failure(&e, || {
+                let message = Self::format_sdk_error(&e);
+                if let aws_sdk_s3::error::SdkError::ServiceError(service_error) = &e
+                    && matches!(service_error.raw().status().as_u16(), 401 | 403)
+                {
+                    Error::Auth(message)
+                } else {
+                    Error::Network(message)
+                }
+            })
         })?;
 
         let buckets = response
@@ -5166,16 +5223,18 @@ impl ObjectStore for S3Client {
         }
 
         let response = request.send().await.map_err(|e| {
-            let err_str = Self::format_sdk_error(&e);
-            if let aws_sdk_s3::error::SdkError::ServiceError(service_error) = &e
-                && matches!(service_error.raw().status().as_u16(), 401 | 403)
-            {
-                Error::Auth(err_str)
-            } else if err_str.contains("NotFound") || err_str.contains("NoSuchBucket") {
-                Error::NotFound(format!("Bucket not found: {}", path.bucket))
-            } else {
-                Error::Network(err_str)
-            }
+            self.map_sdk_failure(&e, || {
+                let err_str = Self::format_sdk_error(&e);
+                if let aws_sdk_s3::error::SdkError::ServiceError(service_error) = &e
+                    && matches!(service_error.raw().status().as_u16(), 401 | 403)
+                {
+                    Error::Auth(err_str)
+                } else if err_str.contains("NotFound") || err_str.contains("NoSuchBucket") {
+                    Error::NotFound(format!("Bucket not found: {}", path.bucket))
+                } else {
+                    Error::Network(err_str)
+                }
+            })
         })?;
 
         let mut items = Vec::new();
@@ -5246,22 +5305,24 @@ impl ObjectStore for S3Client {
         }
 
         let response = request.send().await.map_err(|error| {
-            let message = Self::format_sdk_error(&error);
-            if let aws_sdk_s3::error::SdkError::ServiceError(service_error) = &error {
-                let status = service_error.raw().status().as_u16();
-                let code = service_error.err().code();
-                if matches!(status, 401 | 403) {
-                    return Error::Auth(message);
+            self.map_sdk_failure(&error, || {
+                let message = Self::format_sdk_error(&error);
+                if let aws_sdk_s3::error::SdkError::ServiceError(service_error) = &error {
+                    let status = service_error.raw().status().as_u16();
+                    let code = service_error.err().code();
+                    if matches!(status, 401 | 403) {
+                        return Error::Auth(message);
+                    }
+                    if status == 501 || matches!(code, Some("NotImplemented")) {
+                        return Error::UnsupportedFeature(message);
+                    }
+                    if status == 404 || matches!(code, Some("NoSuchBucket") | Some("NotFound")) {
+                        return Error::NotFound(format!("Bucket not found: {bucket}"));
+                    }
+                    return Error::Network(format!("{message} (HTTP {status})"));
                 }
-                if status == 501 || matches!(code, Some("NotImplemented")) {
-                    return Error::UnsupportedFeature(message);
-                }
-                if status == 404 || matches!(code, Some("NoSuchBucket") | Some("NotFound")) {
-                    return Error::NotFound(format!("Bucket not found: {bucket}"));
-                }
-                return Error::Network(format!("{message} (HTTP {status})"));
-            }
-            Error::Network(message)
+                Error::Network(message)
+            })
         })?;
 
         let truncated = response.is_truncated().unwrap_or(false);
@@ -5344,7 +5405,10 @@ impl ObjectStore for S3Client {
         match result {
             Ok(_) => Ok(()),
             Err(error) => {
-                let message = Self::format_sdk_error(&error);
+                if let Some(auth_error) = crate::auth::sdk_temporary_credential_error(&error) {
+                    return Err(auth_error);
+                }
+                let message = self.redact_sensitive_text(Self::format_sdk_error(&error));
                 if let aws_sdk_s3::error::SdkError::ServiceError(service_error) = &error {
                     let status = service_error.raw().status().as_u16();
                     let code = service_error.err().code();
@@ -5385,7 +5449,9 @@ impl ObjectStore for S3Client {
             request = request.version_id(version_id);
         }
         let response = request.send().await.map_err(|error| {
-            Self::map_object_request_error(&error, path, options.version_id.as_deref())
+            self.map_sdk_failure(&error, || {
+                Self::map_object_request_error(&error, path, options.version_id.as_deref())
+            })
         })?;
 
         if response.delete_marker().unwrap_or(false) {
@@ -5449,10 +5515,12 @@ impl ObjectStore for S3Client {
             request = request.checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled);
         }
         let response = request.send().await.map_err(|error| {
-            self.redact_sse_customer_error(
-                Self::map_object_request_error(&error, path, options.version_id.as_deref()),
-                options.customer_key.as_ref(),
-            )
+            self.map_sdk_failure(&error, || {
+                self.redact_sse_customer_error(
+                    Self::map_object_request_error(&error, path, options.version_id.as_deref()),
+                    options.customer_key.as_ref(),
+                )
+            })
         })?;
         if response.delete_marker().unwrap_or(false) {
             return Err(Error::DeleteMarker {
@@ -5505,10 +5573,12 @@ impl ObjectStore for S3Client {
             request = request.checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled);
         }
         let response = request.send().await.map_err(|error| {
-            self.redact_sse_customer_error(
-                Self::map_object_request_error(&error, path, options.version_id.as_deref()),
-                options.customer_key.as_ref(),
-            )
+            self.map_sdk_failure(&error, || {
+                self.redact_sse_customer_error(
+                    Self::map_object_request_error(&error, path, options.version_id.as_deref()),
+                    options.customer_key.as_ref(),
+                )
+            })
         })?;
         if response.delete_marker().unwrap_or(false) {
             return Err(Error::DeleteMarker {
@@ -5553,6 +5623,9 @@ impl ObjectStore for S3Client {
         match self.inner.head_bucket().bucket(bucket).send().await {
             Ok(_) => Ok(true),
             Err(e) => {
+                if let Some(auth_error) = crate::auth::sdk_temporary_credential_error(&e) {
+                    return Err(auth_error);
+                }
                 // Check HTTP status code for 404 first to avoid unnecessary string formatting
                 // Some S3-compatible services may return 404 without standard error codes
                 if let aws_sdk_s3::error::SdkError::ServiceError(ref service_err) = e
@@ -5560,7 +5633,7 @@ impl ObjectStore for S3Client {
                 {
                     return Ok(false);
                 }
-                let err_str = e.to_string();
+                let err_str = self.redact_sensitive_text(e.to_string());
                 if err_str.contains("NotFound") || err_str.contains("NoSuchBucket") {
                     return Ok(false);
                 }
@@ -5593,34 +5666,37 @@ impl ObjectStore for S3Client {
         }
 
         request.send().await.map_err(|error| {
-            let formatted = Self::format_sdk_error(&error);
-            let mapped = if let aws_sdk_s3::error::SdkError::ServiceError(service_error) = &error {
-                let status = service_error.raw().status().as_u16();
-                let code = service_error.err().code();
-                if matches!(status, 401 | 403)
-                    || matches!(
-                        code,
-                        Some("AccessDenied")
-                            | Some("InvalidAccessKeyId")
-                            | Some("Forbidden")
-                            | Some("Unauthorized")
-                    )
-                {
-                    Error::Auth(formatted)
-                } else if status == 409
-                    || matches!(
-                        code,
-                        Some("BucketAlreadyExists") | Some("BucketAlreadyOwnedByYou")
-                    )
-                {
-                    Error::Conflict(formatted)
-                } else {
-                    Error::Network(formatted)
-                }
-            } else {
-                Error::Network(formatted)
-            };
-            self.redact_sensitive_error(mapped)
+            self.map_sdk_failure(&error, || {
+                let formatted = Self::format_sdk_error(&error);
+                let mapped =
+                    if let aws_sdk_s3::error::SdkError::ServiceError(service_error) = &error {
+                        let status = service_error.raw().status().as_u16();
+                        let code = service_error.err().code();
+                        if matches!(status, 401 | 403)
+                            || matches!(
+                                code,
+                                Some("AccessDenied")
+                                    | Some("InvalidAccessKeyId")
+                                    | Some("Forbidden")
+                                    | Some("Unauthorized")
+                            )
+                        {
+                            Error::Auth(formatted)
+                        } else if status == 409
+                            || matches!(
+                                code,
+                                Some("BucketAlreadyExists") | Some("BucketAlreadyOwnedByYou")
+                            )
+                        {
+                            Error::Conflict(formatted)
+                        } else {
+                            Error::Network(formatted)
+                        }
+                    } else {
+                        Error::Network(formatted)
+                    };
+                self.redact_sensitive_error(mapped)
+            })
         })?;
 
         Ok(())
@@ -5638,6 +5714,9 @@ impl ObjectStore for S3Client {
                     .map(|location| location.as_str().to_string())
             })
             .map_err(|error| {
+                if let Some(error) = crate::auth::sdk_temporary_credential_error(&error) {
+                    return error;
+                }
                 let formatted = Self::format_sdk_error(&error);
                 let mapped =
                     if let aws_sdk_s3::error::SdkError::ServiceError(service_error) = &error {
@@ -5663,34 +5742,37 @@ impl ObjectStore for S3Client {
             .send()
             .await
             .map_err(|e| {
-                let err_str = Self::format_sdk_error(&e);
-                let mapped = if let aws_sdk_s3::error::SdkError::ServiceError(service_error) = &e {
-                    let status = service_error.raw().status().as_u16();
-                    let code = service_error.err().code();
-                    if matches!(status, 401 | 403)
-                        || matches!(
-                            code,
-                            Some("AccessDenied") | Some("Forbidden") | Some("Unauthorized")
-                        )
-                    {
-                        Error::Auth(err_str)
-                    } else if status == 404
-                        || matches!(code, Some("NotFound") | Some("NoSuchBucket"))
-                    {
-                        Error::NotFound(format!("Bucket not found: {bucket}"))
-                    } else if status == 409 || matches!(code, Some("BucketNotEmpty")) {
-                        Error::Conflict(err_str)
-                    } else {
-                        Error::Network(err_str)
-                    }
-                } else if err_str.contains("NotFound") || err_str.contains("NoSuchBucket") {
-                    Error::NotFound(format!("Bucket not found: {bucket}"))
-                } else if err_str.contains("BucketNotEmpty") {
-                    Error::Conflict(err_str)
-                } else {
-                    Error::Network(err_str)
-                };
-                self.redact_sensitive_error(mapped)
+                self.map_sdk_failure(&e, || {
+                    let err_str = Self::format_sdk_error(&e);
+                    let mapped =
+                        if let aws_sdk_s3::error::SdkError::ServiceError(service_error) = &e {
+                            let status = service_error.raw().status().as_u16();
+                            let code = service_error.err().code();
+                            if matches!(status, 401 | 403)
+                                || matches!(
+                                    code,
+                                    Some("AccessDenied") | Some("Forbidden") | Some("Unauthorized")
+                                )
+                            {
+                                Error::Auth(err_str)
+                            } else if status == 404
+                                || matches!(code, Some("NotFound") | Some("NoSuchBucket"))
+                            {
+                                Error::NotFound(format!("Bucket not found: {bucket}"))
+                            } else if status == 409 || matches!(code, Some("BucketNotEmpty")) {
+                                Error::Conflict(err_str)
+                            } else {
+                                Error::Network(err_str)
+                            }
+                        } else if err_str.contains("NotFound") || err_str.contains("NoSuchBucket") {
+                            Error::NotFound(format!("Bucket not found: {bucket}"))
+                        } else if err_str.contains("BucketNotEmpty") {
+                            Error::Conflict(err_str)
+                        } else {
+                            Error::Network(err_str)
+                        };
+                    self.redact_sensitive_error(mapped)
+                })
             })?;
 
         Ok(())
@@ -5751,10 +5833,12 @@ impl ObjectStore for S3Client {
             request = request.checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled);
         }
         let response = request.send().await.map_err(|error| {
-            self.redact_sse_customer_error(
-                Self::map_object_request_error(&error, path, options.version_id.as_deref()),
-                options.customer_key.as_ref(),
-            )
+            self.map_sdk_failure(&error, || {
+                self.redact_sse_customer_error(
+                    Self::map_object_request_error(&error, path, options.version_id.as_deref()),
+                    options.customer_key.as_ref(),
+                )
+            })
         })?;
         if response.delete_marker().unwrap_or(false) {
             return Err(Error::DeleteMarker {
@@ -5823,10 +5907,12 @@ impl ObjectStore for S3Client {
             request = request.range(format!("bytes=0-{}", max_bytes - 1));
         }
         let response = request.send().await.map_err(|error| {
-            self.redact_sse_customer_error(
-                Self::map_object_request_error(&error, path, options.version_id.as_deref()),
-                options.customer_key.as_ref(),
-            )
+            self.map_sdk_failure(&error, || {
+                self.redact_sse_customer_error(
+                    Self::map_object_request_error(&error, path, options.version_id.as_deref()),
+                    options.customer_key.as_ref(),
+                )
+            })
         })?;
         let mut body = response.body;
         let mut bytes_written = 0u64;
@@ -5901,7 +5987,7 @@ impl ObjectStore for S3Client {
         let response = request
             .send()
             .await
-            .map_err(|e| Error::Network(e.to_string()))?;
+            .map_err(|e| self.map_sdk_failure(&e, || Error::Network(e.to_string())))?;
 
         let mut info = ObjectInfo::file(&path.key, size);
         if let Some(etag) = response.e_tag() {
@@ -5973,10 +6059,12 @@ impl ObjectStore for S3Client {
         }
         request = apply_object_lock_to_put_request(request, options)?;
         let response = request.send().await.map_err(|error| {
-            self.redact_sse_customer_error(
-                Self::map_transfer_write_error(&error, path, options),
-                destination_sse_customer_key(options.encryption.as_ref()),
-            )
+            self.map_sdk_failure(&error, || {
+                self.redact_sse_customer_error(
+                    Self::map_transfer_write_error(&error, path, options),
+                    destination_sse_customer_key(options.encryption.as_ref()),
+                )
+            })
         })?;
 
         let mut info = ObjectInfo::file(&path.key, size);
@@ -6060,7 +6148,9 @@ impl ObjectStore for S3Client {
             request = request.copy_source_if_match(quoted_etag(source_etag));
         }
         let response = request.send().await.map_err(|error| {
-            Self::map_object_request_error(&error, src, options.source_version_id.as_deref())
+            self.map_sdk_failure(&error, || {
+                Self::map_object_request_error(&error, src, options.source_version_id.as_deref())
+            })
         })?;
 
         // Get size from head_object since copy doesn't return it
@@ -6108,16 +6198,24 @@ impl ObjectStore for S3Client {
         }
         request = apply_object_lock_to_copy_request(request, &options.destination)?;
         let response = request.send().await.map_err(|error| {
-            if options.destination.retention.is_some() || options.destination.legal_hold.is_some() {
-                Self::map_object_lock_write_error(
-                    &error,
-                    dst,
-                    src,
-                    options.source.version_id.as_deref(),
-                )
-            } else {
-                Self::map_object_request_error(&error, src, options.source.version_id.as_deref())
-            }
+            self.map_sdk_failure(&error, || {
+                if options.destination.retention.is_some()
+                    || options.destination.legal_hold.is_some()
+                {
+                    Self::map_object_lock_write_error(
+                        &error,
+                        dst,
+                        src,
+                        options.source.version_id.as_deref(),
+                    )
+                } else {
+                    Self::map_object_request_error(
+                        &error,
+                        src,
+                        options.source.version_id.as_deref(),
+                    )
+                }
+            })
         })?;
 
         let mut result = self.head_object(dst).await?;
@@ -6171,7 +6269,9 @@ impl ObjectStore for S3Client {
         let create_request =
             apply_object_attributes_to_multipart_create_request(create_request, &attributes)?;
         let create_response = create_request.send().await.map_err(|error| {
-            self.redact_sensitive_error(Self::map_object_request_error(&error, dst, None))
+            self.map_sdk_failure(&error, || {
+                self.redact_sensitive_error(Self::map_object_request_error(&error, dst, None))
+            })
         })?;
         let upload_id = create_response
             .upload_id()
@@ -6271,11 +6371,13 @@ impl ObjectStore for S3Client {
         let create_request =
             apply_object_lock_to_multipart_create_request(create_request, &transfer.destination)?;
         let create_response = create_request.send().await.map_err(|error| {
-            self.redact_sensitive_error(Self::map_transfer_write_error(
-                &error,
-                dst,
-                &transfer.destination,
-            ))
+            self.map_sdk_failure(&error, || {
+                self.redact_sensitive_error(Self::map_transfer_write_error(
+                    &error,
+                    dst,
+                    &transfer.destination,
+                ))
+            })
         })?;
         let upload_id = create_response
             .upload_id()
@@ -6356,7 +6458,9 @@ impl ObjectStore for S3Client {
             .bucket(bucket)
             .send()
             .await
-            .map_err(|e| Error::General(format!("get_versioning: {e}")))?;
+            .map_err(|e| {
+                self.map_sdk_failure(&e, || Error::General(format!("get_versioning: {e}")))
+            })?;
 
         Ok(response
             .status()
@@ -6380,7 +6484,9 @@ impl ObjectStore for S3Client {
             .versioning_configuration(config)
             .send()
             .await
-            .map_err(|e| Error::General(format!("set_versioning: {e}")))?;
+            .map_err(|e| {
+                self.map_sdk_failure(&e, || Error::General(format!("set_versioning: {e}")))
+            })?;
 
         Ok(())
     }
@@ -6398,6 +6504,9 @@ impl ObjectStore for S3Client {
         {
             Ok(response) => response,
             Err(error) => {
+                if let Some(auth_error) = crate::auth::sdk_temporary_credential_error(&error) {
+                    return Err(auth_error);
+                }
                 if let aws_sdk_s3::error::SdkError::ServiceError(service_error) = &error {
                     let raw = service_error.raw();
                     let code = service_error.err().code().or_else(|| {
@@ -6442,10 +6551,12 @@ impl ObjectStore for S3Client {
             .send()
             .await
             .map_err(|error| {
-                self.redact_object_lock_service_error(
-                    &error,
-                    Self::map_bucket_object_lock_error(&error, bucket),
-                )
+                self.map_sdk_failure(&error, || {
+                    self.redact_object_lock_service_error(
+                        &error,
+                        Self::map_bucket_object_lock_error(&error, bucket),
+                    )
+                })
             })?;
         Ok(())
     }
@@ -6464,10 +6575,12 @@ impl ObjectStore for S3Client {
             request = request.version_id(version_id);
         }
         let response = request.send().await.map_err(|error| {
-            self.redact_object_lock_service_error(
-                &error,
-                Self::map_object_request_error(&error, path, options.version_id.as_deref()),
-            )
+            self.map_sdk_failure(&error, || {
+                self.redact_object_lock_service_error(
+                    &error,
+                    Self::map_object_request_error(&error, path, options.version_id.as_deref()),
+                )
+            })
         })?;
         let Some(retention) = response.retention() else {
             return Ok(None);
@@ -6513,10 +6626,12 @@ impl ObjectStore for S3Client {
             request = request.bypass_governance_retention(true);
         }
         request.send().await.map_err(|error| {
-            self.redact_object_lock_service_error(
-                &error,
-                Self::map_object_request_error(&error, path, options.version_id.as_deref()),
-            )
+            self.map_sdk_failure(&error, || {
+                self.redact_object_lock_service_error(
+                    &error,
+                    Self::map_object_request_error(&error, path, options.version_id.as_deref()),
+                )
+            })
         })?;
         Ok(())
     }
@@ -6535,10 +6650,12 @@ impl ObjectStore for S3Client {
             request = request.version_id(version_id);
         }
         let response = request.send().await.map_err(|error| {
-            self.redact_object_lock_service_error(
-                &error,
-                Self::map_object_request_error(&error, path, options.version_id.as_deref()),
-            )
+            self.map_sdk_failure(&error, || {
+                self.redact_object_lock_service_error(
+                    &error,
+                    Self::map_object_request_error(&error, path, options.version_id.as_deref()),
+                )
+            })
         })?;
         let status = response
             .legal_hold()
@@ -6580,10 +6697,12 @@ impl ObjectStore for S3Client {
             request = request.version_id(version_id);
         }
         request.send().await.map_err(|error| {
-            self.redact_object_lock_service_error(
-                &error,
-                Self::map_object_request_error(&error, path, options.version_id.as_deref()),
-            )
+            self.map_sdk_failure(&error, || {
+                self.redact_object_lock_service_error(
+                    &error,
+                    Self::map_object_request_error(&error, path, options.version_id.as_deref()),
+                )
+            })
         })?;
         Ok(())
     }
@@ -6598,7 +6717,10 @@ impl ObjectStore for S3Client {
         {
             Ok(response) => response,
             Err(error) => {
-                let error_text = Self::format_sdk_error(&error);
+                if let Some(auth_error) = crate::auth::sdk_temporary_credential_error(&error) {
+                    return Err(auth_error);
+                }
+                let error_text = self.redact_sensitive_text(Self::format_sdk_error(&error));
                 let missing_config =
                     if let aws_sdk_s3::error::SdkError::ServiceError(service_err) = &error {
                         is_missing_bucket_encryption_response(
@@ -6642,7 +6764,9 @@ impl ObjectStore for S3Client {
             .server_side_encryption_configuration(configuration)
             .send()
             .await
-            .map_err(|e| Error::General(format!("set_bucket_encryption: {e}")))?;
+            .map_err(|e| {
+                self.map_sdk_failure(&e, || Error::General(format!("set_bucket_encryption: {e}")))
+            })?;
 
         Ok(())
     }
@@ -6657,7 +6781,10 @@ impl ObjectStore for S3Client {
         {
             Ok(_) => Ok(()),
             Err(error) => {
-                let error_text = Self::format_sdk_error(&error);
+                if let Some(auth_error) = crate::auth::sdk_temporary_credential_error(&error) {
+                    return Err(auth_error);
+                }
+                let error_text = self.redact_sensitive_text(Self::format_sdk_error(&error));
                 let missing_config =
                     if let aws_sdk_s3::error::SdkError::ServiceError(service_err) = &error {
                         is_missing_bucket_encryption_response(
@@ -6715,10 +6842,15 @@ impl ObjectStore for S3Client {
         {
             Ok(response) => response,
             Err(e) => {
+                if let Some(auth_error) = crate::auth::sdk_temporary_credential_error(&e) {
+                    return Err(auth_error);
+                }
                 if e.to_string().contains("NoSuchTagSet") {
                     return Ok(std::collections::HashMap::new());
                 }
-                return Err(Error::General(format!("get_object_tags: {e}")));
+                return Err(
+                    self.redact_sensitive_error(Error::General(format!("get_object_tags: {e}")))
+                );
             }
         };
 
@@ -6739,10 +6871,15 @@ impl ObjectStore for S3Client {
         let response = match self.inner.get_bucket_tagging().bucket(bucket).send().await {
             Ok(response) => response,
             Err(e) => {
+                if let Some(auth_error) = crate::auth::sdk_temporary_credential_error(&e) {
+                    return Err(auth_error);
+                }
                 if e.to_string().contains("NoSuchTagSet") {
                     return Ok(std::collections::HashMap::new());
                 }
-                return Err(Error::General(format!("get_bucket_tags: {e}")));
+                return Err(
+                    self.redact_sensitive_error(Error::General(format!("get_bucket_tags: {e}")))
+                );
             }
         };
 
@@ -6770,7 +6907,9 @@ impl ObjectStore for S3Client {
             .tagging(tagging)
             .send()
             .await
-            .map_err(|e| Error::General(format!("set_object_tags: {e}")))?;
+            .map_err(|e| {
+                self.map_sdk_failure(&e, || Error::General(format!("set_object_tags: {e}")))
+            })?;
 
         Ok(())
     }
@@ -6788,7 +6927,9 @@ impl ObjectStore for S3Client {
             .tagging(tagging)
             .send()
             .await
-            .map_err(|e| Error::General(format!("set_bucket_tags: {e}")))?;
+            .map_err(|e| {
+                self.map_sdk_failure(&e, || Error::General(format!("set_bucket_tags: {e}")))
+            })?;
 
         Ok(())
     }
@@ -6800,7 +6941,9 @@ impl ObjectStore for S3Client {
             .key(&path.key)
             .send()
             .await
-            .map_err(|e| Error::General(format!("delete_object_tags: {e}")))?;
+            .map_err(|e| {
+                self.map_sdk_failure(&e, || Error::General(format!("delete_object_tags: {e}")))
+            })?;
 
         Ok(())
     }
@@ -6811,7 +6954,9 @@ impl ObjectStore for S3Client {
             .bucket(bucket)
             .send()
             .await
-            .map_err(|e| Error::General(format!("delete_bucket_tags: {e}")))?;
+            .map_err(|e| {
+                self.map_sdk_failure(&e, || Error::General(format!("delete_bucket_tags: {e}")))
+            })?;
 
         Ok(())
     }
@@ -6820,7 +6965,10 @@ impl ObjectStore for S3Client {
         let response = match self.inner.get_bucket_policy().bucket(bucket).send().await {
             Ok(policy) => policy,
             Err(error) => {
-                let error_text = error.to_string();
+                if let Some(auth_error) = crate::auth::sdk_temporary_credential_error(&error) {
+                    return Err(auth_error);
+                }
+                let error_text = self.redact_sensitive_text(error.to_string());
                 let kind = if let aws_sdk_s3::error::SdkError::ServiceError(service_err) = &error {
                     let code = service_err
                         .raw()
@@ -6846,7 +6994,9 @@ impl ObjectStore for S3Client {
             .policy(policy)
             .send()
             .await
-            .map_err(|e| Error::General(format!("set_bucket_policy: {e}")))?;
+            .map_err(|e| {
+                self.map_sdk_failure(&e, || Error::General(format!("set_bucket_policy: {e}")))
+            })?;
 
         Ok(())
     }
@@ -6861,7 +7011,10 @@ impl ObjectStore for S3Client {
         {
             Ok(_) => Ok(()),
             Err(e) => {
-                let error_text = e.to_string();
+                if let Some(auth_error) = crate::auth::sdk_temporary_credential_error(&e) {
+                    return Err(auth_error);
+                }
+                let error_text = self.redact_sensitive_text(e.to_string());
                 let kind = if let aws_sdk_s3::error::SdkError::ServiceError(service_err) = &e {
                     let code = service_err
                         .raw()
@@ -6882,7 +7035,10 @@ impl ObjectStore for S3Client {
         let response = match self.inner.get_bucket_cors().bucket(bucket).send().await {
             Ok(response) => response,
             Err(error) => {
-                let error_text = error.to_string();
+                if let Some(auth_error) = crate::auth::sdk_temporary_credential_error(&error) {
+                    return Err(auth_error);
+                }
+                let error_text = self.redact_sensitive_text(error.to_string());
                 let missing_config =
                     if let aws_sdk_s3::error::SdkError::ServiceError(service_err) = &error {
                         is_missing_cors_configuration_response(
@@ -6939,7 +7095,9 @@ impl ObjectStore for S3Client {
             .cors_configuration(cors_configuration)
             .send()
             .await
-            .map_err(|e| Error::General(format!("set_bucket_cors: {e}")))?;
+            .map_err(|e| {
+                self.map_sdk_failure(&e, || Error::General(format!("set_bucket_cors: {e}")))
+            })?;
 
         Ok(())
     }
@@ -6948,7 +7106,10 @@ impl ObjectStore for S3Client {
         match self.inner.delete_bucket_cors().bucket(bucket).send().await {
             Ok(_) => Ok(()),
             Err(error) => {
-                let error_text = error.to_string();
+                if let Some(auth_error) = crate::auth::sdk_temporary_credential_error(&error) {
+                    return Err(auth_error);
+                }
+                let error_text = self.redact_sensitive_text(error.to_string());
                 let missing_config =
                     if let aws_sdk_s3::error::SdkError::ServiceError(service_err) = &error {
                         is_missing_cors_configuration_response(
@@ -6990,7 +7151,11 @@ impl ObjectStore for S3Client {
             .bucket(bucket)
             .send()
             .await
-            .map_err(|e| Error::General(format!("get_bucket_notifications: {e}")))?;
+            .map_err(|e| {
+                self.map_sdk_failure(&e, || {
+                    Error::General(format!("get_bucket_notifications: {e}"))
+                })
+            })?;
 
         let mut rules = Vec::new();
 
@@ -7119,7 +7284,10 @@ impl ObjectStore for S3Client {
         {
             Ok(_) => {}
             Err(error) => {
-                let error_text = error.to_string();
+                if let Some(auth_error) = crate::auth::sdk_temporary_credential_error(&error) {
+                    return Err(auth_error);
+                }
+                let error_text = self.redact_sensitive_text(error.to_string());
                 // RustFS may apply notification configuration but still return a non-AWS
                 // response envelope that the SDK reports as "service error".
                 if error_text.contains("service error")
@@ -7150,7 +7318,10 @@ impl ObjectStore for S3Client {
                 return Ok(Vec::new());
             }
             Err(error) => {
-                return Err(Error::General(format!("get_bucket_lifecycle: {error}")));
+                return Err(match error {
+                    Error::Auth(_) => error,
+                    _ => Error::General(format!("get_bucket_lifecycle: {error}")),
+                });
             }
         };
 
@@ -7167,9 +7338,14 @@ impl ObjectStore for S3Client {
         let response = self
             .lifecycle_xml_request(Method::PUT, url, Some("application/xml"), Some(body), true)
             .await
-            .map_err(|error| Error::General(format!("set_bucket_lifecycle: {error}")))?;
-        validate_lifecycle_configuration_xml_response(&response)
-            .map_err(|error| Error::General(format!("set_bucket_lifecycle: {error}")))?;
+            .map_err(|error| match error {
+                Error::Auth(_) => error,
+                _ => Error::General(format!("set_bucket_lifecycle: {error}")),
+            })?;
+        validate_lifecycle_configuration_xml_response(&response).map_err(|error| match error {
+            Error::Auth(_) => error,
+            _ => Error::General(format!("set_bucket_lifecycle: {error}")),
+        })?;
 
         Ok(())
     }
@@ -7181,10 +7357,12 @@ impl ObjectStore for S3Client {
             .send()
             .await
             .map_err(|e| {
-                Error::General(format!(
-                    "delete_bucket_lifecycle: {}",
-                    Self::format_sdk_error(&e)
-                ))
+                self.map_sdk_failure(&e, || {
+                    Error::General(format!(
+                        "delete_bucket_lifecycle: {}",
+                        Self::format_sdk_error(&e)
+                    ))
+                })
             })?;
         Ok(())
     }
@@ -7201,7 +7379,9 @@ impl ObjectStore for S3Client {
             .send()
             .await
             .map_err(|e| {
-                Error::General(format!("restore_object: {}", Self::format_sdk_error(&e)))
+                self.map_sdk_failure(&e, || {
+                    Error::General(format!("restore_object: {}", Self::format_sdk_error(&e)))
+                })
             })?;
         Ok(())
     }
@@ -7221,7 +7401,10 @@ impl ObjectStore for S3Client {
                 return Ok(None);
             }
             Err(error) => {
-                return Err(Error::General(format!("get_bucket_replication: {error}")));
+                return Err(match error {
+                    Error::Auth(_) => error,
+                    _ => Error::General(format!("get_bucket_replication: {error}")),
+                });
             }
         };
 
@@ -7237,7 +7420,10 @@ impl ObjectStore for S3Client {
         let body = build_replication_configuration_xml(&config).into_bytes();
         self.xml_request(Method::PUT, url, Some("application/xml"), Some(body))
             .await
-            .map_err(|e| Error::General(format!("set_bucket_replication: {e}")))?;
+            .map_err(|e| match e {
+                Error::Auth(_) => e,
+                _ => Error::General(format!("set_bucket_replication: {e}")),
+            })?;
 
         Ok(())
     }
@@ -7249,10 +7435,12 @@ impl ObjectStore for S3Client {
             .send()
             .await
             .map_err(|e| {
-                Error::General(format!(
-                    "delete_bucket_replication: {}",
-                    Self::format_sdk_error(&e)
-                ))
+                self.map_sdk_failure(&e, || {
+                    Error::General(format!(
+                        "delete_bucket_replication: {}",
+                        Self::format_sdk_error(&e)
+                    ))
+                })
             })?;
         Ok(())
     }
@@ -7356,7 +7544,9 @@ impl ObjectStore for S3Client {
         options: &SelectOptions,
         writer: &mut (dyn AsyncWrite + Send + Unpin),
     ) -> Result<()> {
-        crate::select::select_object_content(&self.inner, path, options, writer).await
+        crate::select::select_object_content(&self.inner, path, options, writer)
+            .await
+            .map_err(|error| self.redact_sensitive_error(error))
     }
 }
 
@@ -7556,6 +7746,74 @@ mod tests {
         test_s3_client_with_endpoint("https://example.com", response)
     }
 
+    #[tokio::test]
+    async fn manual_s3_signing_redacts_session_headers_and_errors() {
+        let (mut client, _) = test_s3_client(None);
+        client.session_token = Some("session-secret-key-token".into());
+        let headers = client
+            .sign_xml_request(
+                &Method::GET,
+                "https://example.com/bucket?lifecycle",
+                &HeaderMap::new(),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(headers["x-amz-security-token"], "session-secret-key-token");
+        assert!(headers["x-amz-security-token"].is_sensitive());
+        assert!(headers["authorization"].is_sensitive());
+        assert!(!format!("{headers:?}").contains("session-secret-key-token"));
+        let error = client.redact_sensitive_error(Error::General(
+            "session-secret-key-token secret-key access-key".into(),
+        ));
+        assert_eq!(error.to_string(), "[REDACTED] [REDACTED] [REDACTED]");
+        client.session_token = None;
+        assert!(
+            !client
+                .sign_xml_request(
+                    &Method::GET,
+                    "https://example.com/bucket",
+                    &HeaderMap::new(),
+                    &[]
+                )
+                .await
+                .unwrap()
+                .contains_key("x-amz-security-token")
+        );
+        client.session_token = Some("ignored".into());
+        client.alias.anonymous = true;
+        assert!(
+            client
+                .sign_xml_request(
+                    &Method::GET,
+                    "https://example.com/bucket",
+                    &HeaderMap::new(),
+                    &[]
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_sdk_requests_classify_temporary_credential_errors() {
+        for code in ["ExpiredToken", "InvalidToken"] {
+            let response = http::Response::builder()
+                .status(400)
+                .body(SdkBody::from(format!(
+                    "<Error><Code>{code}</Code><Message>secret-key</Message></Error>"
+                )))
+                .unwrap();
+            let (client, _) = test_s3_client(Some(response));
+            let error = client.get_versioning("bucket").await.unwrap_err();
+            assert!(matches!(error, Error::Auth(_)));
+            assert_eq!(error.exit_code(), 4);
+            assert!(error.to_string().contains("renew"));
+            assert!(!error.to_string().contains("secret-key"));
+        }
+    }
+
     fn test_s3_client_with_endpoint(
         endpoint: &str,
         response: Option<http::Response<SdkBody>>,
@@ -7606,6 +7864,7 @@ mod tests {
             xml_http_client,
             external_http_client: Arc::new(tokio::sync::OnceCell::new()),
             alias,
+            session_token: None,
             request_headers,
             data_transport_mode: rc_core::DataTransportMode::Http,
             data_transport: None,
@@ -7665,6 +7924,7 @@ mod tests {
             xml_http_client: reqwest::Client::new(),
             external_http_client: Arc::new(tokio::sync::OnceCell::new()),
             alias,
+            session_token: None,
             request_headers,
             data_transport_mode: rc_core::DataTransportMode::Http,
             data_transport: None,
@@ -7797,6 +8057,7 @@ mod tests {
             xml_http_client: reqwest::Client::new(),
             external_http_client: Arc::new(tokio::sync::OnceCell::new()),
             alias,
+            session_token: None,
             request_headers: Vec::new(),
             data_transport_mode: rc_core::DataTransportMode::Http,
             data_transport: None,

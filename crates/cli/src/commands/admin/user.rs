@@ -449,8 +449,8 @@ async fn execute_list(args: ListArgs, formatter: &Formatter) -> ExitCode {
             ExitCode::Success
         }
         Err(e) => {
-            formatter.error(&format!("Failed to list users: {e}"));
-            ExitCode::GeneralError
+            let code = ExitCode::from_i32(e.exit_code()).unwrap_or(ExitCode::GeneralError);
+            formatter.fail(code, &format!("Failed to list users: {e}"))
         }
     }
 }
