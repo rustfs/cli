@@ -6822,6 +6822,11 @@ impl ObjectStore for S3Client {
             Err(error) => {
                 let error_text = error.to_string();
                 let kind = if let aws_sdk_s3::error::SdkError::ServiceError(service_err) = &error {
+                    if matches!(service_err.raw().status().as_u16(), 401 | 403) {
+                        return Err(Error::Auth(
+                            "Access denied when reading bucket policy".into(),
+                        ));
+                    }
                     let code = service_err
                         .raw()
                         .headers()
