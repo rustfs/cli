@@ -224,14 +224,6 @@ async fn execute_set(args: SetArgs, output_config: OutputConfig) -> ExitCode {
         return ExitCode::UsageError;
     }
 
-    if !formatter.is_json() && !target.prefix.is_empty() {
-        formatter.println(&format!(
-            "Warning: setting '{}' will replace the entire bucket policy for '{}', which may remove unrelated statements",
-            target.path_with_bucket_prefix(),
-            target.bucket
-        ));
-    }
-
     let (_alias, client) = match setup_anonymous_client(&target.alias, &formatter).await {
         Ok(client) => client,
         Err(code) => return code,
@@ -240,8 +232,25 @@ async fn execute_set(args: SetArgs, output_config: OutputConfig) -> ExitCode {
     let result = if permission == AccessLevel::Private {
         client.delete_bucket_policy(&target.bucket).await
     } else {
-        let policy = build_policy(&permission, &target.bucket, &target.prefix);
-        client.set_bucket_policy(&target.bucket, &policy).await
+        let policy = if target.prefix.is_empty() {
+            Ok(build_policy(&permission, &target.bucket, &target.prefix))
+        } else {
+            client
+                .get_bucket_policy(&target.bucket)
+                .await
+                .and_then(|existing| {
+                    merge_prefix_policy(
+                        existing.as_deref(),
+                        &permission,
+                        &target.bucket,
+                        &target.prefix,
+                    )
+                })
+        };
+        match policy {
+            Ok(policy) => client.set_bucket_policy(&target.bucket, &policy).await,
+            Err(error) => Err(error),
+        }
     };
 
     match result {
@@ -725,6 +734,70 @@ fn build_object_resource(bucket: &str, prefix: &str) -> String {
     }
 }
 
+fn merge_prefix_policy(
+    existing: Option<&str>,
+    level: &AccessLevel,
+    bucket: &str,
+    prefix: &str,
+) -> Result<String, rc_core::Error> {
+    use serde_json::{Value, json};
+
+    fn without_sid(mut statement: Value) -> Value {
+        if let Some(object) = statement.as_object_mut() {
+            object.remove("Sid");
+        }
+        statement
+    }
+
+    let mut policy: Value = match existing {
+        Some(existing) => serde_json::from_str(existing)?,
+        None => json!({"Version": "2012-10-17", "Statement": []}),
+    };
+    let document = policy.as_object_mut().ok_or_else(|| {
+        rc_core::Error::General("Existing bucket policy must be a JSON object".into())
+    })?;
+    let mut statements = match document.remove("Statement") {
+        Some(Value::Array(statements)) if statements.iter().all(Value::is_object) => statements,
+        Some(statement @ Value::Object(_)) => vec![statement],
+        _ => {
+            return Err(rc_core::Error::General(
+                "Existing bucket policy has invalid statements".into(),
+            ));
+        }
+    };
+    let generated: Value =
+        serde_json::from_str(&build_policy(&AccessLevel::Public, bucket, prefix))?;
+    let templates: Vec<_> = generated["Statement"]
+        .as_array()
+        .expect("generated policy contains statements")
+        .iter()
+        .cloned()
+        .map(without_sid)
+        .collect();
+
+    // Only replace the exact rules rc generates for this prefix. Arbitrary
+    // conditions, principals, Deny statements and other prefixes stay intact.
+    statements.retain(|statement| {
+        let generated_sid = statement.get("Sid").is_none()
+            || matches!(
+                statement["Sid"].as_str(),
+                Some("AnonymousRead1" | "AnonymousList2" | "AnonymousWrite1" | "AnonymousWrite3")
+            );
+        !generated_sid || !templates.contains(&without_sid(statement.clone()))
+    });
+    let replacement: Value = serde_json::from_str(&build_policy(level, bucket, prefix))?;
+    statements.extend(
+        replacement["Statement"]
+            .as_array()
+            .expect("generated policy contains statements")
+            .iter()
+            .cloned()
+            .map(without_sid),
+    );
+    document.insert("Statement".into(), Value::Array(statements));
+    Ok(serde_json::to_string(&policy)?)
+}
+
 async fn list_keys_for_prefix(
     client: &S3Client,
     alias_name: &str,
@@ -1127,6 +1200,76 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&policy).expect("valid json");
         assert_eq!(value["Version"], "2012-10-17");
         assert_eq!(value["Statement"].as_array().expect("array").len(), 2);
+    }
+
+    #[test]
+    fn prefix_policy_updates_preserve_other_prefixes_and_custom_statements() {
+        let mut initial: serde_json::Value =
+            serde_json::from_str(&build_policy(&AccessLevel::Public, "bucket", "music"))
+                .expect("policy JSON");
+        let deny = serde_json::json!({
+            "Sid": "KeepDeny", "Effect": "Deny", "Principal": "*",
+            "Action": "s3:DeleteObject", "Resource": "arn:aws:s3:::bucket/*",
+            "Condition": {"Bool": {"aws:SecureTransport": "false"}}
+        });
+        initial["Id"] = "keep-policy-id".into();
+        initial["Statement"]
+            .as_array_mut()
+            .expect("statements")
+            .push(deny.clone());
+        let result = merge_prefix_policy(
+            Some(&initial.to_string()),
+            &AccessLevel::Public,
+            "bucket",
+            "images",
+        )
+        .expect("merge policy");
+        let result: serde_json::Value = serde_json::from_str(&result).expect("policy JSON");
+        let statements = result["Statement"].as_array().expect("statements");
+        assert_eq!(result["Id"], "keep-policy-id");
+        assert!(statements.contains(&deny));
+        assert!(
+            statements
+                .iter()
+                .any(|s| s["Resource"] == "arn:aws:s3:::bucket/music/*")
+        );
+        assert!(
+            statements
+                .iter()
+                .any(|s| s["Resource"] == "arn:aws:s3:::bucket/images/*")
+        );
+    }
+
+    #[test]
+    fn prefix_policy_updates_are_idempotent_and_replace_only_generated_permissions() {
+        let initial = build_policy(&AccessLevel::Public, "bucket", "images");
+        let updated =
+            merge_prefix_policy(Some(&initial), &AccessLevel::Download, "bucket", "images")
+                .expect("merge policy");
+        let repeated =
+            merge_prefix_policy(Some(&updated), &AccessLevel::Download, "bucket", "images")
+                .expect("repeat merge");
+        assert_eq!(updated, repeated);
+        let policy: serde_json::Value = serde_json::from_str(&updated).expect("policy JSON");
+        let statements = policy["Statement"].as_array().expect("statements");
+        assert_eq!(statements.len(), 2);
+        assert!(statements.iter().all(|s| s.get("Sid").is_none()));
+        assert!(!updated.contains("s3:PutObject"));
+    }
+
+    #[test]
+    fn prefix_policy_updates_reject_malformed_existing_policies() {
+        for existing in [
+            "invalid",
+            "[]",
+            r#"{"Statement":null}"#,
+            r#"{"Statement":[42]}"#,
+        ] {
+            assert!(
+                merge_prefix_policy(Some(existing), &AccessLevel::Download, "bucket", "images")
+                    .is_err()
+            );
+        }
     }
 
     #[test]

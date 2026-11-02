@@ -36,7 +36,9 @@ rc anonymous set private local/public
 
 ## Behavior
 
-Setting prefix-level anonymous access replaces the bucket policy document with statements generated for the target prefix. Setting `private` is bucket-level because it clears the anonymous policy.
+Setting prefix-level anonymous access reads the existing policy and updates only recognizable rc-generated rules for that prefix. Other prefixes, custom statements, principals, conditions, Deny rules, and policy metadata are preserved. Repeating the same prefix update is idempotent. A failed policy read or malformed policy stops the update without writing.
+
+Bucket-level `set` and `set-json` replace the policy. Setting `private` remains bucket-level because it clears the policy. Prefix updates are read-modify-write operations; coordinate concurrent policy writers because S3 bucket policies do not support an atomic merge.
 
 Global options shown in command syntax use the same meaning everywhere:
 
