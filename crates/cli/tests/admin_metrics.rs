@@ -123,7 +123,7 @@ fn metrics_normalized_jsonl_preserves_numbers_labels_timestamps_and_partial_stat
         .expect("captured admin request");
     assert_eq!(
         request.target,
-        "/rustfs/admin/v3/metrics?disks=%2Fdata1&hosts=node-1&interval=3s&n=2&types=3&by-disk=true&by-host=true"
+        "/rustfs/admin/v3/realtime?disks=%2Fdata1&hosts=node-1&interval=3s&n=2&types=3&by-disk=true&by-host=true"
     );
     handle.join().expect("admin test server finished");
 }
@@ -165,7 +165,7 @@ fn metrics_raw_format_emits_bounded_server_records_without_v3_wrapping() {
 #[test]
 fn metrics_empty_response_is_explicit() {
     let config_dir = tempfile::tempdir().expect("create config dir");
-    let (endpoint, _receiver, handle) =
+    let (endpoint, receiver, handle) =
         start_admin_response_test_server("200 OK", "application/x-ndjson", String::new());
     let output = Command::new(rc_binary())
         .args(["admin", "metrics", "myalias"])
@@ -180,6 +180,10 @@ fn metrics_empty_response_is_explicit() {
         "stdout: {}",
         String::from_utf8_lossy(&output.stdout)
     );
+    let request = receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("captured admin request");
+    assert!(request.target.starts_with("/rustfs/admin/v3/realtime?"));
     handle.join().expect("admin test server finished");
 }
 
