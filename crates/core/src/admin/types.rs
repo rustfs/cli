@@ -484,8 +484,8 @@ pub struct BucketQuota {
     /// Quota limit in bytes (None means unlimited)
     pub quota: Option<u64>,
 
-    /// Current bucket usage in bytes
-    pub size: u64,
+    /// Current bucket usage in bytes (None when unavailable)
+    pub size: Option<u64>,
 
     /// Quota type (currently only HARD)
     #[serde(default = "default_quota_type")]
@@ -792,7 +792,7 @@ mod tests {
         let quota = BucketQuota {
             bucket: "my-bucket".to_string(),
             quota: Some(1024),
-            size: 512,
+            size: Some(512),
             quota_type: "HARD".to_string(),
         };
 
@@ -806,13 +806,25 @@ mod tests {
     }
 
     #[test]
+    fn test_bucket_quota_unknown_usage() {
+        for json in [
+            r#"{"bucket":"my-bucket","quota":1024,"size":null}"#,
+            r#"{"bucket":"my-bucket","quota":1024}"#,
+        ] {
+            let quota: BucketQuota = serde_json::from_str(json).expect("unknown usage is valid");
+            let value = serde_json::to_value(quota).expect("serialize quota");
+            assert!(value["size"].is_null());
+        }
+    }
+
+    #[test]
     fn test_bucket_quota_defaults_quota_type_when_missing() {
         let json = r#"{"bucket":"my-bucket","quota":1024,"size":512}"#;
         let decoded: BucketQuota = serde_json::from_str(json).unwrap();
 
         assert_eq!(decoded.bucket, "my-bucket");
         assert_eq!(decoded.quota, Some(1024));
-        assert_eq!(decoded.size, 512);
+        assert_eq!(decoded.size, Some(512));
         assert_eq!(decoded.quota_type, "HARD");
     }
 }
