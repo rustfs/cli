@@ -71,6 +71,9 @@ cd cli
 cargo build --release
 ```
 
+Optional object-data interfaces and the explicit private build are documented
+in [RDMA builds](docs/rdma-build.md). The ordinary build requires no private source.
+
 ## Quick Start
 
 ### Configure Aliases

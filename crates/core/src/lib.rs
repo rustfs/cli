@@ -13,6 +13,7 @@ pub mod admin;
 pub mod alias;
 pub mod config;
 pub mod cors;
+pub mod data_transport;
 pub mod encryption;
 pub mod error;
 pub mod lifecycle;
@@ -36,6 +37,10 @@ pub use alias::{
 };
 pub use config::{Config, ConfigManager};
 pub use cors::{CorsConfiguration, CorsRule};
+pub use data_transport::{
+    DataTransferState, DataTransportMode, global_data_transport_mode,
+    set_global_data_transport_mode,
+};
 pub use encryption::{BucketEncryption, ObjectEncryptionRequest};
 pub use error::{Error, MultipartAbortStatus, Result};
 pub use lifecycle::{
