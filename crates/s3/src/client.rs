@@ -4324,7 +4324,8 @@ impl S3Client {
             ));
         }
         let config = crate::multipart::MultipartConfig::default();
-        let part_size = config.calculate_part_size(file_size);
+        let max_parts = rc_core::global_multipart_max_parts();
+        let part_size = config.checked_part_size(file_size, max_parts)?;
         let part_buffer_size = usize::try_from(part_size)
             .map_err(|_| Error::General(format!("invalid part size: {part_size}")))?;
         let mut file = tokio::fs::File::open(file_path)
@@ -4399,6 +4400,17 @@ impl S3Client {
             // S3 permits the final part to be smaller than the minimum part size.
             if bytes_read == 0 && !(file_size == 0 && part_number == 1) {
                 break;
+            }
+            if part_number as usize > max_parts {
+                return Err(self
+                    .abort_multipart_upload_with_error(
+                        path,
+                        &upload_id,
+                        Error::Conflict(
+                            "Source file grew beyond the configured multipart part limit".into(),
+                        ),
+                    )
+                    .await);
             }
 
             tracing::debug!(part_number, bytes_read, "Uploading part");

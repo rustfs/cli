@@ -532,6 +532,13 @@ rc completions powershell >> $PROFILE
 
 ## Configuration
 
+Backends with a lower multipart ceiling can use `rc --max-parts 1000 cp ...`
+or `RC_MAX_PARTS=1000 rc mirror ...`. The default is 10,000; accepted values
+are 1 through 10,000. Uploads and server-side multipart copies increase their
+part size to stay within the limit and reject objects that cannot fit the
+part-size bounds before creating an upload. Resume layouts that exceed the
+current limit must be restarted; existing upload parts are never rechunked.
+
 Configuration file is located at `~/.config/rc/config.toml`:
 
 ```toml

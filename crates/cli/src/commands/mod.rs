@@ -97,6 +97,11 @@ pub struct Cli {
     #[arg(long, global = true, default_value = "http")]
     pub data_transport: DataTransportMode,
 
+    /// Maximum multipart parts per object for the destination backend
+    #[arg(long, global = true, env = "RC_MAX_PARTS", default_value_t = 10_000,
+        value_parser = clap::value_parser!(u32).range(1..=10_000))]
+    pub max_parts: u32,
+
     /// Output format: auto-detect, human-readable, or JSON
     #[arg(long, global = true, value_enum)]
     pub format: Option<OutputFormat>,
@@ -367,6 +372,10 @@ pub async fn execute(cli: Cli) -> ExitCode {
     set_global_data_transport_mode(cli.data_transport);
     set_global_request_headers(cli.request_headers.clone());
     let cli_output_options = GlobalOutputOptions::from_cli(&cli);
+    if let Err(error) = rc_core::set_global_multipart_max_parts(cli.max_parts as usize) {
+        return Formatter::new(cli_output_options.resolve(OutputBehavior::HumanDefault))
+            .fail(ExitCode::UsageError, &error.to_string());
+    }
     let defaults = match ConfigManager::new() {
         Ok(manager) if manager.config_path().exists() => match manager.load() {
             Ok(config) => Some(config.defaults),

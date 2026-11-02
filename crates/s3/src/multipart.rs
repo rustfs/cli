@@ -42,6 +42,32 @@ impl Default for MultipartConfig {
 }
 
 impl MultipartConfig {
+    /// Size parts for a backend limit, rejecting impossible uploads before mutation.
+    pub fn checked_part_size(&self, file_size: u64, max_parts: usize) -> Result<u64> {
+        if !(1..=MAX_PARTS).contains(&max_parts)
+            || !(MIN_PART_SIZE..=MAX_PART_SIZE).contains(&self.part_size)
+        {
+            return Err(rc_core::Error::InvalidPath(
+                "Invalid multipart part size or part limit".into(),
+            ));
+        }
+        let part_size = self
+            .part_size
+            .max(file_size.div_ceil(max_parts as u64))
+            .max(MIN_PART_SIZE);
+        if file_size > rc_core::S3_MAX_OBJECT_SIZE || part_size > MAX_PART_SIZE {
+            return Err(rc_core::Error::InvalidPath(
+                "Object cannot fit within the configured multipart part limit and S3 size bounds"
+                    .into(),
+            ));
+        }
+        Ok(if file_size <= MIN_PART_SIZE {
+            MIN_PART_SIZE
+        } else {
+            part_size
+        })
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -113,6 +139,30 @@ pub struct CompletedPart {
 }
 
 impl UploadState {
+    /// Reject a saved layout instead of rechunking an already-created upload.
+    pub fn validate_max_parts(&self, max_parts: usize) -> Result<()> {
+        if !(1..=MAX_PARTS).contains(&max_parts) || self.part_size == 0 {
+            return Err(rc_core::Error::InvalidPath(
+                "Invalid multipart resume layout or part limit".into(),
+            ));
+        }
+        let parts = self.total_size.div_ceil(self.part_size).max(1);
+        let mut seen = std::collections::HashSet::new();
+        if parts > max_parts as u64
+            || self.completed_parts.iter().any(|part| {
+                part.part_number <= 0
+                    || part.part_number as u64 > parts
+                    || !seen.insert(part.part_number)
+            })
+        {
+            return Err(rc_core::Error::InvalidPath(
+                "Saved upload is incompatible with the configured part limit; restart the upload"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Create a new upload state
     pub fn new(
         upload_id: impl Into<String>,
@@ -189,6 +239,7 @@ impl UploadState {
         let path = Self::state_file_path(state_dir, upload_id);
         let content = std::fs::read_to_string(&path)?;
         let state: Self = serde_json::from_str(&content)?;
+        state.validate_max_parts(rc_core::global_multipart_max_parts())?;
         Ok(state)
     }
 
@@ -218,6 +269,7 @@ impl UploadState {
                 && let Ok(state) = serde_json::from_str::<Self>(&content)
                 && state.target == target
             {
+                state.validate_max_parts(rc_core::global_multipart_max_parts())?;
                 pending.push(state);
             }
         }
@@ -241,6 +293,37 @@ pub fn part_byte_range(part_number: i32, part_size: u64, total_size: u64) -> (u6
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_part_limit_sizes_uploads_and_rejects_impossible_sizes() {
+        let config = MultipartConfig::default();
+        let size = DEFAULT_PART_SIZE * 1001;
+        let part_size = config
+            .checked_part_size(size, 1000)
+            .expect("backend-specific part size");
+        assert!(size.div_ceil(part_size) <= 1000);
+        assert!(
+            config
+                .checked_part_size(MAX_PART_SIZE * 1000 + 1, 1000)
+                .is_err()
+        );
+        for limit in [0, 10_001] {
+            assert!(config.checked_part_size(size, limit).is_err());
+        }
+    }
+
+    #[test]
+    fn resume_rejects_layouts_incompatible_with_the_part_limit() {
+        let mut state =
+            UploadState::new("upload", "bucket/key", MIN_PART_SIZE * 1001, MIN_PART_SIZE);
+        assert!(state.validate_max_parts(1000).is_err());
+        assert!(state.validate_max_parts(10_000).is_ok());
+        state.part_size = 0;
+        assert!(state.validate_max_parts(1000).is_err());
+        state.part_size = MIN_PART_SIZE * 2;
+        state.add_completed_part(1001, "etag".into());
+        assert!(state.validate_max_parts(1000).is_err());
+    }
 
     #[test]
     fn test_default_config() {
