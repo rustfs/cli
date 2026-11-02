@@ -27,6 +27,7 @@ impl CapturedRequest {
 #[derive(Debug, Clone, Copy)]
 enum ResponseMode {
     Read,
+    Copy,
     Stat,
     Delete,
     MissingVersion,
@@ -228,6 +229,38 @@ fn read_request(stream: &mut TcpStream) -> Option<CapturedRequest> {
 
 fn response_for(mode: ResponseMode, request: &CapturedRequest) -> String {
     match mode {
+        ResponseMode::Copy => {
+            if request.method == "PUT" {
+                let body = if request.header("x-amz-copy-source").is_some() {
+                    "<CopyObjectResult><ETag>\"new-etag\"</ETag></CopyObjectResult>"
+                } else {
+                    ""
+                };
+                return http_response(
+                    200,
+                    &[
+                        ("Content-Type", "application/xml"),
+                        ("ETag", "\"new-etag\""),
+                        ("x-amz-version-id", "v2"),
+                    ],
+                    body,
+                );
+            }
+            let version = if request.path.contains("versionId=null") {
+                "null"
+            } else {
+                "v1"
+            };
+            http_response(
+                200,
+                &[
+                    ("Content-Type", "text/plain"),
+                    ("ETag", "\"etag-v1\""),
+                    ("x-amz-version-id", version),
+                ],
+                "old",
+            )
+        }
         ResponseMode::Read => http_response(
             200,
             &[("Content-Type", "text/plain"), ("x-amz-version-id", "v1")],
@@ -264,6 +297,162 @@ fn response_for(mode: ResponseMode, request: &CapturedRequest) -> String {
         ResponseMode::RecursiveVersions => recursive_versions_response(request),
         ResponseMode::PartialRecursiveVersions => partial_recursive_versions_response(request),
     }
+}
+
+#[test]
+fn copy_selects_the_requested_version_for_download_and_same_alias_copy() {
+    let server = TestServer::start(ResponseMode::Copy);
+    let target = tempfile::tempdir().expect("download directory");
+    let file = target.path().join("old.txt");
+    let output = run_rc(
+        Some(&server),
+        &[
+            "cp",
+            "test/bucket/key",
+            file.to_str().expect("path"),
+            "--version-id",
+            "v1",
+            "--json",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(std::fs::read(&file).expect("downloaded file"), b"old");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("copy JSON");
+    assert_eq!(value["data"]["source_version_id"], "v1");
+
+    let output = run_rc(
+        Some(&server),
+        &[
+            "cp",
+            "test/bucket/key",
+            "test/backup/key",
+            "--vid",
+            "v1",
+            "--json",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("copy JSON");
+    assert_eq!(value["data"]["source_version_id"], "v1");
+    assert_eq!(value["data"]["version_id"], "v2");
+    let requests = server.captured_requests();
+    assert!(
+        requests
+            .iter()
+            .filter(
+                |r| (r.method == "GET" || r.method == "HEAD") && r.path.starts_with("/bucket/key")
+            )
+            .all(|r| r.path.contains("versionId=v1"))
+    );
+    assert!(requests.iter().any(|r| {
+        r.header("x-amz-copy-source")
+            .is_some_and(|source| source.contains("versionId=v1"))
+    }));
+}
+
+#[test]
+fn copy_pins_the_null_version_across_aliases_and_with_transfer_controls() {
+    for controls in [false, true] {
+        let source = TestServer::start(ResponseMode::Copy);
+        let destination = TestServer::start(ResponseMode::Copy);
+        let config = tempfile::tempdir().expect("config directory");
+        let mut command = Command::new(rc_binary());
+        command
+            .args([
+                "cp",
+                "test/bucket/key",
+                "target/backup/key",
+                "--version-id",
+                "null",
+            ])
+            .env("RC_CONFIG_DIR", config.path())
+            .env("RC_HOST_test", source.endpoint_with_credentials())
+            .env("RC_HOST_target", destination.endpoint_with_credentials());
+        if controls {
+            command.args(["--concurrency", "2", "--summary"]);
+        }
+        let output = command.output().expect("copy historical version");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let requests = source.captured_requests();
+        assert!(requests.iter().any(|r| r.method == "GET"));
+        assert!(
+            requests.iter().all(|r| r.path.contains("versionId=null")),
+            "{requests:?}"
+        );
+        assert!(
+            destination
+                .captured_requests()
+                .iter()
+                .all(|r| !r.path.contains("versionId="))
+        );
+    }
+}
+
+#[test]
+fn copy_rejects_invalid_version_selectors_and_reports_missing_versions() {
+    for args in [
+        vec!["cp", "test/bucket/key", "./old.txt", "--vid", ""],
+        vec![
+            "cp",
+            "test/bucket/key",
+            "./old.txt",
+            "--vid",
+            "v1",
+            "--recursive",
+        ],
+        vec![
+            "cp",
+            "test/bucket/key",
+            "./old.txt",
+            "--vid",
+            "v1",
+            "--rewind",
+            "1h",
+        ],
+        vec!["cp", "./Cargo.toml", "test/bucket/key", "--vid", "v1"],
+        vec![
+            "cp",
+            "test/bucket/a",
+            "test/bucket/b",
+            "test/destination/",
+            "--vid",
+            "v1",
+        ],
+    ] {
+        assert_eq!(run_rc(None, &args).status.code(), Some(2), "{args:?}");
+    }
+    let server = TestServer::start(ResponseMode::MissingVersion);
+    let directory = tempfile::tempdir().expect("download directory");
+    let target = directory.path().join("missing");
+    let output = run_rc(
+        Some(&server),
+        &[
+            "cp",
+            "test/bucket/key",
+            target.to_str().expect("path"),
+            "--vid",
+            "missing",
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!target.exists());
 }
 
 fn recursive_versions_response(request: &CapturedRequest) -> String {

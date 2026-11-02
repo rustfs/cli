@@ -29,6 +29,7 @@ rc [GLOBAL OPTIONS] cp [OPTIONS] <SOURCE>... <TARGET>
 | `--newer-than <AGE>` | Select sources strictly newer than an age such as `1h` or `7d`. |
 | `--older-than <AGE>` | Select sources strictly older than an age such as `1h` or `7d`. |
 | `--rewind <TIME>` | Select source metadata at or before a UTC timestamp or age. |
+| `--version-id <ID>`, `--vid <ID>` | Copy one exact remote object version, including `null`. Not combined with recursive copy, multiple sources, local sources, or `--rewind`. Applies only to the source. |
 | `--concurrency <COUNT>` | Bound all in-flight leaf transfers across the command. Defaults to `4`. |
 | `--rate-limit <RATE>` | Pace aggregate transfer starts by expected bytes, for example `10MiB/s`. |
 | `--retry-attempts <COUNT>` | Maximum attempts for classified transient failures. Defaults to `3`. |
@@ -91,6 +92,14 @@ rc cp ./reports/ local/archive/ --recursive --enc-kms local/archive/=alias/archi
 ```
 
 ## Behavior
+
+An explicit source version is used for metadata queries, downloads, server-side copies, and cross-alias staging. The destination receives a new object version according to its bucket configuration. Missing versions return exit code 5. Version-aware single-copy JSON uses the existing `versioned_objects` output-v3 family and reports the selected source version.
+
+```bash
+rc cp local/reports/summary.json ./old-summary.json --version-id VERSION_ID
+rc cp local/reports/summary.json local/archive/summary.json --vid VERSION_ID
+rc cp stage/data/report.json prod/archive/report.json --version-id null
+```
 
 The last path is always the target. Multiple sources require a local directory or remote prefix target, and ambiguous targets fail before any transfer starts. Sources can mix local and remote paths only where the command can infer a valid copy direction. Same-alias S3-to-S3 copies use server-side CopyObject, including recursive prefix copies. Cross-alias copies download through a temporary file and upload with the destination alias credentials. Use trailing slashes consistently when copying directory-like prefixes.
 

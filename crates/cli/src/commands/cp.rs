@@ -163,6 +163,10 @@ pub struct CpArgs {
     #[arg(long)]
     pub rewind: Option<String>,
 
+    /// Copy a specific source object version
+    #[arg(long, alias = "vid", conflicts_with_all = ["rewind", "recursive"])]
+    pub version_id: Option<String>,
+
     /// Maximum number of transfers in flight across the command
     #[arg(long)]
     pub concurrency: Option<usize>,
@@ -203,6 +207,14 @@ impl fmt::Debug for CpArgs {
 }
 
 impl CpArgs {
+    fn source_read_options(&self) -> TransferReadOptions {
+        TransferReadOptions {
+            version_id: self.version_id.clone(),
+            customer_key: self.source_customer_key.clone(),
+            ..TransferReadOptions::default()
+        }
+    }
+
     pub(crate) fn single(source: impl Into<String>, target: impl Into<String>) -> Self {
         Self {
             sources: vec![source.into()],
@@ -231,6 +243,7 @@ impl CpArgs {
             newer_than: None,
             older_than: None,
             rewind: None,
+            version_id: None,
             concurrency: None,
             rate_limit: None,
             retry_attempts: None,
@@ -321,6 +334,18 @@ async fn execute_with_alias(
 ) -> ExitCode {
     let formatter = Formatter::new(output_config);
 
+    if let Err(error) =
+        super::validate_version_selector(args.version_id.as_deref(), args.rewind.as_deref())
+    {
+        return formatter.fail(ExitCode::UsageError, &error);
+    }
+    if args.version_id.is_some() && (args.sources.len() != 1 || args.recursive) {
+        return formatter.fail(
+            ExitCode::UsageError,
+            "--version-id requires one non-recursive remote source",
+        );
+    }
+
     if alias == TransferAlias::Get && args.sources.len() != 1 {
         return formatter.fail(
             ExitCode::UsageError,
@@ -402,6 +427,14 @@ async fn execute_with_alias(
     };
     if let Err(error) = validate_alias_direction(alias, &sources, &target) {
         return formatter.fail(ExitCode::UsageError, error);
+    }
+    if args.version_id.is_some()
+        && !matches!(sources.as_slice(), [ParsedPath::Remote(source)] if !source.key.is_empty() && !source.key.ends_with('/'))
+    {
+        return formatter.fail(
+            ExitCode::UsageError,
+            "--version-id requires one remote object source",
+        );
     }
     if let Err(error) = validate_fidelity_directions(&args, &sources, &target) {
         return formatter.fail(exit_code_for_core_error(&error), &error.to_string());
@@ -642,7 +675,7 @@ fn transfer_copy_options(
     }
     let options = TransferCopyOptions {
         source: TransferReadOptions {
-            version_id: source_version_id,
+            version_id: args.version_id.clone().or(source_version_id),
             customer_key: args.source_customer_key.clone(),
             ..TransferReadOptions::default()
         },
@@ -848,7 +881,7 @@ async fn execute_transfer_plan(
         target_is_container,
         args.recursive,
         encryption,
-        args.source_customer_key.as_ref(),
+        &args.source_read_options(),
         alias_manager,
         args.local_key_policy(),
     )
@@ -1239,10 +1272,7 @@ async fn perform_planned_download(
         .download_object_to_path_with_transfer_options(
             source,
             target,
-            &TransferReadOptions {
-                customer_key: args.source_customer_key.clone(),
-                ..TransferReadOptions::default()
-            },
+            &args.source_read_options(),
             |_, _| {},
         )
         .await
@@ -1298,7 +1328,9 @@ async fn perform_planned_remote_copy(
                 "RustFS beta.10 does not persist storage class for multipart copies".to_string(),
             ));
         }
-        let current = source_client.head_object(source).await?;
+        let current = source_client
+            .head_object_with_transfer_options(source, &args.source_read_options())
+            .await?;
         if !source_identity_matches(source_info, &current) {
             return Err(Error::Conflict(format!(
                 "Source changed after copy planning: {source}"
@@ -1382,7 +1414,9 @@ async fn perform_cross_alias_remote_copy(
         ));
     }
 
-    let current = source_client.head_object(source).await?;
+    let current = source_client
+        .head_object_with_transfer_options(source, &args.source_read_options())
+        .await?;
     if !source_identity_matches(source_info, &current) {
         return Err(Error::Conflict(format!(
             "Source changed after copy planning: {source}"
@@ -1858,7 +1892,7 @@ async fn build_transfer_candidates(
     target_is_container: bool,
     recursive: bool,
     encryption: Option<ObjectEncryptionRequest>,
-    source_customer_key: Option<&SseCustomerKey>,
+    source_read_options: &TransferReadOptions,
     alias_manager: &AliasManager,
     key_policy: ObjectKeyPolicy,
 ) -> rc_core::Result<Vec<TransferCandidate<CpOperation>>> {
@@ -1885,7 +1919,7 @@ async fn build_transfer_candidates(
                     recursive,
                     multiple_sources,
                     encryption.clone(),
-                    source_customer_key,
+                    source_read_options,
                     alias_manager,
                     &mut planning_clients,
                     &mut candidates,
@@ -2109,7 +2143,7 @@ async fn build_remote_candidates(
     recursive: bool,
     multiple_sources: bool,
     encryption: Option<ObjectEncryptionRequest>,
-    source_customer_key: Option<&SseCustomerKey>,
+    source_read_options: &TransferReadOptions,
     alias_manager: &AliasManager,
     planning_clients: &mut HashMap<String, Arc<S3Client>>,
     candidates: &mut Vec<TransferCandidate<CpOperation>>,
@@ -2233,13 +2267,7 @@ async fn build_remote_candidates(
     }
 
     let object = client
-        .head_object_with_transfer_options(
-            source,
-            &TransferReadOptions {
-                customer_key: source_customer_key.cloned(),
-                ..TransferReadOptions::default()
-            },
-        )
+        .head_object_with_transfer_options(source, source_read_options)
         .await?;
     let name = source
         .key
@@ -2848,10 +2876,7 @@ pub(super) async fn download_file(
         .download_object_to_path_with_transfer_options(
             src,
             &dst_path,
-            &TransferReadOptions {
-                customer_key: args.source_customer_key.clone(),
-                ..TransferReadOptions::default()
-            },
+            &args.source_read_options(),
             |bytes_downloaded, total_size| {
                 update_download_progress(
                     &mut progress,
@@ -2872,16 +2897,9 @@ pub(super) async fn download_file(
             let size = size as i64;
 
             if formatter.is_json() {
-                let output = CpOutput {
-                    status: "success",
-                    source: src_display,
-                    target: dst_display,
-                    size_bytes: Some(size),
-                    size_human: Some(humansize::format_size(size as u64, humansize::BINARY)),
-                    version_id: None,
-                    source_version_id: None,
-                };
-                formatter.json(&output);
+                let mut info = ObjectInfo::file(&src.key, size);
+                info.source_version_id = args.version_id.clone();
+                print_copy_json(formatter, &info, &src_display, &dst_display);
             } else {
                 let styled_src = formatter.style_file(&src_display);
                 let styled_dst = formatter.style_file(&dst_display);
@@ -2892,18 +2910,15 @@ pub(super) async fn download_file(
             ExitCode::Success
         }
         Err(e) => {
-            let err_str = e.to_string();
-            if err_str.contains("NotFound") || err_str.contains("NoSuchKey") {
+            let code = exit_code_for_core_error(&e);
+            if code == ExitCode::NotFound {
                 formatter.fail_with_suggestion(
                     ExitCode::NotFound,
                     &format!("Object not found: {src_display}"),
                     "Check the object key and bucket path, then retry the copy command.",
                 )
             } else {
-                formatter.fail(
-                    ExitCode::NetworkError,
-                    &format!("Failed to download {src_display}: {e}"),
-                )
+                formatter.fail(code, &format!("Failed to download {src_display}: {e}"))
             }
         }
     }
@@ -3136,7 +3151,10 @@ async fn copy_s3_to_s3_prepared(
         return ExitCode::Success;
     }
 
-    let source_info = match source_client.head_object(src).await {
+    let source_info = match source_client
+        .head_object_with_transfer_options(src, &args.source_read_options())
+        .await
+    {
         Ok(info) => info,
         Err(Error::NotFound(_)) => {
             return formatter.fail_with_suggestion(
@@ -3224,8 +3242,9 @@ async fn copy_s3_to_s3_prepared(
     let _ = signal_task.await;
 
     match result {
-        Ok(result) => {
+        Ok(mut result) => {
             if formatter.is_json() {
+                result.object.source_version_id = result.source_version_id;
                 print_copy_json(formatter, &result.object, &src_display, &dst_display);
             } else {
                 let styled_src = formatter.style_file(&src_display);
@@ -4032,7 +4051,7 @@ mod tests {
             true,
             false,
             None,
-            None,
+            &TransferReadOptions::default(),
             &alias_manager,
             ObjectKeyPolicy::Logical,
         )
