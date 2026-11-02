@@ -179,7 +179,7 @@ impl MetricGroups {
     }
 }
 
-/// One JSON Lines record from `/rustfs/admin/v3/metrics`.
+/// One JSON Lines record from `/rustfs/admin/v3/realtime`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RealtimeMetrics {
     #[serde(default)]

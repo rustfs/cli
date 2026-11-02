@@ -4705,7 +4705,7 @@ impl ObservabilityApi for AdminClient {
             params.push(("by-depID", deployment_id));
         }
 
-        let mut url = self.admin_url("/metrics");
+        let mut url = self.admin_url("/realtime");
         let query_string = params
             .iter()
             .map(|(key, value)| {
@@ -9920,7 +9920,7 @@ mod tests {
         assert_eq!(request.method, "GET");
         assert_eq!(
             request.target,
-            "/rustfs/admin/v3/metrics?disks=%2Fdata%2Fone&hosts=node%201&interval=3s&n=2&types=3&by-disk=true&by-host=true&by-jobID=job%2F1&by-depID=dep%201"
+            "/rustfs/admin/v3/realtime?disks=%2Fdata%2Fone&hosts=node%201&interval=3s&n=2&types=3&by-disk=true&by-host=true&by-jobID=job%2F1&by-depID=dep%201"
         );
         handle.join().expect("server thread should finish");
     }
