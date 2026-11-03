@@ -5,6 +5,7 @@
 //! depends on the AWS SDK.
 
 pub mod admin;
+mod auth;
 pub mod client;
 pub mod data_transport;
 mod lifecycle_xml;

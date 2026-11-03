@@ -247,6 +247,9 @@ fn map_select_stream_error(
 }
 
 fn classify_aws_code(code: Option<&str>, text: &str) -> Error {
+    if let Some(error) = crate::auth::temporary_credential_error(code) {
+        return error;
+    }
     let c = code.filter(|s| !s.is_empty());
     if text.contains("NotImplemented") && c != Some("NotImplemented") {
         return Error::UnsupportedFeature("The backend does not support S3 Select.".to_string());

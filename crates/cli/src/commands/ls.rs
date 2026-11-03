@@ -461,6 +461,7 @@ fn ls_version_output(result: ObjectVersionListResult, summarize: bool) -> LsVers
 
 fn exit_code_from_version_listing_error(error: &Error) -> ExitCode {
     match error {
+        Error::Auth(_) => ExitCode::AuthError,
         Error::NotFound(_) => ExitCode::NotFound,
         Error::Network(_) => ExitCode::NetworkError,
         _ => {
@@ -540,7 +541,7 @@ async fn list_objects(
         match list_objects_with_paging(client, path, &options).await {
             Ok(r) => r,
             Err((message, exit_code)) => {
-                formatter.error(&message);
+                formatter.error_with_code(exit_code, &message);
                 return exit_code;
             }
         };
@@ -742,6 +743,9 @@ async fn list_objects_with_paging(
                 }
             }
             Err(e) => {
+                if matches!(e, Error::Auth(_)) {
+                    return Err((format!("Failed to list objects: {e}"), ExitCode::AuthError));
+                }
                 let err_str = e.to_string();
                 if err_str.contains("NotFound") || err_str.contains("NoSuchBucket") {
                     return Err((

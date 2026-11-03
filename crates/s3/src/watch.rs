@@ -194,7 +194,7 @@ impl S3Client {
             .map_err(|error| Error::Network(format!("Failed to open watch stream: {error}")))?;
 
         if !response.status().is_success() {
-            return Err(watch_http_error(response).await);
+            return Err(self.redact_sensitive_error(watch_http_error(response).await));
         }
 
         let content_type = response
@@ -380,6 +380,11 @@ async fn read_bounded_error_body(response: reqwest::Response) -> Vec<u8> {
 }
 
 fn map_watch_http_error(status: StatusCode, body: &[u8]) -> Error {
+    if let Some(error) =
+        crate::auth::temporary_credential_body_error(&String::from_utf8_lossy(body))
+    {
+        return error;
+    }
     let detail = watch_error_detail(body);
     // Some S3-compatible servers return a plain-text authentication failure. Use the
     // bounded body for classification, but only include parsed and sanitized fields in

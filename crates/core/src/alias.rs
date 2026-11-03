@@ -156,7 +156,7 @@ impl Default for TimeoutConfig {
 }
 
 /// An alias represents a named S3-compatible storage endpoint
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Alias {
     /// Unique name for this alias
     pub name: String,
@@ -209,6 +209,20 @@ pub struct Alias {
     /// Timeout configuration
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<TimeoutConfig>,
+}
+
+impl std::fmt::Debug for Alias {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Alias")
+            .field("name", &self.name)
+            .field("endpoint", &self.endpoint)
+            .field("access_key", &"[REDACTED]")
+            .field("secret_key", &"[REDACTED]")
+            .field("anonymous", &self.anonymous)
+            .field("region", &self.region)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Validate that an alias endpoint is a usable HTTP(S) URL.
@@ -278,6 +292,35 @@ impl Alias {
     pub fn timeout_config(&self) -> TimeoutConfig {
         self.timeout.clone().unwrap_or_default()
     }
+
+    /// Resolve a process-only token from the same environment credential set.
+    pub fn session_token(&self) -> Result<Option<String>> {
+        if self.anonymous {
+            return Ok(None);
+        }
+        let var_name = env_alias_var_name(&self.name);
+        let Some(value) = env::var_os(&var_name) else {
+            return Ok(None);
+        };
+        let value = value
+            .into_string()
+            .map_err(|_| Error::Config(format!("{var_name} must be valid UTF-8")))?;
+        self.matching_session_token(&value)
+    }
+
+    fn matching_session_token(&self, value: &str) -> Result<Option<String>> {
+        let (environment_alias, token) = parse_env_alias_with_session(&self.name, value)?;
+        // Never combine a token with credentials from a different alias source.
+        if !self.anonymous
+            && self.endpoint.trim_end_matches('/') == environment_alias.endpoint
+            && self.access_key == environment_alias.access_key
+            && self.secret_key == environment_alias.secret_key
+        {
+            Ok(token)
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 fn env_alias_var_name(name: &str) -> String {
@@ -343,10 +386,41 @@ where
 }
 
 fn parse_env_alias(name: &str, value: &str) -> Result<Alias> {
+    parse_env_alias_with_session(name, value).map(|(alias, _)| alias)
+}
+
+fn parse_env_alias_with_session(name: &str, value: &str) -> Result<(Alias, Option<String>)> {
     let var_name = env_alias_var_name(name);
+    if value.bytes().any(|byte| byte.is_ascii_control()) {
+        return Err(Error::Config(format!(
+            "{var_name} must not contain control characters"
+        )));
+    }
     let mut url = Url::parse(value)
         .map_err(|e| Error::Config(format!("{var_name} must be a valid URL: {e}")))?;
 
+    let session_token = if let Some(query) = url.query() {
+        let invalid = || {
+            Error::Config(format!(
+                "{var_name} query must contain one non-empty, URL-encoded session_token"
+            ))
+        };
+        if has_invalid_percent_encoding(query) {
+            return Err(invalid());
+        }
+        let pairs: Vec<_> = url.query_pairs().collect();
+        if pairs.len() != 1 || pairs[0].0 != "session_token" {
+            return Err(invalid());
+        }
+        let token = pairs[0].1.as_ref();
+        if token.is_empty() || !token.bytes().all(|byte| byte.is_ascii_graphic()) {
+            return Err(invalid());
+        }
+        Some(token.to_string())
+    } else {
+        None
+    };
+    url.set_query(None);
     validate_http_endpoint_url(&url, &var_name)?;
 
     let access_key = url.username();
@@ -373,7 +447,10 @@ fn parse_env_alias(name: &str, value: &str) -> Result<Alias> {
     })?;
 
     let endpoint = url.as_str().trim_end_matches('/').to_string();
-    Ok(Alias::new(name, endpoint, access_key, secret_key))
+    Ok((
+        Alias::new(name, endpoint, access_key, secret_key),
+        session_token,
+    ))
 }
 
 fn validate_http_endpoint_url(url: &Url, label: &str) -> Result<()> {
@@ -727,6 +804,64 @@ mod tests {
         assert_eq!(alias.secret_key, "SECRET_KEY");
         assert_eq!(alias.region, "us-east-1");
         assert_eq!(alias.bucket_lookup, "auto");
+    }
+
+    #[test]
+    fn temporary_credentials_are_process_only_and_redacted() {
+        let alias = parse_env_alias(
+            "temporary",
+            "https://ACCESS_KEY:SECRET_KEY@rustfs.local?session_token=TOKEN%2B%2F%3D",
+        )
+        .unwrap();
+
+        assert_eq!(alias.endpoint, "https://rustfs.local");
+        let serialized = serde_json::to_string(&alias).unwrap();
+        assert!(!serialized.contains("TOKEN"));
+        assert!(!serialized.contains("session_token"));
+        let debug = format!("{alias:?}");
+        assert!(!debug.contains("ACCESS_KEY"));
+        assert!(!debug.contains("SECRET_KEY"));
+    }
+
+    #[test]
+    fn session_tokens_never_mix_with_other_credentials() {
+        let value = "https://access:secret@rustfs.local?session_token=TOKEN%2B%2F%3D";
+        let mut alias = parse_env_alias("temporary", value).unwrap();
+        assert_eq!(
+            alias.matching_session_token(value).unwrap().as_deref(),
+            Some("TOKEN+/=")
+        );
+        alias.secret_key = "different".into();
+        assert_eq!(alias.matching_session_token(value).unwrap(), None);
+        alias.secret_key = "secret".into();
+        alias.endpoint = "https://elsewhere.local".into();
+        assert_eq!(alias.matching_session_token(value).unwrap(), None);
+        alias.endpoint = "https://rustfs.local".into();
+        alias.anonymous = true;
+        assert_eq!(alias.matching_session_token(value).unwrap(), None);
+    }
+
+    #[test]
+    fn invalid_session_tokens_are_rejected_without_echoing_them() {
+        for query in [
+            "session_token=",
+            "session_token=TOKEN&session_token=OTHER",
+            "session_token=TOKEN&region=us-east-1",
+            "token=TOKEN",
+            "session_token=TOKEN%ZZ",
+            "session_token=TOKEN%FF",
+            "session_token=TOKEN%0A",
+            "session_token=TOKEN+SUFFIX",
+        ] {
+            let error = parse_env_alias(
+                "temporary",
+                &format!("https://access:secret@rustfs.local?{query}"),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(!error.contains("TOKEN"), "{error}");
+            assert!(!error.contains("secret"), "{error}");
+        }
     }
 
     #[test]

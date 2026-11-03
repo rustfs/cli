@@ -266,6 +266,7 @@ pub struct AdminClient {
     endpoint: String,
     access_key: String,
     secret_key: String,
+    session_token: Option<String>,
     region: String,
     anonymous: bool,
     transport_security_fingerprint: String,
@@ -353,6 +354,7 @@ impl AdminClient {
             endpoint: alias.endpoint.trim_end_matches('/').to_string(),
             access_key: alias.access_key.clone(),
             secret_key: alias.secret_key.clone(),
+            session_token: alias.session_token()?,
             region: alias.region.clone(),
             anonymous: alias.anonymous,
             transport_security_fingerprint,
@@ -428,7 +430,7 @@ impl AdminClient {
         let credentials = Credentials::new(
             &self.access_key,
             &self.secret_key,
-            None,
+            self.session_token.clone(),
             None,
             "admin-client",
         );
@@ -471,8 +473,13 @@ impl AdminClient {
         for (name, value) in signing_instructions.headers() {
             let header_name = HeaderName::try_from(&name.to_string())
                 .map_err(|e| Error::Auth(format!("Invalid header name: {e}")))?;
-            let header_value = HeaderValue::try_from(&value.to_string())
+            let mut header_value = HeaderValue::try_from(&value.to_string())
                 .map_err(|e| Error::Auth(format!("Invalid header value: {e}")))?;
+            if name.eq_ignore_ascii_case("authorization")
+                || name.eq_ignore_ascii_case("x-amz-security-token")
+            {
+                header_value.set_sensitive(true);
+            }
             signed_headers.insert(header_name, header_value);
         }
 
@@ -763,6 +770,13 @@ impl AdminClient {
         let response_body =
             read_bounded_response_body(http_response, response.max_bytes, response.name).await?;
         if !status.is_success() {
+            if status != StatusCode::NOT_FOUND
+                && let Some(error) = crate::auth::temporary_credential_body_error(
+                    &String::from_utf8_lossy(&response_body),
+                )
+            {
+                return Err(error);
+            }
             return Err((response.error_mapper)(
                 self,
                 status,
@@ -1145,6 +1159,25 @@ impl AdminClient {
 
     /// Map HTTP status codes to appropriate errors
     pub(crate) fn map_error(&self, status: StatusCode, body: &str) -> Error {
+        if status != StatusCode::NOT_FOUND
+            && let Some(error) = crate::auth::temporary_credential_body_error(body)
+        {
+            return error;
+        }
+        let mut error = self.classify_response_error(status, body);
+        match &mut error {
+            Error::Auth(message)
+            | Error::NotFound(message)
+            | Error::UnsupportedFeature(message)
+            | Error::Conflict(message)
+            | Error::General(message)
+            | Error::Network(message) => self.redact_admin_credentials(message),
+            _ => {}
+        }
+        error
+    }
+
+    fn classify_response_error(&self, status: StatusCode, body: &str) -> Error {
         if matches!(status, StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED) {
             return Error::Auth(body.to_string());
         }
@@ -1189,6 +1222,11 @@ impl AdminClient {
         body: &str,
         operation_label: &str,
     ) -> Error {
+        if status != StatusCode::NOT_FOUND
+            && let Some(error) = crate::auth::temporary_credential_body_error(body)
+        {
+            return error;
+        }
         if operation_label.starts_with("Site replication repair") {
             return map_site_replication_repair_error(status, body, operation_label);
         }
@@ -1324,7 +1362,8 @@ impl AdminClient {
     }
 
     fn redact_admin_credentials(&self, value: &mut String) {
-        let mut credentials = [&self.access_key, &self.secret_key];
+        let mut credentials = vec![self.access_key.as_str(), self.secret_key.as_str()];
+        credentials.extend(self.session_token.as_deref());
         credentials.sort_by_key(|credential| std::cmp::Reverse(credential.len()));
         for credential in credentials {
             if !credential.is_empty() {
@@ -1334,6 +1373,11 @@ impl AdminClient {
     }
 
     fn map_replication_diff_error(&self, status: StatusCode, body: &str) -> Error {
+        if status != StatusCode::NOT_FOUND
+            && let Some(error) = crate::auth::temporary_credential_body_error(body)
+        {
+            return error;
+        }
         if status != StatusCode::NOT_FOUND {
             return self.map_error(status, body);
         }
@@ -1360,6 +1404,11 @@ impl AdminClient {
     }
 
     fn map_replication_inspection_error(&self, status: StatusCode, body: &str) -> Error {
+        if status != StatusCode::NOT_FOUND
+            && let Some(error) = crate::auth::temporary_credential_body_error(body)
+        {
+            return error;
+        }
         if matches!(status, StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED) {
             return Error::Auth("Authentication failed for replication inspection".into());
         }
@@ -1435,6 +1484,11 @@ impl AdminClient {
     }
 
     fn map_inspect_archive_error(&self, status: StatusCode, body: &str) -> Error {
+        if status != StatusCode::NOT_FOUND
+            && let Some(error) = crate::auth::temporary_credential_body_error(body)
+        {
+            return error;
+        }
         if matches!(status, StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED) {
             return Error::Auth(
                 "Permission denied while requesting the diagnostic archive".to_string(),
@@ -1475,7 +1529,12 @@ impl AdminClient {
         }
     }
 
-    fn map_iam_policy_entities_error(&self, status: StatusCode, _body: &str) -> Error {
+    fn map_iam_policy_entities_error(&self, status: StatusCode, body: &str) -> Error {
+        if status != StatusCode::NOT_FOUND
+            && let Some(error) = crate::auth::temporary_credential_body_error(body)
+        {
+            return error;
+        }
         match status {
             StatusCode::NOT_FOUND
             | StatusCode::METHOD_NOT_ALLOWED
@@ -1496,6 +1555,11 @@ impl AdminClient {
     }
 
     fn map_iam_policy_detach_error(&self, status: StatusCode, body: &str) -> Error {
+        if status != StatusCode::NOT_FOUND
+            && let Some(error) = crate::auth::temporary_credential_body_error(body)
+        {
+            return error;
+        }
         let structured = parse_admin_error(body);
         let is_missing_entity = structured.as_ref().is_some_and(|error| {
             let code = error
@@ -1547,7 +1611,12 @@ impl AdminClient {
         }
     }
 
-    fn map_iam_access_keys_error(&self, status: StatusCode, _body: &str) -> Error {
+    fn map_iam_access_keys_error(&self, status: StatusCode, body: &str) -> Error {
+        if status != StatusCode::NOT_FOUND
+            && let Some(error) = crate::auth::temporary_credential_body_error(body)
+        {
+            return error;
+        }
         match status {
             StatusCode::NOT_FOUND
             | StatusCode::METHOD_NOT_ALLOWED
@@ -2296,10 +2365,21 @@ impl AdminClient {
         if self.anonymous {
             hasher.update(b"anonymous");
         } else {
-            hasher.update(b"authenticated\0");
-            hasher.update(self.access_key.as_bytes());
-            hasher.update(b"\0");
-            hasher.update(self.secret_key.as_bytes());
+            hasher.update(b"authenticated-v2\0");
+            for credential in [
+                Some(self.access_key.as_str()),
+                Some(self.secret_key.as_str()),
+                self.session_token.as_deref(),
+            ] {
+                match credential {
+                    Some(value) => {
+                        hasher.update([1]);
+                        hasher.update((value.len() as u64).to_be_bytes());
+                        hasher.update(value.as_bytes());
+                    }
+                    None => hasher.update([0]),
+                }
+            }
         }
 
         CapabilityCacheKey {
@@ -7719,6 +7799,64 @@ mod tests {
                 .credential_fingerprint
                 .contains("different-secret")
         );
+    }
+
+    #[tokio::test]
+    async fn temporary_admin_credentials_are_signed_sensitive_and_cache_scoped() {
+        let mut client = admin_client_for_endpoint("http://localhost:9000");
+        let static_key = client.capability_cache_key();
+        client.session_token = Some("session-secret-token".into());
+        assert_ne!(static_key, client.capability_cache_key());
+        let url = client.admin_url("/list-users");
+        let headers = client
+            .sign_request(
+                &Method::GET,
+                &url,
+                &client.request_headers(&[]).unwrap(),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(headers["x-amz-security-token"], "session-secret-token");
+        assert!(headers["x-amz-security-token"].is_sensitive());
+        assert!(headers["authorization"].is_sensitive());
+        let debug = format!("{headers:?}");
+        assert!(!debug.contains("session-secret-token"));
+        let error = client.map_error(
+            StatusCode::BAD_REQUEST,
+            r#"{"Code":"Other","Message":"session-secret-token secret"}"#,
+        );
+        assert!(!error.to_string().contains("session-secret-token"));
+        client.anonymous = true;
+        assert!(
+            !client
+                .sign_request(
+                    &Method::GET,
+                    &url,
+                    &client.request_headers(&[]).unwrap(),
+                    &[]
+                )
+                .await
+                .unwrap()
+                .contains_key("x-amz-security-token")
+        );
+    }
+
+    #[test]
+    fn credential_redaction_does_not_change_admin_error_classification() {
+        let alias = Alias::new("test", "http://localhost:9000", "Code", "NotImplemented");
+        let mut client = AdminClient::new(&alias).unwrap();
+        client.session_token = Some("Message".into());
+        let error = client.map_error(
+            StatusCode::BAD_REQUEST,
+            r#"{"Code":"NotImplemented","Message":"Code NotImplemented Message"}"#,
+        );
+        assert!(matches!(error, Error::UnsupportedFeature(_)), "{error}");
+        assert_eq!(error.exit_code(), 7);
+        let message = error.to_string();
+        for credential in ["Code", "NotImplemented", "Message"] {
+            assert!(!message.contains(credential), "{message}");
+        }
     }
 
     #[test]
