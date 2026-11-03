@@ -15,6 +15,11 @@ on:
         required: false
         type: boolean
         default: false
+      use_release_binaries:
+        description: 'Package published static binaries for a stable version tag'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -62,6 +67,8 @@ jobs:
           fi
 
           {
+            echo "version=${image_tag#v}"
+            echo "version_tag=${image_tag}"
             echo 'tags<<EOF'
             echo "rustfs/rc:${image_tag}"
             if [[ ( "$EVENT_NAME" == "workflow_run" || "$PUBLISH_LATEST" == "true" ) && "$image_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -69,6 +76,50 @@ jobs:
             fi
             echo 'EOF'
           } >> "$GITHUB_OUTPUT"
+
+      - name: Install release download tools
+        if: github.event.inputs.use_release_binaries == 'true'
+        uses: ./.github/actions/setup-self-hosted
+        with:
+          profile: github-cli file
+
+      - name: Prepare release binaries
+        if: github.event.inputs.use_release_binaries == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.image.outputs.version_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release binary images require a stable version tag"
+            exit 1
+          fi
+
+          release_dir=$(mktemp -d)
+          trap 'rm -rf "$release_dir"' EXIT
+          for arch in amd64 arm64; do
+            archive="rustfs-cli-linux-${arch}-${RELEASE_TAG}.tar.gz"
+            gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+              --pattern "$archive" --pattern "$archive.sha256" --dir "$release_dir"
+            (cd "$release_dir" && sha256sum --check "$archive.sha256")
+            mkdir -p "release-binaries/$arch"
+            tar -xzOf "$release_dir/$archive" rc > "release-binaries/$arch/rc"
+            chmod 755 "release-binaries/$arch/rc"
+            binary_info=$(file -b "release-binaries/$arch/rc")
+            if ! grep -Eiq 'statically linked|static-pie linked' <<< "$binary_info"; then
+              echo "Release binary must be statically linked: $arch"
+              exit 1
+            fi
+            case "$arch" in
+              amd64) machine='x86-64' ;;
+              arm64) machine='aarch64' ;;
+            esac
+            if ! grep -Eiq "ELF 64-bit.*$machine" <<< "$binary_info"; then
+              echo "Release binary has an unexpected architecture: $arch"
+              exit 1
+            fi
+          done
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
@@ -86,6 +137,8 @@ jobs:
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
+          file: ${{ github.event.inputs.use_release_binaries == 'true' && 'Dockerfile.release' || 'Dockerfile' }}
+          build-args: ${{ github.event.inputs.use_release_binaries == 'true' && format('RC_VERSION={0}', steps.image.outputs.version) || '' }}
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.image.outputs.tags }}
