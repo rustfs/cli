@@ -1845,6 +1845,124 @@ fn recursive_copy_sigint_drains_started_copy_and_returns_130() {
 }
 
 #[test]
+fn multipart_copy_honors_the_cli_and_environment_part_limit() {
+    const SIZE: u64 = 5 * 1024 * 1024 * 1024 + 1;
+    for use_env in [false, true] {
+        let mock = S3Mock::start(|request| {
+            if request.method == "HEAD" {
+                return Response::head_with_etag(SIZE as usize, "source-etag");
+            }
+            if request.method == "POST" && request.target.contains("uploads") {
+                return Response::xml("<InitiateMultipartUploadResult><UploadId>limited-upload</UploadId></InitiateMultipartUploadResult>".into());
+            }
+            if request.method == "PUT" && request.target.contains("uploadId=limited-upload") {
+                return Response::xml(
+                    "<CopyPartResult><ETag>\"part-etag\"</ETag></CopyPartResult>".into(),
+                );
+            }
+            if request.method == "POST" && request.target.contains("uploadId=limited-upload") {
+                return Response::xml("<CompleteMultipartUploadResult><ETag>\"copy-etag\"</ETag></CompleteMultipartUploadResult>".into());
+            }
+            Response::access_denied()
+        });
+        let config = tempfile::tempdir().expect("config directory");
+        let authority = mock.endpoint.strip_prefix("http://").expect("mock URL");
+        let mut command = Command::new(rc_binary());
+        command
+            .args([
+                "cp",
+                "test/source/src/large.bin",
+                "test/destination/dst/large.bin",
+            ])
+            .env("RC_CONFIG_DIR", config.path())
+            .env(
+                "RC_HOST_test",
+                format!("http://ACCESS_KEY:SECRET_KEY@{authority}"),
+            );
+        if use_env {
+            command.env("RC_MAX_PARTS", "2");
+        } else {
+            command
+                .env_remove("RC_MAX_PARTS")
+                .args(["--max-parts", "2"]);
+        }
+        let output = command.output().expect("limited multipart copy");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let ranges: Vec<_> = mock
+            .requests()
+            .iter()
+            .filter_map(|request| request.headers.get("x-amz-copy-source-range").cloned())
+            .collect();
+        let part_size = SIZE.div_ceil(2);
+        assert_eq!(
+            ranges,
+            vec![
+                format!("bytes=0-{}", part_size - 1),
+                format!("bytes={part_size}-{}", SIZE - 1)
+            ]
+        );
+    }
+}
+
+#[test]
+fn invalid_multipart_limits_fail_before_any_remote_request() {
+    let mock = S3Mock::start(|_| Response::access_denied());
+    for value in ["0", "10001", "invalid"] {
+        let output = run_rc(
+            &mock,
+            &[
+                "cp",
+                "test/source/key",
+                "test/destination/key",
+                "--max-parts",
+                value,
+            ],
+        );
+        assert_eq!(output.status.code(), Some(2));
+        let config = tempfile::tempdir().expect("config directory");
+        let output = Command::new(rc_binary())
+            .args(["alias", "list"])
+            .env("RC_CONFIG_DIR", config.path())
+            .env("RC_MAX_PARTS", value)
+            .output()
+            .expect("invalid environment limit");
+        assert_eq!(output.status.code(), Some(2));
+    }
+    assert!(mock.requests().is_empty());
+}
+
+#[test]
+fn upload_rejects_an_impossible_part_limit_before_creating_the_upload() {
+    let mock = S3Mock::start(|_| Response::access_denied());
+    let source = tempfile::NamedTempFile::new().expect("sparse upload source");
+    source
+        .as_file()
+        .set_len(5 * 1024 * 1024 * 1024 + 1)
+        .expect("sparse file length");
+    let output = run_rc(
+        &mock,
+        &[
+            "cp",
+            source.path().to_str().expect("source path"),
+            "test/destination/key",
+            "--max-parts",
+            "1",
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(mock.requests().is_empty());
+}
+
+#[test]
 fn recursive_large_copy_uses_multipart_and_reports_abort_cleanup() {
     const LARGE_SIZE: u64 = 5 * 1024 * 1024 * 1024 + 1;
     let mock = S3Mock::start(|request| {

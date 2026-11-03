@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::{Error, ObjectInfo, Result};
 use tokio::sync::Notify;
@@ -18,6 +18,24 @@ pub const S3_MULTIPART_COPY_MAX_PART_SIZE: u64 = 5 * 1024 * 1024 * 1024;
 
 /// Largest number of parts accepted by S3 multipart uploads.
 pub const S3_MULTIPART_COPY_MAX_PARTS: usize = 10_000;
+
+static GLOBAL_MAX_PARTS: AtomicUsize = AtomicUsize::new(S3_MULTIPART_COPY_MAX_PARTS);
+
+/// Configure the multipart part ceiling before starting this invocation's work.
+pub fn set_global_multipart_max_parts(max_parts: usize) -> Result<()> {
+    if !(1..=S3_MULTIPART_COPY_MAX_PARTS).contains(&max_parts) {
+        return Err(Error::InvalidPath(
+            "Multipart part limit must be between 1 and 10000".into(),
+        ));
+    }
+    GLOBAL_MAX_PARTS.store(max_parts, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Multipart ceiling shared by uploads and server-side copies.
+pub fn global_multipart_max_parts() -> usize {
+    GLOBAL_MAX_PARTS.load(Ordering::Relaxed)
+}
 
 /// Largest object accepted by S3.
 pub const S3_MAX_OBJECT_SIZE: u64 = 5 * 1024 * 1024 * 1024 * 1024;
@@ -99,6 +117,24 @@ pub struct MultipartCopyPlan {
 impl MultipartCopyPlan {
     /// Build a plan that satisfies S3 part size and count limits.
     pub fn new(object_size: u64, preferred_part_size: Option<u64>) -> Result<Self> {
+        Self::new_with_max_parts(
+            object_size,
+            preferred_part_size,
+            S3_MULTIPART_COPY_MAX_PARTS,
+        )
+    }
+
+    /// Build gap-free copy ranges for a backend with a lower part ceiling.
+    pub fn new_with_max_parts(
+        object_size: u64,
+        preferred_part_size: Option<u64>,
+        max_parts: usize,
+    ) -> Result<Self> {
+        if !(1..=S3_MULTIPART_COPY_MAX_PARTS).contains(&max_parts) {
+            return Err(Error::InvalidPath(
+                "Multipart part limit must be between 1 and 10000".into(),
+            ));
+        }
         if object_size == 0 {
             return Err(Error::InvalidPath(
                 "Multipart copy source size must be greater than zero".to_string(),
@@ -119,9 +155,8 @@ impl MultipartCopyPlan {
             )));
         }
 
-        // Raising a caller's preferred size is necessary when its requested size
-        // would exceed S3's 10,000-part ceiling.
-        let minimum_size_for_part_limit = object_size.div_ceil(S3_MULTIPART_COPY_MAX_PARTS as u64);
+        // Increase part size rather than exceeding the backend's part ceiling.
+        let minimum_size_for_part_limit = object_size.div_ceil(max_parts as u64);
         let part_size = preferred_part_size
             .max(minimum_size_for_part_limit)
             .max(S3_MULTIPART_COPY_MIN_PART_SIZE);
@@ -132,9 +167,9 @@ impl MultipartCopyPlan {
         }
 
         let part_count = object_size.div_ceil(part_size);
-        if part_count > S3_MULTIPART_COPY_MAX_PARTS as u64 {
+        if part_count > max_parts as u64 {
             return Err(Error::InvalidPath(format!(
-                "Multipart copy requires {part_count} parts, exceeding the S3 limit of {S3_MULTIPART_COPY_MAX_PARTS}"
+                "Multipart copy requires {part_count} parts, exceeding the configured limit of {max_parts}"
             )));
         }
 
@@ -213,7 +248,11 @@ impl MultipartCopyOptions {
                 "Source version ID cannot be empty".to_string(),
             ));
         }
-        MultipartCopyPlan::new(self.source_size, self.preferred_part_size)
+        MultipartCopyPlan::new_with_max_parts(
+            self.source_size,
+            self.preferred_part_size,
+            global_multipart_max_parts(),
+        )
     }
 }
 
@@ -341,6 +380,33 @@ mod tests {
             .expect("accept maximum S3 object size");
         assert!(max_object.parts.len() <= S3_MULTIPART_COPY_MAX_PARTS);
         assert!(max_object.part_size <= S3_MULTIPART_COPY_MAX_PART_SIZE);
+    }
+
+    #[test]
+    fn configured_part_limit_sizes_copy_ranges_and_rejects_impossible_plans() {
+        let size = S3_MULTIPART_COPY_MIN_PART_SIZE * 1001;
+        let plan = MultipartCopyPlan::new_with_max_parts(
+            size,
+            Some(S3_MULTIPART_COPY_MIN_PART_SIZE),
+            1000,
+        )
+        .expect("backend-specific copy plan");
+        assert!(plan.parts.len() <= 1000);
+        assert_eq!(
+            plan.parts.last().expect("last part").end_inclusive,
+            size - 1
+        );
+        for limit in [0, 10_001] {
+            assert!(MultipartCopyPlan::new_with_max_parts(size, None, limit).is_err());
+        }
+        assert!(
+            MultipartCopyPlan::new_with_max_parts(
+                S3_MULTIPART_COPY_MAX_PART_SIZE * 1000 + 1,
+                None,
+                1000
+            )
+            .is_err()
+        );
     }
 
     #[test]
