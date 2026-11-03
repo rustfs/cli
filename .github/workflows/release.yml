@@ -419,6 +419,11 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Checkout release source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ needs.build-check.outputs.source_ref }}
+          persist-credentials: false
       - name: Install AWS CLI
         uses: ./.github/actions/setup-self-hosted
         with:
@@ -528,7 +533,6 @@ jobs:
   package-deb-rpm:
     name: Package DEB/RPM
     needs: [build-check, upload-release-assets]
-    timeout-minutes: 90
     if: needs.build-check.outputs.is_release == 'true'
     uses: ./.github/workflows/package.yml
     with:

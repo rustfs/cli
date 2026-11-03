@@ -58,6 +58,10 @@ jobs:
       tag: ${{ steps.resolve.outputs.tag }}
       head_sha: ${{ steps.resolve.outputs.head_sha }}
     steps:
+      - name: Checkout workflow source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
       - name: Install GitHub CLI
         uses: ./.github/actions/setup-self-hosted
         with:
@@ -195,16 +199,17 @@ jobs:
             rpm_arch: aarch64
             artifact_name: rustfs-cli-linux-arm64
     steps:
-      - name: Install file(1)
-        uses: ./.github/actions/setup-self-hosted
-        with:
-          # Used to prove the packaged binary is statically linked.
-          profile: file
       - name: Checkout exact build source
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           ref: ${{ needs.resolve.outputs.head_sha }}
           persist-credentials: false
+
+      - name: Install file(1)
+        uses: ./.github/actions/setup-self-hosted
+        with:
+          # Used to prove the packaged binary is statically linked.
+          profile: file
 
       - name: Download binary artifact from release build
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
@@ -384,6 +389,11 @@ jobs:
       contents: write
       actions: read
     steps:
+      - name: Checkout exact build source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ needs.resolve.outputs.head_sha }}
+          persist-credentials: false
       - name: Install GitHub CLI
         uses: ./.github/actions/setup-self-hosted
         with:
@@ -467,8 +477,14 @@ jobs:
     runs-on: sm-standard-2
     timeout-minutes: 15
     permissions:
+      contents: read
       actions: read
     steps:
+      - name: Checkout exact build source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ needs.resolve.outputs.head_sha }}
+          persist-credentials: false
       - name: Install AWS CLI
         uses: ./.github/actions/setup-self-hosted
         with:
