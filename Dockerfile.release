@@ -1,0 +1,19 @@
+FROM alpine:3.23
+
+ARG TARGETARCH
+ARG RC_VERSION
+
+LABEL maintainer="hello@rustfs.com"
+
+RUN apk add --no-cache ca-certificates jq yq-go \
+    && addgroup -S rc \
+    && adduser -S -G rc -h /home/rc rc
+
+COPY --chmod=755 release-binaries/${TARGETARCH}/rc /usr/bin/rc
+COPY LICENSE-MIT LICENSE-APACHE /licenses/
+
+RUN test "$(/usr/bin/rc --version)" = "rc ${RC_VERSION}"
+
+USER rc
+
+ENTRYPOINT ["rc"]
