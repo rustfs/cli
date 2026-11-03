@@ -95,6 +95,37 @@ mod tests {
     }
 
     #[test]
+    fn transfer_error_display_includes_optional_source_without_changing_outcome() {
+        for state in [
+            DataTransferState::NotAccepted,
+            DataTransferState::ConfirmedFailure,
+            DataTransferState::OutcomeUnknown,
+        ] {
+            let mut error = crate::Error::DataTransfer {
+                state,
+                message: "S3 request failed".to_string(),
+                source: None,
+            };
+            assert_eq!(
+                error.to_string(),
+                format!("Object data transfer {state}: S3 request failed")
+            );
+            if let crate::Error::DataTransfer { source, .. } = &mut error {
+                *source = Some(Box::new(crate::Error::Auth("access denied".to_string())));
+            }
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "Object data transfer {state}: S3 request failed: Authentication failed: access denied"
+                )
+            );
+            assert_eq!(error.exit_code(), 4);
+            assert!(std::error::Error::source(&error).is_some());
+            assert!(!crate::is_retryable_error(&error));
+        }
+    }
+
+    #[test]
     fn authoritative_error_retains_exit_code_and_cleanup_without_retry() {
         let error = crate::Error::DataTransfer {
             state: DataTransferState::ConfirmedFailure,
