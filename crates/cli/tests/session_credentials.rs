@@ -9,7 +9,12 @@ const TOKEN: &str = "temporary-TOKEN+/=";
 const LIST: &str =
     "<ListBucketResult><Name>bucket</Name><IsTruncated>false</IsTruncated></ListBucketResult>";
 
-fn run(endpoint: &str, config: &std::path::Path, args: &[&str]) -> Output {
+fn run(
+    endpoint: &str,
+    config: &std::path::Path,
+    args: &[&str],
+    log_filter: Option<&str>,
+) -> Output {
     let mut command = Command::new(rc_binary());
     for (key, _) in std::env::vars_os() {
         if key.to_string_lossy().starts_with("RC_HOST_") {
@@ -19,13 +24,16 @@ fn run(endpoint: &str, config: &std::path::Path, args: &[&str]) -> Output {
     let authority = endpoint.strip_prefix("http://").unwrap();
     command
         .args(args)
+        .env_remove("RUST_LOG")
         .env("RC_CONFIG_DIR", config)
         .env("AWS_EC2_METADATA_DISABLED", "true")
         .env("RC_HOST_temporary", format!(
             "http://temporary-access:temporary-secret@{authority}?session_token=temporary-TOKEN%2B%2F%3D"
-        ))
-        .output()
-        .expect("run rc")
+        ));
+    if let Some(log_filter) = log_filter {
+        command.env("RUST_LOG", log_filter);
+    }
+    command.output().expect("run rc")
 }
 
 fn assert_redacted(output: &Output) {
@@ -41,41 +49,48 @@ fn assert_redacted(output: &Output) {
 
 #[test]
 fn s3_and_admin_sign_with_the_same_process_only_session_token() {
-    for (args, body) in [
-        (vec!["--debug", "ls", "temporary/bucket"], LIST),
-        (vec!["--debug", "admin", "user", "list", "temporary"], "{}"),
+    for log_filter in [
+        None,
+        Some("debug"),
+        Some("trace"),
+        Some("aws_smithy_runtime::client::orchestrator=trace"),
     ] {
-        let config = tempfile::tempdir().unwrap();
-        let (endpoint, requests, server) =
-            start_admin_response_test_server("200 OK", "application/xml", body.into());
-        let output = run(&endpoint, config.path(), &args);
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_redacted(&output);
-        let request = requests
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .unwrap();
-        assert!(
-            request.headers.lines().any(|line| {
-                line.split_once(':').is_some_and(|(name, value)| {
-                    name.eq_ignore_ascii_case("x-amz-security-token") && value.trim() == TOKEN
-                })
-            }),
-            "{}",
-            request.headers
-        );
-        assert!(
-            request
-                .headers
-                .to_ascii_lowercase()
-                .contains("signedheaders=")
-        );
-        assert!(!request.target.contains("session_token"));
-        assert!(!config.path().join("config.toml").exists());
-        server.join().unwrap();
+        for (args, body) in [
+            (vec!["--debug", "ls", "temporary/bucket"], LIST),
+            (vec!["--debug", "admin", "user", "list", "temporary"], "{}"),
+        ] {
+            let config = tempfile::tempdir().unwrap();
+            let (endpoint, requests, server) =
+                start_admin_response_test_server("200 OK", "application/xml", body.into());
+            let output = run(&endpoint, config.path(), &args, log_filter);
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_redacted(&output);
+            let request = requests
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            assert!(
+                request.headers.lines().any(|line| {
+                    line.split_once(':').is_some_and(|(name, value)| {
+                        name.eq_ignore_ascii_case("x-amz-security-token") && value.trim() == TOKEN
+                    })
+                }),
+                "{}",
+                request.headers
+            );
+            assert!(
+                request
+                    .headers
+                    .to_ascii_lowercase()
+                    .contains("signedheaders=")
+            );
+            assert!(!request.target.contains("session_token"));
+            assert!(!config.path().join("config.toml").exists());
+            server.join().unwrap();
+        }
     }
 }
 
@@ -101,7 +116,7 @@ fn expired_or_invalid_tokens_return_auth_error_without_changing_aliases() {
             } else {
                 vec!["--json", "ls", "temporary/bucket"]
             };
-            let output = run(&endpoint, config.path(), &args);
+            let output = run(&endpoint, config.path(), &args, None);
             assert_eq!(
                 output.status.code(),
                 Some(4),
