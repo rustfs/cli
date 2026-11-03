@@ -281,12 +281,16 @@ impl<T> TransferReport<T> {
 #[derive(Debug, Clone)]
 pub struct TransferExecutor {
     controls: TransferControls,
+    rate_gate: Arc<RateGate>,
 }
 
 impl TransferExecutor {
     pub fn new(controls: TransferControls) -> Result<Self> {
         controls.validate()?;
-        Ok(Self { controls })
+        Ok(Self {
+            rate_gate: Arc::new(RateGate::new(controls.bytes_per_second)),
+            controls,
+        })
     }
 
     /// Execute candidates while bounding all in-flight work across the command.
@@ -317,7 +321,7 @@ impl TransferExecutor {
         let mut summary = plan.summary;
         let items = plan.items;
         let operation = Arc::new(operation);
-        let rate_gate = Arc::new(RateGate::new(self.controls.bytes_per_second));
+        let rate_gate = Arc::clone(&self.rate_gate);
         let mut in_flight = FuturesUnordered::new();
         let mut completed = BTreeMap::new();
         let mut next_index = 0usize;
@@ -668,6 +672,31 @@ mod tests {
         let last = starts.iter().max().copied().expect("last start");
         assert!(last.duration_since(first) >= Duration::from_millis(15));
         assert_eq!(report.summary.transferred_bytes, 30);
+    }
+
+    #[tokio::test]
+    async fn executor_preserves_rate_budget_between_incremental_batches() {
+        let executor = TransferExecutor::new(TransferControls {
+            bytes_per_second: Some(1_000),
+            ..TransferControls::default()
+        })
+        .unwrap();
+        let started = Instant::now();
+        for name in ["first", "second"] {
+            let plan = TransferPlan::build(
+                vec![candidate(name, None, 50)],
+                &TransferSelection::default(),
+            );
+            assert_eq!(
+                executor
+                    .execute(plan, |_| async { Ok(50) })
+                    .await
+                    .summary
+                    .successful,
+                1
+            );
+        }
+        assert!(started.elapsed() >= Duration::from_millis(45));
     }
 
     #[tokio::test]

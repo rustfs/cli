@@ -3,6 +3,7 @@
 //! Copies objects between local filesystem and S3, or between S3 locations.
 
 use clap::Args;
+use futures::{StreamExt as _, TryStreamExt as _};
 use jiff::Timestamp;
 use rc_core::alias::RetryConfig;
 use rc_core::{
@@ -842,6 +843,24 @@ async fn execute_transfer_plan(
     formatter: &Formatter,
     alias_manager: &AliasManager,
 ) -> ExitCode {
+    if args.recursive
+        && !args.dry_run
+        && sources.len() == 1
+        && target_is_container
+        && let ParsedPath::Remote(source) = &sources[0]
+    {
+        return execute_streamed_transfer(
+            args,
+            source.clone(),
+            target,
+            encryption,
+            selection,
+            controls,
+            formatter,
+            alias_manager,
+        )
+        .await;
+    }
     let candidates = match build_transfer_candidates(
         &sources,
         &target,
@@ -897,6 +916,7 @@ async fn execute_transfer_plan(
             &mut plan,
             &clients,
             args.destination_customer_key.as_ref(),
+            controls.concurrency,
         )
         .await
         {
@@ -940,24 +960,12 @@ async fn execute_transfer_plan(
         return ExitCode::Success;
     }
 
-    let total_bytes = plan
-        .items
-        .iter()
-        .filter_map(|item| {
-            if matches!(item.payload, CpOperation::RemoteToRemote { .. }) {
-                item.size_bytes
-            } else {
-                None
-            }
-        })
-        .sum::<u64>();
     let executor = match TransferExecutor::new(controls) {
         Ok(executor) => executor,
         Err(error) => {
             return formatter.fail(ExitCode::UsageError, &error.to_string());
         }
     };
-    let operation_args = Arc::new(args.clone());
     let transfer_cancellation = TransferCancellation::new();
     let multipart_cancellation = MultipartCopyCancellation::new();
     let signal_task = tokio::spawn({
@@ -970,6 +978,54 @@ async fn execute_transfer_plan(
             }
         }
     });
+    let report = execute_transfer_batch(
+        args,
+        plan,
+        &executor,
+        clients,
+        transfer_cancellation,
+        multipart_cancellation,
+        formatter,
+    )
+    .await;
+    signal_task.abort();
+    let _ = signal_task.await;
+
+    if args.summary || args.recursive || args.sources.len() > 1 {
+        print_transfer_summary(formatter, &report.summary);
+    }
+
+    if report.was_cancelled {
+        ExitCode::Interrupted
+    } else {
+        report
+            .first_failure()
+            .map_or(ExitCode::Success, exit_code_for_core_error)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_transfer_batch(
+    args: &CpArgs,
+    plan: TransferPlan<CpOperation>,
+    executor: &TransferExecutor,
+    clients: Arc<HashMap<String, Arc<S3Client>>>,
+    transfer_cancellation: TransferCancellation,
+    multipart_cancellation: MultipartCopyCancellation,
+    formatter: &Formatter,
+) -> rc_core::TransferReport<CpOperation> {
+    let total_bytes = plan
+        .items
+        .iter()
+        .filter_map(|item| {
+            if matches!(item.payload, CpOperation::RemoteToRemote { .. }) {
+                item.size_bytes
+            } else {
+                None
+            }
+        })
+        .sum::<u64>();
+    let operation_args = Arc::new(args.clone());
     let copy_details = PlannedCopyDetails::default();
     let copy_progress = Arc::new(PlannedCopyProgress::new(
         formatter.output_config(),
@@ -1002,8 +1058,6 @@ async fn execute_transfer_plan(
             }
         })
         .await;
-    signal_task.abort();
-    let _ = signal_task.await;
     copy_progress.finish();
 
     let copy_details = copy_details.lock().await;
@@ -1037,16 +1091,334 @@ async fn execute_transfer_plan(
         }
     }
 
-    if args.summary || args.recursive || args.sources.len() > 1 {
-        print_transfer_summary(formatter, &report.summary);
-    }
+    report
+}
 
-    if report.was_cancelled {
+#[allow(clippy::too_many_arguments)]
+async fn execute_streamed_transfer(
+    args: &CpArgs,
+    source: RemotePath,
+    target: ParsedPath,
+    encryption: Option<ObjectEncryptionRequest>,
+    selection: TransferSelection,
+    controls: TransferControls,
+    formatter: &Formatter,
+    alias_manager: &AliasManager,
+) -> ExitCode {
+    let source = recursive_listing_source(&source);
+    if let ParsedPath::Remote(target) = &target
+        && remote_copy_scopes_overlap(&source, target)
+    {
+        return formatter.fail(
+            ExitCode::Conflict,
+            &format!("Recursive source '{source}' overlaps destination '{target}'"),
+        );
+    }
+    let mut aliases = BTreeSet::from([source.alias.clone()]);
+    if let ParsedPath::Remote(target) = &target {
+        aliases.insert(target.alias.clone());
+    }
+    let clients = match create_planned_clients(aliases, alias_manager).await {
+        Ok(clients) => Arc::new(clients),
+        Err(error) => return formatter.fail(exit_code_for_core_error(&error), &error.to_string()),
+    };
+    let source_client = match clients.get(&source.alias) {
+        Some(client) => Arc::clone(client),
+        None => {
+            return formatter.fail(
+                ExitCode::NotFound,
+                &format!("Alias '{}' not found", source.alias),
+            );
+        }
+    };
+    let batch_size = controls.concurrency.clamp(1, 1_000);
+    let retry = controls.retry.clone();
+    let executor = match TransferExecutor::new(controls) {
+        Ok(executor) => executor,
+        Err(error) => return formatter.fail(ExitCode::UsageError, &error.to_string()),
+    };
+    let transfer_cancellation = TransferCancellation::new();
+    let multipart_cancellation = MultipartCopyCancellation::new();
+    let signal_task = tokio::spawn({
+        let transfer_cancellation = transfer_cancellation.clone();
+        let multipart_cancellation = multipart_cancellation.clone();
+        async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                multipart_cancellation.cancel();
+                transfer_cancellation.cancel();
+            }
+        }
+    });
+    // One queued page plus the active page and the producer's current page.
+    // Reports, progress maps, and destination comparisons live for one small batch.
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    let producer = tokio::spawn({
+        let cancellation = transfer_cancellation.clone();
+        let args = args.clone();
+        async move {
+            let result = produce_remote_copy_pages(
+                &source_client,
+                &source,
+                &target,
+                encryption,
+                &selection,
+                &args,
+                &retry,
+                &cancellation,
+                &sender,
+            )
+            .await;
+            if let Err(error) = result {
+                tokio::select! {
+                    _ = cancellation.cancelled() => {}
+                    _ = sender.send(Err(error)) => {}
+                }
+            }
+        }
+    });
+    let mut summary = rc_core::TransferSummary::default();
+    let mut exit_code = ExitCode::Success;
+    let mut matched = false;
+    let mut stopped = false;
+    loop {
+        let page = tokio::select! {
+            biased;
+            _ = transfer_cancellation.cancelled() => break,
+            page = receiver.recv() => page,
+        };
+        let Some(page) = page else {
+            break;
+        };
+        let page = match page {
+            Ok(page) => page,
+            Err(error) => {
+                formatter.error_with_code(exit_code_for_core_error(&error), &format!(
+                    "Failed to continue copy planning: {error}. Earlier transfers are retained; the summary covers processed pages"
+                ));
+                if exit_code == ExitCode::Success {
+                    exit_code = exit_code_for_core_error(&error);
+                }
+                break;
+            }
+        };
+        summary.skipped = summary.skipped.saturating_add(page.summary.skipped);
+        matched |= !page.items.is_empty();
+        let mut remaining = page.items.into_iter();
+        while remaining.len() > 0 {
+            let items = remaining.by_ref().take(batch_size).collect::<Vec<_>>();
+            let mut plan = TransferPlan {
+                summary: rc_core::TransferSummary {
+                    planned: items.len(),
+                    ..Default::default()
+                },
+                items,
+            };
+            if !stopped
+                && !transfer_cancellation.is_cancelled()
+                && (args.skip_existing || !args.overwrite)
+            {
+                let inspected = plan.items.len();
+                let result = tokio::select! {
+                    biased;
+                    _ = transfer_cancellation.cancelled() => Err(Error::Interrupted("Copy interrupted".into())),
+                    result = skip_existing_remote_targets(&mut plan, &clients, args.destination_customer_key.as_ref(), batch_size) => result,
+                };
+                match result {
+                    Ok(skipped) => {
+                        for item in skipped {
+                            print_skipped_existing(formatter, &item, false);
+                        }
+                    }
+                    Err(error) => {
+                        summary.planned += inspected + remaining.len();
+                        summary.cancelled += inspected + remaining.len();
+                        formatter.error_with_code(
+                            exit_code_for_core_error(&error),
+                            &format!("Failed to inspect copy destinations: {error}"),
+                        );
+                        if exit_code == ExitCode::Success {
+                            exit_code = exit_code_for_core_error(&error);
+                        }
+                        stopped = true;
+                        break;
+                    }
+                }
+            }
+            let cancellation = if stopped {
+                let cancellation = TransferCancellation::new();
+                cancellation.cancel();
+                cancellation
+            } else {
+                transfer_cancellation.clone()
+            };
+            let report = execute_transfer_batch(
+                args,
+                plan,
+                &executor,
+                Arc::clone(&clients),
+                cancellation,
+                multipart_cancellation.clone(),
+                formatter,
+            )
+            .await;
+            summary.planned += report.summary.planned;
+            summary.skipped += report.summary.skipped;
+            summary.successful += report.summary.successful;
+            summary.failed += report.summary.failed;
+            summary.cancelled += report.summary.cancelled;
+            summary.transferred_bytes = summary
+                .transferred_bytes
+                .saturating_add(report.summary.transferred_bytes);
+            if let Some(error) = report.first_failure() {
+                if exit_code == ExitCode::Success {
+                    exit_code = exit_code_for_core_error(error);
+                }
+                stopped |= !args.continue_on_error;
+            }
+        }
+        if stopped || transfer_cancellation.is_cancelled() {
+            break;
+        }
+    }
+    drop(receiver);
+    producer.abort();
+    if let Err(error) = producer.await
+        && !error.is_cancelled()
+    {
+        formatter.error_with_code(ExitCode::GeneralError, "Copy listing task failed");
+        exit_code = ExitCode::GeneralError;
+    }
+    signal_task.abort();
+    let _ = signal_task.await;
+    print_transfer_summary(formatter, &summary);
+    if transfer_cancellation.is_cancelled() {
         ExitCode::Interrupted
+    } else if !matched && args.fail_empty && exit_code == ExitCode::Success {
+        formatter.fail(
+            ExitCode::NotFound,
+            "No copy sources matched the requested selection",
+        )
     } else {
-        report
-            .first_failure()
-            .map_or(ExitCode::Success, exit_code_for_core_error)
+        exit_code
+    }
+}
+
+#[derive(Default)]
+struct CopyListingCursor {
+    checkpoint: Option<String>,
+    distance: usize,
+    power: usize,
+    last_key: Option<String>,
+    last_relative_path: Option<String>,
+}
+
+impl CopyListingCursor {
+    fn advance_token(&mut self, token: &str) -> rc_core::Result<()> {
+        // Brent's cycle detector retains one checkpoint rather than every page token.
+        if self.checkpoint.as_deref() == Some(token) {
+            return Err(Error::Conflict(
+                "Object listing repeated a continuation token".into(),
+            ));
+        }
+        self.distance = self.distance.saturating_add(1);
+        if self.distance >= self.power {
+            self.checkpoint = Some(token.to_string());
+            self.distance = 0;
+            self.power = self.power.max(1).saturating_mul(2);
+        }
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn produce_remote_copy_pages(
+    client: &S3Client,
+    source: &RemotePath,
+    target: &ParsedPath,
+    encryption: Option<ObjectEncryptionRequest>,
+    selection: &TransferSelection,
+    args: &CpArgs,
+    retry: &RetryConfig,
+    cancellation: &TransferCancellation,
+    sender: &tokio::sync::mpsc::Sender<rc_core::Result<TransferPlan<CpOperation>>>,
+) -> rc_core::Result<()> {
+    let mut token = None;
+    let mut cursor = CopyListingCursor::default();
+    loop {
+        let mut result = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Ok(()),
+            result = rc_core::retry_with_backoff(retry, || client.list_objects(source, rc_core::ListOptions {
+                recursive: true, max_keys: Some(1_000), continuation_token: token.clone(), ..Default::default()
+            }), rc_core::is_retryable_error) => result?,
+        };
+        if result.items.len() > 1_000 {
+            return Err(Error::Conflict(
+                "Object listing exceeded the requested page size".into(),
+            ));
+        }
+        let next = if result.truncated {
+            let next = result
+                .continuation_token
+                .filter(|token| !token.is_empty())
+                .ok_or_else(|| {
+                    Error::InvalidPath(
+                        "Truncated object listing did not include a continuation token".into(),
+                    )
+                })?;
+            cursor.advance_token(&next)?;
+            Some(next)
+        } else {
+            None
+        };
+        result.items.sort_by(|left, right| left.key.cmp(&right.key));
+        let mut candidates = Vec::with_capacity(result.items.len());
+        for object in result.items.into_iter().filter(|object| !object.is_dir) {
+            if cursor
+                .last_key
+                .as_ref()
+                .is_some_and(|last| object.key <= *last)
+            {
+                return Err(Error::Conflict(
+                    "Object listing repeated a key or returned pages out of order".into(),
+                ));
+            }
+            cursor.last_key = Some(object.key.clone());
+            candidates.push(
+                recursive_copy_candidate(
+                    source,
+                    target,
+                    object,
+                    false,
+                    encryption.clone(),
+                    args.local_key_policy(),
+                )
+                .await?,
+            );
+        }
+        let plan = TransferPlan::build(candidates, selection);
+        validate_storage_class_plan(&plan, args.storage_class.as_deref())?;
+        validate_plan_targets(&plan)?;
+        if let Some(first) = plan.items.first()
+            && cursor
+                .last_relative_path
+                .as_ref()
+                .is_some_and(|last| first.relative_path <= *last)
+        {
+            return Err(Error::Conflict("Object listing produced duplicate or out-of-order destination paths; use --dry-run to inspect the full plan".into()));
+        }
+        if let Some(last) = plan.items.last() {
+            cursor.last_relative_path = Some(last.relative_path.clone());
+        }
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Ok(()),
+            sent = sender.send(Ok(plan)) => { if sent.is_err() { return Ok(()); } }
+        }
+        if next.is_none() {
+            return Ok(());
+        }
+        token = next;
     }
 }
 
@@ -1613,8 +1985,15 @@ async fn create_planned_client_cache(
     items: &[TransferCandidate<CpOperation>],
     alias_manager: &AliasManager,
 ) -> rc_core::Result<HashMap<String, Arc<S3Client>>> {
+    create_planned_clients(planned_client_aliases(items), alias_manager).await
+}
+
+async fn create_planned_clients(
+    aliases: BTreeSet<String>,
+    alias_manager: &AliasManager,
+) -> rc_core::Result<HashMap<String, Arc<S3Client>>> {
     let mut clients = HashMap::new();
-    for alias_name in planned_client_aliases(items) {
+    for alias_name in aliases {
         match create_leaf_s3_client(alias_manager, &alias_name).await {
             Ok(client) => {
                 clients.insert(alias_name, Arc::new(client));
@@ -1924,18 +2303,19 @@ async fn skip_existing_remote_targets(
     plan: &mut TransferPlan<CpOperation>,
     clients: &HashMap<String, Arc<S3Client>>,
     destination_customer_key: Option<&SseCustomerKey>,
+    concurrency: usize,
 ) -> rc_core::Result<Vec<TransferCandidate<CpOperation>>> {
     let mut retained = Vec::with_capacity(plan.items.len());
     let mut skipped = Vec::new();
-    for candidate in plan.items.drain(..) {
+    let candidates = std::mem::take(&mut plan.items);
+    let inspected = futures::stream::iter(candidates.into_iter().map(|candidate| async move {
         let destination = match &candidate.payload {
             CpOperation::LocalToRemote { target, .. }
             | CpOperation::RemoteToRemote { target, .. } => Some(target),
             CpOperation::RemoteToLocal { .. } => None,
         };
         let Some(destination) = destination else {
-            retained.push(candidate);
-            continue;
+            return Ok((candidate, false));
         };
         let client = planned_client(clients, &destination.alias)?;
         match client
@@ -1948,11 +2328,19 @@ async fn skip_existing_remote_targets(
             )
             .await
         {
-            Ok(_) => skipped.push(candidate),
-            Err(Error::NotFound(_)) | Err(Error::VersionNotFound { .. }) => {
-                retained.push(candidate);
-            }
-            Err(error) => return Err(error),
+            Ok(_) => Ok((candidate, true)),
+            Err(Error::NotFound(_)) | Err(Error::VersionNotFound { .. }) => Ok((candidate, false)),
+            Err(error) => Err(error),
+        }
+    }))
+    .buffered(concurrency.max(1))
+    .try_collect::<Vec<_>>()
+    .await?;
+    for (candidate, exists) in inspected {
+        if exists {
+            skipped.push(candidate);
+        } else {
+            retained.push(candidate);
         }
     }
     plan.items = retained;
@@ -2102,6 +2490,69 @@ fn collect_local_files(
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn recursive_copy_candidate(
+    listing_source: &RemotePath,
+    target: &ParsedPath,
+    object: ObjectInfo,
+    multiple_sources: bool,
+    encryption: Option<ObjectEncryptionRequest>,
+    key_policy: ObjectKeyPolicy,
+) -> rc_core::Result<TransferCandidate<CpOperation>> {
+    let source_root = recursive_source_root(listing_source, multiple_sources);
+    let object_source = RemotePath::new(&listing_source.alias, &listing_source.bucket, &object.key);
+    match target {
+        ParsedPath::Local(target_root) => {
+            let relative =
+                safe_download_relative_path(&object.key, &listing_source.key, key_policy)
+                    .map_err(Error::InvalidPath)?;
+            let relative_string = relative.to_string_lossy().replace('\\', "/");
+            let target_relative = if source_root.is_empty() {
+                relative.clone()
+            } else {
+                PathBuf::from(&source_root).join(&relative)
+            };
+            let destination = safe_download_destination(target_root, &target_relative)
+                .await
+                .map_err(Error::InvalidPath)?;
+            Ok(TransferCandidate {
+                payload: CpOperation::RemoteToLocal {
+                    source: object_source.clone(),
+                    target: destination.clone(),
+                },
+                source: object_source.to_string(),
+                target: destination.display().to_string(),
+                relative_path: relative_string,
+                modified: object.last_modified,
+                size_bytes: object.size_bytes.and_then(|size| u64::try_from(size).ok()),
+            })
+        }
+        ParsedPath::Remote(target) => {
+            let (destination, relative) = recursive_remote_target(
+                listing_source,
+                target,
+                &object.key,
+                multiple_sources,
+                ObjectKeyPolicy::for_remote_destination(),
+            )?;
+            let size_bytes = object.size_bytes.and_then(|size| u64::try_from(size).ok());
+            Ok(TransferCandidate {
+                payload: CpOperation::RemoteToRemote {
+                    source: object_source.clone(),
+                    target: destination.clone(),
+                    source_info: Box::new(object.clone()),
+                    encryption: encryption.clone(),
+                },
+                source: object_source.to_string(),
+                target: destination.to_string(),
+                relative_path: relative,
+                modified: object.last_modified,
+                size_bytes,
+            })
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn build_remote_candidates(
     source: &RemotePath,
     target: &ParsedPath,
@@ -2141,7 +2592,6 @@ async fn build_remote_candidates(
             )));
         }
 
-        let source_root = recursive_source_root(&listing_source, multiple_sources);
         let mut continuation_token = None;
         let mut seen_tokens = HashSet::new();
         loop {
@@ -2157,62 +2607,17 @@ async fn build_remote_candidates(
                 )
                 .await?;
             for object in result.items.into_iter().filter(|object| !object.is_dir) {
-                let object_source =
-                    RemotePath::new(&listing_source.alias, &listing_source.bucket, &object.key);
-                match target {
-                    ParsedPath::Local(target_root) => {
-                        let relative = safe_download_relative_path(
-                            &object.key,
-                            &listing_source.key,
-                            key_policy,
-                        )
-                        .map_err(Error::InvalidPath)?;
-                        let relative_string = relative.to_string_lossy().replace('\\', "/");
-                        let target_relative = if source_root.is_empty() {
-                            relative.clone()
-                        } else {
-                            PathBuf::from(&source_root).join(&relative)
-                        };
-                        let destination = safe_download_destination(target_root, &target_relative)
-                            .await
-                            .map_err(Error::InvalidPath)?;
-                        candidates.push(TransferCandidate {
-                            payload: CpOperation::RemoteToLocal {
-                                source: object_source.clone(),
-                                target: destination.clone(),
-                            },
-                            source: object_source.to_string(),
-                            target: destination.display().to_string(),
-                            relative_path: relative_string,
-                            modified: object.last_modified,
-                            size_bytes: object.size_bytes.and_then(|size| u64::try_from(size).ok()),
-                        });
-                    }
-                    ParsedPath::Remote(target) => {
-                        let (destination, relative) = recursive_remote_target(
-                            &listing_source,
-                            target,
-                            &object.key,
-                            multiple_sources,
-                            ObjectKeyPolicy::for_remote_destination(),
-                        )?;
-                        let size_bytes =
-                            object.size_bytes.and_then(|size| u64::try_from(size).ok());
-                        candidates.push(TransferCandidate {
-                            payload: CpOperation::RemoteToRemote {
-                                source: object_source.clone(),
-                                target: destination.clone(),
-                                source_info: Box::new(object.clone()),
-                                encryption: encryption.clone(),
-                            },
-                            source: object_source.to_string(),
-                            target: destination.to_string(),
-                            relative_path: relative,
-                            modified: object.last_modified,
-                            size_bytes,
-                        });
-                    }
-                }
+                candidates.push(
+                    recursive_copy_candidate(
+                        &listing_source,
+                        target,
+                        object,
+                        multiple_sources,
+                        encryption.clone(),
+                        key_policy,
+                    )
+                    .await?,
+                );
             }
             if !result.truncated {
                 break;
@@ -3350,6 +3755,24 @@ pub(crate) fn parse_destination_encryption(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listing_cursor_detects_non_adjacent_cycles_after_unique_prefixes() {
+        for prefix in 0..8 {
+            for period in 1..9 {
+                let mut cursor = CopyListingCursor::default();
+                for token in 0..prefix {
+                    cursor.advance_token(&format!("prefix-{token}")).unwrap();
+                }
+                let detected = (0..64).any(|step| {
+                    cursor
+                        .advance_token(&format!("cycle-{}", step % period))
+                        .is_err()
+                });
+                assert!(detected, "prefix={prefix}, period={period}");
+            }
+        }
+    }
     use rc_core::{Alias, ConfigManager};
     use tempfile::TempDir;
 

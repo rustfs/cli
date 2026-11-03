@@ -1457,6 +1457,308 @@ fn recursive_same_alias_copy_paginates_and_emits_deterministic_plan() {
 }
 
 #[test]
+fn recursive_skip_existing_starts_copying_before_listing_or_comparison_finishes() {
+    let copied = Arc::new(AtomicBool::new(false));
+    let copy_started = Arc::clone(&copied);
+    let completed = Arc::new(Mutex::new(BTreeMap::new()));
+    let mock = S3Mock::start(move |request| {
+        if is_list_request(request) {
+            if request.target.contains("continuation-token=page-2") {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while !copy_started.load(Ordering::Acquire) && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                if !copy_started.load(Ordering::Acquire) {
+                    return Response::access_denied();
+                }
+                return list_result(&["src/z.txt".into()], false, None);
+            }
+            return list_result(
+                &(0..10)
+                    .map(|i| format!("src/item-{i:02}.txt"))
+                    .collect::<Vec<_>>(),
+                true,
+                Some("page-2"),
+            );
+        }
+        if is_copy_request(request) {
+            copy_started.store(true, Ordering::Release);
+            completed
+                .lock()
+                .unwrap()
+                .insert(request.target.split('?').next().unwrap().to_string(), true);
+            return copy_result();
+        }
+        if request.method == "HEAD" {
+            if !copy_started.load(Ordering::Acquire) && request.target.contains("item-02") {
+                return Response::access_denied();
+            }
+            return if completed.lock().unwrap().contains_key(&request.target) {
+                Response::head(1)
+            } else {
+                missing_object()
+            };
+        }
+        Response::access_denied()
+    });
+    let output = run_rc(
+        &mock,
+        &[
+            "cp",
+            "-r",
+            "--skip-existing",
+            "--concurrency",
+            "2",
+            "test/source/src/",
+            "test/destination/dst/",
+        ],
+    );
+    assert!(
+        copied.load(Ordering::Acquire),
+        "no copy before the last listing page: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        mock.requests()
+            .iter()
+            .filter(|request| is_copy_request(request))
+            .count(),
+        11
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("11 succeeded"));
+}
+
+#[test]
+fn recursive_copy_applies_backpressure_to_listing_pages() {
+    let started = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let start_copy = Arc::clone(&started);
+    let release_copy = Arc::clone(&release);
+    let mock = Arc::new(S3Mock::start(move |request| {
+        if is_list_request(request) {
+            let page: usize = request
+                .target
+                .split("continuation-token=")
+                .nth(1)
+                .and_then(|value| value.split('&').next())
+                .map(|value| value.parse().unwrap())
+                .unwrap_or(0);
+            let next = (page + 1).to_string();
+            return list_result(
+                &[format!("src/item-{page:02}.txt")],
+                page < 39,
+                (page < 39).then_some(next.as_str()),
+            );
+        }
+        if is_copy_request(request) {
+            start_copy.store(true, Ordering::Release);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !release_copy.load(Ordering::Acquire) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(2));
+            }
+            return copy_result();
+        }
+        if request.method == "HEAD" {
+            return Response::head(1);
+        }
+        Response::access_denied()
+    }));
+    let running = Arc::clone(&mock);
+    let command = thread::spawn(move || {
+        run_rc(
+            &running,
+            &[
+                "cp",
+                "-r",
+                "--concurrency",
+                "2",
+                "test/source/src/",
+                "test/destination/dst/",
+            ],
+        )
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !started.load(Ordering::Acquire) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(2));
+    }
+    thread::sleep(Duration::from_millis(100));
+    let listed_before_release = mock
+        .requests()
+        .iter()
+        .filter(|request| is_list_request(request))
+        .count();
+    release.store(true, Ordering::Release);
+    let output = command.join().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(started.load(Ordering::Acquire));
+    assert!(
+        listed_before_release <= 3,
+        "producer fetched {listed_before_release} pages while one copy was blocked"
+    );
+    assert_eq!(
+        mock.requests()
+            .iter()
+            .filter(|request| is_copy_request(request))
+            .count(),
+        40
+    );
+}
+
+#[test]
+fn late_listing_errors_keep_completed_copies_and_fail_the_command() {
+    let mock = S3Mock::start(|request| {
+        if is_list_request(request) {
+            return if request.target.contains("continuation-token=") {
+                Response::access_denied()
+            } else {
+                list_result(&["src/a.txt".into()], true, Some("next"))
+            };
+        }
+        if is_copy_request(request) {
+            return copy_result();
+        }
+        if request.method == "HEAD" {
+            return Response::head(1);
+        }
+        Response::access_denied()
+    });
+    let output = run_rc(
+        &mock,
+        &["cp", "-r", "test/source/src/", "test/destination/dst/"],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(4),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 succeeded"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Earlier transfers are retained"));
+    assert_eq!(
+        mock.requests()
+            .iter()
+            .filter(|request| is_copy_request(request))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn recursive_download_filters_and_writes_files_before_the_last_listing_page() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().to_path_buf();
+    let first_download = root.join("a.csv");
+    let mock = S3Mock::start(move |request| {
+        if is_list_request(request) {
+            if request.target.contains("continuation-token=") {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while !first_download.exists() && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                if !first_download.exists() {
+                    return Response::access_denied();
+                }
+                return list_result(&["src/z.csv".into()], false, None);
+            }
+            return list_result(
+                &["src/a.csv".into(), "src/private.txt".into()],
+                true,
+                Some("next"),
+            );
+        }
+        if request.method == "GET" && request.target.contains(".csv") {
+            return object_get_result("x");
+        }
+        Response::access_denied()
+    });
+    let target = format!("{}/", directory.path().display());
+    let output = run_rc(
+        &mock,
+        &[
+            "cp",
+            "-r",
+            "--include",
+            "*.csv",
+            "test/source/src/",
+            &target,
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for name in ["a.csv", "z.csv"] {
+        assert_eq!(std::fs::read(directory.path().join(name)).unwrap(), b"x");
+    }
+    assert!(!directory.path().join("private.txt").exists());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("2 planned, 1 skipped, 2 succeeded"));
+}
+
+#[test]
+fn streamed_listing_rejects_empty_page_token_cycles_and_cross_page_collisions() {
+    for collision in [false, true] {
+        let mock = S3Mock::start(move |request| {
+            if is_list_request(request) {
+                if collision {
+                    return if request.target.contains("continuation-token=") {
+                        list_result(&["src/a/b.txt".into()], false, None)
+                    } else {
+                        list_result(&["src/a//b.txt".into()], true, Some("next"))
+                    };
+                }
+                let next = if request.target.contains("continuation-token=a") {
+                    "b"
+                } else {
+                    "a"
+                };
+                return list_result(&[], true, Some(next));
+            }
+            if is_copy_request(request) {
+                return copy_result();
+            }
+            if request.method == "HEAD" {
+                return Response::head(1);
+            }
+            Response::access_denied()
+        });
+        let output = run_rc(
+            &mock,
+            &["cp", "-r", "test/source/src/", "test/destination/dst/"],
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(6),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            mock.requests()
+                .iter()
+                .filter(|request| is_list_request(request))
+                .count()
+                <= 4
+        );
+        assert_eq!(
+            mock.requests()
+                .iter()
+                .filter(|request| is_copy_request(request))
+                .count(),
+            usize::from(collision)
+        );
+    }
+}
+
+#[test]
 fn overlapping_same_bucket_prefix_is_conflict_before_any_copy() {
     let mock = S3Mock::start(|request| {
         if is_list_request(request) {

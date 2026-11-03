@@ -147,6 +147,18 @@ rc cp -r ./reports/ local/archive/ --include '*.csv' --exclude 'private-*' --new
 rc cp -r ./reports/ local/archive/ --rate-limit 10MiB/s --retry-attempts 5 --continue-on-error
 ```
 
+With one recursive remote source, copying starts from the first listing page
+while later pages are fetched through a bounded queue. Destination checks for
+`--skip-existing` and transfers use the requested concurrency; memory use stays
+independent of the bucket's object count. Retries and rate limits apply across
+the whole invocation.
+
+Completed copies are retained if a later listing page fails. The command returns
+an error and reports the totals for processed pages. Replayed pages and duplicate
+or out-of-order destination paths fail before they can overwrite an earlier
+copy. `--dry-run` and multiple-source copies still build and validate the full
+plan before execution.
+
 Direction-safe `mc` compatibility commands reuse the same copy planner:
 
 ```bash
