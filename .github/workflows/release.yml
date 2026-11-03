@@ -251,6 +251,9 @@ jobs:
 
       - name: Build (cross)
         if: matrix.cross
+        env:
+          # The DinD daemon cannot bind-mount the runner's Rust toolchain.
+          CROSS_REMOTE: "true"
         run: cross build --release --locked --target ${{ matrix.target }}
 
       # Package and prepare artifacts
