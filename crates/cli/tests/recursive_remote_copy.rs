@@ -1,7 +1,7 @@
 #![cfg(not(windows))]
 
 use std::collections::BTreeMap;
-use std::io::{ErrorKind, Read, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
@@ -104,7 +104,7 @@ impl S3Mock {
                                     .lock()
                                     .expect("record S3 request")
                                     .push(request.clone());
-                                write_response(&mut stream, handler(&request));
+                                write_response(&mut stream, handler(&request), &request.method);
                             }
                         });
                     }
@@ -193,7 +193,7 @@ fn read_request(stream: &mut TcpStream, pending: &mut Vec<u8>) -> Option<Request
     })
 }
 
-fn write_response(stream: &mut TcpStream, response: Response) {
+fn write_response(stream: &mut TcpStream, response: Response, method: &str) {
     let has_content_length = response
         .headers
         .iter()
@@ -216,10 +216,44 @@ fn write_response(stream: &mut TcpStream, response: Response) {
     stream
         .write_all(head.as_bytes())
         .expect("write S3 response headers");
-    stream
-        .write_all(response.body.as_bytes())
-        .expect("write S3 response body");
+    if method != "HEAD" {
+        stream
+            .write_all(response.body.as_bytes())
+            .expect("write S3 response body");
+    }
     stream.flush().expect("flush S3 response");
+}
+
+#[test]
+fn head_error_response_does_not_corrupt_the_next_keep_alive_response() {
+    let mock = S3Mock::start(|request| {
+        if request.method == "HEAD" {
+            Response::access_denied()
+        } else {
+            Response::empty()
+        }
+    });
+    let mut stream = TcpStream::connect(mock.endpoint.strip_prefix("http://").unwrap()).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    stream
+        .write_all(b"HEAD /bucket/key HTTP/1.1\r\nhost: localhost\r\n\r\n")
+        .unwrap();
+    loop {
+        let mut line = String::new();
+        assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+        if line == "\r\n" {
+            break;
+        }
+    }
+    stream
+        .write_all(b"GET /bucket/key HTTP/1.1\r\nhost: localhost\r\n\r\n")
+        .unwrap();
+    let mut status = String::new();
+    reader.read_line(&mut status).unwrap();
+    assert_eq!(status, "HTTP/1.1 200 OK\r\n");
 }
 
 fn rc_binary() -> PathBuf {

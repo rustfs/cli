@@ -82,23 +82,14 @@ jobs:
     name: Test (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
-    # manual_only lanes are GitHub-hosted and must not run on push or pull_request.
-    # Compared as a string: a boolean false in a matrix is easy to misread as the
-    # truthy string "false" once it crosses an expression boundary.
-    if: ${{ matrix.manual_only != 'yes' || github.event_name == 'workflow_dispatch' }}
+    # Select manual lanes before expansion; job-level conditions cannot use matrix.
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: linux
-            runner: sm-standard-4
-            manual_only: "no"
-          - name: macos-latest, manual
-            runner: macos-latest
-            manual_only: "yes"
-          - name: windows-latest, manual
-            runner: windows-latest
-            manual_only: "yes"
+        include: >-
+          ${{ fromJSON(github.event_name == 'workflow_dispatch' &&
+          '[{"name":"linux","runner":"sm-standard-4","manual_only":"no"},{"name":"macos-latest, manual","runner":"macos-latest","manual_only":"yes"},{"name":"windows-latest, manual","runner":"windows-latest","manual_only":"yes"}]' ||
+          '[{"name":"linux","runner":"sm-standard-4","manual_only":"no"}]') }}
     steps:
       - name: Flag billed GitHub-hosted runner
         if: matrix.manual_only == 'yes'
@@ -121,20 +112,13 @@ jobs:
     name: Build (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
-    if: ${{ matrix.manual_only != 'yes' || github.event_name == 'workflow_dispatch' }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: linux
-            runner: sm-standard-4
-            manual_only: "no"
-          - name: macos-latest, manual
-            runner: macos-latest
-            manual_only: "yes"
-          - name: windows-latest, manual
-            runner: windows-latest
-            manual_only: "yes"
+        include: >-
+          ${{ fromJSON(github.event_name == 'workflow_dispatch' &&
+          '[{"name":"linux","runner":"sm-standard-4","manual_only":"no"},{"name":"macos-latest, manual","runner":"macos-latest","manual_only":"yes"},{"name":"windows-latest, manual","runner":"windows-latest","manual_only":"yes"}]' ||
+          '[{"name":"linux","runner":"sm-standard-4","manual_only":"no"}]') }}
     steps:
       - name: Flag billed GitHub-hosted runner
         if: matrix.manual_only == 'yes'

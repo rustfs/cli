@@ -10,6 +10,11 @@ on:
         description: 'Image tag to build and push'
         required: true
         default: 'latest'
+      publish_latest:
+        description: 'Also update latest for a stable version tag'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -40,6 +45,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           MANUAL_TAG: ${{ github.event.inputs.tag }}
+          PUBLISH_LATEST: ${{ github.event.inputs.publish_latest }}
         shell: bash
         run: |
           set -euo pipefail
@@ -58,7 +64,7 @@ jobs:
           {
             echo 'tags<<EOF'
             echo "rustfs/rc:${image_tag}"
-            if [[ "$EVENT_NAME" == "workflow_run" && "$image_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            if [[ ( "$EVENT_NAME" == "workflow_run" || "$PUBLISH_LATEST" == "true" ) && "$image_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
               echo 'rustfs/rc:latest'
             fi
             echo 'EOF'

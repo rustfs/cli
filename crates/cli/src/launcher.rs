@@ -4,7 +4,7 @@
 //! Designed for RustFS and other S3-compatible backends.
 
 use clap::Parser;
-use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+use tracing_subscriber::{EnvFilter, filter::filter_fn, fmt, prelude::*};
 
 use crate::commands::{self, Cli};
 use crate::exit_code::ExitCode;
@@ -34,6 +34,15 @@ fn build_env_filter(debug: bool, env_is_set: bool) -> EnvFilter {
     }
 }
 
+fn allow_log_metadata(metadata: &tracing::Metadata<'_>) -> bool {
+    // SDK debug events can include credentials and signed request headers.
+    *metadata.level() <= tracing::Level::WARN
+        || matches!(
+            metadata.target().split("::").next(),
+            Some("rustfs_cli" | "rc_core" | "rc_s3")
+        )
+}
+
 /// Run the shared CLI launcher, preserving its worker-thread and exit behavior.
 pub fn run() {
     run_with_shutdown(|| async {});
@@ -52,6 +61,7 @@ where
 
     // Initialize tracing subscriber for logging
     tracing_subscriber::registry()
+        .with(filter_fn(allow_log_metadata))
         .with(fmt::layer())
         .with(env_filter)
         .init();
@@ -156,6 +166,35 @@ mod tests {
     fn debug_uses_debug_filter_when_env_missing() {
         let filter = build_env_filter(true, false);
         assert_eq!(filter.to_string(), "debug");
+    }
+
+    #[test]
+    fn dependency_debug_logs_are_capped_without_hiding_application_diagnostics() {
+        let subscriber = tracing_subscriber::registry()
+            .with(filter_fn(allow_log_metadata))
+            .with(EnvFilter::new("trace"));
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(tracing::enabled!(
+                target: "rc_s3::client",
+                tracing::Level::DEBUG
+            ));
+            assert!(tracing::enabled!(
+                target: "rustfs_cli::launcher",
+                tracing::Level::TRACE
+            ));
+            assert!(tracing::enabled!(
+                target: "aws_smithy_runtime::client",
+                tracing::Level::WARN
+            ));
+            assert!(!tracing::enabled!(
+                target: "aws_smithy_runtime::client",
+                tracing::Level::DEBUG
+            ));
+            assert!(!tracing::enabled!(
+                target: "reqwest::connect",
+                tracing::Level::TRACE
+            ));
+        });
     }
 
     #[test]
