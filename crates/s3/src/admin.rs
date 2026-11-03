@@ -1164,12 +1164,20 @@ impl AdminClient {
         {
             return error;
         }
-        let mut body = body.to_string();
-        self.redact_admin_credentials(&mut body);
-        self.map_redacted_error(status, &body)
+        let mut error = self.classify_response_error(status, body);
+        match &mut error {
+            Error::Auth(message)
+            | Error::NotFound(message)
+            | Error::UnsupportedFeature(message)
+            | Error::Conflict(message)
+            | Error::General(message)
+            | Error::Network(message) => self.redact_admin_credentials(message),
+            _ => {}
+        }
+        error
     }
 
-    fn map_redacted_error(&self, status: StatusCode, body: &str) -> Error {
+    fn classify_response_error(&self, status: StatusCode, body: &str) -> Error {
         if matches!(status, StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED) {
             return Error::Auth(body.to_string());
         }
@@ -7832,6 +7840,23 @@ mod tests {
                 .unwrap()
                 .contains_key("x-amz-security-token")
         );
+    }
+
+    #[test]
+    fn credential_redaction_does_not_change_admin_error_classification() {
+        let alias = Alias::new("test", "http://localhost:9000", "Code", "NotImplemented");
+        let mut client = AdminClient::new(&alias).unwrap();
+        client.session_token = Some("Message".into());
+        let error = client.map_error(
+            StatusCode::BAD_REQUEST,
+            r#"{"Code":"NotImplemented","Message":"Code NotImplemented Message"}"#,
+        );
+        assert!(matches!(error, Error::UnsupportedFeature(_)), "{error}");
+        assert_eq!(error.exit_code(), 7);
+        let message = error.to_string();
+        for credential in ["Code", "NotImplemented", "Message"] {
+            assert!(!message.contains(credential), "{message}");
+        }
     }
 
     #[test]
