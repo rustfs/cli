@@ -2,7 +2,7 @@
 
 ## Purpose
 
-The `rc bucket` operation is the preferred noun-first entry point for bucket-oriented workflows. It groups bucket listing, creation, deletion, notification, CORS, encryption, versioning, Object Lock, quota, anonymous access, lifecycle, and replication operations under one command family.
+The `rc bucket` operation is the preferred noun-first entry point for bucket-oriented workflows. It groups bucket listing, creation, deletion, notification, CORS, encryption, versioning, Object Lock, Public Access Block, quota, anonymous access, lifecycle, and replication operations under one command family.
 
 ## Syntax
 
@@ -17,6 +17,7 @@ rc bucket encryption <set|info|clear> ...
 rc bucket version <enable|suspend|info|list> ...
 rc bucket lock <info|set|clear> ...
 rc bucket quota <set|info|clear> ...
+rc bucket public-access-block <get|set|remove> ...
 rc bucket anonymous <set|set-json|get|get-json|list|links> ...
 rc bucket lifecycle <rule|tier|restore> ...
 rc bucket replication <add|update|list|status|diff|remove|export|import|check|resync> ...
@@ -35,6 +36,7 @@ rc bucket replication <add|update|list|status|diff|remove|export|import|check|re
 | `version` | Manage bucket versioning and object versions. |
 | `lock` | Inspect Object Lock, set default retention, or clear the default while keeping Object Lock enabled. |
 | `quota` | Manage bucket quota. |
+| `public-access-block` | Read, set, or remove the bucket's S3 Public Access Block configuration. |
 | `anonymous` | Manage anonymous bucket or prefix access. |
 | `lifecycle` | Manage lifecycle rules, remote tiers, and object restore requests. |
 | `replication` | Manage bucket replication rules and inspect replication status or differences. |
@@ -56,7 +58,7 @@ rc bucket replication <add|update|list|status|diff|remove|export|import|check|re
 | `--years COUNT` | Set a positive default retention duration in years. Conflicts with `--days`. |
 | `--force` | Force destructive or capability-gated operations; for `bucket remove`, run staged cleanup before ordinary deletion. |
 | `--dangerous` | Permit bounded abort of pre-discovered multipart uploads during removal. Requires `--force --yes`. |
-| `--yes` | Confirm dangerous multipart cleanup. |
+| `--yes` | Confirm dangerous multipart cleanup or removal of Public Access Block settings, which can allow public bucket policies. |
 
 ## Examples
 
@@ -88,6 +90,14 @@ Inspect default bucket encryption:
 
 ```bash
 rc bucket encryption info local/archive
+```
+
+Set all four Public Access Block controls from a JSON file. Every field is required; use `--json` to receive the versioned `public_access_block` output family:
+
+```bash
+rc bucket public-access-block set local/archive public-access-block.json
+rc bucket public-access-block get local/archive
+rc bucket public-access-block remove local/archive --yes
 ```
 
 Inspect and update the bucket Object Lock default:
