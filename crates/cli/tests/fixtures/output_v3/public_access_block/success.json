@@ -1,0 +1,1 @@
+{"schema_version":3,"type":"public_access_block","status":"success","data":{"bucket":"archive","operation":"set","configuration":{"block_public_acls":true,"ignore_public_acls":true,"block_public_policy":true,"restrict_public_buckets":true}}}

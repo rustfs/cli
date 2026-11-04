@@ -8,7 +8,10 @@ use clap::{Args, Subcommand};
 use crate::exit_code::ExitCode;
 use crate::output::OutputConfig;
 
-use super::{anonymous, cors, encryption, event, ilm, lock, ls, mb, quota, rb, replicate, version};
+use super::{
+    anonymous, cors, encryption, event, ilm, lock, ls, mb, public_access_block, quota, rb,
+    replicate, version,
+};
 
 const BUCKET_AFTER_HELP: &str = "\
 Examples:
@@ -19,6 +22,7 @@ Examples:
   rc bucket cors list local/my-bucket
   rc bucket encryption info local/my-bucket
   rc bucket lock info local/my-bucket
+  rc bucket public-access-block get local/my-bucket
   rc bucket replication status local/my-bucket";
 
 /// Manage bucket-oriented workflows
@@ -62,6 +66,10 @@ pub enum BucketCommands {
     /// Manage bucket quota
     #[command(subcommand)]
     Quota(quota::QuotaCommands),
+
+    /// Manage bucket Public Access Block settings
+    #[command(name = "public-access-block", subcommand)]
+    PublicAccessBlock(public_access_block::PublicAccessBlockCommands),
 
     /// Manage anonymous bucket access
     #[command(subcommand)]
@@ -111,6 +119,13 @@ pub async fn execute(args: BucketArgs, output_config: OutputConfig) -> ExitCode 
         BucketCommands::Quota(cmd) => {
             Box::pin(quota::execute(
                 quota::QuotaArgs { command: cmd },
+                output_config,
+            ))
+            .await
+        }
+        BucketCommands::PublicAccessBlock(cmd) => {
+            Box::pin(public_access_block::execute(
+                public_access_block::PublicAccessBlockArgs { command: cmd },
                 output_config,
             ))
             .await

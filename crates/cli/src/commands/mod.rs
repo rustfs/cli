@@ -52,6 +52,7 @@ mod object_identity;
 mod ops_output;
 mod ping;
 mod pipe;
+mod public_access_block;
 mod quota;
 mod rb;
 mod ready;

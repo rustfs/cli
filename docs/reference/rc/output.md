@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | [`output_v1.json`](../../../schemas/output_v1.json) | Original S3 and alias command output | Preserved unchanged |
 | [`output_v2.json`](../../../schemas/output_v2.json) | Existing cluster and administrative output | Preserved unchanged |
-| [`output_v3.json`](../../../schemas/output_v3.json) | New capability, version, lock, multipart, watch, health, usage, metrics, diagnostic snapshot, scanner-status, storage-info, KMS, OIDC, IAM policy, admin-operation, replication, and bucket-operation families | Contract for new implementations |
+| [`output_v3.json`](../../../schemas/output_v3.json) | New capability, version, lock, Public Access Block, multipart, watch, health, usage, metrics, diagnostic snapshot, scanner-status, storage-info, KMS, OIDC, IAM policy, admin-operation, replication, and bucket-operation families | Contract for new implementations |
 
 Adding v3 does not silently change the JSON emitted by existing commands. Each command implementation must document when it adopts v3. Consumers should choose a parser from the command's documented output version instead of inferring a version from the installed `rc` release.
 
@@ -94,6 +94,8 @@ Object retention timestamps are normalized to UTC. A bucket default uses `defaul
 This is an additive v3 extension. Output v1 and v2 require no migration, and the pre-existing v3 lock fields remain valid. Consumers adopting the new commands should dispatch on `schema_version: 3`, then on `type: locks`, and finally on `data.operation`.
 
 The golden fixtures under `crates/cli/tests/fixtures/output_v3/` provide success, empty, and error examples for every v3 family.
+
+Bucket Public Access Block commands use the `public_access_block` family. `data.operation` is `get`, `set`, or `remove`; `data.configuration` contains all four explicit S3 flags or `null` when no configuration exists or after removal.
 
 Authenticated RustFS diagnostics use distinct families so they cannot be confused with lightweight public probes:
 
