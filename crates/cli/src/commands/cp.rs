@@ -15,6 +15,7 @@ use rc_core::{
     normalize_relative_key, parse_path, relative_local_path_from_key,
 };
 use rc_s3::S3Client;
+use rc_s3::multipart::multipart_threshold;
 use serde::Serialize;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
@@ -1521,9 +1522,9 @@ fn validate_storage_class_plan(
             ))
         })?;
         let multipart = match &item.payload {
-            CpOperation::LocalToRemote { .. } => size > MULTIPART_THRESHOLD,
+            CpOperation::LocalToRemote { .. } => size > multipart_threshold(),
             CpOperation::RemoteToRemote { source, target, .. } if source.alias != target.alias => {
-                size > MULTIPART_THRESHOLD
+                size > multipart_threshold()
             }
             CpOperation::RemoteToRemote { .. } => rc_core::requires_multipart_copy(size),
             CpOperation::RemoteToLocal { .. } => false,
@@ -1780,7 +1781,7 @@ async fn perform_cross_alias_remote_copy(
         .size_bytes
         .and_then(|size| u64::try_from(size).ok())
         .ok_or_else(|| Error::InvalidPath(format!("Source size is unavailable: {source}")))?;
-    if args.storage_class.is_some() && planned_size > MULTIPART_THRESHOLD {
+    if args.storage_class.is_some() && planned_size > multipart_threshold() {
         return Err(Error::UnsupportedFeature(
             "RustFS beta.10 does not persist storage class for multipart uploads".to_string(),
         ));
@@ -2933,8 +2934,6 @@ async fn copy_local_to_s3_prepared(
     }
 }
 
-/// Multipart upload threshold: files larger than this size use multipart upload.
-const MULTIPART_THRESHOLD: u64 = rc_s3::multipart::DEFAULT_PART_SIZE;
 /// Download progress threshold: avoid flicker for tiny downloads while surfacing meaningful waits.
 const DOWNLOAD_PROGRESS_THRESHOLD: u64 = 4 * 1024 * 1024;
 
@@ -3004,7 +3003,7 @@ async fn upload_file(
             );
         }
     };
-    if args.storage_class.is_some() && file_size > MULTIPART_THRESHOLD {
+    if args.storage_class.is_some() && file_size > multipart_threshold() {
         return formatter.fail(
             ExitCode::UnsupportedFeature,
             "RustFS beta.10 does not persist storage class for multipart uploads",
@@ -3031,10 +3030,10 @@ async fn upload_file(
     );
 
     // Show progress bar for large files
-    let progress = if file_size > MULTIPART_THRESHOLD {
+    let progress = if file_size > multipart_threshold() {
         tracing::debug!(
             file_size,
-            threshold = MULTIPART_THRESHOLD,
+            threshold = multipart_threshold(),
             "Using multipart upload for large file"
         );
         Some(ProgressBar::new(formatter.output_config(), file_size))
@@ -3087,7 +3086,7 @@ fn select_upload_content_type<'a>(
     guessed_type: Option<&'a str>,
     file_size: u64,
 ) -> Option<&'a str> {
-    if file_size > MULTIPART_THRESHOLD {
+    if file_size > multipart_threshold() {
         explicit_type
     } else {
         explicit_type.or(guessed_type)
@@ -3583,7 +3582,7 @@ async fn copy_s3_to_s3_prepared(
             if src.alias == dst.alias {
                 rc_core::requires_multipart_copy(size)
             } else {
-                size > MULTIPART_THRESHOLD
+                size > multipart_threshold()
             }
         })
     {
@@ -4031,7 +4030,7 @@ mod tests {
     #[test]
     fn test_select_upload_content_type_uses_guess_for_small_files() {
         let selected =
-            select_upload_content_type(None, Some("text/plain"), MULTIPART_THRESHOLD - 1);
+            select_upload_content_type(None, Some("text/plain"), multipart_threshold() - 1);
 
         assert_eq!(selected, Some("text/plain"));
     }
@@ -4039,14 +4038,14 @@ mod tests {
     #[test]
     fn test_select_upload_content_type_skips_guess_for_multipart_files() {
         let selected =
-            select_upload_content_type(None, Some("text/plain"), MULTIPART_THRESHOLD + 1);
+            select_upload_content_type(None, Some("text/plain"), multipart_threshold() + 1);
 
         assert_eq!(selected, None);
     }
 
     #[test]
     fn test_select_upload_content_type_uses_guess_at_multipart_boundary() {
-        let selected = select_upload_content_type(None, Some("text/plain"), MULTIPART_THRESHOLD);
+        let selected = select_upload_content_type(None, Some("text/plain"), multipart_threshold());
 
         assert_eq!(selected, Some("text/plain"));
     }
@@ -4056,7 +4055,7 @@ mod tests {
         let selected = select_upload_content_type(
             Some("application/octet-stream"),
             Some("text/plain"),
-            MULTIPART_THRESHOLD + 1,
+            multipart_threshold() + 1,
         );
 
         assert_eq!(selected, Some("application/octet-stream"));
@@ -4737,7 +4736,7 @@ mod tests {
                     target: RemotePath::new("beta", "target", "medium.bin"),
                     source_info: Box::new(ObjectInfo::file(
                         "medium.bin",
-                        (MULTIPART_THRESHOLD + 1) as i64,
+                        (multipart_threshold() + 1) as i64,
                     )),
                     encryption: None,
                 },
@@ -4745,7 +4744,7 @@ mod tests {
                 target: "beta/target/medium.bin".to_string(),
                 relative_path: "medium.bin".to_string(),
                 modified: None,
-                size_bytes: Some(MULTIPART_THRESHOLD + 1),
+                size_bytes: Some(multipart_threshold() + 1),
             }],
             &TransferSelection::default(),
         );
