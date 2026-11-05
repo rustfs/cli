@@ -18,6 +18,17 @@ pub const MAX_PART_SIZE: u64 = 5 * 1024 * 1024 * 1024;
 /// Maximum number of parts: 10,000 (S3 limit)
 pub const MAX_PARTS: usize = 10_000;
 
+/// Upload threshold in bytes from `RC_MULTIPART_THRESHOLD`, defaulting to 64 MiB.
+/// Missing or invalid values (outside 1 byte through 5 GiB) use the default.
+pub fn multipart_threshold() -> u64 {
+    std::env::var("RC_MULTIPART_THRESHOLD")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        // A larger threshold could select a single PUT beyond the S3 size limit.
+        .filter(|value| (1..=MAX_PART_SIZE).contains(value))
+        .unwrap_or(DEFAULT_PART_SIZE)
+}
+
 /// Multipart upload configuration
 #[derive(Debug, Clone)]
 pub struct MultipartConfig {

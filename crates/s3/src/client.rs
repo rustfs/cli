@@ -76,9 +76,6 @@ use crate::lifecycle_xml::{
     validate_lifecycle_configuration_xml_response,
 };
 
-/// Keep single-part uploads small to avoid backend incompatibilities with
-/// streaming aws-chunked payloads.
-const SINGLE_PUT_OBJECT_MAX_SIZE: u64 = crate::multipart::DEFAULT_PART_SIZE;
 const S3_SERVICE_NAME: &str = "s3";
 const S3_REPLICATION_XML_NAMESPACE: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 const RUSTFS_FORCE_DELETE_HEADER: &str = "x-rustfs-force-delete";
@@ -3245,7 +3242,7 @@ impl S3Client {
     }
 
     fn should_use_multipart(file_size: u64) -> bool {
-        file_size > SINGLE_PUT_OBJECT_MAX_SIZE
+        file_size > crate::multipart::multipart_threshold()
     }
 
     fn sha256_hash(body: &[u8]) -> String {
@@ -9946,20 +9943,69 @@ mod tests {
     }
 
     #[test]
+    fn multipart_threshold_uses_environment() {
+        const EXPECTED_THRESHOLD: &str = "RC_TEST_EXPECTED_MULTIPART_THRESHOLD";
+        if let Ok(expected) = std::env::var(EXPECTED_THRESHOLD) {
+            let threshold = expected.parse::<u64>().expect("valid test threshold");
+            assert!(!S3Client::should_use_multipart(threshold - 1));
+            assert!(!S3Client::should_use_multipart(threshold));
+            assert!(S3Client::should_use_multipart(threshold + 1));
+            return;
+        }
+
+        let default = crate::multipart::DEFAULT_PART_SIZE;
+        // Child environments avoid changing process-global state in parallel tests.
+        for (value, expected) in [
+            (None, default),
+            (Some("1"), 1),
+            (Some("8388608"), 8 * 1024 * 1024),
+            (Some("134217728"), 128 * 1024 * 1024),
+            (Some("5368709120"), crate::multipart::MAX_PART_SIZE),
+            (Some(""), default),
+            (Some("invalid"), default),
+            (Some("0"), default),
+            (Some("-1"), default),
+            (Some("5368709121"), default),
+            (Some("18446744073709551616"), default),
+        ] {
+            let mut command =
+                std::process::Command::new(std::env::current_exe().expect("test executable path"));
+            command
+                .args([
+                    "--exact",
+                    "client::tests::multipart_threshold_uses_environment",
+                ])
+                .env(EXPECTED_THRESHOLD, expected.to_string())
+                .env_remove("RC_MULTIPART_THRESHOLD");
+            if let Some(value) = value {
+                command.env("RC_MULTIPART_THRESHOLD", value);
+            }
+            let output = command.output().expect("run threshold test in child");
+            assert!(
+                output.status.success(),
+                "threshold {value:?}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
     fn should_use_multipart_for_large_files() {
         assert!(S3Client::should_use_multipart(
-            SINGLE_PUT_OBJECT_MAX_SIZE + 1
+            crate::multipart::multipart_threshold() + 1
         ));
     }
 
     #[test]
     fn should_use_single_part_for_small_files() {
         assert!(!S3Client::should_use_multipart(0));
-        assert!(!S3Client::should_use_multipart(1024 * 1024));
         assert!(!S3Client::should_use_multipart(
-            crate::multipart::DEFAULT_PART_SIZE
+            crate::multipart::multipart_threshold() - 1
         ));
-        assert!(!S3Client::should_use_multipart(SINGLE_PUT_OBJECT_MAX_SIZE));
+        assert!(!S3Client::should_use_multipart(
+            crate::multipart::multipart_threshold()
+        ));
     }
 
     #[tokio::test]
