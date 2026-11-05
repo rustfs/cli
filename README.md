@@ -555,6 +555,14 @@ rc completions powershell >> $PROFILE
 
 ## Configuration
 
+Set `RC_MULTIPART_THRESHOLD` to the upload threshold in bytes, for example
+`RC_MULTIPART_THRESHOLD=134217728 rc cp ./archive.tar local/backups/` for 128 MiB.
+Files larger than the threshold use multipart uploads; files at the threshold
+use a single PUT. The default is 64 MiB (67,108,864 bytes). If the setting is
+unset, invalid, zero, or above 5 GiB (5,368,709,120 bytes), it falls back to the
+default. This setting does not change multipart chunk sizes or the server-side
+copy threshold.
+
 Backends with a lower multipart ceiling can use `rc --max-parts 1000 cp ...`
 or `RC_MAX_PARTS=1000 rc mirror ...`. The default is 10,000; accepted values
 are 1 through 10,000. Uploads and server-side multipart copies increase their
