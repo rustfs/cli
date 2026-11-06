@@ -66,9 +66,9 @@ use crate::data_transport::{
     DownloadRequest, ObjectDataTransport, ObservedReader, ObservedWriter, UploadOperation,
     UploadRequest, UploadResult, WriteCondition,
 };
-use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use zeroize::Zeroizing;
 
 use crate::lifecycle_xml::{
@@ -1104,6 +1104,49 @@ fn requested_sha256_checksum(
     }
 }
 
+async fn requested_file_sha256_checksum(
+    file: &mut tokio::fs::File,
+    file_path: &std::path::Path,
+    file_size: u64,
+    request: Option<&ChecksumRequest>,
+) -> Result<Option<String>> {
+    if !matches!(
+        request,
+        Some(ChecksumRequest::Calculate(ChecksumAlgorithm::Sha256))
+    ) {
+        return requested_sha256_checksum(&[], request);
+    }
+    // The checksum must be available before the provider admits the upload.
+    // Keep this preparation bounded independently of the object's length.
+    let mut buffer = vec![0_u8; 64 * 1024];
+    let mut digest = Sha256::new();
+    let mut bytes_read = 0_u64;
+    loop {
+        let count = file.read(&mut buffer).await.map_err(|error| {
+            Error::General(format!("read file '{}': {error}", file_path.display()))
+        })?;
+        if count == 0 {
+            break;
+        }
+        bytes_read = bytes_read.saturating_add(count as u64);
+        if bytes_read > file_size {
+            return Err(Error::Conflict(
+                "Source file length changed before upload".into(),
+            ));
+        }
+        digest.update(&buffer[..count]);
+    }
+    if bytes_read != file_size {
+        return Err(Error::Conflict(
+            "Source file length changed before upload".into(),
+        ));
+    }
+    file.rewind().await.map_err(|error| {
+        Error::General(format!("rewind file '{}': {error}", file_path.display()))
+    })?;
+    Ok(Some(BASE64_STANDARD.encode(digest.finalize())))
+}
+
 fn validate_sha256_checksum_request(request: Option<&ChecksumRequest>) -> Result<()> {
     match request {
         None
@@ -1916,15 +1959,23 @@ impl S3Client {
         request: UploadRequest<'_>,
         data: &[u8],
     ) -> Result<Option<UploadResult>> {
+        let mut source = data;
+        self.try_external_upload_reader(request, &mut source).await
+    }
+
+    async fn try_external_upload_reader(
+        &self,
+        request: UploadRequest<'_>,
+        source: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+    ) -> Result<Option<UploadResult>> {
         let Some(transport) = self.selected_data_transport()? else {
             return Ok(None);
         };
         let length = request.content_length;
         let customer_key =
             destination_sse_customer_key(request.options.encryption.as_ref()).cloned();
-        let mut source = data;
         let mut observed = ObservedReader {
-            inner: &mut source,
+            inner: source,
             polled: false,
             bytes: 0,
             eof: false,
@@ -4227,17 +4278,27 @@ impl S3Client {
         file_size: u64,
         options: PathUploadOptions<'_>,
     ) -> Result<ObjectInfo> {
-        let data = tokio::fs::read(file_path)
+        let mut file = tokio::fs::File::open(file_path)
             .await
-            .map_err(|e| Error::General(format!("read file '{}': {e}", file_path.display())))?;
-        let requested_checksum = requested_sha256_checksum(&data, options.write.checksum.as_ref())?;
+            .map_err(|e| Error::General(format!("open file '{}': {e}", file_path.display())))?;
+        let requested_checksum = if self.selected_data_transport()?.is_some() {
+            requested_file_sha256_checksum(
+                &mut file,
+                file_path,
+                file_size,
+                options.write.checksum.as_ref(),
+            )
+            .await?
+        } else {
+            None
+        };
         let condition = match options.precondition {
             ObjectWritePrecondition::None => WriteCondition::None,
             ObjectWritePrecondition::IfAbsent => WriteCondition::IfAbsent,
             ObjectWritePrecondition::IfMatch(etag) => WriteCondition::IfMatch(etag),
         };
         if let Some(result) = self
-            .try_external_upload(
+            .try_external_upload_reader(
                 UploadRequest {
                     path,
                     operation: UploadOperation::PutObject { condition },
@@ -4245,7 +4306,7 @@ impl S3Client {
                     content_length: file_size,
                     checksum_sha256: requested_checksum.as_deref(),
                 },
-                &data,
+                &mut file,
             )
             .await?
         {
@@ -4261,6 +4322,13 @@ impl S3Client {
             }
             return Ok(result.object);
         }
+        // Auto fallback is only possible before the provider polls the file.
+        // Retain the HTTP SDK's repeatable, immutable request body semantics.
+        let mut data = Vec::new();
+        file.read_to_end(&mut data)
+            .await
+            .map_err(|e| Error::General(format!("read file '{}': {e}", file_path.display())))?;
+        let requested_checksum = requested_sha256_checksum(&data, options.write.checksum.as_ref())?;
         let body = aws_sdk_s3::primitives::ByteStream::from(data);
         let storage_class = rustfs_storage_class(options.write.storage_class.as_deref())?;
 
@@ -14471,6 +14539,18 @@ mod tests {
                     source: None,
                 });
             }
+            if matches!(self.behavior, ExternalBehavior::PartialReject) {
+                let mut prefix = [0_u8; 1];
+                source
+                    .read_exact(&mut prefix)
+                    .await
+                    .expect("read source prefix");
+                return Err(data_transport::DataTransportError {
+                    state: rc_core::DataTransferState::NotAccepted,
+                    message: "provider stopped after reading".to_string(),
+                    source: None,
+                });
+            }
             let mut payload = Vec::new();
             source
                 .read_to_end(&mut payload)
@@ -14638,6 +14718,148 @@ mod tests {
             provider.operations.lock().expect("put record").as_slice(),
             ["PutObject { condition: IfAbsent }"]
         );
+    }
+
+    #[tokio::test]
+    async fn external_upload_reader_consumes_a_bounded_stream() {
+        let (client, replay) = test_s3_client_with_response_sequence(Vec::new());
+        let client = client.with_object_data_transport(
+            rc_core::DataTransportMode::Rdma,
+            external_transport(ExternalBehavior::Success),
+        );
+        let (mut producer, mut source) = tokio::io::duplex(8);
+        let producing = async move {
+            producer
+                .write_all(b"streamed payload")
+                .await
+                .expect("write bounded source");
+        };
+        let path = RemotePath::new("test", "bucket", "key");
+        let options = ObjectWriteOptions::default();
+        let uploading = client.try_external_upload_reader(
+            UploadRequest {
+                path: &path,
+                operation: UploadOperation::PutObject {
+                    condition: WriteCondition::None,
+                },
+                options: &options,
+                content_length: 16,
+                checksum_sha256: None,
+            },
+            &mut source,
+        );
+        let (result, ()) = tokio::join!(uploading, producing);
+        let uploaded = result.expect("stream upload").expect("provider selected");
+        assert_eq!(uploaded.object.size_bytes, Some(16));
+        assert_eq!(replay.actual_requests().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn external_file_rejection_preserves_http_fallback_body() {
+        let response = http::Response::builder()
+            .status(200)
+            .header("etag", "\"http-etag\"")
+            .body(SdkBody::empty())
+            .expect("HTTP upload response");
+        let (client, replay) = test_s3_client_with_response_sequence(vec![response]);
+        let client = client.with_object_data_transport(
+            rc_core::DataTransportMode::Auto,
+            external_transport(ExternalBehavior::Reject),
+        );
+        let mut source = tempfile::NamedTempFile::new().expect("file source");
+        source.write_all(b"file payload").expect("write source");
+        client
+            .put_object_single_part_from_path(
+                &RemotePath::new("test", "bucket", "key"),
+                source.path(),
+                12,
+                PathUploadOptions {
+                    write: &ObjectWriteOptions::default(),
+                    precondition: ObjectWritePrecondition::None,
+                },
+            )
+            .await
+            .expect("unconsumed file can use HTTP");
+        let requests = replay.actual_requests().collect::<Vec<_>>();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].body().bytes(), Some(b"file payload".as_slice()));
+    }
+
+    #[tokio::test]
+    async fn external_file_partial_rejection_never_replays_source() {
+        let (client, replay) = test_s3_client_with_response_sequence(Vec::new());
+        let client = client.with_object_data_transport(
+            rc_core::DataTransportMode::Auto,
+            external_transport(ExternalBehavior::PartialReject),
+        );
+        let mut source = tempfile::NamedTempFile::new().expect("file source");
+        source.write_all(b"file payload").expect("write source");
+        let error = client
+            .put_object_single_part_from_path(
+                &RemotePath::new("test", "bucket", "key"),
+                source.path(),
+                12,
+                PathUploadOptions {
+                    write: &ObjectWriteOptions::default(),
+                    precondition: ObjectWritePrecondition::None,
+                },
+            )
+            .await
+            .expect_err("a consumed source cannot use HTTP fallback");
+        assert!(matches!(
+            error,
+            Error::DataTransfer {
+                state: rc_core::DataTransferState::OutcomeUnknown,
+                ..
+            }
+        ));
+        assert!(!rc_core::is_retryable_error(&error));
+        assert_eq!(replay.actual_requests().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn file_upload_checksum_covers_multiple_chunks_and_rewinds_source() {
+        for data in [Vec::new(), vec![37_u8; 2 * 64 * 1024 + 19]] {
+            let mut source = tempfile::NamedTempFile::new().expect("file source");
+            source.write_all(&data).expect("write source");
+            let mut file = tokio::fs::File::open(source.path())
+                .await
+                .expect("open source");
+            let checksum = requested_file_sha256_checksum(
+                &mut file,
+                source.path(),
+                data.len() as u64,
+                Some(&ChecksumRequest::Calculate(ChecksumAlgorithm::Sha256)),
+            )
+            .await
+            .expect("calculate file checksum");
+            assert_eq!(checksum, Some(sha256_checksum(&data)));
+            assert_eq!(file.stream_position().await.expect("source position"), 0);
+            let mut observed = Vec::new();
+            file.read_to_end(&mut observed)
+                .await
+                .expect("read rewound source");
+            assert_eq!(observed, data);
+        }
+    }
+
+    #[tokio::test]
+    async fn file_upload_checksum_rejects_changed_source_length() {
+        let mut source = tempfile::NamedTempFile::new().expect("file source");
+        source.write_all(b"data").expect("write source");
+        for declared in [3, 5] {
+            let mut file = tokio::fs::File::open(source.path())
+                .await
+                .expect("open source");
+            let result = requested_file_sha256_checksum(
+                &mut file,
+                source.path(),
+                declared,
+                Some(&ChecksumRequest::Calculate(ChecksumAlgorithm::Sha256)),
+            )
+            .await;
+            assert!(matches!(result, Err(Error::Conflict(_))));
+        }
     }
 
     #[tokio::test]
