@@ -493,40 +493,45 @@ struct ReplicationStatusXml {
     status: Option<String>,
 }
 
+/// Resync start/status body. Current servers use the madmin-go
+/// `ResyncTargetsInfo` json tags (`target`, `arn`, `resetid`, ...); servers
+/// released before 2026-08 used PascalCase keys, accepted here as aliases.
+/// serde matches keys case-sensitively, so an unknown spelling would decode
+/// as an empty target list rather than fail.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "PascalCase")]
 struct ReplicationResyncResponseDto {
-    #[serde(default)]
+    // madmin omits an empty target list.
+    #[serde(rename = "target", alias = "Targets", default)]
     targets: Vec<ReplicationResyncTargetDto>,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "PascalCase")]
 struct ReplicationResyncTargetDto {
+    #[serde(rename = "arn", alias = "Arn")]
     arn: String,
-    #[serde(rename = "ResetID")]
+    #[serde(rename = "resetid", alias = "ResetID")]
     reset_id: String,
-    #[serde(default)]
+    #[serde(rename = "ResetBeforeDate", default)]
     reset_before_date: Option<String>,
-    #[serde(default)]
+    #[serde(rename = "startTime", alias = "StartTime", default)]
     start_time: Option<String>,
-    #[serde(default)]
+    #[serde(rename = "endTime", alias = "EndTime", default)]
     end_time: Option<String>,
-    #[serde(default)]
+    #[serde(rename = "resyncStatus", alias = "Status", default)]
     status: Option<String>,
-    #[serde(default)]
+    #[serde(rename = "replicationCount", alias = "ReplicatedCount", default)]
     replicated_count: Option<i64>,
-    #[serde(default)]
+    #[serde(rename = "completedReplicationSize", alias = "ReplicatedSize", default)]
     replicated_size: Option<i64>,
-    #[serde(default)]
+    #[serde(rename = "failedReplicationCount", alias = "FailedCount", default)]
     failed_count: Option<i64>,
-    #[serde(default)]
+    #[serde(rename = "failedReplicationSize", alias = "FailedSize", default)]
     failed_size: Option<i64>,
-    #[serde(default)]
+    #[serde(rename = "bucket", alias = "Bucket", default)]
     bucket: Option<String>,
-    #[serde(default)]
+    #[serde(rename = "object", alias = "Object", default)]
     object: Option<String>,
-    #[serde(default)]
+    #[serde(rename = "Error", default)]
     error: Option<String>,
 }
 
@@ -8305,7 +8310,7 @@ mod tests {
                             .expect("configure blocking follow-up stream");
                         let _ = read_xml_request(&mut stream);
                         let success_body =
-                            br#"{"Targets":[{"Arn":"arn:target","ResetID":"server-id"}]}"#;
+                            br#"{"target":[{"arn":"arn:target","resetid":"server-id"}]}"#;
                         let response = format!(
                             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                             success_body.len()
@@ -11015,7 +11020,7 @@ mod tests {
 
     #[tokio::test]
     async fn replication_resync_start_encodes_options_and_preserves_server_id() {
-        let body = br#"{"Targets":[{"Arn":"arn:rustfs:replication::id:dest bucket","ResetID":"server-id"}]}"#;
+        let body = br#"{"target":[{"arn":"arn:rustfs:replication::id:dest bucket","resetid":"server-id"}]}"#;
         let response = format!(
             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
             body.len()
@@ -11054,7 +11059,7 @@ mod tests {
 
     #[tokio::test]
     async fn replication_resync_start_encodes_caller_reset_id() {
-        let body = br#"{"Targets":[{"Arn":"arn:target","ResetID":"caller id"}]}"#;
+        let body = br#"{"target":[{"arn":"arn:target","resetid":"caller id"}]}"#;
         let response = format!(
             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
             body.len()
@@ -11138,7 +11143,7 @@ mod tests {
 
     #[tokio::test]
     async fn replication_resync_status_preserves_partial_target_state() {
-        let body = br#"{"Targets":[{"Arn":"arn:target","ResetID":"reset-1","ResetBeforeDate":"2026-07-01T00:00:00Z","StartTime":"2026-07-02T00:00:00Z","EndTime":"2026-07-02T00:01:00Z","Status":"Failed","ReplicatedCount":3,"ReplicatedSize":30,"FailedCount":2,"FailedSize":20,"Bucket":"source-bucket","Object":"last.txt","Error":"target unavailable"}]}"#;
+        let body = br#"{"target":[{"arn":"arn:target","resetid":"reset-1","ResetBeforeDate":"2026-07-01T00:00:00Z","startTime":"2026-07-02T00:00:00Z","endTime":"2026-07-02T00:01:00Z","resyncStatus":"Failed","replicationCount":3,"completedReplicationSize":30,"failedReplicationCount":2,"failedReplicationSize":20,"bucket":"source-bucket","object":"last.txt","Error":"target unavailable"}]}"#;
         let response = format!(
             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
             body.len()
@@ -11173,7 +11178,7 @@ mod tests {
 
     #[tokio::test]
     async fn replication_resync_status_retains_multiple_unfiltered_targets() {
-        let body = br#"{"Targets":[{"Arn":"arn:a","ResetID":"reset-a","Status":"Pending"},{"Arn":"arn:b","ResetID":"reset-b","Status":"Completed","ReplicatedCount":2}]}"#;
+        let body = br#"{"target":[{"arn":"arn:a","resetid":"reset-a","resyncStatus":"Pending","replicationCount":0,"completedReplicationSize":0,"failedReplicationCount":0,"failedReplicationSize":0},{"arn":"arn:b","resetid":"reset-b","resyncStatus":"Completed","replicationCount":2,"completedReplicationSize":0,"failedReplicationCount":0,"failedReplicationSize":0}]}"#;
         let response = format!(
             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
             body.len()
@@ -11203,7 +11208,7 @@ mod tests {
 
     #[tokio::test]
     async fn replication_resync_status_is_readable_from_fresh_clients() {
-        let body = br#"{"Targets":[{"Arn":"arn:target","ResetID":"reset-1","Status":"Ongoing","ReplicatedCount":3}]}"#;
+        let body = br#"{"target":[{"arn":"arn:target","resetid":"reset-1","resyncStatus":"Ongoing","replicationCount":3,"completedReplicationSize":0,"failedReplicationCount":0,"failedReplicationSize":0}]}"#;
         let response = format!(
             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
             body.len()
@@ -11230,6 +11235,43 @@ mod tests {
         assert_eq!(fresh, first);
         assert_eq!(fresh.targets[0].state, ReplicationResyncState::Ongoing);
         handle.join().expect("server thread should finish");
+    }
+
+    #[test]
+    fn replication_resync_status_decodes_current_and_legacy_wire_shapes() {
+        // Serialized by current RustFS servers (madmin-go `ResyncTargetsInfo` tags).
+        let current = br#"{"target":[{"arn":"arn:target","resetid":"reset-1","ResetBeforeDate":"2026-07-01T00:00:00Z","startTime":"2026-07-02T00:00:00Z","endTime":"2026-07-02T00:01:00Z","resyncStatus":"Failed","replicationCount":3,"completedReplicationSize":30,"failedReplicationCount":2,"failedReplicationSize":20,"bucket":"source-bucket","object":"last.txt","Error":"target unavailable"}]}"#;
+        // Serialized by RustFS servers released before 2026-08.
+        let legacy = br#"{"Targets":[{"Arn":"arn:target","ResetID":"reset-1","ResetBeforeDate":"2026-07-01T00:00:00Z","StartTime":"2026-07-02T00:00:00Z","EndTime":"2026-07-02T00:01:00Z","Status":"Failed","ReplicatedCount":3,"ReplicatedSize":30,"FailedCount":2,"FailedSize":20,"Bucket":"source-bucket","Object":"last.txt","Error":"target unavailable"}]}"#;
+        let decode = |body: &[u8]| {
+            let response: ReplicationResyncResponseDto =
+                serde_json::from_slice(body).expect("decode resync response");
+            response
+                .targets
+                .into_iter()
+                .map(S3Client::convert_resync_status_target)
+                .collect::<Result<Vec<_>>>()
+                .expect("convert resync targets")
+        };
+
+        let current = decode(current);
+        assert_eq!(current.len(), 1);
+        let target = &current[0];
+        assert_eq!(target.target_arn, "arn:target");
+        assert_eq!(target.reset_id, "reset-1");
+        assert!(target.reset_before.is_some());
+        assert!(target.started_at.is_some());
+        assert!(target.last_updated_at.is_some());
+        assert_eq!(target.state, ReplicationResyncState::Failed);
+        assert_eq!(target.replicated_count, 3);
+        assert_eq!(target.replicated_size, 30);
+        assert_eq!(target.failed_count, 2);
+        assert_eq!(target.failed_size, 20);
+        assert_eq!(target.current_bucket.as_deref(), Some("source-bucket"));
+        assert_eq!(target.current_object.as_deref(), Some("last.txt"));
+        assert_eq!(target.error.as_deref(), Some("target unavailable"));
+        assert_eq!(decode(legacy), current);
+        assert!(decode(br#"{}"#).is_empty());
     }
 
     #[test]
