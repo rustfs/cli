@@ -179,7 +179,7 @@ jobs:
           profile: rust-build
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
         with:
-          toolchain: "1.92"
+          toolchain: "1.99.0"
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Build with MSRV
         run: cargo build --workspace
