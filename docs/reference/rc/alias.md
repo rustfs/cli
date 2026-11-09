@@ -8,7 +8,7 @@ The `rc alias` operation manages named S3-compatible service endpoints in the lo
 
 ```bash
 rc [GLOBAL OPTIONS] alias <COMMAND>
-rc [GLOBAL OPTIONS] alias set [OPTIONS] <NAME> <ENDPOINT> <ACCESS_KEY> <SECRET_KEY>
+rc [GLOBAL OPTIONS] alias set [OPTIONS] <NAME> <ENDPOINT> [ACCESS_KEY] [SECRET_KEY]
 rc [GLOBAL OPTIONS] alias list [-l|--long]
 rc [GLOBAL OPTIONS] alias remove <NAME>
 rc [GLOBAL OPTIONS] alias export [NAMES]... [--output <FILE>] [--include-credentials --acknowledge-credentials]
@@ -31,8 +31,8 @@ rc [GLOBAL OPTIONS] alias import <FILE> [--replace]
 | --- | --- |
 | `NAME` | Local alias name, such as `local`, `s3`, or `rustfs`. |
 | `ENDPOINT` | S3-compatible endpoint URL, such as `http://localhost:9000`. |
-| `ACCESS_KEY` | Access key ID for the endpoint. |
-| `SECRET_KEY` | Secret access key for the endpoint. |
+| `ACCESS_KEY` | Access key ID for the endpoint. Prompted on a terminal when omitted. |
+| `SECRET_KEY` | Secret access key for the endpoint. Prompted with hidden input on a terminal when omitted. |
 | `--region` | AWS region to associate with the alias. Defaults to `us-east-1`. |
 | `--signature` | Signature version, `v4` or `v2`. Defaults to `v4`. |
 | `--bucket-lookup` | Bucket lookup style: `auto`, `path`, or `dns`. Defaults to `auto`. |
@@ -51,6 +51,14 @@ Configure a local RustFS or MinIO-compatible service:
 ```bash
 rc alias set local http://localhost:9000 ACCESS_KEY SECRET_KEY
 ```
+
+Omit the keys on a terminal to be prompted instead of typing them into the shell, where they would be saved in history:
+
+```bash
+rc alias set local http://localhost:9000
+```
+
+When stdin is not a terminal, or when `--json` is set, the keys are required on the command line.
 
 Configure AWS S3 with an explicit region:
 
