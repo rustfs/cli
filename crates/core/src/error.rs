@@ -104,7 +104,10 @@ pub enum Error {
     Network(String),
 
     /// An external data operation with explicit acceptance and outcome state.
-    #[error("Object data transfer {state}: {message}")]
+    #[error(
+        "Object data transfer {state}: {message}{cause}",
+        cause = .source.as_ref().map(|source| format!(": {source}")).unwrap_or_default()
+    )]
     DataTransfer {
         /// Acceptance and business outcome classification.
         state: crate::DataTransferState,
