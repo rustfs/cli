@@ -21,7 +21,7 @@ aws-config.workspace = true
 aws-credential-types.workspace = true
 aws-smithy-types.workspace = true
 aws-smithy-runtime-api.workspace = true
-aws-smithy-checksums = "0.64.8"
+aws-smithy-checksums = "0.65.1"
 
 # Async
 tokio.workspace = true
