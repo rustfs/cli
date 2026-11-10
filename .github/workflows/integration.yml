@@ -172,7 +172,7 @@ jobs:
             "option_behavior_operations::test_head_bytes_returns_prefix_bytes"
             "option_behavior_operations::test_find_print_outputs_full_remote_path"
             "option_behavior_operations::test_find_exec_rejects_json_output"
-            "option_behavior_operations::test_mirror_parallel_zero_returns_usage_error"
+            "option_behavior_operations::test_mirror_concurrency_zero_returns_usage_error"
           )
 
           if [[ "${{ matrix.version }}" == "1.0.0-beta.10" ]]; then
