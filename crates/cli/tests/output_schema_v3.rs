@@ -10,6 +10,7 @@ const V3_FAMILIES: &[&str] = &[
     "capabilities",
     "versioned_objects",
     "locks",
+    "public_access_block",
     "multipart_uploads",
     "watch_event",
     "health",

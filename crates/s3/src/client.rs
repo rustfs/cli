@@ -44,13 +44,14 @@ use rc_core::{
     MultipartUploadListResult, NotificationTarget, ObjectAttributes, ObjectChecksum,
     ObjectEncryptionRequest, ObjectInfo, ObjectLockOptions, ObjectReadOptions, ObjectRetention,
     ObjectStore, ObjectTransferMetadata, ObjectVersion, ObjectVersionIdentifier,
-    ObjectVersionListResult, ObjectWriteEncryption, ObjectWriteOptions, RemotePath,
-    ReplicationCheckPhase, ReplicationCheckPhaseState, ReplicationCheckResult,
-    ReplicationCheckStatus, ReplicationConfiguration, ReplicationResyncStartOptions,
-    ReplicationResyncStartResult, ReplicationResyncState, ReplicationResyncStatus,
-    ReplicationResyncTargetStatus, RequestHeader, Result, RetentionDuration, RetentionDurationUnit,
-    RetentionMode, SelectOptions, SseCustomerKey, TransferCopyOptions, TransferReadOptions,
-    global_request_headers, is_retryable_error, retry_with_backoff,
+    ObjectVersionListResult, ObjectWriteEncryption, ObjectWriteOptions,
+    PublicAccessBlockConfiguration, RemotePath, ReplicationCheckPhase, ReplicationCheckPhaseState,
+    ReplicationCheckResult, ReplicationCheckStatus, ReplicationConfiguration,
+    ReplicationResyncStartOptions, ReplicationResyncStartResult, ReplicationResyncState,
+    ReplicationResyncStatus, ReplicationResyncTargetStatus, RequestHeader, Result,
+    RetentionDuration, RetentionDurationUnit, RetentionMode, SelectOptions, SseCustomerKey,
+    TransferCopyOptions, TransferReadOptions, global_request_headers, is_retryable_error,
+    retry_with_backoff,
 };
 use reqwest::Method;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, LOCATION};
@@ -703,6 +704,12 @@ fn is_missing_cors_configuration_response(
     }
 
     status_code.is_none_or(|status| status == 404)
+}
+
+fn is_missing_public_access_block_configuration(error_text: &str) -> bool {
+    error_text
+        .to_ascii_lowercase()
+        .contains("nosuchpublicaccessblockconfiguration")
 }
 
 fn sdk_cors_rule_to_core(rule: &aws_sdk_s3::types::CorsRule) -> CorsRule {
@@ -7118,6 +7125,119 @@ impl ObjectStore for S3Client {
         }
     }
 
+    async fn get_bucket_public_access_block(
+        &self,
+        bucket: &str,
+    ) -> Result<Option<PublicAccessBlockConfiguration>> {
+        let response = match self
+            .inner
+            .get_public_access_block()
+            .bucket(bucket)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                if let Some(auth_error) = crate::auth::sdk_temporary_credential_error(&error) {
+                    return Err(auth_error);
+                }
+                if is_missing_public_access_block_configuration(&error.to_string()) {
+                    return Ok(None);
+                }
+                let error_text = self.redact_sensitive_text(error.to_string());
+                return Err(Error::General(format!(
+                    "get_bucket_public_access_block: {error_text}"
+                )));
+            }
+        };
+
+        let configuration = response
+            .public_access_block_configuration()
+            .ok_or_else(|| {
+                Error::General(
+                    "get_bucket_public_access_block: response omitted configuration".to_string(),
+                )
+            })?;
+
+        Ok(Some(PublicAccessBlockConfiguration {
+            block_public_acls: configuration.block_public_acls().ok_or_else(|| {
+                Error::General(
+                    "get_bucket_public_access_block: response omitted BlockPublicAcls".to_string(),
+                )
+            })?,
+            ignore_public_acls: configuration.ignore_public_acls().ok_or_else(|| {
+                Error::General(
+                    "get_bucket_public_access_block: response omitted IgnorePublicAcls".to_string(),
+                )
+            })?,
+            block_public_policy: configuration.block_public_policy().ok_or_else(|| {
+                Error::General(
+                    "get_bucket_public_access_block: response omitted BlockPublicPolicy"
+                        .to_string(),
+                )
+            })?,
+            restrict_public_buckets: configuration.restrict_public_buckets().ok_or_else(|| {
+                Error::General(
+                    "get_bucket_public_access_block: response omitted RestrictPublicBuckets"
+                        .to_string(),
+                )
+            })?,
+        }))
+    }
+
+    async fn set_bucket_public_access_block(
+        &self,
+        bucket: &str,
+        configuration: PublicAccessBlockConfiguration,
+    ) -> Result<()> {
+        let configuration = aws_sdk_s3::types::PublicAccessBlockConfiguration::builder()
+            .block_public_acls(configuration.block_public_acls)
+            .ignore_public_acls(configuration.ignore_public_acls)
+            .block_public_policy(configuration.block_public_policy)
+            .restrict_public_buckets(configuration.restrict_public_buckets)
+            .build();
+
+        self.inner
+            .put_public_access_block()
+            .bucket(bucket)
+            .public_access_block_configuration(configuration)
+            .send()
+            .await
+            .map_err(|error| {
+                if let Some(auth_error) = crate::auth::sdk_temporary_credential_error(&error) {
+                    return auth_error;
+                }
+                let error_text = self.redact_sensitive_text(error.to_string());
+                Error::General(format!("set_bucket_public_access_block: {error_text}"))
+            })?;
+
+        Ok(())
+    }
+
+    async fn delete_bucket_public_access_block(&self, bucket: &str) -> Result<()> {
+        match self
+            .inner
+            .delete_public_access_block()
+            .bucket(bucket)
+            .send()
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                if let Some(auth_error) = crate::auth::sdk_temporary_credential_error(&error) {
+                    return Err(auth_error);
+                }
+                if is_missing_public_access_block_configuration(&error.to_string()) {
+                    return Ok(());
+                }
+                let error_text = self.redact_sensitive_text(error.to_string());
+                Err(Error::General(format!(
+                    "delete_bucket_public_access_block: {error_text}"
+                )))
+            }
+        }
+    }
+
     async fn get_bucket_cors(&self, bucket: &str) -> Result<Vec<CorsRule>> {
         let response = match self.inner.get_bucket_cors().bucket(bucket).send().await {
             Ok(response) => response,
@@ -9452,6 +9572,90 @@ mod tests {
             Some(500),
             "The server-side encryption configuration was not found"
         ));
+    }
+
+    #[test]
+    fn missing_public_access_block_configuration_is_detected_by_service_code() {
+        assert!(is_missing_public_access_block_configuration(
+            "service error: NoSuchPublicAccessBlockConfiguration"
+        ));
+        assert!(!is_missing_public_access_block_configuration(
+            "AccessDenied"
+        ));
+        assert!(!is_missing_public_access_block_configuration(
+            "connection closed"
+        ));
+    }
+
+    #[tokio::test]
+    async fn get_bucket_public_access_block_reads_all_four_flags() {
+        let response = http::Response::builder()
+            .status(200)
+            .body(SdkBody::from(
+                r#"<PublicAccessBlockConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><BlockPublicAcls>true</BlockPublicAcls><IgnorePublicAcls>true</IgnorePublicAcls><BlockPublicPolicy>true</BlockPublicPolicy><RestrictPublicBuckets>true</RestrictPublicBuckets></PublicAccessBlockConfiguration>"#,
+            ))
+            .expect("build PAB response");
+        let (client, request_receiver) = test_s3_client(Some(response));
+
+        let result = client
+            .get_bucket_public_access_block("bucket")
+            .await
+            .expect("get bucket PAB")
+            .expect("PAB is configured");
+        assert_eq!(result, PublicAccessBlockConfiguration::secure_default());
+
+        let request = request_receiver.expect_request();
+        assert_eq!(request.method(), http::Method::GET);
+        assert!(request.uri().to_string().contains("?publicAccessBlock"));
+    }
+
+    #[tokio::test]
+    async fn set_bucket_public_access_block_sends_all_four_flags() {
+        let response = http::Response::builder()
+            .status(200)
+            .body(SdkBody::from(""))
+            .expect("build PAB response");
+        let (client, request_receiver) = test_s3_client(Some(response));
+
+        client
+            .set_bucket_public_access_block(
+                "bucket",
+                PublicAccessBlockConfiguration::secure_default(),
+            )
+            .await
+            .expect("set bucket PAB");
+
+        let request = request_receiver.expect_request();
+        assert_eq!(request.method(), http::Method::PUT);
+        assert!(request.uri().to_string().contains("?publicAccessBlock"));
+        let body = request.body().bytes().expect("request body bytes");
+        let body = std::str::from_utf8(body).expect("request body is utf8");
+        for field in [
+            "<BlockPublicAcls>true</BlockPublicAcls>",
+            "<IgnorePublicAcls>true</IgnorePublicAcls>",
+            "<BlockPublicPolicy>true</BlockPublicPolicy>",
+            "<RestrictPublicBuckets>true</RestrictPublicBuckets>",
+        ] {
+            assert!(body.contains(field), "missing {field} from {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_bucket_public_access_block_sends_delete_subresource() {
+        let response = http::Response::builder()
+            .status(204)
+            .body(SdkBody::from(""))
+            .expect("build delete PAB response");
+        let (client, request_receiver) = test_s3_client(Some(response));
+
+        client
+            .delete_bucket_public_access_block("bucket")
+            .await
+            .expect("delete bucket PAB");
+
+        let request = request_receiver.expect_request();
+        assert_eq!(request.method(), http::Method::DELETE);
+        assert!(request.uri().to_string().contains("?publicAccessBlock"));
     }
 
     #[test]

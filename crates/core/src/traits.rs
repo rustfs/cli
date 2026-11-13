@@ -21,6 +21,7 @@ use crate::object_lock::{
     BucketObjectLockConfiguration, LegalHoldStatus, ObjectLockOptions, ObjectRetention,
 };
 use crate::path::RemotePath;
+use crate::public_access_block::PublicAccessBlockConfiguration;
 use crate::replication::{
     ReplicationCheckResult, ReplicationConfiguration, ReplicationResyncStartOptions,
     ReplicationResyncStartResult, ReplicationResyncStatus,
@@ -1027,6 +1028,50 @@ pub trait ObjectStore: Send + Sync {
 
     /// Remove bucket policy (set anonymous access to private).
     async fn delete_bucket_policy(&self, bucket: &str) -> Result<()>;
+
+    /// Get the bucket's Public Access Block configuration.
+    ///
+    /// Returns `None` when the bucket has no configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns `UnsupportedFeature` when the object store does not implement this operation.
+    async fn get_bucket_public_access_block(
+        &self,
+        _bucket: &str,
+    ) -> Result<Option<PublicAccessBlockConfiguration>> {
+        Err(Error::UnsupportedFeature(
+            "Bucket Public Access Block inspection is not supported by this object store".into(),
+        ))
+    }
+
+    /// Replace the bucket's Public Access Block configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns `UnsupportedFeature` when the object store does not implement this operation.
+    async fn set_bucket_public_access_block(
+        &self,
+        _bucket: &str,
+        _configuration: PublicAccessBlockConfiguration,
+    ) -> Result<()> {
+        Err(Error::UnsupportedFeature(
+            "Bucket Public Access Block configuration is not supported by this object store".into(),
+        ))
+    }
+
+    /// Remove the bucket's Public Access Block configuration.
+    ///
+    /// Returns success when the configuration is already absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `UnsupportedFeature` when the object store does not implement this operation.
+    async fn delete_bucket_public_access_block(&self, _bucket: &str) -> Result<()> {
+        Err(Error::UnsupportedFeature(
+            "Bucket Public Access Block removal is not supported by this object store".into(),
+        ))
+    }
 
     /// Get bucket notification configuration as flat rules.
     async fn get_bucket_notifications(&self, bucket: &str) -> Result<Vec<BucketNotification>>;
