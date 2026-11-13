@@ -1,0 +1,14 @@
+---
+source: crates/cli/tests/admin_recovery.rs
+expression: value
+---
+{
+  "error": {
+    "automatic_retry": false,
+    "exit_code": 1,
+    "message": "Action outcome is unknown: Network error: recovery request failed with HTTP 503; inspect the same responsibility or job before retrying a mutation. Query the same node and responsibility; reconcile risk acceptance using the same request ID and identical fields."
+  },
+  "schema_version": 3,
+  "status": "unknown",
+  "type": "mrf_observation"
+}

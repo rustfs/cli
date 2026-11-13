@@ -336,12 +336,11 @@ fn bucket_creation_partial_contract_preserves_effective_state_and_failed_stage()
 }
 
 #[test]
-fn legacy_schemas_compile_and_existing_v1_golden_snapshots_remain_valid() {
-    let v1_validator = load_validator(1);
-    // Compiling v2 guards its existing references even though this repository does not yet
-    // contain v2 golden snapshots. Applying v2 to v1 alias records is invalid because some
-    // historical v2 `oneOf` operation envelopes overlap; v3 must not reinterpret that contract.
-    let _v2_validator = load_validator(2);
+fn all_golden_snapshots_use_their_declared_output_schema() {
+    // Compile every schema, including versions without snapshots. Historical records
+    // without a schema_version retain their v1 contract; newer records declare theirs.
+    let validators = [load_validator(1), load_validator(2), load_validator(3)];
+    let mut checked = [0usize; 3];
     let snapshot_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/snapshots");
 
     for entry in fs::read_dir(&snapshot_dir).expect("snapshot directory must be readable") {
@@ -355,12 +354,25 @@ fn legacy_schemas_compile_and_existing_v1_golden_snapshots_remain_valid() {
             snapshot_payload(&contents).expect("snapshot must contain a payload delimiter");
         let value: Value = serde_json::from_str(payload).expect("snapshot payload must be JSON");
 
-        assert_valid(
-            &v1_validator,
-            &value,
-            &format!("{} against output v1", path.display()),
+        let version = value
+            .get("schema_version")
+            .map(|version| version.as_u64().expect("schema version must be an integer"))
+            .unwrap_or(1);
+        assert!(
+            (1..=3).contains(&version),
+            "unsupported snapshot schema version {version}"
         );
+        let index = usize::try_from(version - 1).expect("bounded version index");
+
+        assert_valid(
+            &validators[index],
+            &value,
+            &format!("{} against output v{version}", path.display()),
+        );
+        checked[index] += 1;
     }
+    assert!(checked[0] > 0, "legacy v1 snapshots must still be checked");
+    assert!(checked[2] > 0, "recovery v3 snapshots must be checked");
 }
 
 #[test]

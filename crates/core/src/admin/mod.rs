@@ -17,6 +17,7 @@ mod kms_diagnostic;
 mod observability;
 mod oidc;
 mod on_demand_migration;
+pub mod recovery;
 mod replication;
 mod site;
 pub mod tier;

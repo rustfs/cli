@@ -20,6 +20,8 @@ rc admin account mfa recovery-codes <ALIAS> [--code CODE|--code-from-env NAME] [
 rc admin diagnostics <health|cluster|extensions> <ALIAS>
 rc admin info <cluster|server|disk|storage> <ALIAS> [OPTIONS]
 rc admin scanner status <ALIAS>
+rc admin heal mrf <status|list|get|refresh|recheck|accept-risk> <ALIAS> [OPTIONS]
+rc admin integrity <readiness|inventory|audit|migrate|job|resume|pause|cancel> <ALIAS> [OPTIONS]
 rc admin idp openid list <ALIAS>
 rc admin idp openid get <ALIAS> <PROVIDER_ID>
 rc admin idp openid validate <ALIAS> <PROVIDER_ID> --config-url URL --client-id ID
@@ -86,6 +88,7 @@ rc admin replicate remove <ALIAS> <--all|--site <NAME>>
 | `kms` | Inspect KMS state and manage safe native key lifecycle operations. |
 | `idp openid` | Inspect, validate, and safely mutate effective OIDC providers. |
 | `heal` | Start, stop, or inspect healing operations. |
+| `integrity` | Select and audit objects, query durable results, or create a qualified protected copy with a recovery receipt. |
 | `pool` | List pools and inspect pool status. |
 | `expand` | Manage post-expansion data rebalancing. Alias: `scale`. |
 | `decommission` | Manage server pool decommissioning. Alias: `decom`. |
@@ -696,6 +699,12 @@ The active upload is attempted once per concurrent lane and is never retried. Re
 | `--dry-run` | Report what would be healed without applying changes. |
 
 All manual heals are token-scoped. Save the `clientToken` returned by `heal start`; the token is required to inspect or stop the task. Root recursive tasks use the token alone, while bucket and prefix tasks also require their original target options.
+
+### MRF responsibility and integrity workflow
+
+`rc admin heal mrf` observes retained responsibilities through the authenticated cluster API and routes explicit actions to their owning node. `rc admin integrity` independently selects objects from inventory, creates paused jobs, and saves a durable no-overwrite receipt before explicit resume. An idle queue, risk acceptance, audit result, or migrated copy does not clear an unverified MRF responsibility. See [recovery commands and receipts](../../recovery.md) for syntax, evidence interpretation, pagination, deployment qualification, unknown outcomes, and exit codes.
+
+These commands use additive output v3 recovery families. Existing heal commands, output v1/v2, configuration schema and exit-code values are unchanged; scripts adopting these commands must handle semantic statuses such as `partial`, `accepted`, `unknown`, and `not_verified`.
 
 ## Decommission Workflow
 

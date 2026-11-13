@@ -4,6 +4,7 @@
 //! using HTTP requests with AWS SigV4 signing.
 
 mod diagnostics;
+mod recovery;
 
 use async_trait::async_trait;
 use aws_credential_types::Credentials;
@@ -730,7 +731,18 @@ impl AdminClient {
         body: Option<&[u8]>,
         response: BoundedJsonResponse,
     ) -> Result<Vec<u8>> {
-        let mut url = self.admin_url(path);
+        self.request_bounded_bytes_url(method, self.admin_url(path), query, body, response)
+            .await
+    }
+
+    async fn request_bounded_bytes_url(
+        &self,
+        method: Method,
+        mut url: String,
+        query: Option<&[(&str, &str)]>,
+        body: Option<&[u8]>,
+        response: BoundedJsonResponse,
+    ) -> Result<Vec<u8>> {
         if let Some(query) = query {
             let query_string = query
                 .iter()
@@ -5751,6 +5763,7 @@ impl ReplicationInspectionApi for AdminClient {
 
 #[cfg(test)]
 mod tests {
+    mod recovery_tests;
     use super::*;
     use rc_core::admin::{ClientDevnullRequest, DiagnosticApi};
     use std::io::{Read, Write};
