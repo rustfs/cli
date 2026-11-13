@@ -4,13 +4,14 @@
 //!
 //! Run with:
 //! ```bash
-//! # Start RustFS container
+//! # Start RustFS container with a public test-only SSE-S3 key (never use for real data).
 //! docker run -d --name rustfs -p 9000:9000 -p 9001:9001 \
 //!     -v rustfs-data:/data \
 //!     -e RUSTFS_ROOT_USER=accesskey \
 //!     -e RUSTFS_ROOT_PASSWORD=secretkey \
 //!     -e RUSTFS_ACCESS_KEY=accesskey \
 //!     -e RUSTFS_SECRET_KEY=secretkey \
+//!     -e RUSTFS_SSE_S3_MASTER_KEY=QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI= \
 //!     rustfs/rustfs:1.0.0-beta.10
 //!
 //! # Run tests

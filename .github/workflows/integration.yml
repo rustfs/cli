@@ -15,6 +15,9 @@ env:
   TEST_S3_ENDPOINT: http://localhost:9000
   TEST_S3_ACCESS_KEY: accesskey
   TEST_S3_SECRET_KEY: secretkey
+  # Public test-only key (32 bytes of 0x42), never use for real data.
+  # beta.10 requires a local SSE-S3 master key when no KMS is configured.
+  RUSTFS_SSE_S3_MASTER_KEY: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI="
   # Self-hosted runner images may still bundle an older Node than current
   # JavaScript actions require.
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -122,6 +125,7 @@ jobs:
             -e RUSTFS_ROOT_PASSWORD=secretkey \
             -e RUSTFS_ACCESS_KEY=accesskey \
             -e RUSTFS_SECRET_KEY=secretkey \
+            -e RUSTFS_SSE_S3_MASTER_KEY \
             -e RUSTFS_VOLUMES=/data \
             -e RUSTFS_ADDRESS=":9000" \
             -e RUSTFS_CONSOLE_ENABLE="true" \
@@ -168,11 +172,14 @@ jobs:
             "option_behavior_operations::test_head_bytes_returns_prefix_bytes"
             "option_behavior_operations::test_find_print_outputs_full_remote_path"
             "option_behavior_operations::test_find_exec_rejects_json_output"
-            "option_behavior_operations::test_mirror_parallel_zero_returns_usage_error"
+            "option_behavior_operations::test_mirror_concurrency_zero_returns_usage_error"
           )
 
           if [[ "${{ matrix.version }}" == "1.0.0-beta.10" ]]; then
             TESTS+=(
+              "encryption_operations::test_cp_enc_s3_upload"
+              "encryption_operations::test_mv_enc_s3_remote_copy"
+              "encryption_operations::test_pipe_enc_s3_upload"
               "checksum_operations::test_beta10_checksum_put_multipart_and_rejection"
               "atomic_object_lock_operations::test_beta10_atomic_object_lock_put_copy_and_multipart"
               "sse_customer_operations::test_beta10_sse_customer_put_head_get_wrong_key_and_multipart"
@@ -239,6 +246,7 @@ jobs:
             -e RUSTFS_ROOT_PASSWORD=secretkey \
             -e RUSTFS_ACCESS_KEY=accesskey \
             -e RUSTFS_SECRET_KEY=secretkey \
+            -e RUSTFS_SSE_S3_MASTER_KEY \
             -e RUSTFS_VOLUMES=/data \
             -e RUSTFS_ADDRESS=":9000" \
             -e RUSTFS_CONSOLE_ENABLE="true" \
