@@ -20,6 +20,9 @@ const HEAL_STOP_STILL_RUNNING_MESSAGE: &str =
 /// Heal subcommands
 #[derive(Subcommand, Debug)]
 pub enum HealCommands {
+    /// Manage retained MRF responsibilities without assuming data verification
+    #[command(subcommand)]
+    Mrf(super::mrf::MrfCommands),
     /// Display current heal status
     Status(StatusArgs),
 
@@ -255,6 +258,7 @@ fn heal_status_indicator(status: &HealStatus) -> HealStatusIndicator {
 /// Execute a heal subcommand
 pub async fn execute(cmd: HealCommands, formatter: &Formatter) -> ExitCode {
     match cmd {
+        HealCommands::Mrf(command) => super::mrf::execute(command, formatter).await,
         HealCommands::Status(args) => execute_status(args, formatter).await,
         HealCommands::Start(args) => execute_start(args, formatter).await,
         HealCommands::Stop(args) => execute_stop(args, formatter).await,

@@ -1,0 +1,14 @@
+---
+source: crates/cli/tests/admin_recovery.rs
+expression: value
+---
+{
+  "error": {
+    "automatic_retry": false,
+    "exit_code": 4,
+    "message": "Authentication failed: permission denied for recovery administration"
+  },
+  "schema_version": 3,
+  "status": "error",
+  "type": "mrf_observation"
+}
