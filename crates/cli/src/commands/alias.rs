@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::exit_code::ExitCode;
 use crate::output::{Formatter, OutputConfig};
+use crate::secret_input::{SecretSource, can_prompt, read_code_interactive};
 use rc_core::{Alias, AliasManager, Error, ObjectStore as _, validate_alias_endpoint};
 use rc_s3::S3Client;
 
@@ -43,10 +44,10 @@ pub struct SetArgs {
     /// S3 endpoint URL (e.g., `http://localhost:9000`, `https://s3.amazonaws.com`)
     pub endpoint: String,
 
-    /// Access key ID (omit with --anonymous)
+    /// Access key ID (prompted on a terminal when omitted; omit with --anonymous)
     pub access_key: Option<String>,
 
-    /// Secret access key (omit with --anonymous)
+    /// Secret access key (prompted on a terminal when omitted; omit with --anonymous)
     pub secret_key: Option<String>,
 
     /// Send requests without SigV4 credentials
@@ -236,7 +237,7 @@ pub async fn execute(cmd: AliasCommands, output_config: OutputConfig) -> ExitCod
     }
 }
 
-async fn execute_set(args: SetArgs, manager: &AliasManager, formatter: &Formatter) -> ExitCode {
+async fn execute_set(mut args: SetArgs, manager: &AliasManager, formatter: &Formatter) -> ExitCode {
     // Validate inputs
     if args.name.is_empty() {
         return formatter.fail(ExitCode::UsageError, "Alias name cannot be empty");
@@ -257,11 +258,11 @@ async fn execute_set(args: SetArgs, manager: &AliasManager, formatter: &Formatte
         );
     }
 
-    let has_access_key = args
+    let mut has_access_key = args
         .access_key
         .as_ref()
         .is_some_and(|value| !value.is_empty());
-    let has_secret_key = args
+    let mut has_secret_key = args
         .secret_key
         .as_ref()
         .is_some_and(|value| !value.is_empty());
@@ -271,6 +272,38 @@ async fn execute_set(args: SetArgs, manager: &AliasManager, formatter: &Formatte
             ExitCode::UsageError,
             "Anonymous aliases must not include access key or secret key credentials",
         );
+    }
+
+    // Prompt for missing keys only on a terminal, so scripts and --json keep
+    // failing fast instead of hanging. This keeps the keys out of shell history.
+    if !args.anonymous && (!has_access_key || !has_secret_key) && can_prompt(formatter.is_json()) {
+        if !has_access_key {
+            match read_code_interactive("Enter Access Key: ") {
+                Ok(value) if !value.is_empty() => {
+                    args.access_key = Some(value.to_string());
+                    has_access_key = true;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    let code = exit_code_from_error(&e);
+                    formatter.error_with_code(code, &e.to_string());
+                    return code;
+                }
+            }
+        }
+        if !has_secret_key {
+            match SecretSource::Prompt.load("Enter Secret Key: ") {
+                Ok(value) => {
+                    args.secret_key = Some(value.to_string());
+                    has_secret_key = true;
+                }
+                Err(e) => {
+                    let code = exit_code_from_error(&e);
+                    formatter.error_with_code(code, &e.to_string());
+                    return code;
+                }
+            }
+        }
     }
 
     if !args.anonymous && (!has_access_key || !has_secret_key) {
