@@ -2,7 +2,9 @@
 
 ## Purpose
 
-The `rc bucket` operation is the preferred noun-first entry point for bucket-oriented workflows. It groups bucket listing, creation, deletion, notification, CORS, encryption, versioning, Object Lock, Public Access Block, quota, anonymous access, lifecycle, and replication operations under one command family.
+The `rc bucket` operation is the preferred noun-first entry point for bucket-oriented workflows. It groups bucket listing, creation, deletion, notification, CORS, encryption, versioning, Object Lock, quota, anonymous access, lifecycle, and replication operations under one command family.
+
+The command family also includes bucket-level S3 Public Access Block configuration.
 
 ## Syntax
 
@@ -58,7 +60,7 @@ rc bucket replication <add|update|list|status|diff|remove|export|import|check|re
 | `--years COUNT` | Set a positive default retention duration in years. Conflicts with `--days`. |
 | `--force` | Force destructive or capability-gated operations; for `bucket remove`, run staged cleanup before ordinary deletion. |
 | `--dangerous` | Permit bounded abort of pre-discovered multipart uploads during removal. Requires `--force --yes`. |
-| `--yes` | Confirm dangerous multipart cleanup or removal of Public Access Block settings, which can allow public bucket policies. |
+| `--yes` | Confirm dangerous multipart cleanup. |
 
 ## Examples
 
@@ -99,6 +101,8 @@ rc bucket public-access-block set local/archive public-access-block.json
 rc bucket public-access-block get local/archive
 rc bucket public-access-block remove local/archive --yes
 ```
+
+Removing Public Access Block settings requires `--yes` because it can allow public bucket policies.
 
 Inspect and update the bucket Object Lock default:
 
