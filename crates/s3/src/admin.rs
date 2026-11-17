@@ -5642,6 +5642,44 @@ impl AdminApi for AdminClient {
         self.request(Method::PUT, "/site-replication/remove", None, Some(&body))
             .await
     }
+
+    async fn site_replication_remove_v2(
+        &self,
+        spec: &rc_core::admin::SiteRemoveV2Spec,
+    ) -> Result<rc_core::admin::SiteRemoveV2Status> {
+        let body = serde_json::to_vec(spec).map_err(Error::Json)?;
+        let result: rc_core::admin::SiteRemoveV2Status = self
+            .request_site_replication(
+                Method::PUT,
+                "/site-replication/remove-v2",
+                Some(&body),
+                "Site decommissioning",
+                (spec.mode == "execute").then_some("Site decommissioning"),
+                None,
+            )
+            .await?;
+        if result.contract_version != 2
+            || !matches!(result.status.as_str(), "planned" | "Partial" | "success")
+            || result.operation_id.is_empty()
+            || result.preflight_token.is_empty()
+            || spec
+                .operation_id
+                .as_ref()
+                .is_some_and(|id| *id != result.operation_id)
+            || result.decommissioned_deployment_ids.is_empty()
+            || result
+                .decommissioned_deployment_ids
+                .iter()
+                .any(|id| !result.removed_deployment_ids.contains(id))
+            || (result.status == "success"
+                && (!result.local_cleanup_complete || !result.pending_peers.is_empty()))
+        {
+            return Err(Error::General(
+                "Invalid durable decommissioning response".to_string(),
+            ));
+        }
+        Ok(result)
+    }
 }
 
 #[async_trait]

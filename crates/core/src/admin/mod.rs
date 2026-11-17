@@ -138,14 +138,14 @@ pub use site::{
     MAX_SITE_REPLICATION_CA_CERT_BYTES, MAX_SITE_REPLICATION_ERROR_RESPONSE_BYTES,
     MAX_SITE_REPLICATION_REPAIR_RESPONSE_BYTES, MAX_SITE_REPLICATION_REQUEST_BYTES,
     MAX_SITE_REPLICATION_SUCCESS_RESPONSE_BYTES, PeerSiteSpec, ReplicateEditStatus,
-    SITE_REPLICATION_REPAIR_CAPABILITY, ServiceActionResult, SiteRemoveSpec, SiteReplicationInfo,
-    SiteReplicationPeer, SiteReplicationRepairApi, SiteReplicationRepairCapabilityContract,
-    SiteReplicationRepairFamilyStatus, SiteReplicationRepairOperationStatus,
-    SiteReplicationRepairPreflight, SiteReplicationRepairRequest, SiteReplicationRepairSiteStatus,
-    SiteReplicationRepairTaskStatus, SiteReplicationResyncBucketStatus,
-    SiteReplicationResyncOperation, SiteReplicationResyncStatus, SiteStatusOptions,
-    validate_site_replication_ca_bundle, validate_site_replication_repair_operation_id,
-    validate_site_replication_repair_token,
+    SITE_REPLICATION_REPAIR_CAPABILITY, ServiceActionResult, SiteRemoveSpec, SiteRemoveV2Spec,
+    SiteRemoveV2Status, SiteReplicationInfo, SiteReplicationPeer, SiteReplicationRepairApi,
+    SiteReplicationRepairCapabilityContract, SiteReplicationRepairFamilyStatus,
+    SiteReplicationRepairOperationStatus, SiteReplicationRepairPreflight,
+    SiteReplicationRepairRequest, SiteReplicationRepairSiteStatus, SiteReplicationRepairTaskStatus,
+    SiteReplicationResyncBucketStatus, SiteReplicationResyncOperation, SiteReplicationResyncStatus,
+    SiteStatusOptions, validate_site_replication_ca_bundle,
+    validate_site_replication_repair_operation_id, validate_site_replication_repair_token,
 };
 pub use tier::{
     ManualTransitionJobResponse, ManualTransitionQueueSnapshot, ManualTransitionRunReport,
@@ -420,6 +420,16 @@ pub trait AdminApi: Send + Sync {
 
     /// Remove sites from the site replication cluster
     async fn site_replication_remove(&self, spec: &SiteRemoveSpec) -> Result<serde_json::Value>;
+
+    /// Preview or execute durable decommissioning. Never falls back to legacy removal.
+    async fn site_replication_remove_v2(
+        &self,
+        _spec: &SiteRemoveV2Spec,
+    ) -> Result<SiteRemoveV2Status> {
+        Err(crate::Error::UnsupportedFeature(
+            "Durable site decommissioning is unavailable".to_string(),
+        ))
+    }
 }
 
 /// Read-only RustFS runtime capability discovery.
