@@ -595,6 +595,60 @@ fn replicate_remove_force_rejects_old_server_without_sending_legacy_remove() {
 }
 
 #[test]
+fn replicate_remove_force_retains_operation_id_when_execute_response_is_invalid() {
+    for json in [false, true] {
+        let (endpoint, requests, server) = start_admin_sequence_test_server(vec![
+            ("200 OK", REMOVE_V2_PREVIEW),
+            ("200 OK", "invalid JSON"),
+        ]);
+        let config = tempfile::tempdir().expect("config");
+        let mut command = Command::new(rc_binary());
+        if json {
+            command.arg("--json");
+        }
+        let output = command
+            .args([
+                "admin",
+                "replicate",
+                "remove",
+                "myalias",
+                "--site",
+                "secondary",
+                "--force",
+                "--yes",
+            ])
+            .env("RC_CONFIG_DIR", config.path())
+            .env("RC_HOST_myalias", rc_host_alias(&endpoint))
+            .output()
+            .expect("run");
+        assert!(!output.status.success());
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            text.contains("550e8400-e29b-41d4-a716-446655440000"),
+            "{text}"
+        );
+        assert!(text.contains("outcome is unknown"), "{text}");
+        assert!(text.contains("--operation-id"), "{text}");
+        if !json {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(stdout.contains("Removal deployments: secondary-dep"));
+            assert!(stdout.contains("Decommissioned deployments: secondary-dep"));
+        }
+        requests
+            .recv_timeout(Duration::from_secs(5))
+            .expect("preview");
+        requests
+            .recv_timeout(Duration::from_secs(5))
+            .expect("execute");
+        server.join().expect("server finished");
+    }
+}
+
+#[test]
 fn replicate_info_json_uses_safe_projection() {
     let config_dir = tempfile::tempdir().expect("create config dir");
     let (endpoint, _receiver, handle) = start_admin_test_server(EDIT_INFO_RESPONSE);

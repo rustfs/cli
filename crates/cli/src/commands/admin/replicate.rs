@@ -1625,6 +1625,17 @@ async fn execute_remove(args: RemoveArgs, formatter: &Formatter) -> ExitCode {
                 return emit_admin_error(formatter, &err, "site-replication-decommission", false);
             }
         };
+        if !formatter.is_json() {
+            formatter.println(&format!(
+                "Removal deployments: {}",
+                preview.removed_deployment_ids.join(", ")
+            ));
+            formatter.println(&format!(
+                "Decommissioned deployments: {}",
+                preview.decommissioned_deployment_ids.join(", ")
+            ));
+            formatter.println(&format!("Operation ID: {}", preview.operation_id));
+        }
         request.mode = "execute".to_string();
         request.operation_id = Some(preview.operation_id.clone());
         request.preflight_token = Some(preview.preflight_token);
@@ -1651,7 +1662,19 @@ async fn execute_remove(args: RemoveArgs, formatter: &Formatter) -> ExitCode {
                     ExitCode::Conflict
                 }
             }
-            Err(err) => emit_admin_error(formatter, &err, "site-replication-decommission", true),
+            Err(err) => {
+                let code = ExitCode::from_i32(err.exit_code()).unwrap_or(ExitCode::GeneralError);
+                let id = request.operation_id.as_deref().unwrap_or("unknown");
+                emit_admin_message_error(
+                    formatter,
+                    code,
+                    "site-replication-decommission",
+                    true,
+                    format!(
+                        "{err}; operation ID: {id}; inspect or resume with the same selectors and --operation-id {id}"
+                    ),
+                )
+            }
         };
     }
 

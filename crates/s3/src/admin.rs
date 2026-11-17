@@ -5655,7 +5655,7 @@ impl AdminApi for AdminClient {
                 Some(&body),
                 "Site decommissioning",
                 (spec.mode == "execute").then_some("Site decommissioning"),
-                None,
+                (spec.mode == "execute").then_some("Site decommissioning"),
             )
             .await?;
         if result.contract_version != 2
