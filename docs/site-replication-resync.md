@@ -1,5 +1,13 @@
 # Site Replication Resync Snapshots
 
+## Permanent site decommissioning
+
+Use `rc admin replicate remove primary --site "Site 2" --force --yes` for a permanently retired remote site. This uses the native durable removal v2 route: the CLI previews the exact deployment identities and deletion scope, then executes with the returned operation ID and preflight token. Unsupported servers are rejected without falling back to ordinary removal.
+
+To dissolve all site replication while skipping only explicitly retired peers, use `rc admin replicate remove primary --all --force --decommissioned-site "Site 2" --yes`. All other participating sites must acknowledge durable local configuration cleanup. A `Partial` result exits with conflict status and reports its operation ID; retry with the same selectors and `--operation-id <id>`.
+
+An existing ordinary pending removal can be resumed through force only with its original deletion scope. Success means site-derived replication rules, targets, and resync intents have been cleaned; ordinary objects, historical versions, and Object Lock protections remain. Background replication purge recovery can subsequently release versions already awaiting deletion once their retired target is no longer configured. Do not downgrade surviving nodes while a durable removal is pending.
+
 `rc` exposes the RustFS site-replication resync handler through three bounded commands:
 
 ```text

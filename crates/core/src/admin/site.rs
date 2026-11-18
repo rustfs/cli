@@ -861,6 +861,35 @@ pub struct SiteRemoveSpec {
     pub remove_all: bool,
 }
 
+/// Explicit durable decommissioning request for the native v2 route.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SiteRemoveV2Spec {
+    pub mode: String,
+    pub sites: Vec<String>,
+    pub all: bool,
+    pub decommissioned_sites: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preflight_token: Option<String>,
+}
+
+/// Configuration cleanup progress; success does not mean the bucket is empty.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SiteRemoveV2Status {
+    pub contract_version: u32,
+    pub operation_id: String,
+    pub status: String,
+    pub preflight_token: String,
+    pub removed_deployment_ids: Vec<String>,
+    pub decommissioned_deployment_ids: Vec<String>,
+    pub pending_peers: Vec<String>,
+    pub local_cleanup_complete: bool,
+    pub errors: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

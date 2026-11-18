@@ -81,6 +81,38 @@ use crate::lifecycle_xml::{
 const SINGLE_PUT_OBJECT_MAX_SIZE: u64 = crate::multipart::DEFAULT_PART_SIZE;
 const S3_SERVICE_NAME: &str = "s3";
 const S3_REPLICATION_XML_NAMESPACE: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
+
+fn format_resync_duration(duration: Duration) -> String {
+    let mut remaining = duration.as_secs();
+    let mut parts = Vec::new();
+    for (seconds, suffix) in [
+        (31_557_600, "years"),
+        (2_630_016, "months"),
+        (86_400, "days"),
+        (3600, "h"),
+        (60, "m"),
+        (1, "s"),
+    ] {
+        let count = remaining / seconds;
+        if count > 0 {
+            parts.push(format!("{count}{suffix}"));
+            remaining %= seconds;
+        }
+    }
+    let mut nanos = duration.subsec_nanos();
+    for (unit, suffix) in [(1_000_000, "ms"), (1000, "us"), (1, "ns")] {
+        let count = nanos / unit;
+        if count > 0 {
+            parts.push(format!("{count}{suffix}"));
+            nanos %= unit;
+        }
+    }
+    if parts.is_empty() {
+        "0s".to_string()
+    } else {
+        parts.join(" ")
+    }
+}
 const RUSTFS_FORCE_DELETE_HEADER: &str = "x-rustfs-force-delete";
 const REPLICATION_EXTENSION_BODY_LIMIT: u64 = 1024 * 1024;
 const REPLICATION_CHECK_PROBE_NAMESPACE: &str = ".rustfs.sys/replication-check/";
@@ -7564,10 +7596,7 @@ impl ObjectStore for S3Client {
             query.push(("arn", target_arn));
         }
         if let Some(older_than) = options.older_than {
-            query.push((
-                "older-than",
-                humantime::format_duration(older_than).to_string(),
-            ));
+            query.push(("older-than", format_resync_duration(older_than)));
         }
         if let Some(reset_id) = options.reset_id {
             query.push(("reset-id", reset_id));
@@ -7800,7 +7829,7 @@ impl ControlExecutor for S3Client {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aws_smithy_http_client::test_util::{
+    use crate::test_http::{
         CaptureRequestReceiver, ReplayEvent, StaticReplayClient, capture_request,
     };
     use rc_core::{
@@ -7818,6 +7847,20 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
     use tokio::sync::Notify;
+
+    #[test]
+    fn resync_duration_formatter_preserves_every_nanosecond() {
+        assert_eq!(format_resync_duration(Duration::from_secs(3600)), "1h");
+        assert_eq!(
+            format_resync_duration(Duration::new(3661, 123_456_789)),
+            "1h 1m 1s 123ms 456us 789ns"
+        );
+        assert_eq!(format_resync_duration(Duration::ZERO), "0s");
+        assert_eq!(
+            format_resync_duration(Duration::from_secs(31_557_600 + 2_630_016)),
+            "1years 1months"
+        );
+    }
 
     #[derive(Debug)]
     struct CapturedXmlRequest {

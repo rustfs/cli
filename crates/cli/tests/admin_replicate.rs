@@ -490,6 +490,165 @@ fn replicate_remove_requires_site_or_all() {
 }
 
 #[test]
+fn replicate_remove_force_requires_explicit_confirmation_and_all_exclusions() {
+    for args in [
+        vec!["--site", "secondary", "--force"],
+        vec!["--all", "--force", "--yes"],
+    ] {
+        let output = Command::new(rc_binary())
+            .args(["admin", "replicate", "remove", "myalias"])
+            .args(args)
+            .output()
+            .expect("run validation");
+        assert_eq!(output.status.code(), Some(2));
+    }
+}
+
+const REMOVE_V2_PREVIEW: &str = r#"{"contractVersion":2,"operationId":"550e8400-e29b-41d4-a716-446655440000","status":"planned","preflightToken":"preview-token","removedDeploymentIds":["secondary-dep"],"decommissionedDeploymentIds":["secondary-dep"],"pendingPeers":[],"localCleanupComplete":false,"errors":[]}"#;
+const REMOVE_V2_SUCCESS: &str = r#"{"contractVersion":2,"operationId":"550e8400-e29b-41d4-a716-446655440000","status":"success","preflightToken":"preview-token","removedDeploymentIds":["secondary-dep"],"decommissionedDeploymentIds":["secondary-dep"],"pendingPeers":[],"localCleanupComplete":true,"errors":[]}"#;
+const REMOVE_V2_PARTIAL: &str = r#"{"contractVersion":2,"operationId":"550e8400-e29b-41d4-a716-446655440000","status":"Partial","preflightToken":"preview-token","removedDeploymentIds":["secondary-dep"],"decommissionedDeploymentIds":["secondary-dep"],"pendingPeers":["third-dep"],"localCleanupComplete":true,"errors":["peer unavailable"]}"#;
+
+#[test]
+fn replicate_remove_force_uses_preview_and_v2_without_legacy_fallback() {
+    for (response, exit) in [(REMOVE_V2_SUCCESS, 0), (REMOVE_V2_PARTIAL, 6)] {
+        let (endpoint, requests, server) = start_admin_sequence_test_server(vec![
+            ("200 OK", REMOVE_V2_PREVIEW),
+            ("200 OK", response),
+        ]);
+        let config = tempfile::tempdir().expect("config");
+        let output = Command::new(rc_binary())
+            .args([
+                "--json",
+                "admin",
+                "replicate",
+                "remove",
+                "myalias",
+                "--site",
+                "secondary",
+                "--force",
+                "--yes",
+            ])
+            .env("RC_CONFIG_DIR", config.path())
+            .env("RC_HOST_myalias", rc_host_alias(&endpoint))
+            .output()
+            .expect("run decommission");
+        assert_eq!(
+            output.status.code(),
+            Some(exit),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for mode in ["dry-run", "execute"] {
+            let request = requests
+                .recv_timeout(Duration::from_secs(5))
+                .expect("request");
+            assert_eq!(
+                request.target,
+                "/rustfs/admin/v3/site-replication/remove-v2"
+            );
+            let body: serde_json::Value = serde_json::from_slice(&request.body).expect("JSON");
+            assert_eq!(body["mode"], mode);
+            assert_eq!(body["sites"], serde_json::json!(["secondary"]));
+            if mode == "execute" {
+                assert_eq!(body["preflightToken"], "preview-token");
+            }
+        }
+        let result: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("JSON output");
+        assert_eq!(
+            result["status"],
+            if exit == 0 { "success" } else { "Partial" }
+        );
+        server.join().expect("server finished");
+    }
+}
+
+#[test]
+fn replicate_remove_force_rejects_old_server_without_sending_legacy_remove() {
+    let (endpoint, requests, server) =
+        start_admin_sequence_test_server(vec![("404 Not Found", "{}")]);
+    let config = tempfile::tempdir().expect("config");
+    let output = Command::new(rc_binary())
+        .args([
+            "admin",
+            "replicate",
+            "remove",
+            "myalias",
+            "--site",
+            "secondary",
+            "--force",
+            "--yes",
+        ])
+        .env("RC_CONFIG_DIR", config.path())
+        .env("RC_HOST_myalias", rc_host_alias(&endpoint))
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(7));
+    assert_eq!(
+        requests
+            .recv_timeout(Duration::from_secs(5))
+            .expect("request")
+            .target,
+        "/rustfs/admin/v3/site-replication/remove-v2"
+    );
+    server.join().expect("server finished");
+}
+
+#[test]
+fn replicate_remove_force_retains_operation_id_when_execute_response_is_invalid() {
+    for json in [false, true] {
+        let (endpoint, requests, server) = start_admin_sequence_test_server(vec![
+            ("200 OK", REMOVE_V2_PREVIEW),
+            ("200 OK", "invalid JSON"),
+        ]);
+        let config = tempfile::tempdir().expect("config");
+        let mut command = Command::new(rc_binary());
+        if json {
+            command.arg("--json");
+        }
+        let output = command
+            .args([
+                "admin",
+                "replicate",
+                "remove",
+                "myalias",
+                "--site",
+                "secondary",
+                "--force",
+                "--yes",
+            ])
+            .env("RC_CONFIG_DIR", config.path())
+            .env("RC_HOST_myalias", rc_host_alias(&endpoint))
+            .output()
+            .expect("run");
+        assert!(!output.status.success());
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            text.contains("550e8400-e29b-41d4-a716-446655440000"),
+            "{text}"
+        );
+        assert!(text.contains("outcome is unknown"), "{text}");
+        assert!(text.contains("--operation-id"), "{text}");
+        if !json {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(stdout.contains("Removal deployments: secondary-dep"));
+            assert!(stdout.contains("Decommissioned deployments: secondary-dep"));
+        }
+        requests
+            .recv_timeout(Duration::from_secs(5))
+            .expect("preview");
+        requests
+            .recv_timeout(Duration::from_secs(5))
+            .expect("execute");
+        server.join().expect("server finished");
+    }
+}
+
+#[test]
 fn replicate_info_json_uses_safe_projection() {
     let config_dir = tempfile::tempdir().expect("create config dir");
     let (endpoint, _receiver, handle) = start_admin_test_server(EDIT_INFO_RESPONSE);
