@@ -609,7 +609,7 @@ These tiers describe S3-compatible data operations. The `rc admin` commands use 
 
 ### Minimum Rust Version
 
-- Rust 1.92 or higher (Edition 2024)
+- Rust 1.99 or higher (Edition 2024)
 
 ## Development
 

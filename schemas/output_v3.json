@@ -1787,6 +1787,493 @@
         }
       ]
     },
+    "recoveryFamily": {
+      "enum": [
+        "mrf_observation",
+        "integrity_readiness",
+        "integrity_inventory",
+        "integrity_create",
+        "integrity_job",
+        "integrity_control",
+        "integrity"
+      ]
+    },
+    "mrfSummary": {
+      "type": "object",
+      "required": [
+        "contractVersion",
+        "sampledAtMs",
+        "checkpointReadable",
+        "checkpointOwner",
+        "checkpointSequence",
+        "activeResponsibilityCount",
+        "heldCount",
+        "legacyGenerationUnknownCount",
+        "bucketIncarnationChangedCount",
+        "operatorAcceptedCount",
+        "bestEffortQueueDepth",
+        "responsibilityBytes"
+      ],
+      "properties": {
+        "contractVersion": {"const": 1},
+        "sampledAtMs": {"type": "integer", "minimum": 0},
+        "checkpointReadable": {"type": "boolean"},
+        "checkpointOwner": {"$ref": "#/definitions/nullableString"},
+        "checkpointSequence": {"$ref": "#/definitions/nullableBytes"},
+        "activeResponsibilityCount": {"type": "integer", "minimum": 0},
+        "heldCount": {"type": "integer", "minimum": 0},
+        "legacyGenerationUnknownCount": {"type": "integer", "minimum": 0},
+        "bucketIncarnationChangedCount": {"type": "integer", "minimum": 0},
+        "operatorAcceptedCount": {"type": "integer", "minimum": 0},
+        "bestEffortQueueDepth": {"type": "integer", "minimum": 0},
+        "responsibilityBytes": {"type": "integer", "minimum": 0}
+      }
+    },
+    "mrfResponsibility": {
+      "type": "object",
+      "required": [
+        "responsibilityId",
+        "bucket",
+        "object",
+        "sourceBucketIncarnationId",
+        "bucketIncarnationId",
+        "versionId",
+        "status",
+        "accepted"
+      ],
+      "properties": {
+        "responsibilityId": {"type": "string"},
+        "bucket": {"type": "string"},
+        "object": {"type": "string"},
+        "sourceBucketIncarnationId": {"$ref": "#/definitions/nullableString"},
+        "bucketIncarnationId": {"$ref": "#/definitions/nullableString"},
+        "versionId": {"$ref": "#/definitions/nullableString"},
+        "status": {"type": "string"},
+        "accepted": {"anyOf": [{"type": "object"}, {"type": "null"}]}
+      }
+    },
+    "mrfPage": {
+      "type": "object",
+      "required": ["contractVersion", "nodeLocal", "responsibilities", "nextCursor"],
+      "properties": {
+        "contractVersion": {"const": 2},
+        "nodeLocal": {"const": true},
+        "responsibilities": {
+          "type": "array",
+          "items": {"$ref": "#/definitions/mrfResponsibility"}
+        },
+        "nextCursor": {"$ref": "#/definitions/nullableString"}
+      }
+    },
+    "mrfCurrentResponsibility": {
+      "type": "object",
+      "required": ["contractVersion", "observedAtMs", "responsibility"],
+      "properties": {
+        "contractVersion": {"const": 1},
+        "observedAtMs": {"type": "integer", "minimum": 0},
+        "responsibility": {"anyOf": [{"$ref": "#/definitions/mrfResponsibility"}, {"type": "null"}]}
+      }
+    },
+    "mrfActionResult": {
+      "type": "object",
+      "required": ["responsibilityId", "state", "dataVerified", "durableResponsibilityRetained"],
+      "properties": {
+        "responsibilityId": {"type": "string"},
+        "state": {"type": "string"},
+        "dataVerified": {"const": false},
+        "durableResponsibilityRetained": {"const": true}
+      }
+    },
+    "mrfReply": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["result", "summary"],
+          "properties": {
+            "result": {"const": "summary"},
+            "summary": {"$ref": "#/definitions/mrfSummary"}
+          }
+        },
+        {
+          "type": "object",
+          "required": ["result", "snapshot", "observedAtMs"],
+          "properties": {
+            "result": {"const": "list"},
+            "snapshot": {"$ref": "#/definitions/mrfPage"},
+            "observedAtMs": {"type": "integer", "minimum": 0}
+          }
+        },
+        {
+          "type": "object",
+          "required": ["result", "observation"],
+          "properties": {
+            "result": {"const": "get"},
+            "observation": {"$ref": "#/definitions/mrfCurrentResponsibility"}
+          }
+        },
+        {
+          "type": "object",
+          "required": ["result", "action"],
+          "properties": {
+            "result": {"const": "action"},
+            "action": {"$ref": "#/definitions/mrfActionResult"}
+          }
+        },
+        {
+          "type": "object",
+          "required": ["result", "code"],
+          "properties": {
+            "result": {"const": "error"},
+            "code": {"type": "string"}
+          }
+        },
+        {
+          "type": "object",
+          "required": ["result"],
+          "properties": {
+            "result": {"const": "unknown"}
+          }
+        }
+      ]
+    },
+    "mrfObservation": {
+      "type": "object",
+      "required": [
+        "contractVersion",
+        "topologyFingerprint",
+        "observationStartedAtMs",
+        "observationFinishedAtMs",
+        "expectedNodes",
+        "pageComplete",
+        "nextCursor",
+        "nodes"
+      ],
+      "properties": {
+        "contractVersion": {"const": 1},
+        "topologyFingerprint": {"type": "string"},
+        "observationStartedAtMs": {"type": "integer", "minimum": 0},
+        "observationFinishedAtMs": {"type": "integer", "minimum": 0},
+        "expectedNodes": {"type": "integer", "minimum": 1},
+        "pageComplete": {"type": "boolean"},
+        "nextCursor": {"$ref": "#/definitions/nullableString"},
+        "nodes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["nodeId", "host", "state", "reply"],
+            "properties": {
+              "nodeId": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"},
+              "host": {"type": "string"},
+              "state": {"type": "string"},
+              "reply": {"anyOf": [{"$ref": "#/definitions/mrfReply"}, {"type": "null"}]}
+            }
+          }
+        }
+      }
+    },
+    "integrityReadiness": {
+      "type": "object",
+      "required": [],
+      "properties": {
+        "local_reader_supported": {"type": "boolean"},
+        "write_requested": {"type": "boolean"},
+        "fleet_operator_attested": {"type": "boolean"},
+        "new_writes_enabled_here": {"type": "boolean"},
+        "fleet_capability_verified": {"type": "boolean"},
+        "unverified_requirements": {
+          "type": "array",
+          "items": {"type": "string"}
+        }
+      }
+    },
+    "integrityInventoryItem": {
+      "type": "object",
+      "required": ["key", "version_id", "size", "protection", "audit_unsupported", "source_fingerprint", "observation_error"],
+      "properties": {
+        "key": {"type": "string"},
+        "version_id": {"type": "string"},
+        "size": {"type": "integer"},
+        "protection": {"type": "string"},
+        "audit_unsupported": {"$ref": "#/definitions/nullableString"},
+        "source_fingerprint": {"type": "string"},
+        "observation_error": {"$ref": "#/definitions/nullableString"}
+      }
+    },
+    "integrityInventory": {
+      "type": "object",
+      "required": ["observed_at", "bucket_incarnation", "items", "is_truncated", "next_key_marker", "next_version_marker"],
+      "properties": {
+        "observed_at": {"type": "string"},
+        "bucket_incarnation": {"type": "string"},
+        "items": {
+          "type": "array",
+          "items": {"$ref": "#/definitions/integrityInventoryItem"}
+        },
+        "is_truncated": {"type": "boolean"},
+        "next_key_marker": {"$ref": "#/definitions/nullableString"},
+        "next_version_marker": {"$ref": "#/definitions/nullableString"}
+      }
+    },
+    "integritySelection": {
+      "type": "object",
+      "required": ["bucket", "inventory"],
+      "properties": {
+        "bucket": {"type": "string"},
+        "inventory": {"$ref": "#/definitions/integrityInventory"}
+      }
+    },
+    "integrityItem": {
+      "type": "object",
+      "required": ["key", "version_id", "expected_sha256", "target_key"],
+      "properties": {
+        "key": {"type": "string"},
+        "version_id": {"$ref": "#/definitions/nullableString"},
+        "expected_sha256": {"$ref": "#/definitions/nullableString"},
+        "target_key": {"$ref": "#/definitions/nullableString"}
+      }
+    },
+    "integrityRequest": {
+      "type": "object",
+      "required": ["mode", "items", "bytes_per_second", "max_object_bytes"],
+      "properties": {
+        "mode": {"enum": ["audit", "migrate"]},
+        "items": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": {"$ref": "#/definitions/integrityItem"}
+        },
+        "bytes_per_second": {"type": "integer", "minimum": 65536, "maximum": 1073741824},
+        "max_object_bytes": {"type": "integer", "minimum": 1, "maximum": 5368709120}
+      }
+    },
+    "integrityItemResult": {
+      "type": "object",
+      "required": [
+        "state",
+        "source_fingerprint",
+        "expected_sha256",
+        "evidence_source",
+        "source_size",
+        "target_version_id",
+        "detail"
+      ],
+      "properties": {
+        "state": {"type": "string"},
+        "source_fingerprint": {"$ref": "#/definitions/nullableString"},
+        "expected_sha256": {"$ref": "#/definitions/nullableString"},
+        "evidence_source": {"$ref": "#/definitions/nullableString"},
+        "source_size": {"$ref": "#/definitions/nullableBytes"},
+        "target_version_id": {"$ref": "#/definitions/nullableString"},
+        "detail": {"$ref": "#/definitions/nullableString"}
+      }
+    },
+    "integrityJob": {
+      "type": "object",
+      "required": [
+        "format_version",
+        "id",
+        "bucket",
+        "bucket_incarnation",
+        "request",
+        "state",
+        "revision",
+        "results",
+        "last_error"
+      ],
+      "properties": {
+        "format_version": {"const": 1},
+        "id": {"type": "string"},
+        "bucket": {"type": "string"},
+        "bucket_incarnation": {"type": "string"},
+        "request": {"$ref": "#/definitions/integrityRequest"},
+        "state": {"type": "string"},
+        "revision": {"type": "integer", "minimum": 0},
+        "results": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": {"$ref": "#/definitions/integrityItemResult"}
+        },
+        "last_error": {"$ref": "#/definitions/nullableString"}
+      }
+    },
+    "integrityReceipt": {
+      "type": "object",
+      "required": [
+        "format_version",
+        "alias",
+        "endpoint",
+        "job",
+        "inventory_observed_at",
+        "inventory_bucket_incarnation",
+        "digest_source_reference",
+        "qualification",
+        "readiness",
+        "estimate",
+        "query_command",
+        "resume_command"
+      ],
+      "properties": {
+        "format_version": {"const": 1},
+        "alias": {"type": "string"},
+        "endpoint": {"type": "string"},
+        "job": {"$ref": "#/definitions/integrityJob"},
+        "inventory_observed_at": {"type": "string"},
+        "inventory_bucket_incarnation": {"type": "string"},
+        "digest_source_reference": {"$ref": "#/definitions/nullableString"},
+        "qualification": {
+          "anyOf": [
+            {
+              "type": "object",
+              "required": ["deployment_id", "reference", "operator_attested"],
+              "properties": {
+                "deployment_id": {"type": "string"},
+                "reference": {"type": "string"},
+                "operator_attested": {"const": true}
+              }
+            },
+            {"type": "null"}
+          ]
+        },
+        "readiness": {"anyOf": [{"$ref": "#/definitions/integrityReadiness"}, {"type": "null"}]},
+        "estimate": {
+          "type": "object",
+          "required": [
+            "object_count",
+            "inventory_selected_bytes",
+            "per_stream_bytes_per_second",
+            "stream_passes",
+            "minimum_stream_seconds",
+            "peak_payload_staging_budget",
+            "note"
+          ],
+          "properties": {
+            "object_count": {"type": "integer", "minimum": 1, "maximum": 64},
+            "inventory_selected_bytes": {"$ref": "#/definitions/nullableBytes"},
+            "per_stream_bytes_per_second": {"type": "integer", "minimum": 0},
+            "stream_passes": {"enum": [1, 3]},
+            "minimum_stream_seconds": {"type": ["number", "null"], "minimum": 0},
+            "peak_payload_staging_budget": {"type": "integer", "minimum": 0},
+            "note": {"type": "string"}
+          }
+        },
+        "query_command": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "resume_command": {
+          "type": "array",
+          "items": {"type": "string"}
+        }
+      }
+    },
+    "integrityJobView": {
+      "type": "object",
+      "required": ["job", "retrieved_at", "checked_at", "source_responsibility_retained"],
+      "properties": {
+        "job": {"$ref": "#/definitions/integrityJob"},
+        "retrieved_at": {"$ref": "#/definitions/timestamp"},
+        "checked_at": {"const": null},
+        "source_responsibility_retained": {"const": true}
+      }
+    },
+    "recoveryOutput": {
+      "description": "Recovery commands preserve observation and control outcomes rather than collapsing them into success. Exit status is part of each command contract; accepted never certifies object contents.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["schema_version", "type", "status", "message", "data"],
+          "properties": {
+            "schema_version": {"const": 3},
+            "type": {"const": "mrf_observation"},
+            "status": {"enum": ["observed", "partial", "not_observed", "accepted", "unsupported", "unknown"]},
+            "message": {"type": "string", "minLength": 1},
+            "data": {"$ref": "#/definitions/mrfObservation"}
+          },
+          "not": {"required": ["error"]}
+        },
+        {
+          "type": "object",
+          "required": ["schema_version", "type", "status", "message", "data"],
+          "properties": {
+            "schema_version": {"const": 3},
+            "type": {"const": "integrity_readiness"},
+            "status": {"enum": ["observed"]},
+            "message": {"type": "string", "minLength": 1},
+            "data": {"$ref": "#/definitions/integrityReadiness"}
+          },
+          "not": {"required": ["error"]}
+        },
+        {
+          "type": "object",
+          "required": ["schema_version", "type", "status", "message", "data"],
+          "properties": {
+            "schema_version": {"const": 3},
+            "type": {"const": "integrity_inventory"},
+            "status": {"enum": ["observed", "partial"]},
+            "message": {"type": "string", "minLength": 1},
+            "data": {"$ref": "#/definitions/integritySelection"}
+          },
+          "not": {"required": ["error"]}
+        },
+        {
+          "type": "object",
+          "required": ["schema_version", "type", "status", "message", "data"],
+          "properties": {
+            "schema_version": {"const": 3},
+            "type": {"const": "integrity_create"},
+            "status": {"enum": ["paused_receipt_saved", "receipt_not_saved"]},
+            "message": {"type": "string", "minLength": 1},
+            "data": {"$ref": "#/definitions/integrityReceipt"}
+          },
+          "not": {"required": ["error"]}
+        },
+        {
+          "type": "object",
+          "required": ["schema_version", "type", "status", "message", "data"],
+          "properties": {
+            "schema_version": {"const": 3},
+            "type": {"const": "integrity_job"},
+            "status": {"enum": ["complete", "not_verified", "incomplete"]},
+            "message": {"type": "string", "minLength": 1},
+            "data": {"$ref": "#/definitions/integrityJobView"}
+          },
+          "not": {"required": ["error"]}
+        },
+        {
+          "type": "object",
+          "required": ["schema_version", "type", "status", "message", "data"],
+          "properties": {
+            "schema_version": {"const": 3},
+            "type": {"const": "integrity_control"},
+            "status": {"enum": ["accepted", "complete", "not_verified", "incomplete"]},
+            "message": {"type": "string", "minLength": 1},
+            "data": {"$ref": "#/definitions/integrityJob"}
+          },
+          "not": {"required": ["error"]}
+        },
+        {
+          "type": "object",
+          "required": ["schema_version", "type", "status", "error"],
+          "properties": {
+            "schema_version": {"const": 3},
+            "type": {"$ref": "#/definitions/recoveryFamily"},
+            "status": {"enum": ["error", "unknown"]},
+            "error": {
+              "type": "object",
+              "required": ["message", "exit_code", "automatic_retry"],
+              "properties": {
+                "message": {"type": "string", "minLength": 1},
+                "exit_code": {"enum": [1, 2, 3, 4, 5, 6, 7, 130]},
+                "automatic_retry": {"const": false}
+              }
+            }
+          },
+          "not": {"required": ["data"]}
+        }
+      ]
+    },
     "iamArchiveOutput": {
       "type": "object",
       "required": ["schema_version", "type", "status", "data"],
@@ -2077,6 +2564,7 @@
         }
       ]
     },
+    { "$ref": "#/definitions/recoveryOutput" },
     { "$ref": "#/definitions/errorOutput" }
   ]
 }

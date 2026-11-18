@@ -18,11 +18,14 @@ mod iam;
 mod idp;
 mod ilm;
 mod info;
+mod integrity;
 mod kms;
 mod metrics;
+mod mrf;
 mod policy;
 mod pool;
 mod rebalance;
+mod recovery;
 mod replicate;
 mod scanner;
 mod service;
@@ -41,6 +44,9 @@ use rc_s3::AdminClient;
 /// Admin subcommands for IAM and cluster management
 #[derive(Subcommand, Debug)]
 pub enum AdminCommands {
+    /// Inspect and verify explicit objects, or migrate qualified objects to new keys
+    #[command(subcommand)]
+    Integrity(integrity::IntegrityCommands),
     /// Manage table catalog maintenance, recovery and migration
     #[command(subcommand)]
     Table(super::table::AdminTableCommands),
@@ -148,6 +154,7 @@ pub async fn execute(cmd: AdminCommands, output_config: OutputConfig) -> ExitCod
     let formatter = Formatter::new(output_config);
 
     match cmd {
+        AdminCommands::Integrity(command) => integrity::execute(command, &formatter).await,
         AdminCommands::Table(cmd) => super::table::execute_admin(cmd, &formatter).await,
         AdminCommands::Account(account_cmd) => account::execute(account_cmd, &formatter).await,
         AdminCommands::Bucket(command) => bucket::execute(command, &formatter).await,

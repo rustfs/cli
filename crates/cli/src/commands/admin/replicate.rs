@@ -17,11 +17,12 @@ use super::{get_admin_client, normalize_admin_alias};
 use crate::exit_code::ExitCode;
 use crate::output::Formatter;
 use rc_core::admin::{
-    AdminApi, PeerSiteSpec, ReplicateEditStatus, SiteRemoveSpec, SiteReplicationInfo,
-    SiteReplicationPeer, SiteReplicationRepairApi, SiteReplicationRepairOperationStatus,
-    SiteReplicationRepairPreflight, SiteReplicationResyncOperation, SiteReplicationResyncStatus,
-    SiteStatusOptions, validate_site_replication_ca_bundle,
-    validate_site_replication_repair_operation_id, validate_site_replication_repair_token,
+    AdminApi, PeerSiteSpec, ReplicateEditStatus, SiteRemoveSpec, SiteRemoveV2Spec,
+    SiteReplicationInfo, SiteReplicationPeer, SiteReplicationRepairApi,
+    SiteReplicationRepairOperationStatus, SiteReplicationRepairPreflight,
+    SiteReplicationResyncOperation, SiteReplicationResyncStatus, SiteStatusOptions,
+    validate_site_replication_ca_bundle, validate_site_replication_repair_operation_id,
+    validate_site_replication_repair_token,
 };
 use rc_core::{AliasManager, Error};
 use rc_s3::AdminClient;
@@ -247,6 +248,22 @@ pub struct RemoveArgs {
     /// Remove all sites (dissolve the cluster)
     #[arg(long)]
     pub all: bool,
+
+    /// Permanently retire the selected remote sites through the durable v2 protocol
+    #[arg(long)]
+    pub force: bool,
+
+    /// Remote sites allowed to miss acknowledgements when dissolving all sites
+    #[arg(long = "decommissioned-site", requires_all = ["all", "force"])]
+    pub decommissioned_sites: Vec<String>,
+
+    /// Resume an exact durable removal operation
+    #[arg(long, requires = "force")]
+    pub operation_id: Option<String>,
+
+    /// Confirm permanent decommissioning
+    #[arg(long, requires = "force")]
+    pub yes: bool,
 }
 
 /// Execute a site replication subcommand
@@ -1581,10 +1598,85 @@ async fn execute_remove(args: RemoveArgs, formatter: &Formatter) -> ExitCode {
         return ExitCode::UsageError;
     }
 
+    if args.force && (!args.yes || (args.all && args.decommissioned_sites.is_empty())) {
+        formatter.error(
+            "Permanent decommissioning requires --yes; --all also requires --decommissioned-site",
+        );
+        return ExitCode::UsageError;
+    }
+
     let client = match get_admin_client(&args.alias, formatter) {
         Ok(c) => c,
         Err(code) => return code,
     };
+
+    if args.force {
+        let mut request = SiteRemoveV2Spec {
+            mode: "dry-run".to_string(),
+            sites: args.sites,
+            all: args.all,
+            decommissioned_sites: args.decommissioned_sites,
+            operation_id: args.operation_id,
+            preflight_token: None,
+        };
+        let preview = match client.site_replication_remove_v2(&request).await {
+            Ok(preview) => preview,
+            Err(err) => {
+                return emit_admin_error(formatter, &err, "site-replication-decommission", false);
+            }
+        };
+        if !formatter.is_json() {
+            formatter.println(&format!(
+                "Removal deployments: {}",
+                preview.removed_deployment_ids.join(", ")
+            ));
+            formatter.println(&format!(
+                "Decommissioned deployments: {}",
+                preview.decommissioned_deployment_ids.join(", ")
+            ));
+            formatter.println(&format!("Operation ID: {}", preview.operation_id));
+        }
+        request.mode = "execute".to_string();
+        request.operation_id = Some(preview.operation_id.clone());
+        request.preflight_token = Some(preview.preflight_token);
+        return match client.site_replication_remove_v2(&request).await {
+            Ok(result) => {
+                let complete = result.status == "success";
+                if formatter.is_json() {
+                    formatter.json(&result);
+                } else {
+                    formatter.println(&format!("Site decommissioning: {}", result.status));
+                    formatter.println(&format!("Operation ID: {}", result.operation_id));
+                    formatter
+                        .println("Configuration cleanup is independent of object-version cleanup.");
+                    for error in &result.errors {
+                        formatter.error(error);
+                    }
+                    if !complete {
+                        formatter.println("Resume with the same selectors and --operation-id.");
+                    }
+                }
+                if complete {
+                    ExitCode::Success
+                } else {
+                    ExitCode::Conflict
+                }
+            }
+            Err(err) => {
+                let code = ExitCode::from_i32(err.exit_code()).unwrap_or(ExitCode::GeneralError);
+                let id = request.operation_id.as_deref().unwrap_or("unknown");
+                emit_admin_message_error(
+                    formatter,
+                    code,
+                    "site-replication-decommission",
+                    true,
+                    format!(
+                        "{err}; operation ID: {id}; inspect or resume with the same selectors and --operation-id {id}"
+                    ),
+                )
+            }
+        };
+    }
 
     let spec = SiteRemoveSpec {
         site_names: args.sites.clone(),

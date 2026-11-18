@@ -2579,9 +2579,38 @@ fn validate_reset_id(reset_id: &str) -> Result<(), Error> {
 }
 
 fn parse_resync_duration(value: &str) -> Result<std::time::Duration, Error> {
-    let duration = humantime::parse_duration(value).map_err(|error| {
+    use fundu::{CustomDurationParser, CustomTimeUnit, Multiplier, TimeUnit::*};
+    let mut parser = CustomDurationParser::with_time_units(&[
+        CustomTimeUnit::with_default(NanoSecond, &["nanos", "nsec", "ns"]),
+        CustomTimeUnit::with_default(MicroSecond, &["usec", "us", "µs"]),
+        CustomTimeUnit::with_default(MilliSecond, &["millis", "msec", "ms"]),
+        CustomTimeUnit::with_default(Second, &["seconds", "second", "secs", "sec", "s"]),
+        CustomTimeUnit::with_default(Minute, &["minutes", "minute", "min", "mins", "m"]),
+        CustomTimeUnit::with_default(Hour, &["hours", "hour", "hr", "hrs", "h"]),
+        CustomTimeUnit::with_default(Day, &["days", "day", "d"]),
+        CustomTimeUnit::with_default(Week, &["weeks", "week", "wk", "wks", "w"]),
+        CustomTimeUnit::new(
+            Second,
+            &["months", "month", "M"],
+            Some(Multiplier(2_630_016, 0)),
+        ),
+        CustomTimeUnit::with_default(Year, &["years", "year", "yr", "yrs", "y"]),
+    ]);
+    parser
+        .allow_time_unit_delimiter(true)
+        .disable_exponent(true)
+        .parse_multiple(true, None);
+    if !resync_duration_components_have_units(value) {
+        return Err(Error::InvalidPath(
+            "--older-than requires an unsigned duration with a time unit".to_string(),
+        ));
+    }
+    let parsed = parser.parse(value.trim()).map_err(|error| {
         Error::InvalidPath(format!("Invalid --older-than duration '{value}': {error}"))
     })?;
+    let duration: std::time::Duration = parsed
+        .try_into()
+        .map_err(|_| Error::InvalidPath("--older-than exceeds the duration range".to_string()))?;
     if duration.is_zero() {
         return Err(Error::InvalidPath(
             "--older-than must be greater than zero".to_string(),
@@ -2593,6 +2622,58 @@ fn parse_resync_duration(value: &str) -> Result<std::time::Duration, Error> {
         ));
     }
     Ok(duration)
+}
+
+fn resync_duration_components_have_units(value: &str) -> bool {
+    let mut characters = value.trim().chars().peekable();
+    if characters.peek().is_none() {
+        return false;
+    }
+    while characters.peek().is_some() {
+        let mut digits = 0;
+        while characters.peek().is_some_and(char::is_ascii_digit) {
+            characters.next();
+            digits += 1;
+        }
+        if digits == 0 {
+            return false;
+        }
+        if characters.peek() == Some(&'.') {
+            characters.next();
+            let mut fraction = 0;
+            while characters.peek().is_some_and(char::is_ascii_digit) {
+                characters.next();
+                fraction += 1;
+            }
+            if fraction == 0 {
+                return false;
+            }
+        }
+        while characters
+            .peek()
+            .is_some_and(|character| character.is_whitespace())
+        {
+            characters.next();
+        }
+        let mut unit = 0;
+        while characters
+            .peek()
+            .is_some_and(|character| character.is_alphabetic() || *character == 'µ')
+        {
+            characters.next();
+            unit += 1;
+        }
+        if unit == 0 {
+            return false;
+        }
+        while characters
+            .peek()
+            .is_some_and(|character| character.is_whitespace())
+        {
+            characters.next();
+        }
+    }
+    true
 }
 
 // ==================== Helpers ====================
@@ -3526,6 +3607,35 @@ mod tests {
         assert!(parse_resync_duration("0s").is_err());
         assert!(parse_resync_duration("-1h").is_err());
         assert!(parse_resync_duration("9223372036854775808s").is_err());
+    }
+
+    #[test]
+    fn resync_duration_preserves_compound_units_aliases_and_month_length() {
+        for (input, expected) in [
+            (
+                "7d10h31s",
+                std::time::Duration::from_secs(7 * 86400 + 10 * 3600 + 31),
+            ),
+            ("2 hours 37 mins", std::time::Duration::from_secs(9420)),
+            ("1month", std::time::Duration::from_secs(2_630_016)),
+            ("4.2s", std::time::Duration::new(4, 200_000_000)),
+            ("1usec 2ns", std::time::Duration::from_nanos(1002)),
+        ] {
+            assert_eq!(parse_resync_duration(input).expect(input), expected);
+        }
+        for invalid in [
+            "123",
+            "1h 2",
+            "1 2h",
+            ".3s",
+            "1.s",
+            "1e3s",
+            "+1h",
+            "1fortnight",
+            "1h,2m",
+        ] {
+            assert!(parse_resync_duration(invalid).is_err(), "{invalid}");
+        }
     }
 
     #[test]
