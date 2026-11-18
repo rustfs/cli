@@ -106,9 +106,9 @@ pub use kms_diagnostic::{
 pub use observability::{
     MAX_METRICS_LINE_BYTES, MAX_METRICS_RESPONSE_BYTES, MAX_METRICS_SAMPLES, MetricGroup,
     MetricGroups, MetricsBatch, MetricsQuery, MetricsScope, ObservabilityApi, RealtimeMetrics,
-    ScannerCycleSchedule, ScannerFreshness, ScannerHealth, ScannerMetrics, ScannerRuntimeConfig,
-    ScannerRuntimeConfigValue, ScannerStatus, StorageBackend, StorageBackendKind, StorageDisk,
-    StorageDiskMetrics, StorageInfo,
+    ScannerCycleResetResult, ScannerCycleSchedule, ScannerFreshness, ScannerHealth, ScannerMetrics,
+    ScannerRecoveryApi, ScannerRuntimeConfig, ScannerRuntimeConfigValue, ScannerStatus,
+    StorageBackend, StorageBackendKind, StorageDisk, StorageDiskMetrics, StorageInfo,
 };
 pub use oidc::{
     MAX_OIDC_RESPONSE_BYTES, OidcMutationApi, OidcMutationRequest, OidcMutationResult,

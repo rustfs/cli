@@ -1,7 +1,7 @@
-//! Scanner health and freshness diagnostics.
+//! Scanner health diagnostics and cycle recovery.
 
 use clap::{Args, Subcommand};
-use rc_core::admin::{ObservabilityApi, ScannerStatus};
+use rc_core::admin::{ObservabilityApi, ScannerRecoveryApi, ScannerStatus};
 use serde::Serialize;
 
 use super::{emit_observability_error, get_admin_client};
@@ -12,6 +12,25 @@ use crate::output::Formatter;
 pub enum ScannerCommands {
     /// Display scanner health, freshness, and current cycle details
     Status(ScannerStatusArgs),
+    /// Reset scanner recovery state
+    #[command(subcommand)]
+    Reset(ScannerResetCommands),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ScannerResetCommands {
+    /// Reset cycle recovery state for a full rescan
+    Cycle(ScannerCycleResetArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ScannerCycleResetArgs {
+    /// Alias name of the server
+    pub alias: String,
+
+    /// Confirm the cycle reset (requires admin:ConfigUpdate)
+    #[arg(long, required = true)]
+    pub yes: bool,
 }
 
 #[derive(Args, Debug)]
@@ -21,12 +40,12 @@ pub struct ScannerStatusArgs {
 }
 
 #[derive(Debug, Serialize)]
-struct ScannerSuccessOutput<'a> {
+struct ScannerSuccessOutput<T> {
     schema_version: u8,
     #[serde(rename = "type")]
     output_type: &'static str,
     status: &'static str,
-    data: ScannerOutput<'a>,
+    data: T,
 }
 
 #[derive(Debug, Serialize)]
@@ -39,6 +58,9 @@ struct ScannerOutput<'a> {
 pub async fn execute(command: ScannerCommands, formatter: &Formatter) -> ExitCode {
     match command {
         ScannerCommands::Status(args) => execute_status(args, formatter).await,
+        ScannerCommands::Reset(ScannerResetCommands::Cycle(args)) => {
+            execute_cycle_reset(args, formatter).await
+        }
     }
 }
 
@@ -75,6 +97,35 @@ async fn execute_status(args: ScannerStatusArgs, formatter: &Formatter) -> ExitC
     }
 }
 
+async fn execute_cycle_reset(args: ScannerCycleResetArgs, formatter: &Formatter) -> ExitCode {
+    let client = match get_admin_client(&args.alias, formatter) {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
+    match client.reset_scanner_cycle().await {
+        Ok(result) => {
+            if formatter.is_json() {
+                formatter.json(&ScannerSuccessOutput {
+                    schema_version: 3,
+                    output_type: "scanner_cycle_reset",
+                    status: "success",
+                    data: result,
+                });
+            } else {
+                formatter.println("Scanner cycle state reset (full-rescan).");
+            }
+            ExitCode::Success
+        }
+        Err(error) => emit_observability_error(
+            "scanner_cycle_reset",
+            "admin.scanner-cycle-reset",
+            "Failed to reset scanner cycle state",
+            &error,
+            formatter,
+        ),
+    }
+}
+
 fn print_status(status: &ScannerStatus, formatter: &Formatter) {
     formatter.println(&formatter.style_name("Scanner Status"));
     formatter.println("");
@@ -101,6 +152,23 @@ fn print_status(status: &ScannerStatus, formatter: &Formatter) {
             "Reason:         {}",
             formatter.sanitize_text(reason)
         ));
+    }
+    if let Some(recovery) = status.extra.get("cycle_recovery") {
+        if let Some(state) = recovery["state"].as_str() {
+            formatter.println(&format!(
+                "Recovery state:  {}",
+                formatter.sanitize_text(state)
+            ));
+        }
+        if let Some(reason) = recovery["reason"]
+            .as_str()
+            .filter(|reason| !reason.is_empty())
+        {
+            formatter.println(&format!(
+                "Recovery reason: {}",
+                formatter.sanitize_text(reason)
+            ));
+        }
     }
 }
 

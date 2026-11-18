@@ -587,6 +587,19 @@ impl StorageInfo {
     }
 }
 
+/// Acknowledgement of a synchronous scanner cycle-state reset.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ScannerCycleResetResult {
+    pub status: String,
+    pub mode: String,
+}
+
+/// Operator-initiated recovery of scanner cycle state.
+#[async_trait]
+pub trait ScannerRecoveryApi: Send + Sync {
+    async fn reset_scanner_cycle(&self) -> Result<ScannerCycleResetResult>;
+}
+
 /// Read-only scanner, storage, and metrics Admin API boundary.
 #[async_trait]
 pub trait ObservabilityApi: Send + Sync {

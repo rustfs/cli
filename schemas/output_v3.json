@@ -39,6 +39,7 @@
         "replication_operations",
         "bucket_operations",
         "scanner_status",
+        "scanner_cycle_reset",
         "storage_info",
         "kms",
         "health_snapshot",
@@ -2383,6 +2384,24 @@
           "properties": {
             "type": { "const": "scanner_status" },
             "data": { "$ref": "#/definitions/scannerStatusData" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/definitions/successEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "scanner_cycle_reset" },
+            "data": {
+              "type": "object",
+              "required": ["status", "mode"],
+              "properties": {
+                "status": { "const": "reset" },
+                "mode": { "const": "full-rescan" }
+              }
+            }
           }
         }
       ]
