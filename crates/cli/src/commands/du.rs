@@ -1,10 +1,10 @@
-//! Storage usage command with RustFS snapshot and explicit S3 fallback.
+//! Storage usage from S3 listings or an explicit RustFS snapshot.
 
 use clap::Args;
 use jiff::Timestamp;
 use rc_core::admin::{CapabilityApi, CapabilityAvailability, CapabilityReport};
 use rc_core::ops::{UsageBucket, UsageReport, UsageScanApi, UsageScanRequest, UsageSnapshotApi};
-use rc_core::{AliasManager, Error};
+use rc_core::{AliasManager, Error, ListOptions, ObjectStore, RemotePath};
 use rc_s3::{AdminClient, S3Client};
 use serde::Serialize;
 
@@ -17,13 +17,17 @@ const DATA_USAGE_CAPABILITY: &str = "admin.data-usage";
 const SNAPSHOT_STALE_AFTER_SECONDS: u64 = 3_600;
 const FALLBACK_SUGGESTION: &str = "Retry with --fallback to permit a slower client-side S3 scan.";
 
-/// Summarize storage usage from a RustFS snapshot or explicit S3 scan.
+/// Summarize storage usage by listing S3 objects.
 #[derive(Args, Debug)]
 pub struct DuArgs {
-    /// Alias, bucket, or prefix path (ALIAS[/BUCKET[/PREFIX]])
+    /// Alias, bucket, or directory prefix (ALIAS[/BUCKET[/PREFIX]])
     pub target: String,
 
-    /// Permit a slower client-side S3 scan when the server snapshot cannot be used
+    /// Read the RustFS usage snapshot for a cluster or bucket
+    #[arg(long)]
+    pub snapshot: bool,
+
+    /// Try the RustFS snapshot first, then use a client-side S3 scan if needed
     #[arg(long)]
     pub fallback: bool,
 
@@ -125,6 +129,34 @@ pub async fn execute(args: DuArgs, output_config: OutputConfig) -> ExitCode {
             );
         }
     };
+    let requires_scan = target.request.requires_client_scan();
+    if requires_scan && args.snapshot && !args.fallback {
+        let error = Error::UnsupportedFeature(
+            "The RustFS data-usage snapshot does not provide exact prefix or incomplete-upload usage"
+                .to_string(),
+        );
+        return ops_output::emit_error(
+            &formatter,
+            USAGE_FAMILY,
+            "Server usage snapshot cannot satisfy the requested dimensions",
+            &error,
+            Some(DATA_USAGE_CAPABILITY),
+            None,
+            Some(FALLBACK_SUGGESTION),
+        );
+    }
+
+    let scan = async {
+        let client = S3Client::new(alias.clone()).await?;
+        if !args.target.ends_with('/') {
+            check_directory_target(&client, &target).await?;
+        }
+        client.scan_usage(&target.request).await
+    };
+    if requires_scan || !(args.snapshot || args.fallback) {
+        return emit_scan_result(scan.await, &target, None, &formatter);
+    }
+
     let admin = match AdminClient::new(&alias) {
         Ok(client) => client,
         Err(error) => {
@@ -139,74 +171,51 @@ pub async fn execute(args: DuArgs, output_config: OutputConfig) -> ExitCode {
             );
         }
     };
-    let scan_client = if args.fallback {
-        match S3Client::new(alias).await {
-            Ok(client) => Some(client),
-            Err(error) => {
-                return ops_output::emit_error(
-                    &formatter,
-                    USAGE_FAMILY,
-                    "Failed to create usage scan client",
-                    &error,
-                    None,
-                    None,
-                    None,
-                );
-            }
-        }
-    } else {
-        None
-    };
-
-    execute_with_apis(
-        &args,
-        &target,
-        &admin,
-        &admin,
-        scan_client
-            .as_ref()
-            .map(|client| client as &dyn UsageScanApi),
-        Timestamp::now(),
-        &formatter,
-    )
-    .await
+    execute_snapshot(&target, &admin, &admin, args.fallback, scan, &formatter).await
 }
 
-async fn execute_with_apis(
-    args: &DuArgs,
+async fn check_directory_target(
+    store: &dyn ObjectStore,
+    target: &ParsedUsageTarget,
+) -> Result<(), Error> {
+    let (Some(bucket), Some(prefix)) = (&target.request.bucket, &target.request.prefix) else {
+        return Ok(());
+    };
+    let path = RemotePath::new(&target.alias, bucket, prefix);
+    let listing = store
+        .list_objects(
+            &path,
+            ListOptions {
+                max_keys: Some(1),
+                recursive: true,
+                ..Default::default()
+            },
+        )
+        .await?;
+    if listing.items.is_empty() {
+        return Err(Error::NotFound(format!(
+            "Directory '{}' does not exist",
+            path.to_full_path()
+        )));
+    }
+    Ok(())
+}
+
+async fn execute_snapshot(
     target: &ParsedUsageTarget,
     capabilities: &dyn CapabilityApi,
     snapshot_api: &dyn UsageSnapshotApi,
-    scan_api: Option<&dyn UsageScanApi>,
-    now: Timestamp,
+    fallback: bool,
+    scan: impl Future<Output = Result<UsageReport, Error>>,
     formatter: &Formatter,
 ) -> ExitCode {
-    if target.request.requires_client_scan() {
-        if !args.fallback {
-            let error = Error::UnsupportedFeature(
-                "The RustFS data-usage snapshot does not provide exact prefix or incomplete-upload usage"
-                    .to_string(),
-            );
-            return ops_output::emit_error(
-                formatter,
-                USAGE_FAMILY,
-                "Server usage snapshot cannot satisfy the requested dimensions",
-                &error,
-                Some(DATA_USAGE_CAPABILITY),
-                None,
-                Some(FALLBACK_SUGGESTION),
-            );
-        }
-        return execute_scan(scan_api, target, None, now, formatter).await;
-    }
-
     let capability_report = capabilities.discover_capabilities(false).await;
     let server_version = capability_report
         .as_ref()
         .ok()
         .and_then(|report| report.server_version.clone());
 
-    let fast_path = match capability_report {
+    let snapshot = match capability_report {
         Ok(report) if data_usage_available(&report) => snapshot_api
             .usage_snapshot()
             .await
@@ -215,11 +224,9 @@ async fn execute_with_apis(
         Err(error) => Err(error),
     };
 
-    match fast_path {
-        Ok(report) => emit_report(report, server_version, now, formatter),
-        Err(_error) if args.fallback => {
-            execute_scan(scan_api, target, server_version, now, formatter).await
-        }
+    match snapshot {
+        Ok(report) => emit_report(report, server_version, formatter),
+        Err(_) if fallback => emit_scan_result(scan.await, target, server_version, formatter),
         Err(error) => ops_output::emit_error(
             formatter,
             USAGE_FAMILY,
@@ -232,26 +239,16 @@ async fn execute_with_apis(
     }
 }
 
-async fn execute_scan(
-    scan_api: Option<&dyn UsageScanApi>,
+fn emit_scan_result(
+    result: Result<UsageReport, Error>,
     target: &ParsedUsageTarget,
     server_version: Option<String>,
-    now: Timestamp,
     formatter: &Formatter,
 ) -> ExitCode {
-    let Some(scan_api) = scan_api else {
-        return ops_output::emit_message(
-            formatter,
-            USAGE_FAMILY,
-            ExitCode::GeneralError,
-            "Client-side usage fallback was permitted but no scan adapter is available",
-            None,
-        );
-    };
-    match scan_api.scan_usage(&target.request).await {
+    match result {
         Ok(mut report) => {
             report.path = target.request.path(&target.alias);
-            emit_report(report, server_version, now, formatter)
+            emit_report(report, server_version, formatter)
         }
         Err(scan_error) => ops_output::emit_error(
             formatter,
@@ -268,9 +265,9 @@ async fn execute_scan(
 fn emit_report(
     report: UsageReport,
     server_version: Option<String>,
-    now: Timestamp,
     formatter: &Formatter,
 ) -> ExitCode {
+    let now = Timestamp::now();
     if formatter.is_json() {
         formatter.json(&success_output(&report, server_version, now));
     } else {
@@ -471,7 +468,13 @@ fn parse_target(value: &str) -> Result<ParsedUsageTarget, Error> {
         .get(2)
         .copied()
         .filter(|component| !component.is_empty())
-        .map(str::to_string);
+        .map(|prefix| {
+            if prefix.ends_with('/') {
+                prefix.to_owned()
+            } else {
+                format!("{prefix}/")
+            }
+        });
     if parts.get(2).is_some() && bucket.is_none() {
         return Err(Error::InvalidPath(
             "A usage prefix requires a non-empty bucket name".to_string(),
@@ -593,36 +596,19 @@ mod tests {
         }
     }
 
-    fn args(target: &str, fallback: bool) -> DuArgs {
-        DuArgs {
-            target: target.to_string(),
-            fallback,
-            versions: false,
-            incomplete: false,
-        }
-    }
-
-    fn parsed(args: &DuArgs) -> ParsedUsageTarget {
-        let mut target = parse_target(&args.target).expect("test target should parse");
-        apply_scan_flags(&mut target, args);
-        target
-    }
-
     #[tokio::test]
     async fn du_uses_advertised_server_snapshot_without_scanning() {
-        let command = args("local", false);
-        let target = parsed(&command);
+        let target = parse_target("local").expect("valid target");
         let scan = MockScan {
             calls: AtomicUsize::new(0),
             report: UsageReport::empty(UsageSource::ClientScan, UsageScope::Cluster, None),
         };
-        let code = execute_with_apis(
-            &command,
+        let code = execute_snapshot(
             &target,
             &MockCapabilities(Ok(capability_report(true))),
             &MockSnapshot(Ok(snapshot(1_700_000_000))),
-            Some(&scan),
-            Timestamp::from_second(1_700_000_100).expect("timestamp"),
+            false,
+            scan.scan_usage(&target.request),
             &Formatter::default(),
         )
         .await;
@@ -633,19 +619,17 @@ mod tests {
 
     #[tokio::test]
     async fn auth_denial_never_scans_without_explicit_fallback() {
-        let command = args("local", false);
-        let target = parsed(&command);
+        let target = parse_target("local").expect("valid target");
         let scan = MockScan {
             calls: AtomicUsize::new(0),
             report: UsageReport::empty(UsageSource::ClientScan, UsageScope::Cluster, None),
         };
-        let code = execute_with_apis(
-            &command,
+        let code = execute_snapshot(
             &target,
             &MockCapabilities(Err(Error::Auth("denied".to_string()))),
             &MockSnapshot(Ok(snapshot(1_700_000_000))),
-            Some(&scan),
-            Timestamp::from_second(1_700_000_100).expect("timestamp"),
+            false,
+            scan.scan_usage(&target.request),
             &Formatter::default(),
         )
         .await;
@@ -656,19 +640,17 @@ mod tests {
 
     #[tokio::test]
     async fn unavailable_snapshot_without_fallback_returns_unsupported_without_scanning() {
-        let command = args("local", false);
-        let target = parsed(&command);
+        let target = parse_target("local").expect("valid target");
         let scan = MockScan {
             calls: AtomicUsize::new(0),
             report: UsageReport::empty(UsageSource::ClientScan, UsageScope::Cluster, None),
         };
-        let code = execute_with_apis(
-            &command,
+        let code = execute_snapshot(
             &target,
             &MockCapabilities(Ok(capability_report(false))),
             &MockSnapshot(Ok(snapshot(1_700_000_000))),
-            Some(&scan),
-            Timestamp::from_second(1_700_000_100).expect("timestamp"),
+            false,
+            scan.scan_usage(&target.request),
             &Formatter::default(),
         )
         .await;
@@ -679,19 +661,17 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_fallback_scans_when_capability_is_unavailable() {
-        let command = args("local/photos", true);
-        let target = parsed(&command);
+        let target = parse_target("local/photos").expect("valid target");
         let scan = MockScan {
             calls: AtomicUsize::new(0),
             report: UsageReport::empty(UsageSource::ClientScan, UsageScope::Bucket, None),
         };
-        let code = execute_with_apis(
-            &command,
+        let code = execute_snapshot(
             &target,
             &MockCapabilities(Ok(capability_report(false))),
             &MockSnapshot(Ok(snapshot(1_700_000_000))),
-            Some(&scan),
-            Timestamp::from_second(1_700_000_100).expect("timestamp"),
+            true,
+            scan.scan_usage(&target.request),
             &Formatter::default(),
         )
         .await;
@@ -702,8 +682,7 @@ mod tests {
 
     #[tokio::test]
     async fn partial_fallback_returns_network_exit_with_partial_result() {
-        let command = args("local", true);
-        let target = parsed(&command);
+        let target = parse_target("local").expect("valid target");
         let mut partial = UsageReport::empty(UsageSource::ClientScan, UsageScope::Cluster, None);
         partial.push_failure(UsageFailure {
             bucket: "private".to_string(),
@@ -713,13 +692,12 @@ mod tests {
             calls: AtomicUsize::new(0),
             report: partial,
         };
-        let code = execute_with_apis(
-            &command,
+        let code = execute_snapshot(
             &target,
             &MockCapabilities(Ok(capability_report(false))),
             &MockSnapshot(Ok(snapshot(1_700_000_000))),
-            Some(&scan),
-            Timestamp::from_second(1_700_000_100).expect("timestamp"),
+            true,
+            scan.scan_usage(&target.request),
             &Formatter::default(),
         )
         .await;

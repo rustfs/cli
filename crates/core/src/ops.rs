@@ -241,7 +241,7 @@ fn sum_optional(values: impl Iterator<Item = Option<u64>>) -> Option<u64> {
     values.try_fold(first, |total, value| Some(total.saturating_add(value?)))
 }
 
-/// Options for an explicitly authorized client-side usage scan.
+/// Scope and optional counts for a client-side S3 usage scan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageScanRequest {
     /// Optional bucket; absent means all visible buckets.

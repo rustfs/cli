@@ -33,7 +33,7 @@ treated as proof that the operation works.
 | Legal hold | `rc object legal-hold` | `rc legalhold` | Alias |
 | Tags | `rc bucket tag` and `rc object tag` | `rc tag` | Alias; runtime gated |
 | Administrative workflows | `rc admin ...` | selected `mc admin`-compatible forms | Canonical, partial by documented subcommand |
-| Health and usage | `rc ping`, `ready`, `du` | equivalent top-level names | Canonical; `du` fast path is runtime gated |
+| Health and usage | `rc ping`, `ready`, `du` | equivalent top-level names | Canonical; `du` lists objects by default |
 | Events | `rc watch` | `mc watch`-style filters | Canonical; runtime gated |
 | Other data workflows | `rc diff`, `sql`, `undo` | equivalent top-level names | Canonical |
 
@@ -50,7 +50,7 @@ on every S3-compatible target:
 | --- | --- |
 | Bucket notifications, CORS, versioning, tags, lifecycle, replication, and watch | RustFS runtime capability or authoritative S3 route response |
 | Admin diagnostics, scanner, storage observations, KMS, OIDC, replication, and configuration | RustFS admin capability and bounded typed response |
-| `du` server snapshot | `admin.data-usage`; client scan requires explicit `--fallback` |
+| `du --snapshot` | Requires `admin.data-usage`. Plain `du` uses S3 listing. |
 | Advanced transfer fidelity | Exact S3 headers and behavior supported by the target release |
 
 An unavailable gate returns exit code `7` (`unsupported_feature`) rather than

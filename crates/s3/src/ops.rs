@@ -281,7 +281,10 @@ async fn scan_current_objects(
                 },
             )
             .await?;
-        for object in page.items.into_iter().filter(|object| !object.is_dir) {
+        for object in page.items {
+            if object.is_dir || is_directory_marker(&object.key, object.size_bytes) {
+                continue;
+            }
             objects = objects.saturating_add(1);
             bytes = bytes.saturating_add(non_negative_bytes(object.size_bytes));
         }
@@ -335,7 +338,7 @@ async fn scan_versions(
         for version in page.items {
             if version.is_delete_marker {
                 delete_markers = delete_markers.saturating_add(1);
-            } else {
+            } else if !is_directory_marker(&version.key, version.size_bytes) {
                 versions = versions.saturating_add(1);
                 bytes = bytes.saturating_add(non_negative_bytes(version.size_bytes));
                 if version.is_latest {
@@ -449,6 +452,10 @@ async fn scan_uploaded_parts(
         }
     }
     Ok(bytes)
+}
+
+fn is_directory_marker(key: &str, size: Option<i64>) -> bool {
+    key.ends_with('/') && size == Some(0)
 }
 
 fn non_negative_bytes(value: Option<i64>) -> u64 {

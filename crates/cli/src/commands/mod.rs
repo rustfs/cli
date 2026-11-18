@@ -354,7 +354,7 @@ pub enum Commands {
     /// Generate shell completion scripts
     Completions(completions::CompletionsArgs),
 
-    /// Summarize storage usage
+    /// Summarize storage usage by listing S3 objects
     Du(du::DuArgs),
 
     /// Check service liveness and round-trip latency
