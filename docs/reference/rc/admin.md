@@ -20,6 +20,7 @@ rc admin account mfa recovery-codes <ALIAS> [--code CODE|--code-from-env NAME] [
 rc admin diagnostics <health|cluster|extensions> <ALIAS>
 rc admin info <cluster|server|disk|storage> <ALIAS> [OPTIONS]
 rc admin scanner status <ALIAS>
+rc admin scanner reset cycle <ALIAS> --yes
 rc admin heal mrf <status|list|get|refresh|recheck|accept-risk> <ALIAS> [OPTIONS]
 rc admin integrity <readiness|inventory|audit|migrate|job|resume|pause|cancel> <ALIAS> [OPTIONS]
 rc admin idp openid list <ALIAS>
@@ -453,6 +454,12 @@ Admin operations use the configured alias to create a RustFS admin client. The c
 `rc admin diagnostics health`, `rc admin diagnostics cluster`, and `rc admin diagnostics extensions` perform bounded read-only requests. Each JSON response for these three snapshot commands is limited to 8 MiB. The health command reads the authenticated RustFS health snapshot and is separate from public liveness or readiness probes. Its drive throughput and latency fields are live observations, not active benchmarks, and the command preserves the server's `unsupported_probes` list instead of claiming `mc support diag` parity. Cluster output represents `snapshot: null` as `initializing_or_unavailable`. Extension diagnostics read schemas and runtime capability summaries only; they never request extension instance configuration.
 
 The diagnostic commands require capability discovery to classify the corresponding route as available. Authentication failures, unsupported routes, malformed JSON, and transport failures retain distinct exit codes.
+
+## Scanner Cycle Recovery
+
+Run `rc admin scanner status <ALIAS>` to inspect cycle recovery on the responding node. When RustFS supplies them, the text output shows the recovery state and reason separately from scan freshness. JSON output retains the complete `data.cycle_recovery` object.
+
+If the scanner is blocked by invalid cycle state, run `rc admin scanner reset cycle <ALIAS> --yes` using an identity with `admin:ConfigUpdate`. This sends a full-rescan reset request. Success confirms that RustFS handled the cycle-state reset. Use `rc admin scanner status <ALIAS>` to follow subsequent scan progress.
 
 ## Observability Workflow
 

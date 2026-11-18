@@ -186,3 +186,133 @@ fn scanner_status_rejects_malformed_payload() {
     assert_eq!(output.status.code(), Some(1));
     handle.join().expect("admin test server finished");
 }
+
+fn run_scanner(args: &[&str], endpoint: &str) -> std::process::Output {
+    let config_dir = tempfile::tempdir().expect("create config dir");
+    Command::new(rc_binary())
+        .args(["admin", "scanner"])
+        .args(args)
+        .env("RC_CONFIG_DIR", config_dir.path())
+        .env("RC_HOST_myalias", rc_host_alias(endpoint))
+        .output()
+        .expect("run rc scanner command")
+}
+
+#[test]
+fn scanner_status_displays_recovery_separately_from_freshness() {
+    let mut body: Value = serde_json::from_str(HEALTHY_SCANNER).expect("scanner fixture");
+    body["freshness"]["reason"] = "last cycle is too old".into();
+    body["cycle_recovery"] = serde_json::json!({
+        "state": "blocked",
+        "reason": "invalid cycle\nmarker",
+        "retry_count": 3,
+    });
+    for json in [false, true] {
+        let (endpoint, _receiver, handle) =
+            start_admin_response_test_server("200 OK", "application/json", body.to_string());
+        let mut args = vec!["status", "myalias"];
+        if json {
+            args.push("--json");
+        }
+        let output = run_scanner(&args, &endpoint);
+        assert!(output.status.success());
+        if json {
+            let value: Value = serde_json::from_slice(&output.stdout).expect("scanner status JSON");
+            assert_eq!(value["data"]["cycle_recovery"], body["cycle_recovery"]);
+            assert_valid_v3(&value);
+        } else {
+            let stdout = String::from_utf8(output.stdout).expect("status text");
+            assert!(stdout.contains("Recovery state:  blocked"), "{stdout}");
+            assert!(
+                stdout.contains(r"Recovery reason: invalid cycle\nmarker"),
+                "{stdout}"
+            );
+            assert!(
+                stdout.contains("Reason:         last cycle is too old"),
+                "{stdout}"
+            );
+        }
+        handle.join().expect("server finished");
+    }
+}
+
+#[test]
+fn scanner_cycle_reset_requires_yes_before_contacting_server() {
+    let output = run_scanner(&["reset", "cycle", "myalias"], "http://127.0.0.1:1");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--yes"));
+}
+
+#[test]
+fn scanner_cycle_reset_posts_full_rescan_and_reports_acknowledgement() {
+    let ack = r#"{"status":"reset","mode":"full-rescan"}"#;
+    for json in [false, true] {
+        let (endpoint, receiver, handle) =
+            start_admin_response_test_server("200 OK", "application/json", ack.to_string());
+        let mut args = vec!["reset", "cycle", "myalias", "--yes"];
+        if json {
+            args.push("--json");
+        }
+        let output = run_scanner(&args, &endpoint);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if json {
+            let value: Value = serde_json::from_slice(&output.stdout).expect("cycle reset JSON");
+            assert_eq!(value["type"], "scanner_cycle_reset");
+            assert_eq!(
+                value["data"],
+                serde_json::from_str::<Value>(ack).expect("ack")
+            );
+            assert_valid_v3(&value);
+        } else {
+            assert!(String::from_utf8_lossy(&output.stdout).contains("Scanner cycle state reset"));
+        }
+        let request = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("reset request");
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.target, "/rustfs/admin/v3/scanner/cycle-state/reset");
+        assert!(
+            request
+                .headers
+                .to_ascii_lowercase()
+                .contains("authorization: aws4-hmac-sha256")
+        );
+        assert!(
+            request
+                .headers
+                .to_ascii_lowercase()
+                .contains("content-type: application/json")
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&request.body).expect("request JSON"),
+            serde_json::json!({"mode": "full-rescan"})
+        );
+        handle.join().expect("server finished");
+    }
+}
+
+#[test]
+fn scanner_cycle_reset_rejects_denied_unsupported_and_invalid_responses() {
+    for (status, body, exit_code) in [
+        ("403 Forbidden", "Access denied", 4),
+        ("404 Not Found", "Route not found", 7),
+        ("200 OK", "{}", 1),
+        ("200 OK", r#"{"status":"pending","mode":"full-rescan"}"#, 1),
+        ("200 OK", r#"{"status":"reset","mode":"full-rebuild"}"#, 1),
+    ] {
+        let (endpoint, _receiver, handle) =
+            start_admin_response_test_server(status, "application/json", body.to_string());
+        let output = run_scanner(&["--json", "reset", "cycle", "myalias", "--yes"], &endpoint);
+        assert_eq!(output.status.code(), Some(exit_code), "{status} {body}");
+        assert!(output.stdout.is_empty());
+        let value: Value = serde_json::from_slice(&output.stderr).expect("reset error JSON");
+        assert_eq!(value["type"], "scanner_cycle_reset");
+        assert_eq!(value["status"], "error");
+        assert_valid_v3(&value);
+        handle.join().expect("server finished");
+    }
+}

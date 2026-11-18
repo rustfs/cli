@@ -49,13 +49,14 @@ use rc_core::admin::{
     PolicyEntitiesResult, PolicyEntity, PolicyInfo, PoolStatus, PoolTarget, RealtimeMetrics,
     RebalanceStartResult, RebalanceStatus, RecoveryCodes, ReplicateEditStatus, ReplicationDiff,
     ReplicationDiffApi, ReplicationInspectionApi, ReplicationMetricScope, ReplicationMetrics,
-    ReplicationMrf, RuntimeCapabilitiesSnapshot, RuntimeCapabilityStatus, ScannerStatus,
-    SecretValue, ServiceAccount, ServiceAccountCreateResponse, ServiceActionResult, SiteRemoveSpec,
-    SiteReplicationInfo, SiteReplicationPeer, SiteReplicationRepairApi,
-    SiteReplicationRepairCapabilityContract, SiteReplicationRepairOperationStatus,
-    SiteReplicationRepairPreflight, SiteReplicationRepairRequest, SiteReplicationResyncOperation,
-    SiteReplicationResyncStatus, SiteStatusOptions, StorageInfo, UpdateGroupMembersRequest,
-    UpdateServiceAccountRequest, User, UserCredentialApi, UserMfaStatus, UserStatus,
+    ReplicationMrf, RuntimeCapabilitiesSnapshot, RuntimeCapabilityStatus, ScannerCycleResetResult,
+    ScannerRecoveryApi, ScannerStatus, SecretValue, ServiceAccount, ServiceAccountCreateResponse,
+    ServiceActionResult, SiteRemoveSpec, SiteReplicationInfo, SiteReplicationPeer,
+    SiteReplicationRepairApi, SiteReplicationRepairCapabilityContract,
+    SiteReplicationRepairOperationStatus, SiteReplicationRepairPreflight,
+    SiteReplicationRepairRequest, SiteReplicationResyncOperation, SiteReplicationResyncStatus,
+    SiteStatusOptions, StorageInfo, UpdateGroupMembersRequest, UpdateServiceAccountRequest, User,
+    UserCredentialApi, UserMfaStatus, UserStatus,
 };
 use rc_core::{Alias, Error, Result};
 use reqwest::header::{CACHE_CONTROL, CONTENT_TYPE, HOST, HeaderMap, HeaderName, HeaderValue};
@@ -4742,6 +4743,32 @@ fn config_applied(headers: &HeaderMap) -> bool {
         .or_else(|| headers.get("x-minio-config-applied"))
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+}
+
+#[async_trait]
+impl ScannerRecoveryApi for AdminClient {
+    async fn reset_scanner_cycle(&self) -> Result<ScannerCycleResetResult> {
+        let result: ScannerCycleResetResult = self
+            .request_bounded_json(
+                Method::POST,
+                "/scanner/cycle-state/reset",
+                None,
+                Some(br#"{"mode":"full-rescan"}"#),
+                BoundedJsonResponse {
+                    max_bytes: 64 * 1024,
+                    name: "Scanner cycle reset response",
+                    error_mapper: Self::map_error,
+                },
+            )
+            .await
+            .map_err(|error| observability_route_error(error, "Scanner cycle reset"))?;
+        if result.status != "reset" || result.mode != "full-rescan" {
+            return Err(Error::General(
+                "Server did not acknowledge a full-rescan cycle reset".to_string(),
+            ));
+        }
+        Ok(result)
+    }
 }
 
 #[async_trait]

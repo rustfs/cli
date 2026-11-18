@@ -76,7 +76,7 @@ pub enum AdminCommands {
     #[command(subcommand)]
     Kms(kms::KmsCommands),
 
-    /// Inspect scanner health and freshness
+    /// Inspect scanner health and manage cycle recovery
     #[command(subcommand)]
     Scanner(scanner::ScannerCommands),
 
@@ -263,7 +263,7 @@ fn observability_error_suggestion(error: &Error) -> Option<&'static str> {
         Error::InvalidPath(_) | Error::Config(_) => Some("Review the command arguments and retry."),
         Error::Network(_) => Some("Verify the endpoint and network connectivity, then retry."),
         Error::Auth(_) => Some("Verify credentials and required admin permissions, then retry."),
-        Error::UnsupportedFeature(_) => Some("Upgrade RustFS to beta.10 or later."),
+        Error::UnsupportedFeature(_) => Some("Use a RustFS release that supports this operation."),
         Error::Interrupted(_) => Some("Retry with --yes if deletion is still intended."),
         _ => None,
     }

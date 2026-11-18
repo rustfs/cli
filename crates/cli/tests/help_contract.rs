@@ -755,7 +755,17 @@ fn nested_subcommand_help_contract() {
         HelpCase {
             args: &["admin", "scanner"],
             usage: "Usage: rc admin scanner [OPTIONS] <COMMAND>",
-            expected_tokens: &["status"],
+            expected_tokens: &["status", "reset"],
+        },
+        HelpCase {
+            args: &["admin", "scanner", "reset"],
+            usage: "Usage: rc admin scanner reset [OPTIONS] <COMMAND>",
+            expected_tokens: &["cycle"],
+        },
+        HelpCase {
+            args: &["admin", "scanner", "reset", "cycle"],
+            usage: "Usage: rc admin scanner reset cycle [OPTIONS] --yes <ALIAS>",
+            expected_tokens: &["--yes", "full rescan"],
         },
         HelpCase {
             args: &["admin", "scanner", "status"],
