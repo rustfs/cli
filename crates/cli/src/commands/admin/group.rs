@@ -221,41 +221,27 @@ async fn execute_add(args: AddArgs, formatter: &Formatter) -> ExitCode {
         })
         .unwrap_or_default();
 
-    if members.is_empty() {
-        if formatter.is_json() {
-            let output = GroupOperationOutput {
-                success: true,
-                name: args.name.clone(),
-                message: format!("Group '{}' created successfully", args.name),
-            };
-            formatter.json(&output);
-        } else {
-            let styled_name = formatter.style_name(&args.name);
-            formatter.success(&format!("Group '{styled_name}' created successfully."));
-        }
-        ExitCode::Success
-    } else {
-        match client.add_group_members(&args.name, &members).await {
-            Ok(()) => {
-                if formatter.is_json() {
-                    let output = GroupOperationOutput {
-                        success: true,
-                        name: args.name.clone(),
-                        message: format!("Group '{}' created successfully with members", args.name),
-                    };
-                    formatter.json(&output);
-                } else {
-                    let styled_name = formatter.style_name(&args.name);
-                    formatter.success(&format!("Group '{styled_name}' created successfully."));
-                }
-                ExitCode::Success
-            }
-            Err(e) => {
-                formatter.error(&format!("Failed to create group: {e}"));
-                ExitCode::GeneralError
-            }
-        }
+    if let Err(e) = client.add_group_members(&args.name, &members).await {
+        formatter.error(&format!("Failed to create group: {e}"));
+        return ExitCode::GeneralError;
     }
+
+    if formatter.is_json() {
+        let message = if members.is_empty() {
+            format!("Group '{}' created successfully", args.name)
+        } else {
+            format!("Group '{}' created successfully with members", args.name)
+        };
+        formatter.json(&GroupOperationOutput {
+            success: true,
+            name: args.name,
+            message,
+        });
+    } else {
+        let styled_name = formatter.style_name(&args.name);
+        formatter.success(&format!("Group '{styled_name}' created successfully."));
+    }
+    ExitCode::Success
 }
 
 async fn execute_info(args: InfoArgs, formatter: &Formatter) -> ExitCode {
