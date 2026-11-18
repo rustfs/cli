@@ -390,15 +390,16 @@ rc admin rebalance status local --json
 rc ping local
 rc ready local --timeout 2
 
-# Prefer the RustFS background-scanner snapshot
-rc du local
+# List S3 objects and sum their sizes
+rc du local/photos
+rc du local/photos/2026/ --versions
+rc du local/photos --incomplete
 
-# Explicitly permit a portable paginated S3 fallback
-rc du local/photos/2026/ --fallback --versions
-rc du local/photos --fallback --incomplete
+# Read the RustFS background scanner's last cluster totals
+rc du local --snapshot
 ```
 
-`rc du` never starts the potentially expensive client scan after an unsupported or unauthorized admin request unless `--fallback` is present. See the [operational utilities reference](docs/reference/rc/ops.md) for count, staleness, and partial-result semantics.
+For large buckets, a live scan may take many S3 requests. Existing scripts using `--fallback` still try the snapshot first. See the [operational utilities reference](docs/reference/rc/ops.md) for permissions, version counts, and partial results.
 
 ## Command Overview
 
@@ -437,7 +438,7 @@ For full command documentation, see the [`rc` command reference](docs/reference/
 | `completions` | Generate shell completion scripts                                            |
 | `ping`        | Check service liveness and round-trip latency                                |
 | `ready`       | Check service dependency readiness                                           |
-| `du`          | Report server-snapshot or explicitly permitted client-scan usage             |
+| `du`          | Sum object sizes through S3 or read a RustFS usage snapshot                 |
 
 ### Admin Subcommands
 

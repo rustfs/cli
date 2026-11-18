@@ -587,6 +587,7 @@ fn top_level_command_help_contract() {
             args: &["du"],
             usage: "Usage: rc du [OPTIONS] <TARGET>",
             expected_tokens: &[
+                "--snapshot",
                 "--fallback",
                 "--versions",
                 "--incomplete",
