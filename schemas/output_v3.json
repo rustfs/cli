@@ -29,6 +29,7 @@
         "on_demand_migration",
         "versioned_objects",
         "locks",
+        "public_access_block",
         "multipart_uploads",
         "watch_event",
         "health",
@@ -470,6 +471,34 @@
         "items": {
           "type": "array",
           "items": { "$ref": "#/definitions/lockState" }
+        }
+      }
+    },
+    "publicAccessBlockConfiguration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "block_public_acls", "ignore_public_acls", "block_public_policy", "restrict_public_buckets"
+      ],
+      "properties": {
+        "block_public_acls": { "type": "boolean" },
+        "ignore_public_acls": { "type": "boolean" },
+        "block_public_policy": { "type": "boolean" },
+        "restrict_public_buckets": { "type": "boolean" }
+      }
+    },
+    "publicAccessBlockData": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bucket", "operation", "configuration"],
+      "properties": {
+        "bucket": { "type": "string", "minLength": 1 },
+        "operation": { "type": "string", "enum": ["get", "set", "remove"] },
+        "configuration": {
+          "oneOf": [
+            { "$ref": "#/definitions/publicAccessBlockConfiguration" },
+            { "type": "null" }
+          ]
         }
       }
     },
@@ -2416,6 +2445,17 @@
           "properties": {
             "type": { "const": "locks" },
             "data": { "$ref": "#/definitions/locksData" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/definitions/successEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "public_access_block" },
+            "data": { "$ref": "#/definitions/publicAccessBlockData" }
           }
         }
       ]

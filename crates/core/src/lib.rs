@@ -22,6 +22,7 @@ pub mod object_key;
 pub mod object_lock;
 pub mod ops;
 pub mod path;
+pub mod public_access_block;
 pub mod replication;
 pub mod retry;
 pub mod select;
@@ -65,6 +66,7 @@ pub use ops::{
     UsageScanRequest, UsageScope, UsageSnapshotApi, UsageSource,
 };
 pub use path::{ParsedPath, RemotePath, parse_object_path, parse_path};
+pub use public_access_block::PublicAccessBlockConfiguration;
 pub use replication::{
     BucketTarget, BucketTargetCredentials, ReplicationCheckPhase, ReplicationCheckPhaseState,
     ReplicationCheckPhases, ReplicationCheckResult, ReplicationCheckStatus, ReplicationCheckTarget,

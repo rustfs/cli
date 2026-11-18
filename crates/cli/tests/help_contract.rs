@@ -247,11 +247,22 @@ fn top_level_command_help_contract() {
                 "lock",
                 "quota",
                 "anonymous",
+                "public-access-block",
                 "lifecycle",
                 "replication",
                 "Examples:",
                 "rc bucket list local/",
             ],
+        },
+        HelpCase {
+            args: &["bucket", "public-access-block"],
+            usage: "Usage: rc bucket public-access-block [OPTIONS] <COMMAND>",
+            expected_tokens: &["get", "set", "remove", "Examples:"],
+        },
+        HelpCase {
+            args: &["bucket", "public-access-block", "set"],
+            usage: "Usage: rc bucket public-access-block set [OPTIONS] <PATH> <SOURCE>",
+            expected_tokens: &["JSON configuration", "stdin"],
         },
         HelpCase {
             args: &["bucket", "encryption"],

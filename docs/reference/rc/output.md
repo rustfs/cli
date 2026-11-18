@@ -95,6 +95,8 @@ This is an additive v3 extension. Output v1 and v2 require no migration, and the
 
 The golden fixtures under `crates/cli/tests/fixtures/output_v3/` provide success, empty, and error examples for every v3 family.
 
+Bucket Public Access Block commands use the `public_access_block` family. `data.operation` is `get`, `set`, or `remove`; `data.configuration` contains all four explicit S3 flags or `null` when no configuration exists or after removal.
+
 Authenticated RustFS diagnostics use distinct families so they cannot be confused with lightweight public probes:
 
 | Family | Command | Meaning |
