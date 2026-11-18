@@ -4,7 +4,7 @@
 
 use async_trait::async_trait;
 use aws_credential_types::Credentials;
-use aws_sdk_s3::error::ProvideErrorMetadata;
+use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sigv4::http_request::{
     PayloadChecksumKind, PercentEncodingMode, SignableBody, SignableRequest, SignatureLocation,
     SigningSettings, UriPathNormalizationMode, sign,
@@ -67,9 +67,9 @@ use crate::data_transport::{
     DownloadRequest, ObjectDataTransport, ObservedReader, ObservedWriter, UploadOperation,
     UploadRequest, UploadResult, WriteCondition,
 };
-use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use zeroize::Zeroizing;
 
 use crate::lifecycle_xml::{
@@ -82,6 +82,38 @@ use crate::lifecycle_xml::{
 const SINGLE_PUT_OBJECT_MAX_SIZE: u64 = crate::multipart::DEFAULT_PART_SIZE;
 const S3_SERVICE_NAME: &str = "s3";
 const S3_REPLICATION_XML_NAMESPACE: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
+
+fn format_resync_duration(duration: Duration) -> String {
+    let mut remaining = duration.as_secs();
+    let mut parts = Vec::new();
+    for (seconds, suffix) in [
+        (31_557_600, "years"),
+        (2_630_016, "months"),
+        (86_400, "days"),
+        (3600, "h"),
+        (60, "m"),
+        (1, "s"),
+    ] {
+        let count = remaining / seconds;
+        if count > 0 {
+            parts.push(format!("{count}{suffix}"));
+            remaining %= seconds;
+        }
+    }
+    let mut nanos = duration.subsec_nanos();
+    for (unit, suffix) in [(1_000_000, "ms"), (1000, "us"), (1, "ns")] {
+        let count = nanos / unit;
+        if count > 0 {
+            parts.push(format!("{count}{suffix}"));
+            nanos %= unit;
+        }
+    }
+    if parts.is_empty() {
+        "0s".to_string()
+    } else {
+        parts.join(" ")
+    }
+}
 const RUSTFS_FORCE_DELETE_HEADER: &str = "x-rustfs-force-delete";
 const REPLICATION_EXTENSION_BODY_LIMIT: u64 = 1024 * 1024;
 const REPLICATION_CHECK_PROBE_NAMESPACE: &str = ".rustfs.sys/replication-check/";
@@ -494,40 +526,45 @@ struct ReplicationStatusXml {
     status: Option<String>,
 }
 
+/// Resync start/status body. Current servers use the madmin-go
+/// `ResyncTargetsInfo` json tags (`target`, `arn`, `resetid`, ...); servers
+/// released before 2026-08 used PascalCase keys, accepted here as aliases.
+/// serde matches keys case-sensitively, so an unknown spelling would decode
+/// as an empty target list rather than fail.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "PascalCase")]
 struct ReplicationResyncResponseDto {
-    #[serde(default)]
+    // madmin omits an empty target list.
+    #[serde(rename = "target", alias = "Targets", default)]
     targets: Vec<ReplicationResyncTargetDto>,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "PascalCase")]
 struct ReplicationResyncTargetDto {
+    #[serde(rename = "arn", alias = "Arn")]
     arn: String,
-    #[serde(rename = "ResetID")]
+    #[serde(rename = "resetid", alias = "ResetID")]
     reset_id: String,
-    #[serde(default)]
+    #[serde(rename = "ResetBeforeDate", default)]
     reset_before_date: Option<String>,
-    #[serde(default)]
+    #[serde(rename = "startTime", alias = "StartTime", default)]
     start_time: Option<String>,
-    #[serde(default)]
+    #[serde(rename = "endTime", alias = "EndTime", default)]
     end_time: Option<String>,
-    #[serde(default)]
+    #[serde(rename = "resyncStatus", alias = "Status", default)]
     status: Option<String>,
-    #[serde(default)]
+    #[serde(rename = "replicationCount", alias = "ReplicatedCount", default)]
     replicated_count: Option<i64>,
-    #[serde(default)]
+    #[serde(rename = "completedReplicationSize", alias = "ReplicatedSize", default)]
     replicated_size: Option<i64>,
-    #[serde(default)]
+    #[serde(rename = "failedReplicationCount", alias = "FailedCount", default)]
     failed_count: Option<i64>,
-    #[serde(default)]
+    #[serde(rename = "failedReplicationSize", alias = "FailedSize", default)]
     failed_size: Option<i64>,
-    #[serde(default)]
+    #[serde(rename = "bucket", alias = "Bucket", default)]
     bucket: Option<String>,
-    #[serde(default)]
+    #[serde(rename = "object", alias = "Object", default)]
     object: Option<String>,
-    #[serde(default)]
+    #[serde(rename = "Error", default)]
     error: Option<String>,
 }
 
@@ -701,10 +738,29 @@ fn is_missing_cors_configuration_response(
     status_code.is_none_or(|status| status == 404)
 }
 
-fn is_missing_public_access_block_configuration(error_text: &str) -> bool {
-    error_text
-        .to_ascii_lowercase()
-        .contains("nosuchpublicaccessblockconfiguration")
+fn public_access_block_error_code<E: ProvideErrorMetadata>(error: &SdkError<E>) -> Option<&str> {
+    let SdkError::ServiceError(service) = error else {
+        return None;
+    };
+    let code = service.err().code();
+    // The S3 SDK synthesizes NotFound for an empty 404 response. The header
+    // can still distinguish a missing configuration from a missing bucket.
+    match code {
+        None | Some("NotFound") => service.raw().headers().get("x-amz-error-code").or(code),
+        _ => code,
+    }
+}
+
+fn is_missing_public_access_block_configuration<E: ProvideErrorMetadata>(
+    error: &SdkError<E>,
+) -> bool {
+    public_access_block_error_code(error) == Some("NoSuchPublicAccessBlockConfiguration")
+        && !matches!(
+            error
+                .raw_response()
+                .map(|response| response.status().as_u16()),
+            Some(401 | 403)
+        )
 }
 
 fn sdk_cors_rule_to_core(rule: &aws_sdk_s3::types::CorsRule) -> CorsRule {
@@ -1109,6 +1165,49 @@ fn requested_sha256_checksum(
             "RustFS beta.10 checksum writes currently support SHA-256 only".to_string(),
         )),
     }
+}
+
+async fn requested_file_sha256_checksum(
+    file: &mut tokio::fs::File,
+    file_path: &std::path::Path,
+    file_size: u64,
+    request: Option<&ChecksumRequest>,
+) -> Result<Option<String>> {
+    if !matches!(
+        request,
+        Some(ChecksumRequest::Calculate(ChecksumAlgorithm::Sha256))
+    ) {
+        return requested_sha256_checksum(&[], request);
+    }
+    // The checksum must be available before the provider admits the upload.
+    // Keep this preparation bounded independently of the object's length.
+    let mut buffer = vec![0_u8; 64 * 1024];
+    let mut digest = Sha256::new();
+    let mut bytes_read = 0_u64;
+    loop {
+        let count = file.read(&mut buffer).await.map_err(|error| {
+            Error::General(format!("read file '{}': {error}", file_path.display()))
+        })?;
+        if count == 0 {
+            break;
+        }
+        bytes_read = bytes_read.saturating_add(count as u64);
+        if bytes_read > file_size {
+            return Err(Error::Conflict(
+                "Source file length changed before upload".into(),
+            ));
+        }
+        digest.update(&buffer[..count]);
+    }
+    if bytes_read != file_size {
+        return Err(Error::Conflict(
+            "Source file length changed before upload".into(),
+        ));
+    }
+    file.rewind().await.map_err(|error| {
+        Error::General(format!("rewind file '{}': {error}", file_path.display()))
+    })?;
+    Ok(Some(BASE64_STANDARD.encode(digest.finalize())))
 }
 
 fn validate_sha256_checksum_request(request: Option<&ChecksumRequest>) -> Result<()> {
@@ -1923,15 +2022,23 @@ impl S3Client {
         request: UploadRequest<'_>,
         data: &[u8],
     ) -> Result<Option<UploadResult>> {
+        let mut source = data;
+        self.try_external_upload_reader(request, &mut source).await
+    }
+
+    async fn try_external_upload_reader(
+        &self,
+        request: UploadRequest<'_>,
+        source: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+    ) -> Result<Option<UploadResult>> {
         let Some(transport) = self.selected_data_transport()? else {
             return Ok(None);
         };
         let length = request.content_length;
         let customer_key =
             destination_sse_customer_key(request.options.encryption.as_ref()).cloned();
-        let mut source = data;
         let mut observed = ObservedReader {
-            inner: &mut source,
+            inner: source,
             polled: false,
             bytes: 0,
             eof: false,
@@ -2704,6 +2811,31 @@ impl S3Client {
         self.redact_sensitive_error(
             crate::auth::sdk_temporary_credential_error(error).unwrap_or_else(fallback),
         )
+    }
+
+    fn map_public_access_block_error<E: ProvideErrorMetadata>(&self, error: &SdkError<E>) -> Error {
+        if matches!(
+            error,
+            SdkError::DispatchFailure(_) | SdkError::TimeoutError(_)
+        ) {
+            return Error::Network(error.to_string());
+        }
+        let code = public_access_block_error_code(error);
+        if let Some(auth_error) = crate::auth::temporary_credential_error(code) {
+            return auth_error;
+        }
+        let message =
+            self.redact_sensitive_text(code.map_or_else(|| error.to_string(), str::to_owned));
+        let status = error
+            .raw_response()
+            .map(|response| response.status().as_u16());
+        match (status, code) {
+            (Some(401 | 403), _) | (_, Some("AccessDenied" | "Unauthorized" | "Forbidden")) => {
+                Error::Auth(message)
+            }
+            (_, Some("NoSuchBucket")) => Error::NotFound(message),
+            _ => Error::General(message),
+        }
     }
 
     /// Format AWS SDK error into a detailed error message
@@ -4234,17 +4366,27 @@ impl S3Client {
         file_size: u64,
         options: PathUploadOptions<'_>,
     ) -> Result<ObjectInfo> {
-        let data = tokio::fs::read(file_path)
+        let mut file = tokio::fs::File::open(file_path)
             .await
-            .map_err(|e| Error::General(format!("read file '{}': {e}", file_path.display())))?;
-        let requested_checksum = requested_sha256_checksum(&data, options.write.checksum.as_ref())?;
+            .map_err(|e| Error::General(format!("open file '{}': {e}", file_path.display())))?;
+        let requested_checksum = if self.selected_data_transport()?.is_some() {
+            requested_file_sha256_checksum(
+                &mut file,
+                file_path,
+                file_size,
+                options.write.checksum.as_ref(),
+            )
+            .await?
+        } else {
+            None
+        };
         let condition = match options.precondition {
             ObjectWritePrecondition::None => WriteCondition::None,
             ObjectWritePrecondition::IfAbsent => WriteCondition::IfAbsent,
             ObjectWritePrecondition::IfMatch(etag) => WriteCondition::IfMatch(etag),
         };
         if let Some(result) = self
-            .try_external_upload(
+            .try_external_upload_reader(
                 UploadRequest {
                     path,
                     operation: UploadOperation::PutObject { condition },
@@ -4252,7 +4394,7 @@ impl S3Client {
                     content_length: file_size,
                     checksum_sha256: requested_checksum.as_deref(),
                 },
-                &data,
+                &mut file,
             )
             .await?
         {
@@ -4268,6 +4410,13 @@ impl S3Client {
             }
             return Ok(result.object);
         }
+        // Auto fallback is only possible before the provider polls the file.
+        // Retain the HTTP SDK's repeatable, immutable request body semantics.
+        let mut data = Vec::new();
+        file.read_to_end(&mut data)
+            .await
+            .map_err(|e| Error::General(format!("read file '{}': {e}", file_path.display())))?;
+        let requested_checksum = requested_sha256_checksum(&data, options.write.checksum.as_ref())?;
         let body = aws_sdk_s3::primitives::ByteStream::from(data);
         let storage_class = rustfs_storage_class(options.write.storage_class.as_deref())?;
 
@@ -7064,18 +7213,8 @@ impl ObjectStore for S3Client {
             .await
         {
             Ok(response) => response,
-            Err(error) => {
-                if let Some(auth_error) = crate::auth::sdk_temporary_credential_error(&error) {
-                    return Err(auth_error);
-                }
-                if is_missing_public_access_block_configuration(&error.to_string()) {
-                    return Ok(None);
-                }
-                let error_text = self.redact_sensitive_text(error.to_string());
-                return Err(Error::General(format!(
-                    "get_bucket_public_access_block: {error_text}"
-                )));
-            }
+            Err(error) if is_missing_public_access_block_configuration(&error) => return Ok(None),
+            Err(error) => return Err(self.map_public_access_block_error(&error)),
         };
 
         let configuration = response
@@ -7130,13 +7269,7 @@ impl ObjectStore for S3Client {
             .public_access_block_configuration(configuration)
             .send()
             .await
-            .map_err(|error| {
-                if let Some(auth_error) = crate::auth::sdk_temporary_credential_error(&error) {
-                    return auth_error;
-                }
-                let error_text = self.redact_sensitive_text(error.to_string());
-                Error::General(format!("set_bucket_public_access_block: {error_text}"))
-            })?;
+            .map_err(|error| self.map_public_access_block_error(&error))?;
 
         Ok(())
     }
@@ -7150,18 +7283,8 @@ impl ObjectStore for S3Client {
             .await
         {
             Ok(_) => Ok(()),
-            Err(error) => {
-                if let Some(auth_error) = crate::auth::sdk_temporary_credential_error(&error) {
-                    return Err(auth_error);
-                }
-                if is_missing_public_access_block_configuration(&error.to_string()) {
-                    return Ok(());
-                }
-                let error_text = self.redact_sensitive_text(error.to_string());
-                Err(Error::General(format!(
-                    "delete_bucket_public_access_block: {error_text}"
-                )))
-            }
+            Err(error) if is_missing_public_access_block_configuration(&error) => Ok(()),
+            Err(error) => Err(self.map_public_access_block_error(&error)),
         }
     }
 
@@ -7611,10 +7734,7 @@ impl ObjectStore for S3Client {
             query.push(("arn", target_arn));
         }
         if let Some(older_than) = options.older_than {
-            query.push((
-                "older-than",
-                humantime::format_duration(older_than).to_string(),
-            ));
+            query.push(("older-than", format_resync_duration(older_than)));
         }
         if let Some(reset_id) = options.reset_id {
             query.push(("reset-id", reset_id));
@@ -7847,7 +7967,7 @@ impl ControlExecutor for S3Client {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aws_smithy_http_client::test_util::{
+    use crate::test_http::{
         CaptureRequestReceiver, ReplayEvent, StaticReplayClient, capture_request,
     };
     use rc_core::{
@@ -7865,6 +7985,20 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
     use tokio::sync::Notify;
+
+    #[test]
+    fn resync_duration_formatter_preserves_every_nanosecond() {
+        assert_eq!(format_resync_duration(Duration::from_secs(3600)), "1h");
+        assert_eq!(
+            format_resync_duration(Duration::new(3661, 123_456_789)),
+            "1h 1m 1s 123ms 456us 789ns"
+        );
+        assert_eq!(format_resync_duration(Duration::ZERO), "0s");
+        assert_eq!(
+            format_resync_duration(Duration::from_secs(31_557_600 + 2_630_016)),
+            "1years 1months"
+        );
+    }
 
     #[derive(Debug)]
     struct CapturedXmlRequest {
@@ -8425,7 +8559,7 @@ mod tests {
                             .expect("configure blocking follow-up stream");
                         let _ = read_xml_request(&mut stream);
                         let success_body =
-                            br#"{"Targets":[{"Arn":"arn:target","ResetID":"server-id"}]}"#;
+                            br#"{"target":[{"arn":"arn:target","resetid":"server-id"}]}"#;
                         let response = format!(
                             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                             success_body.len()
@@ -9501,16 +9635,44 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn missing_public_access_block_configuration_is_detected_by_service_code() {
+        let response = http::Response::builder()
+            .status(404)
+            .header("x-amz-error-code", "NoSuchPublicAccessBlockConfiguration")
+            .body(SdkBody::empty())
+            .expect("build header-only response");
+        let (client, _) = test_s3_client(Some(response));
+        assert_eq!(
+            client
+                .get_bucket_public_access_block("bucket")
+                .await
+                .expect("missing configuration"),
+            None
+        );
+
+        let response = http::Response::builder()
+            .status(404)
+            .body(SdkBody::from("<Error><Code>OtherError</Code><Message>NoSuchPublicAccessBlockConfiguration</Message></Error>"))
+            .expect("build unrelated error");
+        let (client, _) = test_s3_client(Some(response));
+        assert!(
+            client
+                .get_bucket_public_access_block("bucket")
+                .await
+                .is_err()
+        );
+    }
+
     #[test]
-    fn missing_public_access_block_configuration_is_detected_by_service_code() {
-        assert!(is_missing_public_access_block_configuration(
-            "service error: NoSuchPublicAccessBlockConfiguration"
-        ));
-        assert!(!is_missing_public_access_block_configuration(
-            "AccessDenied"
-        ));
-        assert!(!is_missing_public_access_block_configuration(
-            "connection closed"
+    fn public_access_block_timeouts_are_network_errors() {
+        use aws_sdk_s3::operation::get_public_access_block::GetPublicAccessBlockError;
+
+        let (client, _) = test_s3_client(None);
+        let error = SdkError::<GetPublicAccessBlockError>::timeout_error("request timed out");
+        assert!(matches!(
+            client.map_public_access_block_error(&error),
+            Error::Network(_)
         ));
     }
 
@@ -11219,7 +11381,7 @@ mod tests {
 
     #[tokio::test]
     async fn replication_resync_start_encodes_options_and_preserves_server_id() {
-        let body = br#"{"Targets":[{"Arn":"arn:rustfs:replication::id:dest bucket","ResetID":"server-id"}]}"#;
+        let body = br#"{"target":[{"arn":"arn:rustfs:replication::id:dest bucket","resetid":"server-id"}]}"#;
         let response = format!(
             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
             body.len()
@@ -11258,7 +11420,7 @@ mod tests {
 
     #[tokio::test]
     async fn replication_resync_start_encodes_caller_reset_id() {
-        let body = br#"{"Targets":[{"Arn":"arn:target","ResetID":"caller id"}]}"#;
+        let body = br#"{"target":[{"arn":"arn:target","resetid":"caller id"}]}"#;
         let response = format!(
             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
             body.len()
@@ -11342,7 +11504,7 @@ mod tests {
 
     #[tokio::test]
     async fn replication_resync_status_preserves_partial_target_state() {
-        let body = br#"{"Targets":[{"Arn":"arn:target","ResetID":"reset-1","ResetBeforeDate":"2026-07-01T00:00:00Z","StartTime":"2026-07-02T00:00:00Z","EndTime":"2026-07-02T00:01:00Z","Status":"Failed","ReplicatedCount":3,"ReplicatedSize":30,"FailedCount":2,"FailedSize":20,"Bucket":"source-bucket","Object":"last.txt","Error":"target unavailable"}]}"#;
+        let body = br#"{"target":[{"arn":"arn:target","resetid":"reset-1","ResetBeforeDate":"2026-07-01T00:00:00Z","startTime":"2026-07-02T00:00:00Z","endTime":"2026-07-02T00:01:00Z","resyncStatus":"Failed","replicationCount":3,"completedReplicationSize":30,"failedReplicationCount":2,"failedReplicationSize":20,"bucket":"source-bucket","object":"last.txt","Error":"target unavailable"}]}"#;
         let response = format!(
             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
             body.len()
@@ -11377,7 +11539,7 @@ mod tests {
 
     #[tokio::test]
     async fn replication_resync_status_retains_multiple_unfiltered_targets() {
-        let body = br#"{"Targets":[{"Arn":"arn:a","ResetID":"reset-a","Status":"Pending"},{"Arn":"arn:b","ResetID":"reset-b","Status":"Completed","ReplicatedCount":2}]}"#;
+        let body = br#"{"target":[{"arn":"arn:a","resetid":"reset-a","resyncStatus":"Pending","replicationCount":0,"completedReplicationSize":0,"failedReplicationCount":0,"failedReplicationSize":0},{"arn":"arn:b","resetid":"reset-b","resyncStatus":"Completed","replicationCount":2,"completedReplicationSize":0,"failedReplicationCount":0,"failedReplicationSize":0}]}"#;
         let response = format!(
             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
             body.len()
@@ -11407,7 +11569,7 @@ mod tests {
 
     #[tokio::test]
     async fn replication_resync_status_is_readable_from_fresh_clients() {
-        let body = br#"{"Targets":[{"Arn":"arn:target","ResetID":"reset-1","Status":"Ongoing","ReplicatedCount":3}]}"#;
+        let body = br#"{"target":[{"arn":"arn:target","resetid":"reset-1","resyncStatus":"Ongoing","replicationCount":3,"completedReplicationSize":0,"failedReplicationCount":0,"failedReplicationSize":0}]}"#;
         let response = format!(
             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
             body.len()
@@ -11434,6 +11596,43 @@ mod tests {
         assert_eq!(fresh, first);
         assert_eq!(fresh.targets[0].state, ReplicationResyncState::Ongoing);
         handle.join().expect("server thread should finish");
+    }
+
+    #[test]
+    fn replication_resync_status_decodes_current_and_legacy_wire_shapes() {
+        // Serialized by current RustFS servers (madmin-go `ResyncTargetsInfo` tags).
+        let current = br#"{"target":[{"arn":"arn:target","resetid":"reset-1","ResetBeforeDate":"2026-07-01T00:00:00Z","startTime":"2026-07-02T00:00:00Z","endTime":"2026-07-02T00:01:00Z","resyncStatus":"Failed","replicationCount":3,"completedReplicationSize":30,"failedReplicationCount":2,"failedReplicationSize":20,"bucket":"source-bucket","object":"last.txt","Error":"target unavailable"}]}"#;
+        // Serialized by RustFS servers released before 2026-08.
+        let legacy = br#"{"Targets":[{"Arn":"arn:target","ResetID":"reset-1","ResetBeforeDate":"2026-07-01T00:00:00Z","StartTime":"2026-07-02T00:00:00Z","EndTime":"2026-07-02T00:01:00Z","Status":"Failed","ReplicatedCount":3,"ReplicatedSize":30,"FailedCount":2,"FailedSize":20,"Bucket":"source-bucket","Object":"last.txt","Error":"target unavailable"}]}"#;
+        let decode = |body: &[u8]| {
+            let response: ReplicationResyncResponseDto =
+                serde_json::from_slice(body).expect("decode resync response");
+            response
+                .targets
+                .into_iter()
+                .map(S3Client::convert_resync_status_target)
+                .collect::<Result<Vec<_>>>()
+                .expect("convert resync targets")
+        };
+
+        let current = decode(current);
+        assert_eq!(current.len(), 1);
+        let target = &current[0];
+        assert_eq!(target.target_arn, "arn:target");
+        assert_eq!(target.reset_id, "reset-1");
+        assert!(target.reset_before.is_some());
+        assert!(target.started_at.is_some());
+        assert!(target.last_updated_at.is_some());
+        assert_eq!(target.state, ReplicationResyncState::Failed);
+        assert_eq!(target.replicated_count, 3);
+        assert_eq!(target.replicated_size, 30);
+        assert_eq!(target.failed_count, 2);
+        assert_eq!(target.failed_size, 20);
+        assert_eq!(target.current_bucket.as_deref(), Some("source-bucket"));
+        assert_eq!(target.current_object.as_deref(), Some("last.txt"));
+        assert_eq!(target.error.as_deref(), Some("target unavailable"));
+        assert_eq!(decode(legacy), current);
+        assert!(decode(br#"{}"#).is_empty());
     }
 
     #[test]
@@ -14675,6 +14874,18 @@ mod tests {
                     source: None,
                 });
             }
+            if matches!(self.behavior, ExternalBehavior::PartialReject) {
+                let mut prefix = [0_u8; 1];
+                source
+                    .read_exact(&mut prefix)
+                    .await
+                    .expect("read source prefix");
+                return Err(data_transport::DataTransportError {
+                    state: rc_core::DataTransferState::NotAccepted,
+                    message: "provider stopped after reading".to_string(),
+                    source: None,
+                });
+            }
             let mut payload = Vec::new();
             source
                 .read_to_end(&mut payload)
@@ -14842,6 +15053,148 @@ mod tests {
             provider.operations.lock().expect("put record").as_slice(),
             ["PutObject { condition: IfAbsent }"]
         );
+    }
+
+    #[tokio::test]
+    async fn external_upload_reader_consumes_a_bounded_stream() {
+        let (client, replay) = test_s3_client_with_response_sequence(Vec::new());
+        let client = client.with_object_data_transport(
+            rc_core::DataTransportMode::Rdma,
+            external_transport(ExternalBehavior::Success),
+        );
+        let (mut producer, mut source) = tokio::io::duplex(8);
+        let producing = async move {
+            producer
+                .write_all(b"streamed payload")
+                .await
+                .expect("write bounded source");
+        };
+        let path = RemotePath::new("test", "bucket", "key");
+        let options = ObjectWriteOptions::default();
+        let uploading = client.try_external_upload_reader(
+            UploadRequest {
+                path: &path,
+                operation: UploadOperation::PutObject {
+                    condition: WriteCondition::None,
+                },
+                options: &options,
+                content_length: 16,
+                checksum_sha256: None,
+            },
+            &mut source,
+        );
+        let (result, ()) = tokio::join!(uploading, producing);
+        let uploaded = result.expect("stream upload").expect("provider selected");
+        assert_eq!(uploaded.object.size_bytes, Some(16));
+        assert_eq!(replay.actual_requests().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn external_file_rejection_preserves_http_fallback_body() {
+        let response = http::Response::builder()
+            .status(200)
+            .header("etag", "\"http-etag\"")
+            .body(SdkBody::empty())
+            .expect("HTTP upload response");
+        let (client, replay) = test_s3_client_with_response_sequence(vec![response]);
+        let client = client.with_object_data_transport(
+            rc_core::DataTransportMode::Auto,
+            external_transport(ExternalBehavior::Reject),
+        );
+        let mut source = tempfile::NamedTempFile::new().expect("file source");
+        source.write_all(b"file payload").expect("write source");
+        client
+            .put_object_single_part_from_path(
+                &RemotePath::new("test", "bucket", "key"),
+                source.path(),
+                12,
+                PathUploadOptions {
+                    write: &ObjectWriteOptions::default(),
+                    precondition: ObjectWritePrecondition::None,
+                },
+            )
+            .await
+            .expect("unconsumed file can use HTTP");
+        let requests = replay.actual_requests().collect::<Vec<_>>();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].body().bytes(), Some(b"file payload".as_slice()));
+    }
+
+    #[tokio::test]
+    async fn external_file_partial_rejection_never_replays_source() {
+        let (client, replay) = test_s3_client_with_response_sequence(Vec::new());
+        let client = client.with_object_data_transport(
+            rc_core::DataTransportMode::Auto,
+            external_transport(ExternalBehavior::PartialReject),
+        );
+        let mut source = tempfile::NamedTempFile::new().expect("file source");
+        source.write_all(b"file payload").expect("write source");
+        let error = client
+            .put_object_single_part_from_path(
+                &RemotePath::new("test", "bucket", "key"),
+                source.path(),
+                12,
+                PathUploadOptions {
+                    write: &ObjectWriteOptions::default(),
+                    precondition: ObjectWritePrecondition::None,
+                },
+            )
+            .await
+            .expect_err("a consumed source cannot use HTTP fallback");
+        assert!(matches!(
+            error,
+            Error::DataTransfer {
+                state: rc_core::DataTransferState::OutcomeUnknown,
+                ..
+            }
+        ));
+        assert!(!rc_core::is_retryable_error(&error));
+        assert_eq!(replay.actual_requests().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn file_upload_checksum_covers_multiple_chunks_and_rewinds_source() {
+        for data in [Vec::new(), vec![37_u8; 2 * 64 * 1024 + 19]] {
+            let mut source = tempfile::NamedTempFile::new().expect("file source");
+            source.write_all(&data).expect("write source");
+            let mut file = tokio::fs::File::open(source.path())
+                .await
+                .expect("open source");
+            let checksum = requested_file_sha256_checksum(
+                &mut file,
+                source.path(),
+                data.len() as u64,
+                Some(&ChecksumRequest::Calculate(ChecksumAlgorithm::Sha256)),
+            )
+            .await
+            .expect("calculate file checksum");
+            assert_eq!(checksum, Some(sha256_checksum(&data)));
+            assert_eq!(file.stream_position().await.expect("source position"), 0);
+            let mut observed = Vec::new();
+            file.read_to_end(&mut observed)
+                .await
+                .expect("read rewound source");
+            assert_eq!(observed, data);
+        }
+    }
+
+    #[tokio::test]
+    async fn file_upload_checksum_rejects_changed_source_length() {
+        let mut source = tempfile::NamedTempFile::new().expect("file source");
+        source.write_all(b"data").expect("write source");
+        for declared in [3, 5] {
+            let mut file = tokio::fs::File::open(source.path())
+                .await
+                .expect("open source");
+            let result = requested_file_sha256_checksum(
+                &mut file,
+                source.path(),
+                declared,
+                Some(&ChecksumRequest::Calculate(ChecksumAlgorithm::Sha256)),
+            )
+            .await;
+            assert!(matches!(result, Err(Error::Conflict(_))));
+        }
     }
 
     #[tokio::test]

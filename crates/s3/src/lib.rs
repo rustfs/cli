@@ -13,6 +13,8 @@ pub mod multipart;
 mod ops;
 mod payload_checksum;
 mod select;
+#[cfg(test)]
+mod test_http;
 mod watch;
 
 pub use admin::AdminClient;
