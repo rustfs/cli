@@ -1,7 +1,7 @@
 //! Golden tests for verifying JSON output format stability
 //!
 //! These tests ensure that the JSON output format remains stable
-//! and matches the schema defined in `schemas/output_v1.json`.
+//! and matches the applicable versioned output contract in `schemas/`.
 //!
 //! Run with: `cargo test --features golden`
 
@@ -260,8 +260,13 @@ mod s3_tests {
         let json: serde_json::Value =
             serde_json::from_str(&stdout).expect("Output should be valid JSON");
 
-        assert_eq!(json["success"], true);
-        assert!(json["bucket"].as_str().unwrap().contains("test-bucket"));
+        assert_eq!(json["schema_version"], 3);
+        assert_eq!(json["type"], "bucket_operations");
+        assert_eq!(json["status"], "success");
+        assert_eq!(json["data"]["operation"], "create");
+        assert_eq!(json["data"]["bucket"], bucket);
+        assert_eq!(json["data"]["outcome"], "created");
+        assert_eq!(json["data"]["created"], true);
 
         // Cleanup: remove the bucket
         Command::new(rc_binary())
@@ -300,7 +305,15 @@ mod s3_tests {
         let json: serde_json::Value =
             serde_json::from_str(&stdout).expect("Output should be valid JSON");
 
-        assert_eq!(json["success"], true);
+        assert_eq!(json["schema_version"], 3);
+        assert_eq!(json["type"], "bucket_remove");
+        assert_eq!(json["status"], "success");
+        assert_eq!(json["data"]["bucket"], bucket);
+        assert_eq!(json["data"]["outcome"], "success");
+        assert_eq!(
+            json["data"]["completed_stages"],
+            serde_json::json!(["bucket_delete"])
+        );
 
         drop(temp_dir);
     }
@@ -454,8 +467,8 @@ mod s3_tests {
         let json: serde_json::Value =
             serde_json::from_str(&stdout).expect("Output should be valid JSON");
 
-        assert!(json["key"].is_string());
-        assert!(json["size_bytes"].is_number());
+        assert_eq!(json["name"], "stat-test.txt");
+        assert_eq!(json["size_bytes"], b"Test content for stat".len());
 
         // Cleanup
         Command::new(rc_binary())

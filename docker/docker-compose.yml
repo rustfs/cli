@@ -18,6 +18,8 @@ services:
       RUSTFS_ROOT_PASSWORD: secretkey
       RUSTFS_ACCESS_KEY: accesskey
       RUSTFS_SECRET_KEY: secretkey
+      # Public test-only key (32 bytes of 0x42), never use for real data.
+      RUSTFS_SSE_S3_MASTER_KEY: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI="
       RUSTFS_VOLUMES: /data
       RUSTFS_ADDRESS: ":9000"
       RUSTFS_CONSOLE_ENABLE: "true"
