@@ -1,0 +1,43 @@
+---
+source: crates/cli/tests/admin_recovery.rs
+expression: value
+---
+{
+  "data": {
+    "contractVersion": 1,
+    "expectedNodes": 1,
+    "nextCursor": null,
+    "nodes": [
+      {
+        "host": "node-a",
+        "nodeId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "reply": {
+          "result": "summary",
+          "summary": {
+            "activeResponsibilityCount": 0,
+            "bestEffortQueueDepth": 0,
+            "bucketIncarnationChangedCount": 0,
+            "checkpointOwner": "11111111-1111-4111-8111-111111111111",
+            "checkpointReadable": true,
+            "checkpointSequence": 1,
+            "contractVersion": 1,
+            "heldCount": 2,
+            "legacyGenerationUnknownCount": 1,
+            "operatorAcceptedCount": 1,
+            "responsibilityBytes": 200,
+            "sampledAtMs": 9
+          }
+        },
+        "state": "ok"
+      }
+    ],
+    "observationFinishedAtMs": 20,
+    "observationStartedAtMs": 10,
+    "pageComplete": true,
+    "topologyFingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "message": "Requested page observed. Idle, absence, and risk acceptance never establish data integrity.",
+  "schema_version": 3,
+  "status": "observed",
+  "type": "mrf_observation"
+}

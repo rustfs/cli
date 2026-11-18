@@ -1,0 +1,82 @@
+---
+source: crates/cli/tests/admin_recovery.rs
+expression: snapshot
+---
+{
+  "data": {
+    "alias": "local",
+    "digest_source_reference": "backup/original-3177",
+    "endpoint": "http://server:9000/",
+    "estimate": {
+      "inventory_selected_bytes": 128,
+      "minimum_stream_seconds": 0.001953125,
+      "note": "Inventory is a prior observation, not an execution precondition. Current-version size is unknown. Stream estimates exclude EC, metadata, retries and device waits; they are not an ETA. Payload staging is conservatively budgeted across server versions: older audits can stage the full payload, while streaming audits do not. API availability alone does not identify that behavior. Checkpoints still write metadata.",
+      "object_count": 1,
+      "peak_payload_staging_budget": 1024,
+      "per_stream_bytes_per_second": 65536,
+      "stream_passes": 1
+    },
+    "format_version": 1,
+    "inventory_bucket_incarnation": "22222222-2222-4222-8222-222222222222",
+    "inventory_observed_at": "2026-11-13T00:00:00Z",
+    "job": {
+      "bucket": "bucket",
+      "bucket_incarnation": "22222222-2222-4222-8222-222222222222",
+      "format_version": 1,
+      "id": "11111111-1111-4111-8111-111111111111",
+      "last_error": null,
+      "request": {
+        "bytes_per_second": 65536,
+        "items": [
+          {
+            "expected_sha256": "q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s=",
+            "key": "object",
+            "target_key": null,
+            "version_id": "null"
+          }
+        ],
+        "max_object_bytes": 1024,
+        "mode": "audit"
+      },
+      "results": [
+        {
+          "detail": null,
+          "evidence_source": null,
+          "expected_sha256": null,
+          "source_fingerprint": null,
+          "source_size": null,
+          "state": "pending",
+          "target_version_id": null
+        }
+      ],
+      "revision": 1,
+      "state": "paused"
+    },
+    "qualification": null,
+    "query_command": [
+      "rc",
+      "admin",
+      "integrity",
+      "job",
+      "local",
+      "bucket",
+      "11111111-1111-4111-8111-111111111111"
+    ],
+    "readiness": null,
+    "resume_command": [
+      "rc",
+      "admin",
+      "integrity",
+      "resume",
+      "local",
+      "bucket",
+      "11111111-1111-4111-8111-111111111111",
+      "--receipt",
+      "receipt.json"
+    ]
+  },
+  "message": "Paused job created and receipt saved. Review the selection and budgets, then explicitly resume. No historical MRF responsibility is verified or removed.",
+  "schema_version": 3,
+  "status": "paused_receipt_saved",
+  "type": "integrity_create"
+}

@@ -1,4 +1,4 @@
-FROM rust:1.92.0-alpine3.23 AS builder
+FROM rust:1.99.1-alpine3.23 AS builder
 
 LABEL maintainer="hello@rustfs.com"
 
