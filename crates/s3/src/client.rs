@@ -4363,52 +4363,60 @@ impl S3Client {
         &self,
         path: &RemotePath,
         file_path: &std::path::Path,
-        file_size: u64,
         options: PathUploadOptions<'_>,
+        on_progress: impl Fn(u64) + Send,
     ) -> Result<ObjectInfo> {
         let mut file = tokio::fs::File::open(file_path)
             .await
             .map_err(|e| Error::General(format!("open file '{}': {e}", file_path.display())))?;
-        let requested_checksum = if self.selected_data_transport()?.is_some() {
-            requested_file_sha256_checksum(
+        if self.selected_data_transport()?.is_some() {
+            // Declare the length of the opened source, which may have changed since
+            // the caller selected a single-part upload.
+            let content_length = file
+                .metadata()
+                .await
+                .map_err(|e| {
+                    Error::General(format!("read metadata for '{}': {e}", file_path.display()))
+                })?
+                .len();
+            let requested_checksum = requested_file_sha256_checksum(
                 &mut file,
                 file_path,
-                file_size,
+                content_length,
                 options.write.checksum.as_ref(),
             )
-            .await?
-        } else {
-            None
-        };
-        let condition = match options.precondition {
-            ObjectWritePrecondition::None => WriteCondition::None,
-            ObjectWritePrecondition::IfAbsent => WriteCondition::IfAbsent,
-            ObjectWritePrecondition::IfMatch(etag) => WriteCondition::IfMatch(etag),
-        };
-        if let Some(result) = self
-            .try_external_upload_reader(
-                UploadRequest {
-                    path,
-                    operation: UploadOperation::PutObject { condition },
-                    options: options.write,
-                    content_length: file_size,
-                    checksum_sha256: requested_checksum.as_deref(),
-                },
-                &mut file,
-            )
-            .await?
-        {
-            if let Some(checksum) = &requested_checksum {
-                self.verify_persisted_sha256(
-                    path,
-                    result.object.version_id.clone(),
-                    checksum,
-                    destination_sse_customer_key(options.write.encryption.as_ref()),
+            .await?;
+            let condition = match options.precondition {
+                ObjectWritePrecondition::None => WriteCondition::None,
+                ObjectWritePrecondition::IfAbsent => WriteCondition::IfAbsent,
+                ObjectWritePrecondition::IfMatch(etag) => WriteCondition::IfMatch(etag),
+            };
+            if let Some(result) = self
+                .try_external_upload_reader(
+                    UploadRequest {
+                        path,
+                        operation: UploadOperation::PutObject { condition },
+                        options: options.write,
+                        content_length,
+                        checksum_sha256: requested_checksum.as_deref(),
+                    },
+                    &mut file,
                 )
-                .await
-                .map_err(data_transport::committed_verification_failure)?;
+                .await?
+            {
+                if let Some(checksum) = &requested_checksum {
+                    self.verify_persisted_sha256(
+                        path,
+                        result.object.version_id.clone(),
+                        checksum,
+                        destination_sse_customer_key(options.write.encryption.as_ref()),
+                    )
+                    .await
+                    .map_err(data_transport::committed_verification_failure)?;
+                }
+                on_progress(content_length);
+                return Ok(result.object);
             }
-            return Ok(result.object);
         }
         // Auto fallback is only possible before the provider polls the file.
         // Retain the HTTP SDK's repeatable, immutable request body semantics.
@@ -4416,6 +4424,7 @@ impl S3Client {
         file.read_to_end(&mut data)
             .await
             .map_err(|e| Error::General(format!("read file '{}': {e}", file_path.display())))?;
+        let file_size = data.len() as u64;
         let requested_checksum = requested_sha256_checksum(&data, options.write.checksum.as_ref())?;
         let body = aws_sdk_s3::primitives::ByteStream::from(data);
         let storage_class = rustfs_storage_class(options.write.storage_class.as_deref())?;
@@ -4482,6 +4491,7 @@ impl S3Client {
             )
             .await?;
         }
+        on_progress(file_size);
         Ok(info)
     }
 
@@ -5005,11 +5015,8 @@ impl S3Client {
             self.put_object_multipart_from_path(path, file_path, file_size, options, on_progress)
                 .await
         } else {
-            let result = self
-                .put_object_single_part_from_path(path, file_path, file_size, options)
-                .await?;
-            on_progress(file_size);
-            Ok(result)
+            self.put_object_single_part_from_path(path, file_path, options, on_progress)
+                .await
         }
     }
 
@@ -14807,9 +14814,9 @@ mod tests {
         assert_eq!(third, 0);
     }
 
-    #[derive(Clone, Copy)]
     enum ExternalBehavior {
         Reject,
+        RewriteThenReject(std::path::PathBuf, &'static [u8]),
         PartialReject,
         Success,
         Unknown,
@@ -14818,6 +14825,7 @@ mod tests {
     struct TestExternalTransport {
         behavior: ExternalBehavior,
         operations: std::sync::Mutex<Vec<String>>,
+        uploaded_payloads: std::sync::Mutex<Vec<Vec<u8>>>,
     }
 
     #[async_trait]
@@ -14867,7 +14875,13 @@ mod tests {
                 .lock()
                 .expect("record upload")
                 .push(format!("{:?}", request.operation));
-            if matches!(self.behavior, ExternalBehavior::Reject) {
+            if let ExternalBehavior::RewriteThenReject(path, bytes) = &self.behavior {
+                std::fs::write(path, bytes).expect("change source before HTTP fallback");
+            }
+            if matches!(
+                self.behavior,
+                ExternalBehavior::Reject | ExternalBehavior::RewriteThenReject(..)
+            ) {
                 return Err(data_transport::DataTransportError {
                     state: rc_core::DataTransferState::NotAccepted,
                     message: "provider unavailable".to_string(),
@@ -14892,6 +14906,10 @@ mod tests {
                 .await
                 .expect("read external source");
             assert_eq!(payload.len() as u64, request.content_length);
+            self.uploaded_payloads
+                .lock()
+                .expect("record upload payload")
+                .push(payload);
             if matches!(self.behavior, ExternalBehavior::Unknown) {
                 return Err(data_transport::DataTransportError {
                     state: rc_core::DataTransferState::OutcomeUnknown,
@@ -14917,7 +14935,99 @@ mod tests {
         Arc::new(TestExternalTransport {
             behavior,
             operations: std::sync::Mutex::new(Vec::new()),
+            uploaded_payloads: std::sync::Mutex::new(Vec::new()),
         })
+    }
+
+    #[tokio::test]
+    async fn external_single_part_upload_uses_current_file_contents() {
+        for payload in [b"longer payload".as_slice(), b"x", b""] {
+            let (client, replay) = test_s3_client_with_response_sequence(Vec::new());
+            let provider = external_transport(ExternalBehavior::Success);
+            let client = client
+                .with_object_data_transport(rc_core::DataTransportMode::Rdma, provider.clone());
+            let source = tempfile::NamedTempFile::new().expect("file source");
+            std::fs::write(source.path(), b"original").expect("initial source");
+            let initial_size = std::fs::metadata(source.path())
+                .expect("initial metadata")
+                .len();
+            std::fs::write(source.path(), payload).expect("replace source");
+            assert_ne!(initial_size, payload.len() as u64);
+            let progress = std::sync::Mutex::new(Vec::new());
+            let info = client
+                .put_object_single_part_from_path(
+                    &RemotePath::new("test", "bucket", "key"),
+                    source.path(),
+                    PathUploadOptions {
+                        write: &ObjectWriteOptions::default(),
+                        precondition: ObjectWritePrecondition::None,
+                    },
+                    |bytes| progress.lock().expect("progress record").push(bytes),
+                )
+                .await
+                .expect("upload current file contents");
+            assert_eq!(info.size_bytes, Some(payload.len() as i64));
+            assert_eq!(
+                *progress.lock().expect("progress record"),
+                vec![payload.len() as u64]
+            );
+            assert_eq!(
+                provider
+                    .uploaded_payloads
+                    .lock()
+                    .expect("uploaded payloads")
+                    .as_slice(),
+                &[payload.to_vec()]
+            );
+            assert_eq!(replay.actual_requests().count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn external_single_part_auto_fallback_uses_current_file_contents() {
+        for payload in [b"longer payload".as_slice(), b"x", b""] {
+            let response = http::Response::builder()
+                .status(200)
+                .header("etag", "\"http-etag\"")
+                .body(SdkBody::empty())
+                .expect("HTTP PUT response");
+            let (client, receiver) = test_s3_client(Some(response));
+            let source = tempfile::NamedTempFile::new().expect("file source");
+            std::fs::write(source.path(), b"original").expect("initial source");
+            let provider = external_transport(ExternalBehavior::RewriteThenReject(
+                source.path().to_owned(),
+                payload,
+            ));
+            let client = client
+                .with_object_data_transport(rc_core::DataTransportMode::Auto, provider.clone());
+            let progress = std::sync::Mutex::new(Vec::new());
+            let info = client
+                .put_object_from_path_with_options(
+                    &RemotePath::new("test", "bucket", "key"),
+                    source.path(),
+                    &ObjectWriteOptions::default(),
+                    |bytes| progress.lock().expect("progress record").push(bytes),
+                )
+                .await
+                .expect("HTTP fallback uploads current file contents");
+            assert_eq!(info.size_bytes, Some(payload.len() as i64));
+            assert_eq!(
+                *progress.lock().expect("progress record"),
+                vec![payload.len() as u64]
+            );
+            assert_eq!(receiver.expect_request().body().bytes(), Some(payload));
+            assert!(
+                provider
+                    .uploaded_payloads
+                    .lock()
+                    .expect("uploaded payloads")
+                    .is_empty()
+            );
+            assert_eq!(
+                provider.operations.lock().expect("upload attempts").len(),
+                1
+            );
+        }
     }
 
     #[tokio::test]
@@ -15107,11 +15217,11 @@ mod tests {
             .put_object_single_part_from_path(
                 &RemotePath::new("test", "bucket", "key"),
                 source.path(),
-                12,
                 PathUploadOptions {
                     write: &ObjectWriteOptions::default(),
                     precondition: ObjectWritePrecondition::None,
                 },
+                |_| {},
             )
             .await
             .expect("unconsumed file can use HTTP");
@@ -15133,11 +15243,11 @@ mod tests {
             .put_object_single_part_from_path(
                 &RemotePath::new("test", "bucket", "key"),
                 source.path(),
-                12,
                 PathUploadOptions {
                     write: &ObjectWriteOptions::default(),
                     precondition: ObjectWritePrecondition::None,
                 },
+                |_| panic!("a failed upload cannot report completion"),
             )
             .await
             .expect_err("a consumed source cannot use HTTP fallback");
@@ -15217,16 +15327,26 @@ mod tests {
     #[test]
     fn external_error_source_is_redacted_without_losing_business_class() {
         let (client, _) = test_s3_client(None);
+        let key = test_sse_customer_key();
+        let headers = SseCustomerHeaders::new(&key);
         let error = Error::DataTransfer {
             state: rc_core::DataTransferState::ConfirmedFailure,
             message: "secret-key in response".to_string(),
-            source: Some(Box::new(Error::Auth("access-key secret-key".to_string()))),
+            source: Some(Box::new(Error::Auth(format!(
+                "access denied: access-key secret-key {} {} 0123456789abcdef0123456789abcdef",
+                headers.key.as_str(),
+                headers.key_md5.as_str(),
+            )))),
         };
-        let error = client.redact_sensitive_error(error);
+        let error = client.redact_sse_customer_error(error, Some(&key));
         assert_eq!(error.exit_code(), 4);
-        let diagnostic = format!("{error:?}");
+        assert!(error.to_string().contains("access denied"));
+        let diagnostic = format!("{error:?} {error}");
         assert!(!diagnostic.contains("secret-key"));
         assert!(!diagnostic.contains("access-key"));
+        assert!(!diagnostic.contains(headers.key.as_str()));
+        assert!(!diagnostic.contains(headers.key_md5.as_str()));
+        assert!(!diagnostic.contains("0123456789abcdef0123456789abcdef"));
         assert!(std::error::Error::source(&error).is_some());
         assert!(!rc_core::is_retryable_error(&error));
     }
@@ -15290,6 +15410,7 @@ mod tests {
         ));
         assert!(!rc_core::is_retryable_error(&error));
         assert_eq!(receiver.expect_request().method(), "HEAD");
+        assert!(error.to_string().contains("ServiceUnavailable"));
     }
     #[tokio::test]
     async fn external_multipart_completion_failure_does_not_replay_the_file() {
@@ -15334,6 +15455,7 @@ mod tests {
         ));
         assert!(!rc_core::is_retryable_error(&error));
         assert!(error.to_string().contains("upload-id"));
+        assert!(error.to_string().contains("ServiceUnavailable"));
         assert_eq!(replay.actual_requests().count(), 3);
     }
 
@@ -15381,6 +15503,7 @@ mod tests {
             }
         ));
         assert!(!rc_core::is_retryable_error(&error));
+        assert!(error.to_string().contains("ServiceUnavailable"));
         assert_eq!(replay.actual_requests().count(), 3);
     }
     #[tokio::test]
