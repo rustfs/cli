@@ -12,6 +12,20 @@ pub struct ConfigDocument {
     pub content: String,
 }
 
+impl ConfigDocument {
+    /// Render a config query with server-reported environment overrides above their scopes.
+    pub fn redacted_with_env_overrides(&self) -> String {
+        self.content
+            .lines()
+            .filter_map(|line| match line.trim_start().strip_prefix('#') {
+                Some(comment) => redact_env_override(comment.trim_start()),
+                None => redact_config_line(line),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
 impl std::fmt::Debug for ConfigDocument {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -215,31 +229,60 @@ fn parse_directives(input: &str, allow_bare_keys: bool) -> Result<Vec<ParsedDire
     Ok(directives)
 }
 
-fn is_sensitive_key(key: &str) -> bool {
-    let key = key.trim().to_ascii_lowercase().replace(['-', '.'], "_");
+const SENSITIVE_FIELD_NAMES: &[&str] = &[
+    "access_key",
+    "account_key",
+    "api_key",
+    "client_key",
+    "private_key",
+    "master_key",
+    "signing_key",
+    "encryption_key",
+    "session_key",
+    "connection_string",
+    "conn_string",
+    "dsn",
+    "authorization",
+    "auth_header",
+    "cookie",
+];
+
+fn has_sensitive_keyword(key: &str) -> bool {
     key.contains("secret")
         || key.contains("password")
         || key.contains("passphrase")
         || key.split('_').any(|part| part == "token")
         || key.split('_').any(|part| part == "credential")
-        || matches!(
-            key.as_str(),
-            "access_key"
-                | "account_key"
-                | "api_key"
-                | "client_key"
-                | "private_key"
-                | "master_key"
-                | "signing_key"
-                | "encryption_key"
-                | "session_key"
-                | "connection_string"
-                | "conn_string"
-                | "dsn"
-                | "authorization"
-                | "auth_header"
-                | "cookie"
-        )
+}
+
+fn is_sensitive_key(key: &str) -> bool {
+    let key = key.trim().to_ascii_lowercase().replace(['-', '.'], "_");
+    has_sensitive_keyword(&key) || SENSITIVE_FIELD_NAMES.contains(&key.as_str())
+}
+
+fn redact_env_override(assignment: &str) -> Option<String> {
+    let (name, value) = assignment.split_once('=')?;
+    let field = name.strip_prefix("RUSTFS_")?;
+    if field.is_empty()
+        || !field.bytes().all(|b| {
+            b.is_ascii_uppercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-' | b'.')
+        })
+    {
+        return None;
+    }
+
+    // A sensitive field can sit between a subsystem prefix and a named target suffix.
+    let field = format!("_{}_", field.to_ascii_lowercase().replace(['-', '.'], "_"));
+    let sensitive = has_sensitive_keyword(&field)
+        || SENSITIVE_FIELD_NAMES
+            .iter()
+            .any(|key| field.contains(&format!("_{key}_")));
+    let value = if sensitive && !value.is_empty() {
+        "*redacted*"
+    } else {
+        value
+    };
+    Some(format!("# {name}={value}"))
 }
 
 fn redacted_value(key: &str, value: &str) -> String {
@@ -463,6 +506,40 @@ mod tests {
         assert!(redacted.contains("client_secret=\"*redacted*\""));
         assert!(redacted.contains("speed=\"fast\""));
         assert!(!redacted.contains("super-secret"));
+    }
+
+    #[test]
+    fn config_get_preserves_only_env_assignments_and_redacts_named_target_secrets() {
+        let document = ConfigDocument {
+            content: concat!(
+                "# no assignment\n",
+                "# RUSTFS_SCANNER_SPEED\n",
+                "# RUSTFS_SCANNER_SPEED extra=discard\n",
+                "# OTHER_VARIABLE=discard\n",
+                "# RUSTFS_SCANNER_SPEED=slow\n",
+                "scanner speed=default\n",
+                "#RUSTFS_NOTIFY_WEBHOOK_COMMENT_PRIMARY= a=b  \n",
+                "# RUSTFS_NOTIFY_WEBHOOK_TLS_CLIENT_KEY_PRIMARY=named-secret\n",
+                "# RUSTFS_NOTIFY_WEBHOOK_AUTH_TOKEN_PRIMARY=token-secret\n",
+                "notify_webhook:primary queue_limit=100",
+            )
+            .into(),
+        };
+        assert_eq!(
+            document.redacted_with_env_overrides(),
+            concat!(
+                "# RUSTFS_SCANNER_SPEED=slow\n",
+                "scanner speed=\"default\"\n",
+                "# RUSTFS_NOTIFY_WEBHOOK_COMMENT_PRIMARY= a=b  \n",
+                "# RUSTFS_NOTIFY_WEBHOOK_TLS_CLIENT_KEY_PRIMARY=*redacted*\n",
+                "# RUSTFS_NOTIFY_WEBHOOK_AUTH_TOKEN_PRIMARY=*redacted*\n",
+                "notify_webhook:primary queue_limit=\"100\"",
+            )
+        );
+        assert_eq!(
+            redact_config_document(&document.content),
+            "scanner speed=\"default\"\nnotify_webhook:primary queue_limit=\"100\""
+        );
     }
 
     #[test]

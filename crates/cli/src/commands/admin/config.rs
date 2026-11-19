@@ -22,7 +22,7 @@ use crate::private_file::write_private_file;
 #[derive(Subcommand, Debug)]
 #[command(disable_help_subcommand = true)]
 pub enum ConfigCommands {
-    /// Read a subsystem or target configuration
+    /// Read persisted settings and environment overrides for a subsystem or target
     Get(GetArgs),
     /// Set one or more keys after showing a preflight diff
     Set(SetArgs),
@@ -303,7 +303,7 @@ async fn execute_with_api(
 async fn get(args: GetArgs, api: &dyn ConfigApi, formatter: &Formatter) -> rc_core::Result<()> {
     validate_selector(&args.selector)?;
     let document = api.get_config(&args.selector).await?;
-    let content = redact_config_document(&document.content);
+    let content = document.redacted_with_env_overrides();
     output(
         formatter,
         false,
