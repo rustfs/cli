@@ -41,10 +41,40 @@ fn assert_valid_v3(value: &serde_json::Value) {
 }
 
 #[test]
+fn config_get_displays_storage_class_env_overrides_above_persisted_values() {
+    let config_dir = tempfile::tempdir().expect("create config dir");
+    let (endpoint, _receiver, handle) = start_admin_test_server(concat!(
+        "# RUSTFS_STORAGE_CLASS_RRS=EC:8\n",
+        "#RUSTFS_STORAGE_CLASS_STANDARD=EC:8\n",
+        "storage_class rrs=\"EC:1\" standard=\"\"\n",
+    ));
+
+    let output = run(
+        &["admin", "config", "get", "myalias", "storage_class"],
+        &endpoint,
+        &config_dir,
+    );
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("UTF-8 stdout"),
+        concat!(
+            "# RUSTFS_STORAGE_CLASS_RRS=EC:8\n",
+            "# RUSTFS_STORAGE_CLASS_STANDARD=EC:8\n",
+            "storage_class rrs=\"EC:1\" standard=\"\"\n",
+        )
+    );
+    handle.join().expect("server finished");
+}
+
+#[test]
 fn config_get_defensively_redacts_server_output() {
     let config_dir = tempfile::tempdir().expect("create config dir");
-    let (endpoint, receiver, handle) =
-        start_admin_test_server("identity_openid client_id=console client_secret=server-secret");
+    let (endpoint, receiver, handle) = start_admin_test_server(concat!(
+        "# ordinary comment\n",
+        "# RUSTFS_IDENTITY_OPENID_CLIENT_ID=env-console\n",
+        "# RUSTFS_IDENTITY_OPENID_CLIENT_SECRET=env-secret\n",
+        "identity_openid client_id=console client_secret=server-secret",
+    ));
 
     let output = run(
         &[
@@ -67,10 +97,19 @@ fn config_get_defensively_redacts_server_output() {
     let stdout = String::from_utf8(output.stdout).expect("UTF-8 stdout");
     assert!(stdout.contains("*redacted*"));
     assert!(!stdout.contains("server-secret"));
+    assert!(!stdout.contains("env-secret"));
     let value: serde_json::Value = serde_json::from_str(&stdout).expect("JSON output");
     assert_eq!(value["schema_version"], 3);
     assert_eq!(value["type"], "admin_operations");
     assert_eq!(value["data"]["operations"][0]["changed"], false);
+    assert_eq!(
+        value["data"]["operations"][0]["result"]["result"],
+        concat!(
+            "# RUSTFS_IDENTITY_OPENID_CLIENT_ID=env-console\n",
+            "# RUSTFS_IDENTITY_OPENID_CLIENT_SECRET=*redacted*\n",
+            "identity_openid client_id=\"console\" client_secret=\"*redacted*\"",
+        )
+    );
     assert_valid_v3(&value);
 
     let request = receiver
@@ -121,7 +160,10 @@ fn config_set_dry_run_never_sends_mutation() {
     let config_dir = tempfile::tempdir().expect("create config dir");
     let (endpoint, receiver, handle) = start_admin_sequence_test_server(vec![
         ("200 OK", SCANNER_HELP),
-        ("200 OK", "scanner speed=default"),
+        (
+            "200 OK",
+            "# RUSTFS_SCANNER_SPEED=slow\nscanner speed=default",
+        ),
     ]);
 
     let output = run(
@@ -144,6 +186,13 @@ fn config_set_dry_run_never_sends_mutation() {
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON diff");
+    let changes = value["data"]["operations"][0]["result"]["diff"]["changes"]
+        .as_array()
+        .expect("changes");
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0]["before"], "default");
+    assert_eq!(changes[0]["after"], "fast");
     let first = receiver
         .recv_timeout(Duration::from_secs(5))
         .expect("help request");
