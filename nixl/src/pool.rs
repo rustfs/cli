@@ -47,13 +47,8 @@ impl Pools {
                     pool
                 }
             };
-            let mut lost = pool.lost.subscribe();
-            tokio::select! {
-                biased;
-                _ = lost.wait_for(|count| *count == WINDOWS_PER_POOL) => continue,
-                result = pool.agent.reserve(Duration::from_secs(60)) => {
-                    return Ok(Window { chunk: result.map_err(native_error)?, pool });
-                }
+            if let Some(window) = pool.reserve().await? {
+                return Ok(window);
             }
         }
     }
@@ -93,6 +88,18 @@ impl Pool {
             lost: watch::Sender::new(0),
             _budget: budget,
         }))
+    }
+
+    /// A retired registration wakes its waiters so the owner can replace it.
+    async fn reserve(self: &Arc<Self>) -> Result<Option<Window>> {
+        let mut lost = self.lost.subscribe();
+        tokio::select! {
+            biased;
+            _ = lost.wait_for(|count| *count == WINDOWS_PER_POOL) => Ok(None),
+            result = self.agent.reserve(Duration::from_secs(60)) => {
+                Ok(Some(Window { chunk: result.map_err(native_error)?, pool: self.clone() }))
+            }
+        }
     }
 }
 
@@ -154,19 +161,21 @@ mod tests {
         let second = pools.reserve(32).await.unwrap();
         let old = first.pool.clone();
         assert!(Arc::ptr_eq(&old, &second.pool));
-        let waiting = pools.reserve(32);
+        let waiting = old.reserve();
         tokio::pin!(waiting);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(5), &mut waiting)
-                .await
-                .is_err()
-        );
+        tokio::select! {
+            biased;
+            _ = &mut waiting => panic!("both windows are checked out"),
+            _ = std::future::ready(()) => {}
+        }
         drop(first.expose());
         drop(second.expose());
-        let replacement = tokio::time::timeout(Duration::from_secs(10), waiting)
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::select! {
+            biased;
+            result = waiting => assert!(result.unwrap().is_none()),
+            _ = std::future::ready(()) => panic!("retiring a pool must wake its waiters immediately"),
+        }
+        let replacement = pools.reserve(32).await.unwrap();
         assert!(!Arc::ptr_eq(&old, &replacement.pool));
         let returned = replacement.expose().finished();
         drop(returned);
