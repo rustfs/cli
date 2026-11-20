@@ -95,7 +95,7 @@ fn validate_version_selector(version_id: Option<&str>, rewind: Option<&str>) -> 
 #[command(propagate_version = true)]
 pub struct Cli {
     /// Object data transport: http, auto, or rdma (requires an installed provider)
-    #[arg(long, global = true, default_value = "http")]
+    #[arg(long, global = true, env = "RC_DATA_TRANSPORT", default_value = "http")]
     pub data_transport: DataTransportMode,
 
     /// Maximum multipart parts per object for the destination backend

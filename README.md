@@ -71,8 +71,7 @@ cd cli
 cargo build --release
 ```
 
-Optional object-data interfaces and the explicit private build are documented
-in [RDMA builds](docs/rdma-build.md). The ordinary build requires no private source.
+To use RustFS native NIXL/UCX for object transfers, build the [Linux RDMA client](docs/rdma-build.md#rustfs-native-nixlucx).
 
 ## Quick Start
 

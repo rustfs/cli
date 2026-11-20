@@ -54,6 +54,12 @@ pub struct ControlResponse {
 #[async_trait]
 pub trait ControlExecutor: Send + Sync {
     async fn execute(&self, request: ControlRequest) -> Result<ControlResponse>;
+
+    /// Return only the status and headers. A server may decline an external GET
+    /// by streaming an ordinary S3 payload of arbitrary size.
+    async fn execute_headers(&self, request: ControlRequest) -> Result<ControlResponse> {
+        self.execute(request).await
+    }
 }
 
 /// Configuration passed to a process-installed provider factory.
@@ -167,6 +173,28 @@ pub(crate) fn committed_verification_failure(source: Error) -> Error {
     }
 }
 
+/// Access to unpublished S3 parts for providers without atomic direct PUT negotiation.
+#[async_trait]
+pub trait StagedUploadTransport: ObjectDataTransport {
+    fn max_part_size(&self) -> u64;
+
+    /// Probe part 1 of a newly created upload before reading application data.
+    async fn probe(
+        &self,
+        path: &RemotePath,
+        upload_id: &str,
+        first_part_bytes: u64,
+    ) -> DataTransportResult<bool>;
+
+    /// Read an exact file range directly into registered memory.
+    async fn upload_file_part(
+        &self,
+        request: UploadRequest<'_>,
+        file: Arc<std::fs::File>,
+        offset: u64,
+    ) -> DataTransportResult<UploadResult>;
+}
+
 /// One provider call performs one S3 data operation and its owned reconciliation.
 ///
 /// Success requires authenticated acceptance, exact logical length, data
@@ -175,6 +203,22 @@ pub(crate) fn committed_verification_failure(source: Error) -> Error {
 /// retain their classification; callers never infer replay safety from strings.
 #[async_trait]
 pub trait ObjectDataTransport: Send + Sync {
+    /// A server which can interpret a declined external PUT as an empty S3 PUT
+    /// must receive data only into unpublished multipart parts.
+    fn staged_upload(&self) -> Option<&dyn StagedUploadTransport> {
+        None
+    }
+
+    /// Write verified data directly to the host's unpublished temporary file.
+    /// Providers using the streaming sink return None without accessing the file.
+    async fn download_file(
+        &self,
+        _request: DownloadRequest<'_>,
+        _file: Arc<std::fs::File>,
+    ) -> DataTransportResult<Option<DownloadResult>> {
+        Ok(None)
+    }
+
     async fn download(
         &self,
         request: DownloadRequest<'_>,

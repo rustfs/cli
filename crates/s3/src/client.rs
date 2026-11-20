@@ -2,6 +2,8 @@
 //!
 //! Wraps aws-sdk-s3 and implements the ObjectStore trait from rc-core.
 
+mod staged_upload;
+
 use async_trait::async_trait;
 use aws_credential_types::Credentials;
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
@@ -2034,6 +2036,41 @@ impl S3Client {
         let Some(transport) = self.selected_data_transport()? else {
             return Ok(None);
         };
+        if let Some(staged) = transport.staged_upload() {
+            if request.content_length == 0 {
+                return Ok(None);
+            }
+            if let UploadOperation::PutObject { condition } = request.operation {
+                let options = PathUploadOptions {
+                    write: request.options,
+                    precondition: condition.into(),
+                };
+                let result = self
+                    .put_staged_object(
+                        request.path,
+                        staged_upload::Source::Reader(source),
+                        request.content_length,
+                        options,
+                        staged,
+                        &mut |_| {},
+                    )
+                    .await?;
+                return Ok(result.map(|object| UploadResult {
+                    object,
+                    checksum_sha256: None,
+                }));
+            }
+        }
+        self.upload_with_transport(transport.as_ref(), request, source)
+            .await
+    }
+
+    async fn upload_with_transport(
+        &self,
+        transport: &dyn ObjectDataTransport,
+        request: UploadRequest<'_>,
+        source: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+    ) -> Result<Option<UploadResult>> {
         let length = request.content_length;
         let customer_key =
             destination_sse_customer_key(request.options.encryption.as_ref()).cloned();
@@ -2335,13 +2372,63 @@ impl S3Client {
     ) -> Result<u64> {
         options.validate()?;
         self.ensure_sse_customer_transport(options.customer_key.as_ref())?;
-        if self.selected_data_transport()?.is_some() {
-            let (mut file, temporary) = Self::temporary_download_file(destination)?;
-            if let Some(bytes) = self
-                .try_external_download(path, options, &mut file, None, &mut on_progress)
-                .await?
-            {
-                drop(file);
+        if let Some(transport) = self.selected_data_transport()? {
+            let (file, temporary) = Self::temporary_download_file(destination)?;
+            let file = Arc::new(file.into_std().await);
+            let result = transport
+                .download_file(
+                    DownloadRequest {
+                        path,
+                        options,
+                        max_bytes: None,
+                        max_receive_bytes: rc_core::S3_MAX_OBJECT_SIZE,
+                        on_progress: &mut on_progress,
+                    },
+                    file.clone(),
+                )
+                .await;
+            let bytes = match result {
+                Ok(Some(done))
+                    if done.bytes_transferred == done.content_length
+                        && done.content_length <= rc_core::S3_MAX_OBJECT_SIZE
+                        && file.metadata()?.len() == done.content_length =>
+                {
+                    Some(done.content_length)
+                }
+                Ok(Some(_)) => {
+                    return Err(Error::DataTransfer {
+                        state: rc_core::DataTransferState::ConfirmedFailure,
+                        message: "Native download length differs from its temporary file".into(),
+                        source: None,
+                    });
+                }
+                Ok(None) => {
+                    let file = Arc::try_unwrap(file).map_err(|_| {
+                        Error::General("Unused download file is still in use".into())
+                    })?;
+                    self.try_external_download(
+                        path,
+                        options,
+                        &mut tokio::fs::File::from_std(file),
+                        None,
+                        &mut on_progress,
+                    )
+                    .await?
+                }
+                Err(err)
+                    if err.state == rc_core::DataTransferState::NotAccepted
+                        && file.metadata()?.len() == 0
+                        && self.data_transport_mode == rc_core::DataTransportMode::Auto =>
+                {
+                    None
+                }
+                Err(err) => {
+                    return Err(
+                        self.redact_sse_customer_error(err.into(), options.customer_key.as_ref())
+                    );
+                }
+            };
+            if let Some(bytes) = bytes {
                 temporary.persist(destination).map_err(|error| {
                     Error::General(format!(
                         "atomically replace download destination '{}': {}",
@@ -4534,7 +4621,7 @@ impl S3Client {
         options: PathUploadOptions<'_>,
         on_progress: impl Fn(u64) + Send,
     ) -> Result<ObjectInfo> {
-        use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+        use aws_sdk_s3::types::CompletedPart;
 
         if options.write.storage_class.is_some() {
             return Err(Error::UnsupportedFeature(
@@ -4564,40 +4651,9 @@ impl S3Client {
         }
         tracing::debug!(file_size, part_size, "Starting multipart upload");
 
-        let mut create_request = apply_object_write_encryption_to_multipart_create_request(
-            self.inner
-                .create_multipart_upload()
-                .bucket(&path.bucket)
-                .key(&path.key),
-            options.write.encryption.as_ref(),
-        );
-        if let Some(attributes) = &options.write.attributes {
-            create_request =
-                apply_object_attributes_to_multipart_create_request(create_request, attributes)?;
-        }
-        if let Some(tags) = &options.write.tags {
-            create_request = create_request.tagging(encode_object_tags(tags));
-        }
-        if checksum_requested {
-            create_request =
-                create_request.checksum_algorithm(aws_sdk_s3::types::ChecksumAlgorithm::Sha256);
-        }
-        create_request =
-            apply_object_lock_to_multipart_create_request(create_request, options.write)?;
-
-        let create_response = create_request.send().await.map_err(|error| {
-            self.map_sdk_failure(&error, || {
-                self.redact_sse_customer_error(
-                    Self::map_transfer_write_error(&error, path, options.write),
-                    destination_sse_customer_key(options.write.encryption.as_ref()),
-                )
-            })
-        })?;
-
-        let upload_id = create_response
-            .upload_id()
-            .ok_or_else(|| Error::General("missing upload id from multipart upload".to_string()))?
-            .to_string();
+        let upload_id = self
+            .start_object_upload(path, options, checksum_requested)
+            .await?;
 
         tracing::debug!(upload_id = %upload_id, "Multipart upload initiated");
 
@@ -4755,70 +4811,16 @@ impl S3Client {
             part_number += 1;
         }
 
-        let completed_upload = CompletedMultipartUpload::builder()
-            .set_parts(Some(completed_parts))
-            .build();
-        let mut complete_request = self
-            .inner
-            .complete_multipart_upload()
-            .bucket(&path.bucket)
-            .key(&path.key)
-            .upload_id(&upload_id)
-            .multipart_upload(completed_upload);
-        complete_request = match options.precondition {
-            ObjectWritePrecondition::None => complete_request,
-            ObjectWritePrecondition::IfAbsent => complete_request.if_none_match("*"),
-            ObjectWritePrecondition::IfMatch(etag) => complete_request.if_match(etag),
-        };
-        let complete_result = complete_request.send().await;
-
-        let complete_response = match complete_result {
-            Ok(response) => response,
-            Err(error) => {
-                tracing::debug!(upload_id = %upload_id, "Attempting to abort multipart upload after completion failure");
-                let primary = if !matches!(options.precondition, ObjectWritePrecondition::None)
-                    && let aws_sdk_s3::error::SdkError::ServiceError(service_error) = &error
-                    && matches!(service_error.raw().status().as_u16(), 409 | 412)
-                {
-                    Error::Conflict(format!("Object changed before upload: {path}"))
-                } else {
-                    self.redact_sse_customer_error(
-                        Self::map_object_request_error(&error, path, None),
-                        destination_sse_customer_key(options.write.encryption.as_ref()),
-                    )
-                };
-                let primary = if has_external_parts {
-                    let state = match &error {
-                        aws_sdk_s3::error::SdkError::ServiceError(service_error)
-                            if matches!(service_error.raw().status().as_u16(), 409 | 412) =>
-                        {
-                            rc_core::DataTransferState::ConfirmedFailure
-                        }
-                        _ => rc_core::DataTransferState::OutcomeUnknown,
-                    };
-                    Error::DataTransfer {
-                        state,
-                        message: "Multipart completion did not return a usable success result"
-                            .to_string(),
-                        source: Some(Box::new(primary)),
-                    }
-                } else {
-                    primary
-                };
-                return Err(self
-                    .abort_multipart_upload_with_error(path, &upload_id, primary)
-                    .await);
-            }
-        };
-
-        tracing::debug!("Multipart upload completed");
-
-        let mut info = ObjectInfo::file(&path.key, file_size as i64);
-        if let Some(etag) = complete_response.e_tag() {
-            info.etag = Some(etag.trim_matches('"').to_string());
-        }
-        info.version_id = complete_response.version_id().map(ToString::to_string);
-        info.last_modified = Some(jiff::Timestamp::now());
+        let info = self
+            .finish_object_upload(
+                path,
+                &upload_id,
+                options,
+                completed_parts,
+                file_size,
+                has_external_parts,
+            )
+            .await?;
 
         if checksum_requested {
             let expected_checksum = composite_sha256_checksum(&part_digests);
@@ -4992,7 +4994,7 @@ impl S3Client {
         file_path: &std::path::Path,
         write: &ObjectWriteOptions,
         precondition: ObjectWritePrecondition<'_>,
-        on_progress: impl Fn(u64) + Send,
+        mut on_progress: impl Fn(u64) + Send,
     ) -> Result<ObjectInfo> {
         validate_attribute_tag_write_options(write)?;
         self.ensure_write_sse_customer_transport(write.encryption.as_ref())?;
@@ -5011,11 +5013,42 @@ impl S3Client {
             write,
             precondition,
         };
+        let mut http;
+        let client = if file_size > 0
+            && let Some(transport) = self.selected_data_transport()?
+            && let Some(staged) = transport.staged_upload()
+        {
+            let file =
+                std::sync::Arc::new(tokio::fs::File::open(file_path).await?.into_std().await);
+            if file.metadata()?.len() != file_size {
+                return Err(Error::Conflict("Upload source length changed".into()));
+            }
+            if let Some(info) = self
+                .put_staged_object(
+                    path,
+                    staged_upload::Source::File(file),
+                    file_size,
+                    options,
+                    staged,
+                    &mut on_progress,
+                )
+                .await?
+            {
+                return Ok(info);
+            }
+            http = self.clone();
+            http.data_transport_mode = rc_core::DataTransportMode::Http;
+            &http
+        } else {
+            self
+        };
         if Self::should_use_multipart(file_size) {
-            self.put_object_multipart_from_path(path, file_path, file_size, options, on_progress)
+            client
+                .put_object_multipart_from_path(path, file_path, file_size, options, on_progress)
                 .await
         } else {
-            self.put_object_single_part_from_path(path, file_path, options, on_progress)
+            client
+                .put_object_single_part_from_path(path, file_path, options, on_progress)
                 .await
         }
     }
@@ -7815,6 +7848,20 @@ impl ObjectStore for S3Client {
 #[async_trait]
 impl ControlExecutor for S3Client {
     async fn execute(&self, request: ControlRequest) -> Result<ControlResponse> {
+        self.execute_control(request, true).await
+    }
+
+    async fn execute_headers(&self, request: ControlRequest) -> Result<ControlResponse> {
+        self.execute_control(request, false).await
+    }
+}
+
+impl S3Client {
+    async fn execute_control(
+        &self,
+        request: ControlRequest,
+        read_body: bool,
+    ) -> Result<ControlResponse> {
         if self.alias.anonymous {
             return Err(Error::RequestRejected(
                 "External object control requires an authenticated S3 principal".to_string(),
@@ -7941,6 +7988,13 @@ impl ControlExecutor for S3Client {
             .map_err(|_| Error::Network("External control exchange failed".to_string()))?;
         let status = response.status();
         let headers = response.headers().clone();
+        if !read_body {
+            return Ok(ControlResponse {
+                status,
+                headers,
+                body: Bytes::new(),
+            });
+        }
         if response
             .content_length()
             .is_some_and(|length| length > request.response_limit as u64)
