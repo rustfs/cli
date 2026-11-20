@@ -28,7 +28,8 @@ or `rdma` to reuse the selection across commands. The default is `http`. Signed 
 read timeouts, including the wait for each transfer receipt.
 
 File uploads use positional reads directly into two reusable registered
-windows. For transfers of up to 1 MiB, the client can register two 1 MiB
+windows. Each completed part frees a window for the next part, and S3 receives
+the completion list in part-number order. For transfers of up to 1 MiB, the client can register two 1 MiB
 windows. Larger transfers use 64 MiB windows, which also serve subsequent
 small requests on the same client. File downloads write directly into the temporary
 destination file. A range GET for the next window can proceed while the

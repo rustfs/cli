@@ -3,6 +3,7 @@
 use super::*;
 use crate::data_transport::StagedUploadTransport;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+use futures::{StreamExt, stream::FuturesUnordered};
 
 pub(super) enum Source<'a> {
     File(Arc<std::fs::File>),
@@ -240,20 +241,32 @@ impl S3Client {
             };
             match source {
                 Source::File(file) => {
-                    // Ordered collection preserves the completion manifest while two
-                    // independent positional reads and transfers can run concurrently.
-                    let send = |i: u64| {
-                        staged.upload_file_part(part_request(i), Arc::clone(&file), i * part_size)
+                    const FILE_WINDOWS: usize = 2;
+                    let send = |i| {
+                        let part = staged.upload_file_part(
+                            part_request(i),
+                            Arc::clone(&file),
+                            i * part_size,
+                        );
+                        async move { (i, part.await) }
                     };
-                    for i in (0..count).step_by(2) {
-                        if i + 1 == count {
-                            finish_part(i, send(i).await?)?;
-                        } else {
-                            let (first, second) = tokio::join!(send(i), send(i + 1));
-                            finish_part(i, first?)?;
-                            finish_part(i + 1, second?)?;
+                    let mut remaining = 0..count;
+                    let mut in_flight: FuturesUnordered<_> =
+                        remaining.by_ref().take(FILE_WINDOWS).map(send).collect();
+                    while let Some((i, result)) = in_flight.next().await {
+                        if let Err(error) = result
+                            .map_err(Error::from)
+                            .and_then(|part| finish_part(i, part))
+                        {
+                            // Let already-exposed windows receive their receipts before aborting.
+                            while in_flight.next().await.is_some() {}
+                            return Err(error);
+                        }
+                        if let Some(next) = remaining.next() {
+                            in_flight.push(send(next));
                         }
                     }
+                    parts.sort_unstable_by_key(CompletedPart::part_number);
                     if file.metadata()?.len() != length {
                         return Err(Error::Conflict("Upload source length changed".into()));
                     }

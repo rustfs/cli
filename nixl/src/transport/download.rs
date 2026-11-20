@@ -7,10 +7,23 @@ pub(super) enum Sink<'a> {
 
 struct Selection<'a> {
     path: &'a RemotePath,
-    query: Vec<(String, String)>,
+    requested_version: Option<&'a str>,
     total: u64,
     etag: HeaderValue,
-    version: Option<&'a str>,
+    observed_version: Option<&'a str>,
+}
+
+fn read_request(
+    method: Method,
+    path: &RemotePath,
+    version: Option<&str>,
+    headers: HeaderMap,
+) -> ControlRequest {
+    let query = version
+        .map(|value| ("versionId".into(), value.to_owned()))
+        .into_iter()
+        .collect();
+    wire::request(method, path, query, headers)
 }
 
 impl Transport {
@@ -39,17 +52,19 @@ impl Transport {
         let exposed = window.expose();
         let (response, exposed) = self
             .exchange(
-                wire::request(
+                read_request(
                     Method::GET,
                     selection.path,
-                    selection.query.clone(),
+                    selection.requested_version,
                     headers,
                 ),
                 exposed,
             )
             .await?;
         if !response.status.is_success() {
-            return Err(rejected(wire::s3_error(response.status, selection.path)));
+            return Err(rejected(
+                response.object_error(selection.path, selection.requested_version),
+            ));
         }
         if !response.headers.contains_key(RDMA_REPLY_HEADER) {
             // An ordinary successful GET returned the object in its HTTP body.
@@ -75,7 +90,7 @@ impl Transport {
             )));
         }
         if wire::field(&response.headers, "x-amz-version-id").map_err(rejected)?
-            != selection.version
+            != selection.observed_version
         {
             return Err(rejected(Error::Conflict(format!(
                 "Object version changed: {}",
@@ -114,26 +129,23 @@ impl Transport {
                 "NIXL does not encrypt SSE-C payloads in transit".into(),
             )));
         }
-        let mut query = Vec::new();
-        if let Some(version) = &request.options.version_id {
-            query.push(("versionId".into(), version.clone()));
-        }
+        let requested_version = request.options.version_id.as_deref();
         let mut headers = HeaderMap::new();
         if request.options.checksum_mode {
             headers.insert("x-amz-checksum-mode", HeaderValue::from_static("ENABLED"));
         }
         let head = self
             .control
-            .execute_headers(wire::request(
+            .execute_headers(read_request(
                 Method::HEAD,
                 request.path,
-                query.clone(),
+                requested_version,
                 headers,
             ))
             .await
             .map_err(unavailable)?;
         if head.status != StatusCode::OK {
-            return Err(rejected(wire::s3_error(head.status, request.path)));
+            return Err(rejected(head.object_error(request.path, requested_version)));
         }
         let total = wire::field(&head.headers, "content-length")
             .map_err(rejected)?
@@ -145,7 +157,7 @@ impl Transport {
                 "NIXL object exceeds the receive bound".into(),
             )));
         }
-        let version = wire::field(&head.headers, "x-amz-version-id").map_err(rejected)?;
+        let observed_version = wire::field(&head.headers, "x-amz-version-id").map_err(rejected)?;
         let etag = head
             .headers
             .get("etag")
@@ -153,10 +165,10 @@ impl Transport {
             .ok_or_else(|| rejected(Error::General("Object HEAD has no ETag".into())))?;
         let selection = Selection {
             path: request.path,
-            query,
+            requested_version,
             total,
             etag,
-            version,
+            observed_version,
         };
         let ranged = length > 0 && (request.max_bytes.is_some() || length > WINDOW as u64);
         let first = length.min(WINDOW as u64) as usize;

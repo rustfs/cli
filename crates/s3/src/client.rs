@@ -2,6 +2,7 @@
 //!
 //! Wraps aws-sdk-s3 and implements the ObjectStore trait from rc-core.
 
+mod object_error;
 mod staged_upload;
 
 use async_trait::async_trait;
@@ -2930,123 +2931,6 @@ impl S3Client {
             }
             _ => error.to_string(),
         }
-    }
-
-    fn map_object_request_error<E>(
-        error: &aws_sdk_s3::error::SdkError<E>,
-        path: &RemotePath,
-        requested_version: Option<&str>,
-    ) -> Error
-    where
-        E: ProvideErrorMetadata + std::fmt::Display,
-    {
-        if let Some(error) = crate::auth::sdk_temporary_credential_error(error) {
-            return error;
-        }
-        let formatted = Self::format_sdk_error(error);
-
-        if let aws_sdk_s3::error::SdkError::ServiceError(service_error) = error {
-            let raw = service_error.raw();
-            let code = service_error.err().code().or_else(|| {
-                raw.headers()
-                    .get("x-amz-error-code")
-                    .and_then(|value| std::str::from_utf8(value.as_bytes()).ok())
-            });
-            let status = raw.status().as_u16();
-            if matches!(code, Some("InvalidStorageClass")) {
-                return Error::UnsupportedFeature(
-                    "The S3 endpoint rejected the requested storage class".to_string(),
-                );
-            }
-            if matches!(code, Some("BadDigest") | Some("InvalidDigest")) {
-                return Error::Conflict(
-                    "The S3 endpoint rejected the supplied object checksum".to_string(),
-                );
-            }
-            if matches!(status, 409 | 412)
-                || matches!(
-                    code,
-                    Some("ConditionalRequestConflict") | Some("PreconditionFailed")
-                )
-            {
-                return Error::Conflict(formatted);
-            }
-            if status == 401 || matches!(code, Some("Unauthorized")) {
-                return Error::Auth(formatted);
-            }
-
-            let version_header = raw
-                .headers()
-                .get("x-amz-version-id")
-                .and_then(|value| std::str::from_utf8(value.as_bytes()).ok());
-            let is_delete_marker = raw
-                .headers()
-                .get("x-amz-delete-marker")
-                .and_then(|value| std::str::from_utf8(value.as_bytes()).ok())
-                .is_some_and(|value| value.eq_ignore_ascii_case("true"));
-
-            let service_message = service_error.err().message().unwrap_or(formatted.as_str());
-            if Self::is_retention_denial(service_message) {
-                return Error::GovernanceDenied {
-                    path: path.to_string(),
-                    version_id: requested_version.map(ToString::to_string),
-                };
-            }
-
-            if matches!(code, Some("AccessDenied") | Some("Forbidden")) || status == 403 {
-                return Error::Auth(formatted);
-            }
-
-            if is_delete_marker {
-                return Error::DeleteMarker {
-                    path: path.to_string(),
-                    version_id: version_header
-                        .or(requested_version)
-                        .unwrap_or("unknown")
-                        .to_string(),
-                };
-            }
-
-            if matches!(code, Some("NoSuchVersion"))
-                || (requested_version.is_some()
-                    && (matches!(code, Some("NoSuchKey") | Some("NotFound")) || status == 404))
-            {
-                return Error::VersionNotFound {
-                    path: path.to_string(),
-                    version_id: requested_version.unwrap_or("unknown").to_string(),
-                };
-            }
-
-            if matches!(code, Some("NoSuchKey") | Some("NotFound")) || status == 404 {
-                return Error::NotFound(path.to_string());
-            }
-        }
-
-        if Self::is_retention_denial(&formatted) {
-            return Error::GovernanceDenied {
-                path: path.to_string(),
-                version_id: requested_version.map(ToString::to_string),
-            };
-        }
-        if formatted.contains("AccessDenied")
-            || formatted.contains("Forbidden")
-            || formatted.contains("Unauthorized")
-        {
-            return Error::Auth(formatted);
-        }
-        if formatted.contains("NoSuchVersion")
-            || (requested_version.is_some()
-                && (formatted.contains("NoSuchKey") || formatted.contains("NotFound")))
-        {
-            return Error::VersionNotFound {
-                path: path.to_string(),
-                version_id: requested_version.unwrap_or("unknown").to_string(),
-            };
-        }
-        if formatted.contains("NoSuchKey") || formatted.contains("NotFound") {
-            return Error::NotFound(path.to_string());
-        }
-        Error::Network(formatted)
     }
 
     fn map_object_lock_write_error<E>(
@@ -14743,6 +14627,7 @@ mod tests {
     }
 
     enum ExternalBehavior {
+        OutOfOrderFile(tokio::sync::Notify),
         Reject,
         RewriteThenReject(std::path::PathBuf, &'static [u8]),
         PartialReject,
@@ -14758,6 +14643,10 @@ mod tests {
 
     #[async_trait]
     impl ObjectDataTransport for TestExternalTransport {
+        fn staged_upload(&self) -> Option<&dyn data_transport::StagedUploadTransport> {
+            matches!(self.behavior, ExternalBehavior::OutOfOrderFile(_)).then_some(self)
+        }
+
         async fn download(
             &self,
             request: DownloadRequest<'_>,
@@ -14857,6 +14746,79 @@ mod tests {
                 checksum_sha256: request.checksum_sha256.map(ToString::to_string),
             })
         }
+    }
+
+    #[async_trait]
+    impl data_transport::StagedUploadTransport for TestExternalTransport {
+        fn max_part_size(&self) -> u64 {
+            crate::multipart::DEFAULT_PART_SIZE
+        }
+
+        async fn probe(
+            &self,
+            _: &RemotePath,
+            _: &str,
+            _: u64,
+        ) -> data_transport::DataTransportResult<bool> {
+            panic!("forced native upload does not probe")
+        }
+
+        async fn upload_file_part(
+            &self,
+            request: UploadRequest<'_>,
+            _: Arc<std::fs::File>,
+            offset: u64,
+        ) -> data_transport::DataTransportResult<UploadResult> {
+            let ExternalBehavior::OutOfOrderFile(release_first) = &self.behavior else {
+                unreachable!()
+            };
+            let UploadOperation::UploadPart { part_number, .. } = request.operation else {
+                unreachable!()
+            };
+            assert_eq!(offset, (part_number as u64 - 1) * self.max_part_size());
+            match part_number {
+                1 => release_first.notified().await,
+                2 => {}
+                3 => release_first.notify_one(),
+                _ => unreachable!(),
+            }
+            let mut object = ObjectInfo::file(&request.path.key, request.content_length as i64);
+            object.etag = Some(format!("part-{part_number}"));
+            Ok(UploadResult {
+                object,
+                checksum_sha256: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn native_file_upload_refills_free_windows_and_completes_in_part_order() {
+        let (client, replay) = test_s3_client_with_response_sequence(vec![
+            multipart_copy_create_response("native-upload"),
+            multipart_copy_complete_response(),
+        ]);
+        let provider =
+            external_transport(ExternalBehavior::OutOfOrderFile(tokio::sync::Notify::new()));
+        let client = client.with_object_data_transport(rc_core::DataTransportMode::Rdma, provider);
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let len = 2 * crate::multipart::DEFAULT_PART_SIZE + 1;
+        file.as_file().set_len(len).unwrap();
+        let path = RemotePath::new("test", "bucket", "data");
+        let options = ObjectWriteOptions::default();
+        let upload = client.put_object_from_path_with_options(&path, file.path(), &options, |_| {});
+        let object = tokio::time::timeout(Duration::from_secs(5), upload)
+            .await
+            .expect("part 3 must start while part 1 is pending")
+            .unwrap();
+        assert_eq!(object.size_bytes, Some(len as i64));
+        let requests: Vec<_> = replay.actual_requests().collect();
+        assert_eq!(requests.len(), 2);
+        let manifest = std::str::from_utf8(requests[1].body().bytes().unwrap()).unwrap();
+        let positions = ["part-1", "part-2", "part-3"].map(|etag| manifest.find(etag).unwrap());
+        assert!(
+            positions[0] < positions[1] && positions[1] < positions[2],
+            "{manifest}"
+        );
     }
 
     fn external_transport(behavior: ExternalBehavior) -> Arc<TestExternalTransport> {

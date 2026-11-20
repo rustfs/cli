@@ -80,3 +80,46 @@ async fn replacement_with_the_same_etag_is_detected_before_writing() {
         matches!(result, Err(error) if matches!(error.source.as_deref(), Some(Error::Conflict(_))))
     );
 }
+
+#[tokio::test]
+async fn a_delete_marker_keeps_its_version_and_exit_code() {
+    struct DeleteMarker;
+    #[async_trait]
+    impl ControlExecutor for DeleteMarker {
+        async fn execute_headers(&self, request: ControlRequest) -> Result<ControlResponse> {
+            assert_eq!(request.method, Method::HEAD);
+            let mut headers = HeaderMap::new();
+            headers.insert("x-amz-delete-marker", HeaderValue::from_static("true"));
+            headers.insert("x-amz-version-id", HeaderValue::from_static("v2"));
+            Ok(ControlResponse {
+                status: StatusCode::METHOD_NOT_ALLOWED,
+                headers,
+            })
+        }
+    }
+
+    let transport = Factory.create(Arc::new(DeleteMarker)).unwrap();
+    let path = RemotePath::new("test", "bucket", "key");
+    let options = rc_core::ObjectReadOptions {
+        version_id: Some("v2".into()),
+    };
+    let alias = rc_core::Alias::new("test", "https://127.0.0.1:1", "test", "test");
+    let client = rc_s3::S3Client::new(alias).await.unwrap();
+    for mode in [
+        rc_core::DataTransportMode::Auto,
+        rc_core::DataTransportMode::Rdma,
+    ] {
+        let client = client
+            .clone()
+            .with_object_data_transport(mode, transport.clone());
+        let error = client
+            .write_object_to_with_options(&path, &options, &mut tokio::io::sink(), None)
+            .await
+            .expect_err("a delete marker cannot be read as an object");
+        assert_eq!(error.exit_code(), 5, "{mode:?}");
+        assert!(
+            matches!(error, Error::DataTransfer { source: Some(source), .. }
+            if matches!(*source, Error::DeleteMarker { ref version_id, .. } if version_id == "v2"))
+        );
+    }
+}

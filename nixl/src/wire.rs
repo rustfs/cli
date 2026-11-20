@@ -69,19 +69,6 @@ pub(crate) fn receipt(status: StatusCode, headers: &HeaderMap, bytes: u64) -> Re
     Ok(())
 }
 
-pub(crate) fn s3_error(status: StatusCode, path: &RemotePath) -> Error {
-    match status {
-        StatusCode::NOT_FOUND => Error::NotFound(path.to_string()),
-        StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED => {
-            Error::Auth(format!("S3 refused access to {path}"))
-        }
-        StatusCode::PRECONDITION_FAILED | StatusCode::CONFLICT => {
-            Error::Conflict(format!("Object changed: {path}"))
-        }
-        _ => Error::General(format!("S3 returned HTTP {status} for {path}")),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

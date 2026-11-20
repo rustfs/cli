@@ -152,7 +152,7 @@ impl Transport {
             .await?;
         if response.status != StatusCode::OK {
             // RustFS can start reading ahead before it validates the multipart ID.
-            return Err(rejected(wire::s3_error(response.status, request.path)));
+            return Err(rejected(response.object_error(request.path, None)));
         }
         if !response.headers.contains_key(RDMA_REPLY_HEADER) {
             drop(exposed.finished());
