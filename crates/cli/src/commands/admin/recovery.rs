@@ -41,15 +41,24 @@ pub(super) fn output<T: Serialize>(
 }
 
 pub(super) fn error(kind: &str, error: &Error, unknown: bool, formatter: &Formatter) -> ExitCode {
+    error_with_message(kind, error, unknown, &error.to_string(), formatter)
+}
+
+pub(super) fn error_with_message(
+    kind: &str,
+    error: &Error,
+    unknown: bool,
+    message: &str,
+    formatter: &Formatter,
+) -> ExitCode {
     let code = ExitCode::from_i32(error.exit_code()).unwrap_or(ExitCode::GeneralError);
-    let message = error.to_string();
     if formatter.is_json() {
         formatter.json_error(&serde_json::json!({
             "schema_version": 3, "type": kind, "status": if unknown { "unknown" } else { "error" },
             "error": { "message": message, "exit_code": code.as_i32(), "automatic_retry": false }
         }));
     } else {
-        formatter.error_with_code(code, &message);
+        formatter.error_with_code(code, message);
     }
     code
 }

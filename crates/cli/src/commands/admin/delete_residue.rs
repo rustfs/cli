@@ -188,7 +188,14 @@ pub async fn execute(command: DeleteResidueCommands, formatter: &Formatter) -> E
                     &error,
                     Error::Network(_) | Error::General(_) | Error::Conflict(_) | Error::Io(_)
                 );
-            recovery::error("delete_residue", &error, unknown, formatter)
+            if unknown {
+                let message = format!(
+                    "Discard outcome is unknown; residue may already have been discarded; automatic retry is disabled. Run delete-residue inspect for the exact bucket, object, pool and set to inspect the exact object before another discard. {error}"
+                );
+                recovery::error_with_message("delete_residue", &error, true, &message, formatter)
+            } else {
+                recovery::error("delete_residue", &error, false, formatter)
+            }
         }
     }
 }
