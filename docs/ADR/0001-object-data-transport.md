@@ -15,7 +15,7 @@ existing worker-thread configuration.
 
 The provider supplies NIXL agent metadata and a registered buffer description
 to a host-owned `ControlExecutor`. The S3 client signs and sends a bodyless
-HTTPS request with a deadline. It returns the status and headers directly,
+HTTPS request on the shared S3 HTTP client using the alias timeout policy. It returns the status and headers directly,
 including duplicate headers. The provider verifies the RustFS transfer receipt
 and byte count. Credentials, endpoint addressing, custom headers, and TLS
 remain in the S3 client.

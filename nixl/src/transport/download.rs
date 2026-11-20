@@ -10,6 +10,7 @@ struct Selection<'a> {
     query: Vec<(String, String)>,
     total: u64,
     etag: HeaderValue,
+    version: Option<&'a str>,
 }
 
 impl Transport {
@@ -19,8 +20,7 @@ impl Transport {
         offset: u64,
         len: usize,
         ranged: bool,
-    ) -> DataTransportResult<StagingChunk> {
-        let pool = self.pool(len as u64).await?;
+    ) -> DataTransportResult<Window> {
         let mut headers = HeaderMap::new();
         headers.insert("if-match", selection.etag.clone());
         let expected = if ranged {
@@ -33,17 +33,10 @@ impl Transport {
         } else {
             StatusCode::OK
         };
-        let chunk = pool.reserve().await.map_err(unavailable)?;
-        // A zero-byte object still needs a valid, nonempty NIXL descriptor.
-        wire::bind(
-            &mut headers,
-            &pool.name,
-            &pool.metadata,
-            chunk.addr(),
-            len.max(1),
-        )
-        .map_err(unavailable)?;
-        let exposed = Exposed::new(chunk, pool.clone());
+        let window = self.pools.reserve(len as u64).await.map_err(unavailable)?;
+        // An empty object still requires a nonempty descriptor.
+        window.bind(&mut headers, len.max(1)).map_err(unavailable)?;
+        let exposed = window.expose();
         let (response, exposed) = self
             .exchange(
                 wire::request(
@@ -72,7 +65,7 @@ impl Transport {
             )));
         }
         wire::receipt(expected, &response.headers, len as u64).map_err(rejected)?;
-        let mut chunk = exposed.finished();
+        let mut window = exposed.finished();
         if wire::field(&response.headers, "content-length")
             .map_err(rejected)?
             .is_some_and(|value| value != "0")
@@ -80,6 +73,14 @@ impl Transport {
             return Err(rejected(Error::General(
                 "NIXL GET returned an HTTP payload".into(),
             )));
+        }
+        if wire::field(&response.headers, "x-amz-version-id").map_err(rejected)?
+            != selection.version
+        {
+            return Err(rejected(Error::Conflict(format!(
+                "Object version changed: {}",
+                selection.path
+            ))));
         }
         if ranged {
             let expected_range = format!(
@@ -95,8 +96,12 @@ impl Transport {
                 )));
             }
         }
-        chunk.advance(len).map_err(native_error).map_err(rejected)?;
-        Ok(chunk)
+        window
+            .chunk
+            .advance(len)
+            .map_err(native_error)
+            .map_err(rejected)?;
+        Ok(window)
     }
 
     pub(super) async fn download_into(
@@ -140,12 +145,7 @@ impl Transport {
                 "NIXL object exceeds the receive bound".into(),
             )));
         }
-        if query.is_empty()
-            && let Some(version) =
-                wire::field(&head.headers, "x-amz-version-id").map_err(rejected)?
-        {
-            query.push(("versionId".into(), version.into()));
-        }
+        let version = wire::field(&head.headers, "x-amz-version-id").map_err(rejected)?;
         let etag = head
             .headers
             .get("etag")
@@ -156,6 +156,7 @@ impl Transport {
             query,
             total,
             etag,
+            version,
         };
         let ranged = length > 0 && (request.max_bytes.is_some() || length > WINDOW as u64);
         let first = length.min(WINDOW as u64) as usize;
@@ -165,20 +166,23 @@ impl Transport {
         loop {
             let write = async {
                 if length == total {
-                    checksum.update(current.staged().map_err(native_error)?);
+                    checksum.update(current.chunk.staged().map_err(native_error)?);
                 }
-                let offset = end - current.len() as u64;
+                let offset = end - current.chunk.len() as u64;
                 match &mut target {
                     Sink::Writer(writer) => {
                         writer
-                            .write_all(current.staged().map_err(native_error)?)
+                            .write_all(current.chunk.staged().map_err(native_error)?)
                             .await?
                     }
                     Sink::File(file) => {
                         use std::os::unix::fs::FileExt;
                         let file = file.clone();
                         tokio::task::spawn_blocking(move || {
-                            file.write_all_at(current.staged().map_err(native_error)?, offset)?;
+                            file.write_all_at(
+                                current.chunk.staged().map_err(native_error)?,
+                                offset,
+                            )?;
                             Ok::<_, Error>(())
                         })
                         .await

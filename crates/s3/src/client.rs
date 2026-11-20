@@ -252,25 +252,6 @@ async fn build_reqwest_client(
     client_key: Option<&str>,
     timeout: Option<&rc_core::alias::TimeoutConfig>,
 ) -> Result<reqwest::Client> {
-    build_reqwest_client_with_read_policy(
-        insecure,
-        ca_bundle,
-        client_cert,
-        client_key,
-        timeout,
-        true,
-    )
-    .await
-}
-
-async fn build_reqwest_client_with_read_policy(
-    insecure: bool,
-    ca_bundle: Option<&str>,
-    client_cert: Option<&str>,
-    client_key: Option<&str>,
-    timeout: Option<&rc_core::alias::TimeoutConfig>,
-    apply_read_timeout: bool,
-) -> Result<reqwest::Client> {
     // NOTE: When `insecure = true`, `danger_accept_invalid_certs` disables all TLS
     // certificate verification. Any CA bundle provided will still be added to the
     // trust store but is rendered ineffective for this connection.
@@ -280,9 +261,7 @@ async fn build_reqwest_client_with_read_policy(
 
     if let Some(timeout) = timeout {
         builder = builder.connect_timeout(Duration::from_millis(timeout.connect_ms));
-        if apply_read_timeout {
-            builder = builder.read_timeout(Duration::from_millis(timeout.read_ms));
-        }
+        builder = builder.read_timeout(Duration::from_millis(timeout.read_ms));
     }
 
     if let Some(bundle_path) = ca_bundle {
@@ -1789,7 +1768,6 @@ pub struct S3Client {
     inner: aws_sdk_s3::Client,
     presign_inner: aws_sdk_s3::Client,
     xml_http_client: reqwest::Client,
-    external_http_client: Arc<tokio::sync::OnceCell<reqwest::Client>>,
     alias: Alias,
     session_token: Option<String>,
     request_headers: Vec<RequestHeader>,
@@ -1915,7 +1893,6 @@ impl S3Client {
             inner: client,
             presign_inner: presign_client,
             xml_http_client,
-            external_http_client: Arc::new(tokio::sync::OnceCell::new()),
             alias,
             session_token,
             request_headers,
@@ -7845,18 +7822,6 @@ impl ControlExecutor for S3Client {
                 "External object control requires an authenticated S3 principal".to_string(),
             ));
         }
-        let remaining = || {
-            request
-                .deadline
-                .checked_duration_since(std::time::Instant::now())
-                .filter(|duration| !duration.is_zero())
-                .ok_or_else(|| {
-                    Error::RequestRejected(
-                        "The external control operation deadline has elapsed".to_string(),
-                    )
-                })
-        };
-        remaining()?;
         let url = self.external_control_url(&request.path, &request.query)?;
         let mut headers = request.headers;
         for name in [
@@ -7910,27 +7875,26 @@ impl ControlExecutor for S3Client {
                 std::time::SystemTime::now(),
             )
             .await?;
-        let client = self
-            .external_http_client
-            .get_or_try_init(|| async {
-                build_reqwest_client_with_read_policy(
-                    self.alias.insecure,
-                    self.alias.ca_bundle.as_deref(),
-                    self.alias.client_cert.as_deref(),
-                    self.alias.client_key.as_deref(),
-                    self.alias.timeout.as_ref(),
-                    false,
-                )
-                .await
-            })
-            .await?;
-        let mut response = client
+        // Only response headers travel over HTTPS. Bound the complete wait,
+        // including connection setup, using the same alias policy as S3.
+        let timeout = self.alias.timeout_config();
+        let mut response = self
+            .xml_http_client
             .request(request.method, url)
             .headers(signed)
-            .timeout(remaining()?)
+            .timeout(Duration::from_millis(
+                timeout.connect_ms.saturating_add(timeout.read_ms),
+            ))
             .send()
             .await
-            .map_err(|_| Error::Network("External control exchange failed".to_string()))?;
+            .map_err(|error| {
+                let message = if error.is_timeout() {
+                    "Timed out waiting for the S3 control response"
+                } else {
+                    "External control exchange failed"
+                };
+                Error::Network(message.to_owned())
+            })?;
         Ok(ControlResponse {
             status: response.status(),
             headers: std::mem::take(response.headers_mut()),
@@ -8104,7 +8068,6 @@ mod tests {
             inner: aws_sdk_s3::Client::from_conf(config),
             presign_inner: aws_sdk_s3::Client::from_conf(presign_config),
             xml_http_client,
-            external_http_client: Arc::new(tokio::sync::OnceCell::new()),
             alias,
             session_token: None,
             request_headers,
@@ -8164,7 +8127,6 @@ mod tests {
             inner: aws_sdk_s3::Client::from_conf(config),
             presign_inner: aws_sdk_s3::Client::from_conf(presign_config),
             xml_http_client: reqwest::Client::new(),
-            external_http_client: Arc::new(tokio::sync::OnceCell::new()),
             alias,
             session_token: None,
             request_headers,
@@ -8297,7 +8259,6 @@ mod tests {
             inner: aws_sdk_s3::Client::from_conf(config.clone()),
             presign_inner: aws_sdk_s3::Client::from_conf(config),
             xml_http_client: reqwest::Client::new(),
-            external_http_client: Arc::new(tokio::sync::OnceCell::new()),
             alias,
             session_token: None,
             request_headers: Vec::new(),
@@ -15596,7 +15557,6 @@ mod tests {
             path: RemotePath::new("test", "bucket", "key"),
             query: Vec::new(),
             headers: HeaderMap::new(),
-            deadline: Instant::now() + Duration::from_secs(30),
         };
         assert!(matches!(
             ControlExecutor::execute_headers(&client, request).await,
@@ -15606,21 +15566,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn external_control_rejects_an_elapsed_operation_deadline_before_network_io() {
-        let (client, replay) = test_s3_client_with_response_sequence(Vec::new());
+    async fn external_control_honors_alias_timeouts() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listen");
+        let endpoint = format!("https://{}", listener.local_addr().expect("port"));
+        let (mut client, _) = test_s3_client_with_endpoint(&endpoint, None);
+        client.xml_http_client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("loopback HTTP client");
+        client.alias.timeout = Some(rc_core::alias::TimeoutConfig {
+            connect_ms: 150,
+            read_ms: 150,
+        });
         let request = ControlRequest {
-            method: Method::PUT,
+            method: Method::HEAD,
             path: RemotePath::new("test", "bucket", "key"),
             query: Vec::new(),
             headers: HeaderMap::new(),
-            deadline: Instant::now(),
         };
-        assert!(matches!(
-            ControlExecutor::execute_headers(&client, request).await,
-            Err(Error::RequestRejected(_))
-        ));
-        assert_eq!(replay.actual_requests().count(), 0);
-        assert!(client.external_http_client.get().is_none());
+        let (result, connection) = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(client.execute_headers(request), listener.accept())
+        })
+        .await
+        .expect("the alias deadline must end a stalled TLS exchange");
+        assert!(connection.is_ok());
+        assert!(matches!(result, Err(Error::Network(message)) if message.contains("Timed out")));
     }
 
     #[tokio::test]

@@ -7,12 +7,11 @@ use async_trait::async_trait;
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use rc_core::{DataTransferState, Error, ObjectInfo, RemotePath, Result};
 use rc_s3::data_transport::*;
-use rustfs_nixl::{RDMA_REPLY_HEADER, StagingChunk};
+use rustfs_nixl::RDMA_REPLY_HEADER;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::OnceCell;
 
-use crate::pool::{Exposed, Pool, SMALL_WINDOW, WINDOW, native_error};
+use crate::pool::{Exposed, Pools, WINDOW, Window, native_error};
 use crate::wire;
 
 pub(crate) struct Factory;
@@ -21,16 +20,14 @@ impl ObjectDataTransportFactory for Factory {
     fn create(&self, control: Arc<dyn ControlExecutor>) -> Result<Arc<dyn ObjectDataTransport>> {
         Ok(Arc::new(Transport {
             control,
-            small_pool: OnceCell::new(),
-            full_pool: OnceCell::new(),
+            pools: Pools::default(),
         }))
     }
 }
 
 struct Transport {
     control: Arc<dyn ControlExecutor>,
-    small_pool: OnceCell<Arc<Pool>>,
-    full_pool: OnceCell<Arc<Pool>>,
+    pools: Pools,
 }
 
 fn failed(state: DataTransferState, source: Error) -> DataTransportError {
@@ -67,24 +64,6 @@ impl Transport {
             Err(error) => Err(unknown(error)),
         }
     }
-
-    async fn pool(&self, required: u64) -> DataTransportResult<&Arc<Pool>> {
-        if let Some(pool) = self.full_pool.get() {
-            return Ok(pool);
-        }
-        let (slot, window) = if required <= SMALL_WINDOW as u64 {
-            (&self.small_pool, SMALL_WINDOW)
-        } else {
-            (&self.full_pool, WINDOW)
-        };
-        slot.get_or_try_init(|| async {
-            tokio::task::spawn_blocking(move || Pool::open(window))
-                .await
-                .map_err(|_| Error::General("NIXL agent startup was interrupted".into()))?
-        })
-        .await
-        .map_err(unavailable)
-    }
 }
 
 #[async_trait]
@@ -120,3 +99,6 @@ impl ObjectDataTransport for Transport {
         self.upload_reader(request, source).await
     }
 }
+
+#[cfg(test)]
+mod tests;

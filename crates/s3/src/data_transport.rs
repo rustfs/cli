@@ -25,7 +25,6 @@ pub struct ControlRequest {
     pub path: RemotePath,
     pub query: Vec<(String, String)>,
     pub headers: HeaderMap,
-    pub deadline: std::time::Instant,
 }
 
 /// Uninterpreted control response; duplicate and binary headers are preserved.

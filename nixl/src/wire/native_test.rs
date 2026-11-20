@@ -1,10 +1,10 @@
 use super::*;
-use crate::pool::Pool;
+use crate::pool::Pools;
 use rustfs_nixl::{NixlConfig, NixlServer, RdmaToken};
 
 #[tokio::test]
 async fn rustfs_reads_and_writes_the_advertised_host_window() {
-    let client = Pool::open(4096).unwrap();
+    let client = Pools::default();
     let peer = NixlServer::new(&NixlConfig {
         agent_name: "rc-interop-peer".into(),
         chunk_bytes: 4096,
@@ -12,17 +12,10 @@ async fn rustfs_reads_and_writes_the_advertised_host_window() {
         ..Default::default()
     })
     .unwrap();
-    let mut source = client.reserve().await.unwrap();
-    source.append(b"upload").unwrap();
+    let mut source = client.reserve(6).await.unwrap();
+    source.chunk.append(b"upload").unwrap();
     let mut fields = HeaderMap::new();
-    bind(
-        &mut fields,
-        &client.name,
-        &client.metadata,
-        source.addr(),
-        6,
-    )
-    .unwrap();
+    source.bind(&mut fields, 6).unwrap();
     let token = RdmaToken::from_headers(
         fields[NIXL_AGENT_HEADER].to_str().unwrap(),
         Some(fields[NIXL_METADATA_HEADER].to_str().unwrap()),
@@ -43,5 +36,5 @@ async fn rustfs_reads_and_writes_the_advertised_host_window() {
         .await
         .unwrap();
     assert_eq!(written, 6);
-    assert_eq!(source.staged().unwrap(), b"result");
+    assert_eq!(source.chunk.staged().unwrap(), b"result");
 }

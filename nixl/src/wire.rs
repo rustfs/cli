@@ -7,7 +7,6 @@ use rustfs_nixl::{
     NIXL_AGENT_HEADER, NIXL_BUFFER_HEADER, NIXL_METADATA_HEADER, RDMA_BYTES_TRANSFERRED_HEADER,
     RDMA_REPLY_HEADER,
 };
-use std::time::{Duration, Instant};
 
 pub(crate) fn request(
     method: Method,
@@ -20,7 +19,6 @@ pub(crate) fn request(
         path: path.clone(),
         query,
         headers,
-        deadline: Instant::now() + Duration::from_secs(3600),
     }
 }
 
