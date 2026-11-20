@@ -105,3 +105,21 @@ Recovery commands add the `mrf_observation`, `integrity_readiness`, `integrity_i
 | 7 | Unsupported recovery API, unsupported selection, or protection not activated for migration. |
 
 Errors carry `message`, `exit_code`, and `automatic_retry: false`. A node-local failure inside an aggregate response can produce `partial` or an unconfirmed action instead of a whole-request HTTP error. Every HTTP request has a 35-second total deadline, including response body reads, and an 8 MiB response limit. A command containing readiness, job lookup and control can make several bounded requests. A timeout does not undo a mutation already accepted by the server; always reconcile by original identity before retrying it.
+
+## Historical delete residue
+
+These commands require the matching RustFS v4 delete-residue Admin API. Use an alias pinned to the same server while paging. Each list call reads one bounded page from one configured disk. The same candidate may appear on several disks or pages. Follow the returned cursor even when a page is empty. A terminal page with incomplete sources leaves coverage unknown.
+
+```sh
+rc --json admin heal delete-residue list production --bucket media --limit 32
+rc --json admin heal delete-residue list production --bucket media --cursor "$NEXT_CURSOR"
+rc --json admin heal delete-residue inspect production --bucket media --object 'photos/a b' --pool 0 --set 0
+```
+
+Inspect reads the participant and transaction evidence for an exact key. Only a complete, eligible observation carries a top-level discard fingerprint. Before discarding, confirm from application records that this specific object was intended to be deleted. Discard is a fresh deletion decision and preserves the server's versioning, Object Lock, participant coverage and ownership checks. Use the top-level fingerprint from the matching inspection, not a per-disk copy fingerprint.
+
+```sh
+rc --json admin heal delete-residue discard production --bucket media --object 'photos/a b' --pool 0 --set 0 --expected-fingerprint "$FINGERPRINT"
+```
+
+Discard sends one request. If the fingerprint is stale, the connection fails or the outcome is unclear, inspect the same key again to see what evidence remains. Treat only a validated discard response with a positive reclaimed count as confirmed cleanup. Retain the original volumes and use authoritative snapshots or backups when the object's intended state is unknown.

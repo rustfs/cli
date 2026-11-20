@@ -3,7 +3,9 @@
 //! This module provides the AdminClient that implements the AdminApi trait
 //! using HTTP requests with AWS SigV4 signing.
 
+mod delete_residue;
 mod diagnostics;
+pub use delete_residue::DeleteResidueClient;
 mod recovery;
 
 use async_trait::async_trait;
@@ -277,7 +279,11 @@ pub struct AdminClient {
 impl AdminClient {
     /// Create a new AdminClient from an Alias
     pub fn new(alias: &Alias) -> Result<Self> {
-        let mut builder = Client::builder()
+        Self::with_builder(alias, Client::builder())
+    }
+
+    fn with_builder(alias: &Alias, builder: reqwest::ClientBuilder) -> Result<Self> {
+        let mut builder = builder
             .danger_accept_invalid_certs(alias.insecure)
             .tls_built_in_native_certs(true)
             .tls_built_in_webpki_certs(true)

@@ -10,6 +10,7 @@ mod bucket_metadata;
 mod capabilities;
 mod config;
 mod decommission;
+mod delete_residue;
 mod diagnostics;
 mod expand;
 mod group;

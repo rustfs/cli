@@ -504,3 +504,344 @@ fn qualified_migration_receipt_keeps_external_attestation_separate_from_local_re
     server.join().unwrap();
     assert_eq!(receiver.try_iter().count(), 2);
 }
+
+#[test]
+fn delete_residue_list_preserves_page_coverage_and_reports_unsupported_servers() {
+    let args = [
+        "admin",
+        "heal",
+        "delete-residue",
+        "list",
+        "local",
+        "--bucket",
+        "bucket",
+        "--limit",
+        "1",
+        "--cursor",
+        ID,
+    ];
+    let page = json!({"bucket":"bucket","incarnation":INCARNATION,"source":{"pool":0,"set":1,"drive":2},
+        "sourceStatus":"scanned","candidates":[{"object":"documents/a","transaction":ID}],"nextCursor":ID,"incompleteSources":0,"complete":false});
+    let (value, request) = run(&args, "200 OK", page.clone(), 0);
+    assert_eq!(value["data"], page);
+    assert_eq!(request.method, "GET");
+    assert!(request.target.contains("/v4/heal/delete-residue?"));
+    assert!(request.target.contains("limit=1"));
+    assert!(request.target.contains(ID));
+    let mut partial = page;
+    partial["sourceStatus"] = json!("unavailable");
+    partial["nextCursor"] = Value::Null;
+    partial["candidates"] = json!([]);
+    partial["incompleteSources"] = json!(1);
+    assert_eq!(run(&args, "200 OK", partial, 1).0["status"], "partial");
+    assert_eq!(
+        run(&args, "404 Not Found", json!({}), 7).0["status"],
+        "error"
+    );
+}
+
+#[test]
+fn delete_residue_inspect_and_discard_preserve_exact_identity_and_reject_stale_fingerprints() {
+    let mut args = vec![
+        "admin",
+        "heal",
+        "delete-residue",
+        "inspect",
+        "local",
+        "--bucket",
+        "bucket",
+        "--object",
+        "a +/b?",
+        "--pool",
+        "0",
+        "--set",
+        "1",
+    ];
+    let fingerprint = "ab".repeat(32);
+    let mut detail = json!({"bucket":"bucket","object":"a +/b?","pool":0,"set":1,"incarnation":INCARNATION,
+        "complete":true,"reason":"discard_eligible","participants":[{"slot":0,"diskId":ID,"discovery":"complete"}],
+        "transactions":[{"id":ID,"copies":[{"slot":0,"state":"legacy_ambiguous","currentMetadataPresent":false,"backupPresent":true,
+        "journalPresent":false,"fingerprint":fingerprint}]}],"fingerprint":fingerprint,"reclaimed":0});
+    let (value, req) = run(&args, "200 OK", detail.clone(), 0);
+    assert_eq!(value["data"], detail);
+    assert_eq!(req.method, "GET");
+    assert!(req.target.contains("object=a%20%2B%2Fb%3F"));
+    let mut wrong = detail.clone();
+    wrong["object"] = json!("another key");
+    assert_eq!(run(&args, "200 OK", wrong, 1).0["status"], "error");
+    let (denied, _) = run(&args, "403 Forbidden", json!({}), 4);
+    assert_eq!(denied["status"], "error");
+
+    args[3] = "discard";
+    args.extend(["--expected-fingerprint", &fingerprint]);
+    detail.as_object_mut().unwrap().remove("fingerprint");
+    detail["reason"] = json!("discarded");
+    detail["reclaimed"] = json!(1);
+    let (result, req) = run(&args, "200 OK", detail, 0);
+    assert_eq!(result["status"], "discarded");
+    let mut invalid = result;
+    invalid["data"]["reclaimed"] = json!(0);
+    assert!(!validator().is_valid(&invalid));
+    assert_eq!(req.method, "POST");
+    assert!(req.target.ends_with("/v4/heal/delete-residue/discard"));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&req.body).unwrap(),
+        json!({"bucket":"bucket","object":"a +/b?",
+        "pool":0,"set":1,"expectedFingerprint":fingerprint})
+    );
+    let (stale, _) = run(&args, "412 Precondition Failed", json!({}), 6);
+    assert_eq!(stale["error"]["automatic_retry"], false);
+    let (unknown, _) = run(
+        &args,
+        "503 Service Unavailable",
+        json!({"message":"DO-NOT-ECHO"}),
+        3,
+    );
+    assert_eq!(unknown["status"], "unknown");
+}
+
+fn discard_args() -> Vec<&'static str> {
+    vec![
+        "admin",
+        "heal",
+        "delete-residue",
+        "discard",
+        "local",
+        "--bucket",
+        "bucket",
+        "--object",
+        "a +/b?",
+        "--pool",
+        "0",
+        "--set",
+        "1",
+        "--expected-fingerprint",
+        NODE,
+    ]
+}
+
+fn assert_unknown_discard(output: &Output, json: bool) {
+    let message = if json {
+        let value = record(output, 3);
+        assert_eq!(value["status"], "unknown");
+        assert_eq!(value["error"]["automatic_retry"], false);
+        value["error"]["message"].as_str().unwrap().to_owned()
+    } else {
+        assert_eq!(output.status.code(), Some(3));
+        assert!(output.stdout.is_empty());
+        String::from_utf8(output.stderr.clone()).unwrap()
+    };
+    assert!(message.contains("outcome is unknown"), "{message}");
+    assert!(
+        message.contains("may already have been discarded"),
+        "{message}"
+    );
+    assert!(message.contains("inspect the exact object"), "{message}");
+    assert!(message.contains("before another discard"), "{message}");
+    assert!(message.contains("automatic retry is disabled"), "{message}");
+    assert!(!message.contains("DO-NOT-ECHO"));
+    assert!(!message.contains("ACCESS_KEY"));
+    assert!(!message.contains("SECRET_KEY"));
+}
+
+#[test]
+fn delete_residue_text_error_requires_reconciliation_after_server_failure() {
+    let root = tempfile::tempdir().unwrap();
+    let (endpoint, receiver, server) = start_admin_response_test_server(
+        "503 Service Unavailable",
+        "application/json",
+        "DO-NOT-ECHO".into(),
+    );
+    let output = Command::new(rc_binary())
+        .args(discard_args())
+        .env("RC_CONFIG_DIR", root.path())
+        .env("RC_HOST_local", rc_host_alias(&endpoint))
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("no_proxy", "127.0.0.1,localhost")
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    assert_eq!(receiver.try_iter().count(), 1);
+    assert_unknown_discard(&output, false);
+}
+
+#[derive(Clone, Copy)]
+enum DiscardFault {
+    RefusedStream,
+    LostResponse,
+}
+
+struct DiscardFaultServer {
+    endpoint: String,
+    certificate: reqwest::Certificate,
+    root: tempfile::TempDir,
+    stop: tokio::sync::oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<Vec<serde_json::Value>>,
+}
+
+impl DiscardFaultServer {
+    async fn start(fault: DiscardFault) -> Self {
+        use std::sync::Arc;
+        use tokio_rustls::{TlsAcceptor, rustls};
+
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let certificate = reqwest::Certificate::from_der(certified.cert.der()).unwrap();
+        let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![certified.cert.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der())
+                .into(),
+        )
+        .unwrap();
+        tls.alpn_protocols = vec![b"h2".to_vec()];
+        let acceptor = TlsAcceptor::from(Arc::new(tls));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!(
+            "https://localhost:{}",
+            listener.local_addr().unwrap().port()
+        );
+        let root = tempfile::tempdir().unwrap();
+        let ca = root.path().join("ca.pem");
+        std::fs::write(&ca, certified.cert.pem()).unwrap();
+        let mut alias = rc_core::Alias::new("local", &endpoint, "ACCESS_KEY", "SECRET_KEY");
+        alias.ca_bundle = Some(ca.to_str().unwrap().into());
+        rc_core::ConfigManager::with_path(root.path().join("config.toml"))
+            .save(&rc_core::Config {
+                aliases: vec![alias],
+                ..Default::default()
+            })
+            .unwrap();
+        let (stop, mut stopped) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    _ = &mut stopped => break,
+                    accepted = listener.accept() => {
+                        let (stream, _) = accepted.unwrap();
+                        let acceptor = acceptor.clone();
+                        let requests = requests.clone();
+                        connections.spawn(async move {
+                            let stream = acceptor.accept(stream).await.unwrap();
+                            assert_eq!(stream.get_ref().1.alpn_protocol(), Some(b"h2".as_slice()));
+                            let mut connection = h2::server::handshake(stream).await.unwrap();
+                            while let Some(request) = connection.accept().await {
+                                let (request, mut response) = request.unwrap();
+                                assert_eq!(request.method(), "POST");
+                                assert_eq!(request.uri().path(), "/rustfs/admin/v4/heal/delete-residue/discard");
+                                assert!(request.headers()["authorization"].to_str().unwrap().starts_with("AWS4-HMAC-SHA256 "));
+                                let bytes = tokio::select! {
+                                    bytes = async {
+                                        let mut body = request.into_body();
+                                        let mut bytes = Vec::new();
+                                        while let Some(chunk) = body.data().await {
+                                            bytes.extend_from_slice(&chunk.unwrap());
+                                        }
+                                        bytes
+                                    } => bytes,
+                                    extra = connection.accept() => panic!("unexpected stream before fault injection: {extra:?}"),
+                                };
+                                requests.lock().unwrap().push(serde_json::from_slice(&bytes).unwrap());
+                                match fault {
+                                    DiscardFault::RefusedStream => response.send_reset(h2::Reason::REFUSED_STREAM),
+                                    DiscardFault::LostResponse => return,
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+            // The client has completed, so no new request can now be issued.
+            connections.abort_all();
+            while let Some(result) = connections.join_next().await {
+                if let Err(error) = result {
+                    assert!(error.is_cancelled(), "fault server failed: {error}");
+                }
+            }
+            Arc::try_unwrap(requests).unwrap().into_inner().unwrap()
+        });
+        Self {
+            endpoint,
+            certificate,
+            root,
+            stop,
+            task,
+        }
+    }
+
+    async fn finish(self) -> Vec<Value> {
+        self.stop.send(()).unwrap();
+        self.task.await.unwrap()
+    }
+
+    async fn discard(&self, json: bool) -> Output {
+        let mut command = tokio::process::Command::new(rc_binary());
+        if json {
+            command.arg("--json");
+        }
+        let output = command
+            .args(discard_args())
+            .env("RC_CONFIG_DIR", self.root.path())
+            .env_remove("RC_HOST_local")
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("no_proxy", "127.0.0.1,localhost")
+            .kill_on_drop(true)
+            .output();
+        tokio::time::timeout(Duration::from_secs(10), output)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+}
+
+#[tokio::test]
+async fn delete_residue_fault_fixture_triggers_default_http2_protocol_retries() {
+    let server = DiscardFaultServer::start(DiscardFault::RefusedStream).await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .add_root_certificate(server.certificate.clone())
+        .build()
+        .unwrap();
+    let error = tokio::time::timeout(
+        Duration::from_secs(10),
+        client
+            .post(format!(
+                "{}/rustfs/admin/v4/heal/delete-residue/discard",
+                server.endpoint
+            ))
+            .header("authorization", "AWS4-HMAC-SHA256 test-fixture")
+            .json(&json!({"control":true}))
+            .send(),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(error.is_request());
+    assert!(
+        server.finish().await.len() > 1,
+        "the control must actually retry"
+    );
+}
+
+#[tokio::test]
+async fn delete_residue_discard_faults_report_unknown_without_a_second_post() {
+    for fault in [DiscardFault::RefusedStream, DiscardFault::LostResponse] {
+        for json in [true, false] {
+            let server = DiscardFaultServer::start(fault).await;
+            let output = server.discard(json).await;
+            let requests = server.finish().await;
+            assert_eq!(
+                requests,
+                vec![json!({"bucket":"bucket", "object":"a +/b?",
+                "pool":0, "set":1, "expectedFingerprint":NODE})]
+            );
+            assert_unknown_discard(&output, json);
+        }
+    }
+}
