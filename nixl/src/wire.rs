@@ -2,7 +2,7 @@
 
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use rc_core::{Error, RemotePath, Result};
-use rc_s3::data_transport::{ControlPayload, ControlRequest};
+use rc_s3::data_transport::ControlRequest;
 use rustfs_nixl::{
     NIXL_AGENT_HEADER, NIXL_BUFFER_HEADER, NIXL_METADATA_HEADER, RDMA_BYTES_TRANSFERRED_HEADER,
     RDMA_REPLY_HEADER,
@@ -20,11 +20,7 @@ pub(crate) fn request(
         path: path.clone(),
         query,
         headers,
-        body: Default::default(),
-        payload: ControlPayload::External {
-            deadline: Instant::now() + Duration::from_secs(3600),
-        },
-        response_limit: 64 * 1024,
+        deadline: Instant::now() + Duration::from_secs(3600),
     }
 }
 

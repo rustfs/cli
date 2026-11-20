@@ -10,7 +10,6 @@ use std::{
 };
 
 use async_trait::async_trait;
-use bytes::Bytes;
 use http::{HeaderMap, Method, StatusCode};
 use rc_core::{
     DataTransferState, Error, ObjectInfo, ObjectWriteOptions, RemotePath, Result,
@@ -26,51 +25,26 @@ pub struct ControlRequest {
     pub path: RemotePath,
     pub query: Vec<(String, String)>,
     pub headers: HeaderMap,
-    pub body: Bytes,
-    pub payload: ControlPayload,
-    pub response_limit: usize,
-}
-
-/// Signing policy for a bounded control body or separately delivered payload.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum ControlPayload {
-    /// Sign the exact HTTPS control body with SHA256.
-    #[default]
-    Body,
-    /// Use S3 UNSIGNED-PAYLOAD for a logical payload delivered by the provider.
-    /// The HTTPS request body must be empty; logical integrity is verified by
-    /// the provider and the authenticated S3 operation before publication.
-    External { deadline: std::time::Instant },
+    pub deadline: std::time::Instant,
 }
 
 /// Uninterpreted control response; duplicate and binary headers are preserved.
 pub struct ControlResponse {
     pub status: StatusCode,
     pub headers: HeaderMap,
-    pub body: Bytes,
 }
 
 /// Host-owned HTTPS, credentials, signing, custom headers, and TLS configuration.
 #[async_trait]
 pub trait ControlExecutor: Send + Sync {
-    async fn execute(&self, request: ControlRequest) -> Result<ControlResponse>;
-
-    /// Return only the status and headers. A server may decline an external GET
-    /// by streaming an ordinary S3 payload of arbitrary size.
-    async fn execute_headers(&self, request: ControlRequest) -> Result<ControlResponse> {
-        self.execute(request).await
-    }
-}
-
-/// Configuration passed to a process-installed provider factory.
-pub struct DataTransportContext {
-    pub endpoint: String,
-    pub control: Arc<dyn ControlExecutor>,
+    /// Read only the status and headers. A declined external GET can return an
+    /// ordinary S3 payload of arbitrary size.
+    async fn execute_headers(&self, request: ControlRequest) -> Result<ControlResponse>;
 }
 
 /// External transport construction is separate from process-wide policy.
 pub trait ObjectDataTransportFactory: Send + Sync {
-    fn create(&self, context: DataTransportContext) -> Result<Arc<dyn ObjectDataTransport>>;
+    fn create(&self, control: Arc<dyn ControlExecutor>) -> Result<Arc<dyn ObjectDataTransport>>;
 }
 
 static FACTORY: OnceLock<Arc<dyn ObjectDataTransportFactory>> = OnceLock::new();

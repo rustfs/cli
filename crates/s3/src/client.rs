@@ -65,9 +65,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::data_transport::{
-    self, ControlExecutor, ControlPayload, ControlRequest, ControlResponse, DataTransportContext,
-    DownloadRequest, ObjectDataTransport, ObservedReader, ObservedWriter, UploadOperation,
-    UploadRequest, UploadResult, WriteCondition,
+    self, ControlExecutor, ControlRequest, ControlResponse, DownloadRequest, ObjectDataTransport,
+    ObservedReader, ObservedWriter, UploadOperation, UploadRequest, UploadResult, WriteCondition,
 };
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
@@ -1926,10 +1925,7 @@ impl S3Client {
         if client.data_transport_mode != rc_core::DataTransportMode::Http
             && let Some(factory) = data_transport::installed_factory()
         {
-            client.data_transport = Some(factory.create(DataTransportContext {
-                endpoint: client.alias.endpoint.clone(),
-                control: Arc::new(client.clone()),
-            })?);
+            client.data_transport = Some(factory.create(Arc::new(client.clone()))?);
         }
         Ok(client)
     }
@@ -3911,8 +3907,7 @@ impl S3Client {
         method: &Method,
         url: &str,
         headers: &HeaderMap,
-        body: &[u8],
-        payload: ControlPayload,
+        body: SignableBody<'_>,
         time: std::time::SystemTime,
     ) -> Result<HeaderMap> {
         let mut settings = SigningSettings::default();
@@ -3923,10 +3918,7 @@ impl S3Client {
             method,
             url,
             headers,
-            match payload {
-                ControlPayload::Body => SignableBody::Bytes(body),
-                ControlPayload::External { .. } => SignableBody::UnsignedPayload,
-            },
+            body,
             RequestSigningOptions {
                 region: &self.alias.region,
                 settings,
@@ -7847,51 +7839,24 @@ impl ObjectStore for S3Client {
 /// External control exchanges retain the host client's TLS and signing policy.
 #[async_trait]
 impl ControlExecutor for S3Client {
-    async fn execute(&self, request: ControlRequest) -> Result<ControlResponse> {
-        self.execute_control(request, true).await
-    }
-
     async fn execute_headers(&self, request: ControlRequest) -> Result<ControlResponse> {
-        self.execute_control(request, false).await
-    }
-}
-
-impl S3Client {
-    async fn execute_control(
-        &self,
-        request: ControlRequest,
-        read_body: bool,
-    ) -> Result<ControlResponse> {
         if self.alias.anonymous {
             return Err(Error::RequestRejected(
                 "External object control requires an authenticated S3 principal".to_string(),
             ));
         }
-        const MAX_CONTROL_BYTES: usize = 1024 * 1024;
-        if request.body.len() > MAX_CONTROL_BYTES
-            || request.response_limit == 0
-            || request.response_limit > MAX_CONTROL_BYTES
-        {
-            return Err(Error::RequestRejected(
-                "Control envelope exceeds the bounded exchange policy".to_string(),
-            ));
-        }
-        if matches!(request.payload, ControlPayload::External { .. }) && !request.body.is_empty() {
-            return Err(Error::RequestRejected(
-                "An external payload control request must have an empty HTTPS body".to_string(),
-            ));
-        }
-        let operation_deadline = match request.payload {
-            ControlPayload::Body => None,
-            ControlPayload::External { deadline } => {
-                if deadline <= std::time::Instant::now() {
-                    return Err(Error::RequestRejected(
+        let remaining = || {
+            request
+                .deadline
+                .checked_duration_since(std::time::Instant::now())
+                .filter(|duration| !duration.is_zero())
+                .ok_or_else(|| {
+                    Error::RequestRejected(
                         "The external control operation deadline has elapsed".to_string(),
-                    ));
-                }
-                Some(deadline)
-            }
+                    )
+                })
         };
+        remaining()?;
         let url = self.external_control_url(&request.path, &request.query)?;
         let mut headers = request.headers;
         for name in [
@@ -7929,11 +7894,7 @@ impl S3Client {
         );
         headers.insert(
             "x-amz-content-sha256",
-            HeaderValue::from_str(&match request.payload {
-                ControlPayload::Body => Self::sha256_hash(&request.body),
-                ControlPayload::External { .. } => "UNSIGNED-PAYLOAD".to_string(),
-            })
-            .map_err(|_| Error::RequestRejected("Invalid payload digest".to_string()))?,
+            HeaderValue::from_static("UNSIGNED-PAYLOAD"),
         );
         if headers.values().any(|value| value.to_str().is_err()) {
             return Err(Error::RequestRejected(
@@ -7945,82 +7906,34 @@ impl S3Client {
                 &request.method,
                 url.as_str(),
                 &headers,
-                &request.body,
-                request.payload,
+                SignableBody::UnsignedPayload,
                 std::time::SystemTime::now(),
             )
             .await?;
-        let client = if operation_deadline.is_some() {
-            self.external_http_client
-                .get_or_try_init(|| async {
-                    build_reqwest_client_with_read_policy(
-                        self.alias.insecure,
-                        self.alias.ca_bundle.as_deref(),
-                        self.alias.client_cert.as_deref(),
-                        self.alias.client_key.as_deref(),
-                        self.alias.timeout.as_ref(),
-                        false,
-                    )
-                    .await
-                })
-                .await?
-        } else {
-            &self.xml_http_client
-        };
-        let mut outgoing = client
+        let client = self
+            .external_http_client
+            .get_or_try_init(|| async {
+                build_reqwest_client_with_read_policy(
+                    self.alias.insecure,
+                    self.alias.ca_bundle.as_deref(),
+                    self.alias.client_cert.as_deref(),
+                    self.alias.client_key.as_deref(),
+                    self.alias.timeout.as_ref(),
+                    false,
+                )
+                .await
+            })
+            .await?;
+        let mut response = client
             .request(request.method, url)
             .headers(signed)
-            .body(request.body);
-        if let Some(deadline) = operation_deadline {
-            let remaining = deadline
-                .checked_duration_since(std::time::Instant::now())
-                .filter(|remaining| !remaining.is_zero())
-                .ok_or_else(|| {
-                    Error::RequestRejected(
-                        "The external control operation deadline has elapsed".to_string(),
-                    )
-                })?;
-            outgoing = outgoing.timeout(remaining);
-        }
-        let response = outgoing
+            .timeout(remaining()?)
             .send()
             .await
             .map_err(|_| Error::Network("External control exchange failed".to_string()))?;
-        let status = response.status();
-        let headers = response.headers().clone();
-        if !read_body {
-            return Ok(ControlResponse {
-                status,
-                headers,
-                body: Bytes::new(),
-            });
-        }
-        if response
-            .content_length()
-            .is_some_and(|length| length > request.response_limit as u64)
-        {
-            return Err(Error::Network(
-                "External control response exceeds its bound".to_string(),
-            ));
-        }
-        let mut body = Vec::new();
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream
-            .try_next()
-            .await
-            .map_err(|_| Error::Network("External control response was interrupted".to_string()))?
-        {
-            if chunk.len() > request.response_limit.saturating_sub(body.len()) {
-                return Err(Error::Network(
-                    "External control response exceeds its bound".to_string(),
-                ));
-            }
-            body.extend_from_slice(&chunk);
-        }
         Ok(ControlResponse {
-            status,
-            headers,
-            body: Bytes::from(body),
+            status: response.status(),
+            headers: std::mem::take(response.headers_mut()),
         })
     }
 }
@@ -15654,8 +15567,7 @@ mod tests {
                     &Method::GET,
                     sdk_request.uri(),
                     &headers,
-                    &[],
-                    ControlPayload::Body,
+                    SignableBody::Bytes(&[]),
                     time,
                 )
                 .await
@@ -15684,33 +15596,10 @@ mod tests {
             path: RemotePath::new("test", "bucket", "key"),
             query: Vec::new(),
             headers: HeaderMap::new(),
-            body: Bytes::new(),
-            payload: ControlPayload::Body,
-            response_limit: 1024,
+            deadline: Instant::now() + Duration::from_secs(30),
         };
         assert!(matches!(
-            ControlExecutor::execute(&client, request).await,
-            Err(Error::RequestRejected(_))
-        ));
-        assert_eq!(replay.actual_requests().count(), 0);
-    }
-
-    #[tokio::test]
-    async fn external_control_rejects_a_body_with_separately_delivered_payload() {
-        let (client, replay) = test_s3_client_with_response_sequence(Vec::new());
-        let request = ControlRequest {
-            method: Method::PUT,
-            path: RemotePath::new("test", "bucket", "key"),
-            query: Vec::new(),
-            headers: HeaderMap::new(),
-            body: Bytes::from_static(b"unexpected control body"),
-            payload: ControlPayload::External {
-                deadline: Instant::now() + Duration::from_secs(30),
-            },
-            response_limit: 1024,
-        };
-        assert!(matches!(
-            ControlExecutor::execute(&client, request).await,
+            ControlExecutor::execute_headers(&client, request).await,
             Err(Error::RequestRejected(_))
         ));
         assert_eq!(replay.actual_requests().count(), 0);
@@ -15724,14 +15613,10 @@ mod tests {
             path: RemotePath::new("test", "bucket", "key"),
             query: Vec::new(),
             headers: HeaderMap::new(),
-            body: Bytes::new(),
-            payload: ControlPayload::External {
-                deadline: Instant::now(),
-            },
-            response_limit: 1024,
+            deadline: Instant::now(),
         };
         assert!(matches!(
-            ControlExecutor::execute(&client, request).await,
+            ControlExecutor::execute_headers(&client, request).await,
             Err(Error::RequestRejected(_))
         ));
         assert_eq!(replay.actual_requests().count(), 0);
@@ -15752,10 +15637,7 @@ mod tests {
                         &Method::PUT,
                         "https://objects.example.test/bucket/key",
                         &headers,
-                        &[],
-                        ControlPayload::External {
-                            deadline: Instant::now() + Duration::from_secs(30),
-                        },
+                        SignableBody::UnsignedPayload,
                         std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
                     )
                     .await

@@ -18,9 +18,9 @@ use crate::wire;
 pub(crate) struct Factory;
 
 impl ObjectDataTransportFactory for Factory {
-    fn create(&self, context: DataTransportContext) -> Result<Arc<dyn ObjectDataTransport>> {
+    fn create(&self, control: Arc<dyn ControlExecutor>) -> Result<Arc<dyn ObjectDataTransport>> {
         Ok(Arc::new(Transport {
-            control: context.control,
+            control,
             small_pool: OnceCell::new(),
             full_pool: OnceCell::new(),
         }))
