@@ -504,3 +504,98 @@ fn qualified_migration_receipt_keeps_external_attestation_separate_from_local_re
     server.join().unwrap();
     assert_eq!(receiver.try_iter().count(), 2);
 }
+
+#[test]
+fn delete_residue_list_preserves_page_coverage_and_reports_unsupported_servers() {
+    let args = [
+        "admin",
+        "heal",
+        "delete-residue",
+        "list",
+        "local",
+        "--bucket",
+        "bucket",
+        "--limit",
+        "1",
+        "--cursor",
+        ID,
+    ];
+    let page = json!({"bucket":"bucket","incarnation":INCARNATION,"source":{"pool":0,"set":1,"drive":2},
+        "sourceStatus":"scanned","candidates":[{"object":"documents/a","transaction":ID}],"nextCursor":ID,"incompleteSources":0,"complete":false});
+    let (value, request) = run(&args, "200 OK", page.clone(), 0);
+    assert_eq!(value["data"], page);
+    assert_eq!(request.method, "GET");
+    assert!(request.target.contains("/v4/heal/delete-residue?"));
+    assert!(request.target.contains("limit=1"));
+    assert!(request.target.contains(ID));
+    let mut partial = page;
+    partial["sourceStatus"] = json!("unavailable");
+    partial["nextCursor"] = Value::Null;
+    partial["candidates"] = json!([]);
+    partial["incompleteSources"] = json!(1);
+    assert_eq!(run(&args, "200 OK", partial, 1).0["status"], "partial");
+    assert_eq!(
+        run(&args, "404 Not Found", json!({}), 7).0["status"],
+        "error"
+    );
+}
+
+#[test]
+fn delete_residue_inspect_and_discard_preserve_exact_identity_and_reject_stale_fingerprints() {
+    let mut args = vec![
+        "admin",
+        "heal",
+        "delete-residue",
+        "inspect",
+        "local",
+        "--bucket",
+        "bucket",
+        "--object",
+        "a +/b?",
+        "--pool",
+        "0",
+        "--set",
+        "1",
+    ];
+    let fingerprint = "ab".repeat(32);
+    let mut detail = json!({"bucket":"bucket","object":"a +/b?","pool":0,"set":1,"incarnation":INCARNATION,
+        "complete":true,"reason":"discard_eligible","participants":[{"slot":0,"diskId":ID,"discovery":"complete"}],
+        "transactions":[{"id":ID,"copies":[{"slot":0,"state":"legacy_ambiguous","currentMetadataPresent":false,"backupPresent":true,
+        "journalPresent":false,"fingerprint":fingerprint}]}],"fingerprint":fingerprint,"reclaimed":0});
+    let (value, req) = run(&args, "200 OK", detail.clone(), 0);
+    assert_eq!(value["data"], detail);
+    assert_eq!(req.method, "GET");
+    assert!(req.target.contains("object=a%20%2B%2Fb%3F"));
+    let mut wrong = detail.clone();
+    wrong["object"] = json!("another key");
+    assert_eq!(run(&args, "200 OK", wrong, 1).0["status"], "error");
+    let (denied, _) = run(&args, "403 Forbidden", json!({}), 4);
+    assert_eq!(denied["status"], "error");
+
+    args[3] = "discard";
+    args.extend(["--expected-fingerprint", &fingerprint]);
+    detail.as_object_mut().unwrap().remove("fingerprint");
+    detail["reason"] = json!("discarded");
+    detail["reclaimed"] = json!(1);
+    let (result, req) = run(&args, "200 OK", detail, 0);
+    assert_eq!(result["status"], "discarded");
+    let mut invalid = result;
+    invalid["data"]["reclaimed"] = json!(0);
+    assert!(!validator().is_valid(&invalid));
+    assert_eq!(req.method, "POST");
+    assert!(req.target.ends_with("/v4/heal/delete-residue/discard"));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&req.body).unwrap(),
+        json!({"bucket":"bucket","object":"a +/b?",
+        "pool":0,"set":1,"expectedFingerprint":fingerprint})
+    );
+    let (stale, _) = run(&args, "412 Precondition Failed", json!({}), 6);
+    assert_eq!(stale["error"]["automatic_retry"], false);
+    let (unknown, _) = run(
+        &args,
+        "503 Service Unavailable",
+        json!({"message":"DO-NOT-ECHO"}),
+        3,
+    );
+    assert_eq!(unknown["status"], "unknown");
+}

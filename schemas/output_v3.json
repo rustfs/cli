@@ -1819,6 +1819,7 @@
     },
     "recoveryFamily": {
       "enum": [
+        "delete_residue",
         "mrf_observation",
         "integrity_readiness",
         "integrity_inventory",
@@ -2211,6 +2212,56 @@
     "recoveryOutput": {
       "description": "Recovery commands preserve observation and control outcomes rather than collapsing them into success. Exit status is part of each command contract; accepted never certifies object contents.",
       "oneOf": [
+        {
+          "type": "object",
+          "required": ["schema_version", "type", "status", "message", "data"],
+          "properties": {
+            "schema_version": {"const": 3},
+            "type": {"const": "delete_residue"},
+            "status": {"enum": ["observed", "partial", "discarded"]},
+            "message": {"type": "string", "minLength": 1},
+            "data": {
+              "type": "object",
+              "required": ["bucket", "incarnation", "complete"],
+              "properties": {
+                "bucket": {"type": "string"}, "incarnation": {"type": "string"}, "complete": {"type": "boolean"}
+              },
+              "oneOf": [
+                {
+                  "required": ["source", "sourceStatus", "candidates", "incompleteSources", "nextCursor"],
+                  "properties": {
+                    "source": {"type": "object", "required": ["pool", "set", "drive"]},
+                    "sourceStatus": {"enum": ["scanned", "unavailable", "unreadable"]},
+                    "candidates": {"type": "array", "items": {"type": "object", "required": ["object", "transaction"]}},
+                    "incompleteSources": {"type": "integer", "minimum": 0},
+                    "nextCursor": {"type": ["string", "null"]}
+                  }
+                },
+                {
+                  "required": ["object", "pool", "set", "reason", "participants", "transactions", "reclaimed"],
+                  "properties": {
+                    "object": {"type": "string"}, "pool": {"type": "integer", "minimum": 0},
+                    "set": {"type": "integer", "minimum": 0}, "reason": {"type": "string"},
+                    "participants": {"type": "array", "items": {"type": "object", "required": ["slot", "discovery"]}},
+                    "transactions": {"type": "array", "items": {"type": "object", "required": ["id", "copies"]}},
+                    "fingerprint": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+                    "reclaimed": {"type": "integer", "minimum": 0}
+                  }
+                }
+              ]
+            }
+          },
+          "allOf": [{
+            "if": {"properties": {"status": {"const": "discarded"}}},
+            "then": {
+              "properties": {"data": {
+                "required": ["reclaimed", "reason"],
+                "properties": {"complete": {"const": true}, "reason": {"const": "discarded"}, "reclaimed": {"minimum": 1}}
+              }}
+            }
+          }],
+          "not": {"required": ["error"]}
+        },
         {
           "type": "object",
           "required": ["schema_version", "type", "status", "message", "data"],

@@ -9,6 +9,7 @@ mod bucket_metadata;
 mod capabilities;
 mod cluster;
 mod configuration;
+pub mod delete_residue;
 mod diagnostics;
 mod iam;
 mod inspect_archive;

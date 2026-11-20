@@ -20,6 +20,9 @@ const HEAL_STOP_STILL_RUNNING_MESSAGE: &str =
 /// Heal subcommands
 #[derive(Subcommand, Debug)]
 pub enum HealCommands {
+    /// Discover, inspect, and conditionally discard historical delete residue
+    #[command(subcommand)]
+    DeleteResidue(super::delete_residue::DeleteResidueCommands),
     /// Manage retained MRF responsibilities without assuming data verification
     #[command(subcommand)]
     Mrf(super::mrf::MrfCommands),
@@ -258,6 +261,9 @@ fn heal_status_indicator(status: &HealStatus) -> HealStatusIndicator {
 /// Execute a heal subcommand
 pub async fn execute(cmd: HealCommands, formatter: &Formatter) -> ExitCode {
     match cmd {
+        HealCommands::DeleteResidue(command) => {
+            super::delete_residue::execute(command, formatter).await
+        }
         HealCommands::Mrf(command) => super::mrf::execute(command, formatter).await,
         HealCommands::Status(args) => execute_status(args, formatter).await,
         HealCommands::Start(args) => execute_start(args, formatter).await,
