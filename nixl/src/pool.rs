@@ -11,7 +11,14 @@ pub(crate) const WINDOW: usize = rc_s3::multipart::DEFAULT_PART_SIZE as usize;
 const SMALL_WINDOW: usize = 1024 * 1024;
 const WINDOWS_PER_POOL: usize = 2;
 static AGENTS: Semaphore = Semaphore::const_new(8);
-static QUARANTINE: Mutex<Vec<Window>> = Mutex::new(Vec::new());
+// Keep the exposed registration and its budget, so the retired pool can free its idle buffers.
+type Budget = Arc<SemaphorePermit<'static>>;
+static QUARANTINE: Mutex<Vec<(Buffer, Budget)>> = Mutex::new(Vec::new());
+
+fn window_size(required: u64) -> usize {
+    let required = required.clamp(SMALL_WINDOW as u64, WINDOW as u64) as usize;
+    required.next_power_of_two().min(WINDOW)
+}
 
 #[derive(Default)]
 pub(crate) struct Pools {
@@ -28,11 +35,7 @@ impl Pools {
     }
 
     pub(crate) async fn reserve(&self, required: u64) -> Result<Window> {
-        let size = if required <= SMALL_WINDOW as u64 {
-            SMALL_WINDOW
-        } else {
-            WINDOW
-        };
+        let size = window_size(required);
         loop {
             let pool = {
                 let mut active = self.active.lock().await;
@@ -64,7 +67,7 @@ struct Pool {
     free: Mutex<Vec<Buffer>>,
     available: Semaphore,
     lost: watch::Sender<usize>,
-    _budget: SemaphorePermit<'static>,
+    budget: Budget,
 }
 
 impl Pool {
@@ -78,7 +81,7 @@ impl Pool {
             free: Mutex::new(buffers),
             available: Semaphore::new(WINDOWS_PER_POOL),
             lost: watch::Sender::new(0),
-            _budget: budget,
+            budget: Arc::new(budget),
         }))
     }
 
@@ -184,12 +187,13 @@ impl Exposed {
 }
 impl Drop for Exposed {
     fn drop(&mut self) {
-        if let Some(window) = self.0.take() {
+        if let Some(mut window) = self.0.take() {
+            let buffer = window.buffer.take().expect("owned transfer");
             window.pool.lost.send_modify(|lost| *lost += 1);
             QUARANTINE
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .push(window);
+                .push((buffer, Arc::clone(&window.pool.budget)));
         }
     }
 }
@@ -197,6 +201,14 @@ impl Drop for Exposed {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registrations_use_a_bounded_size_class() {
+        assert_eq!(window_size(0), SMALL_WINDOW);
+        assert_eq!(window_size(SMALL_WINDOW as u64), SMALL_WINDOW);
+        assert_eq!(window_size(3 * SMALL_WINDOW as u64), 4 * SMALL_WINDOW);
+        assert_eq!(window_size(u64::MAX), WINDOW);
+    }
 
     #[tokio::test]
     async fn uncertain_windows_wake_waiters_and_cannot_be_reissued() {
@@ -283,11 +295,12 @@ mod tests {
                 &headers[crate::nvidia::TOKEN_HEADER],
                 &put_headers[crate::nvidia::TOKEN_HEADER],
             ] {
-                assert!(retained.iter().any(|window| Arc::ptr_eq(&window.pool, &old)
-                    && matches!(&window.buffer, Some(Buffer::CuObject(host)) if host.holds_token(advertised))));
+                assert!(retained.iter().any(|(buffer, budget)| Arc::ptr_eq(budget, &old.budget)
+                    && matches!(buffer, Buffer::CuObject(host) if host.holds_token(advertised))));
             }
         }
-        let replacement = pools.reserve(32).await.unwrap();
+        let replacement = pools.reserve(3 * SMALL_WINDOW as u64).await.unwrap();
+        assert_eq!(replacement.pool.size, 4 * SMALL_WINDOW);
         assert!(!Arc::ptr_eq(&old, &replacement.pool));
         let fresh_pool = replacement.pool.clone();
         let (completed, completed_releases) = observe(
@@ -316,5 +329,19 @@ mod tests {
         }
         assert_eq!(fresh_pool.available.available_permits(), WINDOWS_PER_POOL);
         assert_eq!(old.available.available_permits(), 0);
+
+        // Retiring a pool with one uncertain transfer must free its idle sibling.
+        let window = pools.reserve(32).await.unwrap();
+        let pool = Arc::downgrade(&fresh_pool);
+        let budget = Arc::downgrade(&fresh_pool.budget);
+        drop(
+            window
+                .expose(&Method::GET, 32, &mut HeaderMap::new())
+                .unwrap(),
+        );
+        drop(fresh_pool);
+        drop(pools);
+        assert!(pool.upgrade().is_none());
+        assert!(budget.upgrade().is_some());
     }
 }
