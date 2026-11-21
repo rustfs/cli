@@ -58,12 +58,12 @@ impl Transport {
         match self.control.execute_registered(request).await {
             Ok(RegisteredControlResponse::Response(response)) => Ok((response, exposed)),
             Ok(RegisteredControlResponse::RejectedBeforeDma(error)) => {
-                drop(exposed.finished());
+                drop(exposed.finished().map_err(rejected)?);
                 Err(rejected(error))
             }
             Err(error @ Error::RequestRejected(_)) => {
                 // ControlExecutor rejected the request locally before sending it.
-                drop(exposed.finished());
+                drop(exposed.finished().map_err(rejected)?);
                 Err(unavailable(error))
             }
             Err(error) => Err(unknown(error)),

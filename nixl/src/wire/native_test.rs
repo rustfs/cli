@@ -36,7 +36,7 @@ async fn rustfs_reads_and_writes_the_advertised_host_window() {
         .await
         .unwrap();
     assert_eq!(written, 6);
-    let mut source = exposed.finished();
+    let mut source = exposed.finished().unwrap();
     source.finish_read(6).unwrap();
     assert_eq!(source.received().unwrap(), b"result");
 }

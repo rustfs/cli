@@ -11,7 +11,7 @@ pub(crate) const WINDOW: usize = rc_s3::multipart::DEFAULT_PART_SIZE as usize;
 const SMALL_WINDOW: usize = 1024 * 1024;
 const WINDOWS_PER_POOL: usize = 2;
 static AGENTS: Semaphore = Semaphore::const_new(8);
-static QUARANTINE: Mutex<Vec<Transfer>> = Mutex::new(Vec::new());
+static QUARANTINE: Mutex<Vec<Window>> = Mutex::new(Vec::new());
 
 #[derive(Default)]
 pub(crate) struct Pools {
@@ -135,26 +135,23 @@ impl Window {
         len: usize,
         headers: &mut HeaderMap,
     ) -> Result<Exposed> {
-        let transfer = match self.buffer.as_ref().expect("owned window") {
+        let mut exposed = Exposed(Some(self));
+        let buffer = exposed.window_mut().buffer.as_mut().expect("owned window");
+        let result = match buffer {
             Buffer::Nixl {
                 chunk,
                 agent,
                 metadata,
-            } => {
-                crate::wire::bind(headers, agent, metadata, chunk.addr(), len)?;
-                Transfer::Nixl(self)
-            }
+            } => crate::wire::bind(headers, agent, metadata, chunk.addr(), len),
             #[cfg(feature = "cuobject")]
-            Buffer::CuObject(_) => {
-                Transfer::CuObject(crate::nvidia::Exposure::try_new(self, |window| {
-                    let Some(Buffer::CuObject(buffer)) = window.buffer.as_ref() else {
-                        unreachable!("cuObject window")
-                    };
-                    buffer.describe(_method, len, headers)
-                })?)
-            }
+            Buffer::CuObject(buffer) => buffer.describe(_method, len, headers),
         };
-        Ok(Exposed(Some(transfer)))
+        if let Err(error) = result {
+            // The token has not left this process. Release it before reuse.
+            exposed.finished()?;
+            return Err(error);
+        }
+        Ok(exposed)
     }
 }
 
@@ -171,43 +168,28 @@ impl Drop for Window {
     }
 }
 
-enum Transfer {
-    Nixl(Window),
-    #[cfg(feature = "cuobject")]
-    CuObject(crate::nvidia::Exposure),
-}
-
-impl Transfer {
-    fn window(&self) -> &Window {
-        match self {
-            Self::Nixl(window) => window,
-            #[cfg(feature = "cuobject")]
-            Self::CuObject(transfer) => transfer.borrow_owner(),
-        }
-    }
-    fn finished(self) -> Window {
-        match self {
-            Self::Nixl(window) => window,
-            #[cfg(feature = "cuobject")]
-            Self::CuObject(transfer) => transfer.into_owner(),
-        }
-    }
-}
-
-pub(crate) struct Exposed(Option<Transfer>);
+pub(crate) struct Exposed(Option<Window>);
 impl Exposed {
-    pub(crate) fn finished(mut self) -> Window {
-        self.0.take().expect("owned transfer").finished()
+    fn window_mut(&mut self) -> &mut Window {
+        self.0.as_mut().expect("owned transfer")
+    }
+
+    pub(crate) fn finished(mut self) -> Result<Window> {
+        #[cfg(feature = "cuobject")]
+        if let Some(Buffer::CuObject(host)) = self.window_mut().buffer.as_mut() {
+            host.release_token()?;
+        }
+        Ok(self.0.take().expect("owned transfer"))
     }
 }
 impl Drop for Exposed {
     fn drop(&mut self) {
-        if let Some(transfer) = self.0.take() {
-            transfer.window().pool.lost.send_modify(|lost| *lost += 1);
+        if let Some(window) = self.0.take() {
+            window.pool.lost.send_modify(|lost| *lost += 1);
             QUARANTINE
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .push(transfer);
+                .push(window);
         }
     }
 }
@@ -232,8 +214,15 @@ mod tests {
         #[cfg(feature = "cuobject")]
         {
             let mut exposed = exposed;
-            let release = match exposed.0.as_mut() {
-                Some(Transfer::CuObject(offer)) => Some(offer.observe_token_release()),
+            let release = match exposed.window_mut().buffer.as_mut() {
+                Some(Buffer::CuObject(host)) => {
+                    assert!(host.writable().is_err());
+                    assert!(
+                        host.describe(&Method::GET, 1, &mut HeaderMap::new())
+                            .is_err()
+                    );
+                    Some(host.releases.clone())
+                }
                 _ => None,
             };
             (exposed, release)
@@ -260,7 +249,7 @@ mod tests {
             observe(first.expose(&Method::GET, 32, &mut headers).unwrap());
         #[cfg(feature = "cuobject")]
         if backend == RdmaBackend::CuObject {
-            assert!(headers[cuobject::TOKEN_HEADER].is_sensitive());
+            assert!(headers[crate::nvidia::TOKEN_HEADER].is_sensitive());
         }
         let exchanging = |exposed: Exposed| async move {
             std::future::pending::<()>().await;
@@ -291,11 +280,11 @@ mod tests {
         if backend == RdmaBackend::CuObject {
             let retained = QUARANTINE.lock().unwrap();
             for advertised in [
-                &headers[cuobject::TOKEN_HEADER],
-                &put_headers[cuobject::TOKEN_HEADER],
+                &headers[crate::nvidia::TOKEN_HEADER],
+                &put_headers[crate::nvidia::TOKEN_HEADER],
             ] {
-                assert!(retained.iter().any(|transfer| matches!(transfer, Transfer::CuObject(offer)
-                    if Arc::ptr_eq(&offer.borrow_owner().pool, &old) && offer.holds_token(advertised))));
+                assert!(retained.iter().any(|window| Arc::ptr_eq(&window.pool, &old)
+                    && matches!(&window.buffer, Some(Buffer::CuObject(host)) if host.holds_token(advertised))));
             }
         }
         let replacement = pools.reserve(32).await.unwrap();
@@ -306,7 +295,7 @@ mod tests {
                 .expose(&Method::GET, 32, &mut HeaderMap::new())
                 .unwrap(),
         );
-        let returned = completed.finished();
+        let returned = completed.finished().unwrap();
         if let Some(count) = &completed_releases {
             assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
         }

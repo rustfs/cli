@@ -17,9 +17,9 @@ The common launcher preserves command dispatch, output, exit codes, and the
 existing worker-thread configuration.
 
 The NIXL backend supplies agent metadata and a registered buffer description.
-The NVIDIA cuObject backend supplies a direction-specific SDK token for the
-registered host buffer. Each token stays alive with its buffer until a
-receipt confirms completion. An uncertain transfer retains both resources
+The NVIDIA cuObject backend uses a private CXX bridge to register host memory with
+`cuObjClient` and acquire a direction-specific token for each transfer. The window can be reused after
+a verified receipt or proof that DMA never started. An uncertain transfer retains both resources
 within the process registration budget. Both use the host-owned `ControlExecutor`. The S3 client signs and sends a bodyless
 HTTPS request on the shared S3 HTTP client using the alias timeout policy. It returns the status and headers directly,
 including duplicate headers. The provider verifies the RustFS transfer receipt

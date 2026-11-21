@@ -81,7 +81,7 @@ impl Transport {
             )));
         }
         wire::receipt(expected, &response.headers, len as u64).map_err(rejected)?;
-        let mut window = exposed.finished();
+        let mut window = exposed.finished().map_err(rejected)?;
         if wire::field(&response.headers, "content-length")
             .map_err(rejected)?
             .is_some_and(|value| value != "0")

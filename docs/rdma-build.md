@@ -34,6 +34,7 @@ to the same executable, install the NVIDIA cuObject **client** SDK,
 cuFile development libraries, libibverbs development headers and CUDA headers
 for the target architecture.
 Set `CUOBJCLIENT_ROOT` to the SDK prefix and `CUDA_HOME` to the CUDA toolkit.
+The CLI builds its C++17 adapter against `cuobjclient.h` and links directly to the NVIDIA SDK.
 The SDK's `libcuobjclient`, `libcufile` and RDMA plugin must be available
 at runtime. Set `CUOBJ_ENV_PATH_JSON` to the NVIDIA client configuration
 that selects the application RDMA device.

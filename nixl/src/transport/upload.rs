@@ -149,7 +149,7 @@ impl Transport {
             return Ok(None);
         }
         wire::receipt(StatusCode::OK, &response.headers, len as u64).map_err(unknown)?;
-        drop(exposed.finished());
+        drop(exposed.finished().map_err(rejected)?);
         let etag = wire::field(&response.headers, "etag")
             .map_err(rejected)?
             .filter(|e| !e.is_empty())
