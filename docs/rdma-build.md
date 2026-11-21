@@ -1,6 +1,6 @@
 # Object data over RDMA
 
-## RustFS native NIXL/UCX
+## Build the native client
 
 Build on Linux with Rust 1.99 or later, libclang, a C++ compiler and the
 NIXL libraries, headers and UCX plugin used by the RustFS server. Set
@@ -26,6 +26,34 @@ feature and `RUSTFS_NIXL_ENABLE=true`. For a private CA, pass
 `--ca-bundle /path/to/ca.pem` to `rc alias set`. Set `RC_DATA_TRANSPORT=auto`
 or `rdma` to reuse the selection across commands. The default is `http`. Signed control requests use the alias connection and
 read timeouts, including the wait for each transfer receipt.
+
+### Choose the RDMA backend
+
+The native executable uses NIXL/UCX by default. To add NVIDIA cuObject
+to the same executable, install the NVIDIA cuObject **client** SDK,
+cuFile development libraries, libibverbs development headers and CUDA headers
+for the target architecture.
+Set `CUOBJCLIENT_ROOT` to the SDK prefix and `CUDA_HOME` to the CUDA toolkit.
+The SDK's `libcuobjclient`, `libcufile` and RDMA plugin must be available
+at runtime. Set `CUOBJ_ENV_PATH_JSON` to the NVIDIA client configuration
+that selects the application RDMA device.
+
+```sh
+./scripts/build-rdma.sh --release --features cuobject
+rc --data-transport rdma --rdma-backend cuobject put model.bin lab/models/model.bin
+rc --data-transport rdma --rdma-backend cuobject get lab/models/model.bin downloaded.bin
+cmp model.bin downloaded.bin
+rc --data-transport rdma --rdma-backend nixl get other/models/model.bin from-nixl.bin
+```
+
+Configure `lab` as a verified HTTPS alias for a RustFS server built with
+`--features cuobject` and `RUSTFS_CUOBJECT_ENABLE=true`. Use an alias for a
+NIXL-enabled server with the `nixl` backend. `RC_RDMA_BACKEND` sets the
+backend for subsequent commands. The `rdma` policy requires the selected
+backend. The `auto` policy allows a safe S3 fallback when that backend is
+unavailable. The default `http` policy transfers the payload through S3.
+
+### Object transfers
 
 File uploads use positional reads directly into two reusable registered
 windows. Each completed part frees a window for the next part, and S3 receives
@@ -53,6 +81,16 @@ size above 64 MiB use HTTP in `auto` and report an error in `rdma`.
 To run the real two-agent memory transfer test, use
 `cargo test --manifest-path nixl/Cargo.toml --locked`. For an S3 command
 round trip, set `RC` to the native executable and supply disposable buckets
-in `NIXL_BUCKET` and `HTTP_BUCKET` on enabled and disabled endpoints. Run
-`nixl/tests/interop.sh` with those variables. `UCX_TLS=tcp,self` exercises
-the protocol on a machine without an RDMA network adapter.
+in `RDMA_BUCKET` and `HTTP_BUCKET` on a native and an HTTP-only endpoint.
+Run `RC_RDMA_BACKEND=cuobject nixl/tests/interop.sh` on an NVIDIA client
+or `RC_RDMA_BACKEND=nixl nixl/tests/interop.sh` on a NIXL client. The
+script accepts `NIXL_BUCKET` as an alias for `RDMA_BUCKET`. For NIXL,
+`UCX_TLS=tcp,self` exercises the protocol on a machine without an RDMA adapter.
+
+On a cuObject client with an active RDMA device, run the buffer lifetime
+test with the same SDK and device configuration used by the CLI:
+
+```sh
+cargo test --locked --manifest-path nixl/Cargo.toml --features cuobject \
+  cuobject_token_survives_cancellation_and_timeout -- --ignored
+```

@@ -29,6 +29,40 @@ impl FromStr for DataTransportMode {
     }
 }
 
+/// The wire protocol for external object transfers, independent of HTTP fallback.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RdmaBackend {
+    #[default]
+    Nixl,
+    CuObject,
+}
+
+impl FromStr for RdmaBackend {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "nixl" => Ok(Self::Nixl),
+            "cuobject" => Ok(Self::CuObject),
+            _ => Err("RDMA backend must be nixl or cuobject".into()),
+        }
+    }
+}
+
+static GLOBAL_BACKEND: AtomicU8 = AtomicU8::new(RdmaBackend::Nixl as u8);
+
+pub fn set_global_rdma_backend(backend: RdmaBackend) {
+    GLOBAL_BACKEND.store(backend as u8, Ordering::Relaxed);
+}
+
+pub fn global_rdma_backend() -> RdmaBackend {
+    match GLOBAL_BACKEND.load(Ordering::Relaxed) {
+        i if i == RdmaBackend::CuObject as u8 => RdmaBackend::CuObject,
+        _ => RdmaBackend::Nixl,
+    }
+}
+
 /// Business outcome classification. Transport timeouts never imply rejection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataTransferState {

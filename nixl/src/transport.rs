@@ -11,16 +11,17 @@ use rustfs_nixl::RDMA_REPLY_HEADER;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::pool::{Exposed, Pools, WINDOW, Window, native_error};
+use crate::pool::{Exposed, Pools, WINDOW, Window};
 use crate::wire;
+use rc_core::RdmaBackend;
 
-pub(crate) struct Factory;
+pub(crate) struct Factory(pub(crate) RdmaBackend);
 
 impl ObjectDataTransportFactory for Factory {
     fn create(&self, control: Arc<dyn ControlExecutor>) -> Result<Arc<dyn ObjectDataTransport>> {
         Ok(Arc::new(Transport {
             control,
-            pools: Pools::default(),
+            pools: Pools::new(self.0),
         }))
     }
 }
@@ -33,7 +34,7 @@ struct Transport {
 fn failed(state: DataTransferState, source: Error) -> DataTransportError {
     DataTransportError {
         state,
-        message: "RustFS NIXL object transfer".into(),
+        message: "RDMA object transfer".into(),
         source: Some(Box::new(source)),
     }
 }

@@ -36,7 +36,7 @@ async fn download(
         queries: Mutex::default(),
         get_version,
     });
-    let transport = Factory.create(endpoint.clone()).unwrap();
+    let transport = Factory(RdmaBackend::Nixl).create(endpoint.clone()).unwrap();
     let path = RemotePath::new("test", "bucket", "key");
     let options = rc_core::TransferReadOptions {
         version_id: version_id.map(str::to_owned),
@@ -98,7 +98,9 @@ async fn a_delete_marker_keeps_its_version_and_exit_code() {
         }
     }
 
-    let transport = Factory.create(Arc::new(DeleteMarker)).unwrap();
+    let transport = Factory(RdmaBackend::Nixl)
+        .create(Arc::new(DeleteMarker))
+        .unwrap();
     let path = RemotePath::new("test", "bucket", "key");
     let options = rc_core::ObjectReadOptions {
         version_id: Some("v2".into()),

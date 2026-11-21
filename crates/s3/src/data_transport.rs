@@ -46,19 +46,38 @@ pub trait ObjectDataTransportFactory: Send + Sync {
     fn create(&self, control: Arc<dyn ControlExecutor>) -> Result<Arc<dyn ObjectDataTransport>>;
 }
 
-static FACTORY: OnceLock<Arc<dyn ObjectDataTransportFactory>> = OnceLock::new();
+static NIXL_FACTORY: OnceLock<Arc<dyn ObjectDataTransportFactory>> = OnceLock::new();
 
-/// Install a provider before running the CLI. Replacing a provider is rejected.
+static CUOBJECT_FACTORY: OnceLock<Arc<dyn ObjectDataTransportFactory>> = OnceLock::new();
+
+fn factory_slot(
+    backend: rc_core::RdmaBackend,
+) -> &'static OnceLock<Arc<dyn ObjectDataTransportFactory>> {
+    match backend {
+        rc_core::RdmaBackend::Nixl => &NIXL_FACTORY,
+        rc_core::RdmaBackend::CuObject => &CUOBJECT_FACTORY,
+    }
+}
+
+/// Install the default NIXL provider before running the CLI. Replacing a provider is rejected.
 pub fn install_object_data_transport_factory(
     factory: Arc<dyn ObjectDataTransportFactory>,
 ) -> Result<()> {
-    FACTORY.set(factory).map_err(|_| {
+    install_rdma_backend(rc_core::RdmaBackend::Nixl, factory)
+}
+
+/// Register one backend without replacing another provider.
+pub fn install_rdma_backend(
+    backend: rc_core::RdmaBackend,
+    factory: Arc<dyn ObjectDataTransportFactory>,
+) -> Result<()> {
+    factory_slot(backend).set(factory).map_err(|_| {
         Error::Config("An object data transport factory is already installed".to_string())
     })
 }
 
 pub(crate) fn installed_factory() -> Option<Arc<dyn ObjectDataTransportFactory>> {
-    FACTORY.get().cloned()
+    factory_slot(rc_core::global_rdma_backend()).get().cloned()
 }
 
 /// A GET's S3 selection and an independent finite receive bound.

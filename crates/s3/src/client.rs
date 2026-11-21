@@ -1926,7 +1926,8 @@ impl S3Client {
             (_, Some(transport)) => Ok(Some(transport)),
             (DataTransportMode::Rdma, None) => Err(Error::DataTransfer {
                 state: rc_core::DataTransferState::NotAccepted,
-                message: "This executable has no external object data provider".to_string(),
+                message: "This executable has no provider for the selected RDMA backend"
+                    .to_string(),
                 source: None,
             }),
         }

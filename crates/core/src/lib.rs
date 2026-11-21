@@ -39,8 +39,8 @@ pub use alias::{
 pub use config::{Config, ConfigManager};
 pub use cors::{CorsConfiguration, CorsRule};
 pub use data_transport::{
-    DataTransferState, DataTransportMode, global_data_transport_mode,
-    set_global_data_transport_mode,
+    DataTransferState, DataTransportMode, RdmaBackend, global_data_transport_mode,
+    global_rdma_backend, set_global_data_transport_mode, set_global_rdma_backend,
 };
 pub use encryption::{BucketEncryption, ObjectEncryptionRequest};
 pub use error::{Error, MultipartAbortStatus, Result};
