@@ -33,12 +33,29 @@ pub struct ControlResponse {
     pub headers: HeaderMap,
 }
 
+/// Outcome of an exchange that advertised client memory.
+pub enum RegisteredControlResponse {
+    Response(ControlResponse),
+    /// The authenticated peer rejected the request before starting any data transfer.
+    RejectedBeforeDma(Error),
+}
+
 /// Host-owned HTTPS, credentials, signing, custom headers, and TLS configuration.
 #[async_trait]
 pub trait ControlExecutor: Send + Sync {
     /// Read only the status and headers. A declined external GET can return an
     /// ordinary S3 payload of arbitrary size.
     async fn execute_headers(&self, request: ControlRequest) -> Result<ControlResponse>;
+
+    /// Executors that cannot establish a pre-transfer rejection return ordinary responses.
+    async fn execute_registered(
+        &self,
+        request: ControlRequest,
+    ) -> Result<RegisteredControlResponse> {
+        self.execute_headers(request)
+            .await
+            .map(RegisteredControlResponse::Response)
+    }
 }
 
 /// External transport construction is separate from process-wide policy.

@@ -228,6 +228,20 @@ mod tests {
         check_window_lifetime(RdmaBackend::CuObject).await;
     }
 
+    fn observe(exposed: Exposed) -> (Exposed, Option<Arc<std::sync::atomic::AtomicUsize>>) {
+        #[cfg(feature = "cuobject")]
+        {
+            let mut exposed = exposed;
+            let release = match exposed.0.as_mut() {
+                Some(Transfer::CuObject(offer)) => Some(offer.observe_token_release()),
+                _ => None,
+            };
+            (exposed, release)
+        }
+        #[cfg(not(feature = "cuobject"))]
+        (exposed, None)
+    }
+
     async fn check_window_lifetime(backend: RdmaBackend) {
         let pools = Pools::new(backend);
         let first = pools.reserve(32).await.unwrap();
@@ -242,7 +256,8 @@ mod tests {
             _ = std::future::ready(()) => {}
         }
         let mut headers = HeaderMap::new();
-        let first = first.expose(&Method::GET, 32, &mut headers).unwrap();
+        let (first, first_releases) =
+            observe(first.expose(&Method::GET, 32, &mut headers).unwrap());
         #[cfg(feature = "cuobject")]
         if backend == RdmaBackend::CuObject {
             assert!(headers[cuobject::TOKEN_HEADER].is_sensitive());
@@ -251,12 +266,17 @@ mod tests {
             std::future::pending::<()>().await;
             exposed.finished()
         };
-        let cancelled = tokio::spawn(exchanging(first));
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let cancelled = tokio::spawn(async move {
+            started.send(()).unwrap();
+            exchanging(first).await
+        });
+        ready.await.unwrap();
         cancelled.abort();
         assert!(matches!(cancelled.await, Err(e) if e.is_cancelled()));
-        let second = second
-            .expose(&Method::PUT, 32, &mut HeaderMap::new())
-            .unwrap();
+        let mut put_headers = HeaderMap::new();
+        let second = second.expose(&Method::PUT, 32, &mut put_headers).unwrap();
+        let (second, second_releases) = observe(second);
         assert!(
             tokio::time::timeout(Duration::from_millis(1), exchanging(second))
                 .await
@@ -267,14 +287,44 @@ mod tests {
             result = waiting => assert!(result.unwrap().is_none()),
             _ = std::future::ready(()) => panic!("retiring a pool must wake its waiters immediately"),
         }
+        #[cfg(feature = "cuobject")]
+        if backend == RdmaBackend::CuObject {
+            let retained = QUARANTINE.lock().unwrap();
+            for advertised in [
+                &headers[cuobject::TOKEN_HEADER],
+                &put_headers[cuobject::TOKEN_HEADER],
+            ] {
+                assert!(retained.iter().any(|transfer| matches!(transfer, Transfer::CuObject(offer)
+                    if Arc::ptr_eq(&offer.borrow_owner().pool, &old) && offer.holds_token(advertised))));
+            }
+        }
         let replacement = pools.reserve(32).await.unwrap();
         assert!(!Arc::ptr_eq(&old, &replacement.pool));
         let fresh_pool = replacement.pool.clone();
-        let returned = replacement
-            .expose(&Method::GET, 32, &mut HeaderMap::new())
-            .unwrap()
-            .finished();
+        let (completed, completed_releases) = observe(
+            replacement
+                .expose(&Method::GET, 32, &mut HeaderMap::new())
+                .unwrap(),
+        );
+        let returned = completed.finished();
+        if let Some(count) = &completed_releases {
+            assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
         drop(returned);
+        if backend == RdmaBackend::CuObject {
+            for counter in [first_releases, second_releases] {
+                assert_eq!(
+                    counter.unwrap().load(std::sync::atomic::Ordering::SeqCst),
+                    0
+                );
+            }
+            assert_eq!(
+                completed_releases
+                    .unwrap()
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
+        }
         assert_eq!(fresh_pool.available.available_permits(), WINDOWS_PER_POOL);
         assert_eq!(old.available.available_permits(), 0);
     }

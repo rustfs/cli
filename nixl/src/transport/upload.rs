@@ -145,7 +145,7 @@ impl Transport {
             return Err(rejected(response.object_error(request.path, None)));
         }
         if !response.headers.contains_key(RDMA_REPLY_HEADER) {
-            drop(exposed.finished());
+            // A missing receipt permits the S3 fallback but does not prove the window is idle.
             return Ok(None);
         }
         wire::receipt(StatusCode::OK, &response.headers, len as u64).map_err(unknown)?;

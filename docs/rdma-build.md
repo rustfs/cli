@@ -49,7 +49,8 @@ rc --data-transport rdma --rdma-backend nixl get other/models/model.bin from-nix
 Configure `lab` as a verified HTTPS alias for a RustFS server built with
 `--features cuobject` and `RUSTFS_CUOBJECT_ENABLE=true`. Use an alias for a
 NIXL-enabled server with the `nixl` backend. `RC_RDMA_BACKEND` sets the
-backend for subsequent commands. The `rdma` policy requires the selected
+backend for subsequent commands. Request headers in the `x-amz-rdma-*` and
+`x-rustfs-nixl-*` namespaces are reserved for the selected provider. The `rdma` policy requires the selected
 backend. The `auto` policy allows a safe S3 fallback when that backend is
 unavailable. The default `http` policy transfers the payload through S3.
 
@@ -64,7 +65,12 @@ destination file. A range GET for the next window can proceed while the
 previous window is being written. All requests keep the caller's version selector. Each GET uses
 `If-Match` and checks the version from HEAD before delivering that range. Downloads publish the temporary file
 after verifying the transfer count and any applicable object checksum.
-A window with an uncertain transfer stays registered until the process exits.
+A verified receipt releases the window. A local rejection before sending or
+an authenticated S3 `PreconditionFailed` response to an `If-Match` GET also
+releases it. For the latter, the client requires HTTP 412, a bounded S3
+error document and no RDMA response headers. An ambiguous response, a
+missing receipt, cancellation or timeout retains the token and window until
+the process exits.
 When both windows are unavailable for this reason, waiting operations use a
 fresh pool within the process registration budget.
 

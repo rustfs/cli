@@ -70,7 +70,7 @@ impl Transport {
         if !response.headers.contains_key(RDMA_REPLY_HEADER) {
             // An ordinary successful GET returned the object in its HTTP body.
             // It is safe to try the ordinary reader before publishing any bytes.
-            drop(exposed.finished());
+            // A missing receipt permits the S3 fallback but does not prove the window is idle.
             return Err(unavailable(Error::UnsupportedFeature(
                 "The endpoint served GET over HTTP".into(),
             )));

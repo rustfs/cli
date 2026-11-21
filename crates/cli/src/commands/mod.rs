@@ -598,6 +598,37 @@ mod tests {
         assert!(Cli::try_parse_from(["rc", "--data-transport", "udp", "alias", "list"]).is_err());
     }
     #[test]
+    fn external_transport_headers_cannot_be_supplied_by_the_caller() {
+        for name in [
+            "X-AmZ-RdMa-ToKeN",
+            "x-amz-rdma-reply",
+            "x-amz-rdma-bytes-transferred",
+            "x-rustfs-nixl-agent",
+            "x-rustfs-nixl-metadata",
+            "x-rustfs-nixl-buffer",
+        ] {
+            for mode in ["http", "auto", "rdma"] {
+                assert!(
+                    Cli::try_parse_from([
+                        "rc",
+                        "--data-transport",
+                        mode,
+                        "-H",
+                        &format!("{name}:opaque"),
+                        "alias",
+                        "list"
+                    ])
+                    .is_err(),
+                    "{name} in {mode}"
+                );
+            }
+        }
+        assert!(
+            Cli::try_parse_from(["rc", "-H", "x-amz-meta-format:onnx", "alias", "list"]).is_ok()
+        );
+    }
+
+    #[test]
     fn rdma_backend_is_independent_of_fallback_policy() {
         for policy in ["rdma", "auto"] {
             let args = [

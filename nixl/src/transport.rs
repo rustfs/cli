@@ -55,8 +55,12 @@ impl Transport {
         request: ControlRequest,
         exposed: Exposed,
     ) -> DataTransportResult<(ControlResponse, Exposed)> {
-        match self.control.execute_headers(request).await {
-            Ok(response) => Ok((response, exposed)),
+        match self.control.execute_registered(request).await {
+            Ok(RegisteredControlResponse::Response(response)) => Ok((response, exposed)),
+            Ok(RegisteredControlResponse::RejectedBeforeDma(error)) => {
+                drop(exposed.finished());
+                Err(rejected(error))
+            }
             Err(error @ Error::RequestRejected(_)) => {
                 // ControlExecutor rejected the request locally before sending it.
                 drop(exposed.finished());

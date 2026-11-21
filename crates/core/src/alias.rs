@@ -60,10 +60,23 @@ impl RequestHeader {
             return Err(Error::Config(format!("Invalid value for header '{name}'")));
         }
 
-        Ok(Self {
+        let header = Self {
             name,
             value: header_value,
-        })
+        };
+        header.validate_transport_name()?;
+        Ok(header)
+    }
+
+    /// Transport control headers must come from the owner of the registered memory.
+    pub fn validate_transport_name(&self) -> Result<()> {
+        let name = self.name.to_ascii_lowercase();
+        if name.starts_with("x-amz-rdma-") || name.starts_with("x-rustfs-nixl-") {
+            return Err(Error::Config(
+                "RDMA headers are reserved for the selected transport".into(),
+            ));
+        }
+        Ok(())
     }
 }
 

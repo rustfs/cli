@@ -125,3 +125,108 @@ async fn a_delete_marker_keeps_its_version_and_exit_code() {
         );
     }
 }
+
+#[tokio::test]
+async fn only_proven_conditional_rejections_reuse_the_registered_window() {
+    struct Peer(Mutex<Vec<HeaderValue>>);
+    #[async_trait]
+    impl ControlExecutor for Peer {
+        async fn execute_headers(&self, req: ControlRequest) -> Result<ControlResponse> {
+            assert_eq!(req.method, Method::HEAD);
+            let mut headers = HeaderMap::new();
+            headers.insert("etag", HeaderValue::from_static("\"etag\""));
+            headers.insert("content-length", HeaderValue::from_static("0"));
+            Ok(ControlResponse {
+                status: StatusCode::OK,
+                headers,
+            })
+        }
+        async fn execute_registered(
+            &self,
+            req: ControlRequest,
+        ) -> Result<RegisteredControlResponse> {
+            assert_eq!(req.method, Method::GET);
+            assert!(req.headers.contains_key("if-match"));
+            let mut seen = self.0.lock().unwrap();
+            seen.push(req.headers[rustfs_nixl::NIXL_BUFFER_HEADER].clone());
+            Ok(match seen.len() {
+                1 => RegisteredControlResponse::Response(ControlResponse {
+                    status: StatusCode::PRECONDITION_FAILED,
+                    headers: HeaderMap::new(),
+                }),
+                2..=19 => RegisteredControlResponse::RejectedBeforeDma(Error::Conflict(
+                    "PreconditionFailed".into(),
+                )),
+                _ => {
+                    let mut headers = HeaderMap::new();
+                    headers.insert(RDMA_REPLY_HEADER, HeaderValue::from_static("200"));
+                    RegisteredControlResponse::Response(ControlResponse {
+                        status: StatusCode::OK,
+                        headers,
+                    })
+                }
+            })
+        }
+    }
+    let peer = Arc::new(Peer(Mutex::default()));
+    let transport = Factory(RdmaBackend::Nixl).create(peer.clone()).unwrap();
+    let path = RemotePath::new("test", "bucket", "key");
+    let opts = rc_core::TransferReadOptions::default();
+    for i in 1..=20 {
+        let r = transport
+            .download(
+                DownloadRequest {
+                    path: &path,
+                    options: &opts,
+                    max_bytes: None,
+                    max_receive_bytes: 64,
+                    on_progress: &mut |_, _| {},
+                },
+                &mut tokio::io::sink(),
+            )
+            .await;
+        assert_eq!(r.is_ok(), i == 20);
+    }
+    let seen = peer.0.lock().unwrap();
+    assert_ne!(seen[0], seen[1]);
+    assert!(seen[1..].iter().all(|v| v == seen[1]));
+}
+
+#[cfg(feature = "cuobject")]
+#[tokio::test]
+#[ignore = "requires an NVIDIA RDMA device and an authenticated RustFS object"]
+async fn rustfs_declines_a_stale_conditional_get_before_dma() {
+    let env = |key| {
+        std::env::var(key)
+            .expect("configure the test endpoint, credentials, CA and existing bucket")
+    };
+    let mut alias = rc_core::Alias::new(
+        "test",
+        env("RC_TEST_ENDPOINT"),
+        env("AWS_ACCESS_KEY_ID"),
+        env("AWS_SECRET_ACCESS_KEY"),
+    );
+    alias.ca_bundle = Some(env("RC_TEST_CA"));
+    let client = rc_s3::S3Client::new(alias).await.unwrap();
+    let path = RemotePath::new("test", env("RC_TEST_BUCKET"), "known");
+    let transport = Transport {
+        control: Arc::new(client),
+        pools: Pools::new(RdmaBackend::CuObject),
+    };
+    for _ in 0..20 {
+        let mut headers = HeaderMap::new();
+        headers.insert("if-match", HeaderValue::from_static("\"stale\""));
+        let exposed = transport
+            .pools
+            .reserve(4096)
+            .await
+            .unwrap()
+            .expose(&Method::GET, 4096, &mut headers)
+            .unwrap();
+        let req = wire::request(Method::GET, &path, vec![], headers);
+        match transport.exchange(req, exposed).await {
+            Err(error) if matches!(error.source.as_deref(), Some(Error::Conflict(_))) => {}
+            _ => panic!("expected an authenticated pre-transfer rejection"),
+        }
+    }
+}
