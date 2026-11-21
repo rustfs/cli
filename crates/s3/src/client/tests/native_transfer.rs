@@ -66,8 +66,17 @@ async fn accepted_probe_uploads_the_part_and_completes() {
 
     assert_eq!(object.etag.as_deref(), Some("complete-etag"));
     assert_eq!(
-        provider.operations.lock().unwrap().first().unwrap(),
-        "probe:upload-id:4"
+        *provider.operations.lock().unwrap(),
+        [
+            "probe:upload-id:4".to_owned(),
+            format!(
+                "{:?}",
+                UploadOperation::UploadPart {
+                    upload_id: "upload-id",
+                    part_number: 1,
+                }
+            ),
+        ]
     );
     assert_eq!(*provider.uploaded_payloads.lock().unwrap(), [b"data"]);
     assert_multipart_requests(
