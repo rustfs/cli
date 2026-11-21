@@ -59,9 +59,10 @@ unavailable. The default `http` policy transfers the payload through S3.
 
 File uploads use positional reads directly into two reusable registered
 windows. Each completed part frees a window for the next part, and S3 receives
-the completion list in part-number order. For transfers of up to 1 MiB, the client can register two 1 MiB
-windows. Larger transfers use 64 MiB windows, which also serve subsequent
-small requests on the same client. File downloads write directly into the temporary
+the completion list in part-number order. A new pool sizes each window to the
+next power of two that fits the requested part or range, with a 1 MiB minimum
+and a 64 MiB maximum. For example, a 4 MiB range registers two 4 MiB windows.
+A client can reuse its existing larger pool for subsequent small requests. File downloads write directly into the temporary
 destination file. A range GET for the next window can proceed while the
 previous window is being written. All requests keep the caller's version selector. Each GET uses
 `If-Match` and checks the version from HEAD before delivering that range. Downloads publish the temporary file
@@ -73,7 +74,9 @@ error document and no RDMA response headers. An ambiguous response, a
 missing receipt, cancellation or timeout retains the token and window until
 the process exits.
 When both windows are unavailable for this reason, waiting operations use a
-fresh pool within the process registration budget.
+fresh pool within the process registration budget. Retiring a cuObject pool
+releases its idle registrations. Each quarantined window keeps its own
+registration and the pool's budget reservation.
 
 RustFS can interpret a declined external PUT as an ordinary empty PUT.
 The client uploads nonempty objects into unpublished multipart parts and
