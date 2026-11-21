@@ -7788,6 +7788,8 @@ impl ControlExecutor for S3Client {
 
 #[cfg(test)]
 mod tests {
+    mod native_transfer;
+
     use super::*;
     use crate::test_http::{
         CaptureRequestReceiver, ReplayEvent, StaticReplayClient, capture_request,
@@ -14627,12 +14629,32 @@ mod tests {
     }
 
     enum ExternalBehavior {
+        DirectDownload(std::result::Result<(u64, u64), rc_core::DataTransferState>),
+        Probe(std::result::Result<bool, rc_core::DataTransferState>),
+        FailSecondFilePart(Arc<FilePartFailure>),
         OutOfOrderFile(tokio::sync::Notify),
         Reject,
         RewriteThenReject(std::path::PathBuf, &'static [u8]),
         PartialReject,
         Success,
         Unknown,
+    }
+
+    #[derive(Default)]
+    struct FilePartFailure {
+        first_pending: Notify,
+        second_failed: Notify,
+        release_first: Notify,
+    }
+
+    fn test_transfer_error(
+        state: rc_core::DataTransferState,
+    ) -> data_transport::DataTransportError {
+        data_transport::DataTransportError {
+            state,
+            message: "test transfer failure".into(),
+            source: None,
+        }
     }
 
     struct TestExternalTransport {
@@ -14644,7 +14666,29 @@ mod tests {
     #[async_trait]
     impl ObjectDataTransport for TestExternalTransport {
         fn staged_upload(&self) -> Option<&dyn data_transport::StagedUploadTransport> {
-            matches!(self.behavior, ExternalBehavior::OutOfOrderFile(_)).then_some(self)
+            matches!(
+                self.behavior,
+                ExternalBehavior::OutOfOrderFile(_)
+                    | ExternalBehavior::FailSecondFilePart(_)
+                    | ExternalBehavior::Probe(_)
+            )
+            .then_some(self)
+        }
+
+        async fn download_file(
+            &self,
+            _: DownloadRequest<'_>,
+            file: Arc<std::fs::File>,
+        ) -> data_transport::DataTransportResult<Option<data_transport::DownloadResult>> {
+            let ExternalBehavior::DirectDownload(outcome) = self.behavior else {
+                return Ok(None);
+            };
+            file.as_ref().write_all(b"file").unwrap();
+            let (bytes_transferred, content_length) = outcome.map_err(test_transfer_error)?;
+            Ok(Some(data_transport::DownloadResult {
+                bytes_transferred,
+                content_length,
+            }))
         }
 
         async fn download(
@@ -14757,10 +14801,17 @@ mod tests {
         async fn probe(
             &self,
             _: &RemotePath,
-            _: &str,
-            _: u64,
+            upload_id: &str,
+            first_part_bytes: u64,
         ) -> data_transport::DataTransportResult<bool> {
-            panic!("forced native upload does not probe")
+            let ExternalBehavior::Probe(outcome) = self.behavior else {
+                panic!("forced native upload does not probe");
+            };
+            self.operations
+                .lock()
+                .unwrap()
+                .push(format!("probe:{upload_id}:{first_part_bytes}"));
+            outcome.map_err(test_transfer_error)
         }
 
         async fn upload_file_part(
@@ -14769,17 +14820,28 @@ mod tests {
             _: Arc<std::fs::File>,
             offset: u64,
         ) -> data_transport::DataTransportResult<UploadResult> {
-            let ExternalBehavior::OutOfOrderFile(release_first) = &self.behavior else {
-                unreachable!()
-            };
             let UploadOperation::UploadPart { part_number, .. } = request.operation else {
                 unreachable!()
             };
             assert_eq!(offset, (part_number as u64 - 1) * self.max_part_size());
-            match part_number {
-                1 => release_first.notified().await,
-                2 => {}
-                3 => release_first.notify_one(),
+            match (&self.behavior, part_number) {
+                (ExternalBehavior::OutOfOrderFile(release_first), 1) => {
+                    release_first.notified().await
+                }
+                (ExternalBehavior::OutOfOrderFile(_), 2) => {}
+                (ExternalBehavior::OutOfOrderFile(release_first), 3) => release_first.notify_one(),
+                (ExternalBehavior::FailSecondFilePart(control), 1) => {
+                    control.first_pending.notify_one();
+                    control.release_first.notified().await;
+                    self.operations.lock().unwrap().push("receipt:1".into());
+                }
+                (ExternalBehavior::FailSecondFilePart(control), 2) => {
+                    control.first_pending.notified().await;
+                    control.second_failed.notify_one();
+                    return Err(test_transfer_error(
+                        rc_core::DataTransferState::ConfirmedFailure,
+                    ));
+                }
                 _ => unreachable!(),
             }
             let mut object = ObjectInfo::file(&request.path.key, request.content_length as i64);
