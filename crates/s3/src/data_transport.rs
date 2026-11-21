@@ -10,7 +10,6 @@ use std::{
 };
 
 use async_trait::async_trait;
-use bytes::Bytes;
 use http::{HeaderMap, Method, StatusCode};
 use rc_core::{
     DataTransferState, Error, ObjectInfo, ObjectWriteOptions, RemotePath, Result,
@@ -26,45 +25,25 @@ pub struct ControlRequest {
     pub path: RemotePath,
     pub query: Vec<(String, String)>,
     pub headers: HeaderMap,
-    pub body: Bytes,
-    pub payload: ControlPayload,
-    pub response_limit: usize,
-}
-
-/// Signing policy for a bounded control body or separately delivered payload.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum ControlPayload {
-    /// Sign the exact HTTPS control body with SHA256.
-    #[default]
-    Body,
-    /// Use S3 UNSIGNED-PAYLOAD for a logical payload delivered by the provider.
-    /// The HTTPS request body must be empty; logical integrity is verified by
-    /// the provider and the authenticated S3 operation before publication.
-    External { deadline: std::time::Instant },
 }
 
 /// Uninterpreted control response; duplicate and binary headers are preserved.
 pub struct ControlResponse {
     pub status: StatusCode,
     pub headers: HeaderMap,
-    pub body: Bytes,
 }
 
 /// Host-owned HTTPS, credentials, signing, custom headers, and TLS configuration.
 #[async_trait]
 pub trait ControlExecutor: Send + Sync {
-    async fn execute(&self, request: ControlRequest) -> Result<ControlResponse>;
-}
-
-/// Configuration passed to a process-installed provider factory.
-pub struct DataTransportContext {
-    pub endpoint: String,
-    pub control: Arc<dyn ControlExecutor>,
+    /// Read only the status and headers. A declined external GET can return an
+    /// ordinary S3 payload of arbitrary size.
+    async fn execute_headers(&self, request: ControlRequest) -> Result<ControlResponse>;
 }
 
 /// External transport construction is separate from process-wide policy.
 pub trait ObjectDataTransportFactory: Send + Sync {
-    fn create(&self, context: DataTransportContext) -> Result<Arc<dyn ObjectDataTransport>>;
+    fn create(&self, control: Arc<dyn ControlExecutor>) -> Result<Arc<dyn ObjectDataTransport>>;
 }
 
 static FACTORY: OnceLock<Arc<dyn ObjectDataTransportFactory>> = OnceLock::new();
@@ -167,6 +146,28 @@ pub(crate) fn committed_verification_failure(source: Error) -> Error {
     }
 }
 
+/// Access to unpublished S3 parts for providers without atomic direct PUT negotiation.
+#[async_trait]
+pub trait StagedUploadTransport: ObjectDataTransport {
+    fn max_part_size(&self) -> u64;
+
+    /// Probe part 1 of a newly created upload before reading application data.
+    async fn probe(
+        &self,
+        path: &RemotePath,
+        upload_id: &str,
+        first_part_bytes: u64,
+    ) -> DataTransportResult<bool>;
+
+    /// Read an exact file range directly into registered memory.
+    async fn upload_file_part(
+        &self,
+        request: UploadRequest<'_>,
+        file: Arc<std::fs::File>,
+        offset: u64,
+    ) -> DataTransportResult<UploadResult>;
+}
+
 /// One provider call performs one S3 data operation and its owned reconciliation.
 ///
 /// Success requires authenticated acceptance, exact logical length, data
@@ -175,6 +176,22 @@ pub(crate) fn committed_verification_failure(source: Error) -> Error {
 /// retain their classification; callers never infer replay safety from strings.
 #[async_trait]
 pub trait ObjectDataTransport: Send + Sync {
+    /// A server which can interpret a declined external PUT as an empty S3 PUT
+    /// must receive data only into unpublished multipart parts.
+    fn staged_upload(&self) -> Option<&dyn StagedUploadTransport> {
+        None
+    }
+
+    /// Write verified data directly to the host's unpublished temporary file.
+    /// Providers using the streaming sink return None without accessing the file.
+    async fn download_file(
+        &self,
+        _request: DownloadRequest<'_>,
+        _file: Arc<std::fs::File>,
+    ) -> DataTransportResult<Option<DownloadResult>> {
+        Ok(None)
+    }
+
     async fn download(
         &self,
         request: DownloadRequest<'_>,

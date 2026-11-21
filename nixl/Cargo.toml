@@ -1,0 +1,25 @@
+[package]
+name = "rustfs-cli-nixl"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99.0"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace]
+resolver = "3"
+
+[[bin]]
+name = "rc"
+path = "src/main.rs"
+
+[dependencies]
+rustfs-cli = { path = "../crates/cli" }
+rc-core = { path = "../crates/core" }
+rc-s3 = { path = "../crates/s3" }
+rustfs-nixl = { git = "https://github.com/rustfs/rustfs", rev = "b86624520c99de06d9e36b971520a7071ca54b4c", features = ["sys"] }
+async-trait = "0.1"
+base64 = "0.22"
+getrandom = "0.4"
+http = "1"
+tokio = { version = "1", features = ["io-util", "sync", "time"] }

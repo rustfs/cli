@@ -7,16 +7,18 @@ completion, and abort continue to use the established S3 implementation.
 
 `rc-core` owns transport selection and business outcome classification.
 `rc-s3::data_transport` owns the optional provider ports, expressed with existing
-S3 read/write options and borrowed asynchronous IO. A separately built executable
-can install an `ObjectDataTransportFactory` before calling `rustfs_cli::run()`.
+S3 read/write options, registered file transfers, and borrowed asynchronous IO.
+The Linux NIXL executable installs an `ObjectDataTransportFactory` before
+calling `rustfs_cli::run()`.
 The common launcher preserves command dispatch, output, exit codes, and the
 existing worker-thread configuration.
 
-The provider receives a host-owned `ControlExecutor` for bounded, signed HTTPS
-exchanges. Credentials, endpoint addressing, custom headers, and TLS remain in
-the S3 client. The executor sends each exchange once and preserves response
-status and duplicate headers. The provider owns acceptance proof and any
-reconciliation required after an ambiguous response.
+The provider supplies NIXL agent metadata and a registered buffer description
+to a host-owned `ControlExecutor`. The S3 client signs and sends a bodyless
+HTTPS request on the shared S3 HTTP client using the alias timeout policy. It returns the status and headers directly,
+including duplicate headers. The provider verifies the RustFS transfer receipt
+and byte count. Credentials, endpoint addressing, custom headers, and TLS
+remain in the S3 client.
 
 External control requires an authenticated principal and verified HTTPS. Object
 paths and query values use the S3 encoding rules, with canonical path
@@ -24,9 +26,11 @@ normalization disabled and single URI encoding during SigV4 signing. The
 encoding and signature are checked against actual AWS SDK requests for reserved
 characters, Unicode, repeated slashes, and selected version IDs.
 
-Object reads to vectors, writers, and temporary files use the same provider
-entry point. Files retain atomic replacement only after verified data and writer
-flush. Existing version, checksum, encryption, and Range options are forwarded.
+Object reads to vectors and writers share the streaming provider entry point.
+For file downloads the provider can write registered memory directly to a
+temporary file. The client verifies the transfer before replacing the
+destination. Existing version, checksum, encryption, and Range options are
+forwarded.
 Object writes and multipart parts retain their existing option validation and
 checksum verification; conditional file writes retain HTTP-managed multipart
 completion. No existing S3 options may be silently omitted by a provider.
@@ -38,13 +42,11 @@ outcome state through redaction and multipart cleanup; generic timeout-string
 retry logic does not retry them. `rdma` reports an explicit failure when no
 provider or usable capability exists.
 
-After a successful external PUT, a failed persisted-checksum HEAD cannot cause
-the object write to replay. Multipart transfers record whether an external part
-succeeded. Uncertain completion responses retain an unknown outcome and upload
-identity; post-completion verification failures retain a confirmed failure with
-their original diagnostic cause. These failures remain outside generic business
-retry logic.
+Nonempty native uploads use unpublished multipart parts. The client publishes
+the object after all part receipts and ETags have been verified. An uncertain
+completion retains the upload ID and an unknown outcome. A failed checksum
+verification after completion cannot replay the write. Empty objects use S3
+directly.
 
-Native provider code is outside the default workspace dependency graph. The
-independent opt-in build and private dependency instructions are described in
-the project build documentation.
+The [RDMA build guide](../rdma-build.md) describes the Linux executable,
+native dependencies, and runtime setup.

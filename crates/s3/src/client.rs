@@ -2,6 +2,9 @@
 //!
 //! Wraps aws-sdk-s3 and implements the ObjectStore trait from rc-core.
 
+mod object_error;
+mod staged_upload;
+
 use async_trait::async_trait;
 use aws_credential_types::Credentials;
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
@@ -63,9 +66,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::data_transport::{
-    self, ControlExecutor, ControlPayload, ControlRequest, ControlResponse, DataTransportContext,
-    DownloadRequest, ObjectDataTransport, ObservedReader, ObservedWriter, UploadOperation,
-    UploadRequest, UploadResult, WriteCondition,
+    self, ControlExecutor, ControlRequest, ControlResponse, DownloadRequest, ObjectDataTransport,
+    ObservedReader, ObservedWriter, UploadOperation, UploadRequest, UploadResult, WriteCondition,
 };
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
@@ -251,25 +253,6 @@ async fn build_reqwest_client(
     client_key: Option<&str>,
     timeout: Option<&rc_core::alias::TimeoutConfig>,
 ) -> Result<reqwest::Client> {
-    build_reqwest_client_with_read_policy(
-        insecure,
-        ca_bundle,
-        client_cert,
-        client_key,
-        timeout,
-        true,
-    )
-    .await
-}
-
-async fn build_reqwest_client_with_read_policy(
-    insecure: bool,
-    ca_bundle: Option<&str>,
-    client_cert: Option<&str>,
-    client_key: Option<&str>,
-    timeout: Option<&rc_core::alias::TimeoutConfig>,
-    apply_read_timeout: bool,
-) -> Result<reqwest::Client> {
     // NOTE: When `insecure = true`, `danger_accept_invalid_certs` disables all TLS
     // certificate verification. Any CA bundle provided will still be added to the
     // trust store but is rendered ineffective for this connection.
@@ -279,9 +262,7 @@ async fn build_reqwest_client_with_read_policy(
 
     if let Some(timeout) = timeout {
         builder = builder.connect_timeout(Duration::from_millis(timeout.connect_ms));
-        if apply_read_timeout {
-            builder = builder.read_timeout(Duration::from_millis(timeout.read_ms));
-        }
+        builder = builder.read_timeout(Duration::from_millis(timeout.read_ms));
     }
 
     if let Some(bundle_path) = ca_bundle {
@@ -1788,7 +1769,6 @@ pub struct S3Client {
     inner: aws_sdk_s3::Client,
     presign_inner: aws_sdk_s3::Client,
     xml_http_client: reqwest::Client,
-    external_http_client: Arc<tokio::sync::OnceCell<reqwest::Client>>,
     alias: Alias,
     session_token: Option<String>,
     request_headers: Vec<RequestHeader>,
@@ -1914,7 +1894,6 @@ impl S3Client {
             inner: client,
             presign_inner: presign_client,
             xml_http_client,
-            external_http_client: Arc::new(tokio::sync::OnceCell::new()),
             alias,
             session_token,
             request_headers,
@@ -1924,10 +1903,7 @@ impl S3Client {
         if client.data_transport_mode != rc_core::DataTransportMode::Http
             && let Some(factory) = data_transport::installed_factory()
         {
-            client.data_transport = Some(factory.create(DataTransportContext {
-                endpoint: client.alias.endpoint.clone(),
-                control: Arc::new(client.clone()),
-            })?);
+            client.data_transport = Some(factory.create(Arc::new(client.clone()))?);
         }
         Ok(client)
     }
@@ -2034,6 +2010,41 @@ impl S3Client {
         let Some(transport) = self.selected_data_transport()? else {
             return Ok(None);
         };
+        if let Some(staged) = transport.staged_upload() {
+            if request.content_length == 0 {
+                return Ok(None);
+            }
+            if let UploadOperation::PutObject { condition } = request.operation {
+                let options = PathUploadOptions {
+                    write: request.options,
+                    precondition: condition.into(),
+                };
+                let result = self
+                    .put_staged_object(
+                        request.path,
+                        staged_upload::Source::Reader(source),
+                        request.content_length,
+                        options,
+                        staged,
+                        &mut |_| {},
+                    )
+                    .await?;
+                return Ok(result.map(|object| UploadResult {
+                    object,
+                    checksum_sha256: None,
+                }));
+            }
+        }
+        self.upload_with_transport(transport.as_ref(), request, source)
+            .await
+    }
+
+    async fn upload_with_transport(
+        &self,
+        transport: &dyn ObjectDataTransport,
+        request: UploadRequest<'_>,
+        source: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+    ) -> Result<Option<UploadResult>> {
         let length = request.content_length;
         let customer_key =
             destination_sse_customer_key(request.options.encryption.as_ref()).cloned();
@@ -2335,13 +2346,63 @@ impl S3Client {
     ) -> Result<u64> {
         options.validate()?;
         self.ensure_sse_customer_transport(options.customer_key.as_ref())?;
-        if self.selected_data_transport()?.is_some() {
-            let (mut file, temporary) = Self::temporary_download_file(destination)?;
-            if let Some(bytes) = self
-                .try_external_download(path, options, &mut file, None, &mut on_progress)
-                .await?
-            {
-                drop(file);
+        if let Some(transport) = self.selected_data_transport()? {
+            let (file, temporary) = Self::temporary_download_file(destination)?;
+            let file = Arc::new(file.into_std().await);
+            let result = transport
+                .download_file(
+                    DownloadRequest {
+                        path,
+                        options,
+                        max_bytes: None,
+                        max_receive_bytes: rc_core::S3_MAX_OBJECT_SIZE,
+                        on_progress: &mut on_progress,
+                    },
+                    file.clone(),
+                )
+                .await;
+            let bytes = match result {
+                Ok(Some(done))
+                    if done.bytes_transferred == done.content_length
+                        && done.content_length <= rc_core::S3_MAX_OBJECT_SIZE
+                        && file.metadata()?.len() == done.content_length =>
+                {
+                    Some(done.content_length)
+                }
+                Ok(Some(_)) => {
+                    return Err(Error::DataTransfer {
+                        state: rc_core::DataTransferState::ConfirmedFailure,
+                        message: "Native download length differs from its temporary file".into(),
+                        source: None,
+                    });
+                }
+                Ok(None) => {
+                    let file = Arc::try_unwrap(file).map_err(|_| {
+                        Error::General("Unused download file is still in use".into())
+                    })?;
+                    self.try_external_download(
+                        path,
+                        options,
+                        &mut tokio::fs::File::from_std(file),
+                        None,
+                        &mut on_progress,
+                    )
+                    .await?
+                }
+                Err(err)
+                    if err.state == rc_core::DataTransferState::NotAccepted
+                        && file.metadata()?.len() == 0
+                        && self.data_transport_mode == rc_core::DataTransportMode::Auto =>
+                {
+                    None
+                }
+                Err(err) => {
+                    return Err(
+                        self.redact_sse_customer_error(err.into(), options.customer_key.as_ref())
+                    );
+                }
+            };
+            if let Some(bytes) = bytes {
                 temporary.persist(destination).map_err(|error| {
                     Error::General(format!(
                         "atomically replace download destination '{}': {}",
@@ -2870,123 +2931,6 @@ impl S3Client {
             }
             _ => error.to_string(),
         }
-    }
-
-    fn map_object_request_error<E>(
-        error: &aws_sdk_s3::error::SdkError<E>,
-        path: &RemotePath,
-        requested_version: Option<&str>,
-    ) -> Error
-    where
-        E: ProvideErrorMetadata + std::fmt::Display,
-    {
-        if let Some(error) = crate::auth::sdk_temporary_credential_error(error) {
-            return error;
-        }
-        let formatted = Self::format_sdk_error(error);
-
-        if let aws_sdk_s3::error::SdkError::ServiceError(service_error) = error {
-            let raw = service_error.raw();
-            let code = service_error.err().code().or_else(|| {
-                raw.headers()
-                    .get("x-amz-error-code")
-                    .and_then(|value| std::str::from_utf8(value.as_bytes()).ok())
-            });
-            let status = raw.status().as_u16();
-            if matches!(code, Some("InvalidStorageClass")) {
-                return Error::UnsupportedFeature(
-                    "The S3 endpoint rejected the requested storage class".to_string(),
-                );
-            }
-            if matches!(code, Some("BadDigest") | Some("InvalidDigest")) {
-                return Error::Conflict(
-                    "The S3 endpoint rejected the supplied object checksum".to_string(),
-                );
-            }
-            if matches!(status, 409 | 412)
-                || matches!(
-                    code,
-                    Some("ConditionalRequestConflict") | Some("PreconditionFailed")
-                )
-            {
-                return Error::Conflict(formatted);
-            }
-            if status == 401 || matches!(code, Some("Unauthorized")) {
-                return Error::Auth(formatted);
-            }
-
-            let version_header = raw
-                .headers()
-                .get("x-amz-version-id")
-                .and_then(|value| std::str::from_utf8(value.as_bytes()).ok());
-            let is_delete_marker = raw
-                .headers()
-                .get("x-amz-delete-marker")
-                .and_then(|value| std::str::from_utf8(value.as_bytes()).ok())
-                .is_some_and(|value| value.eq_ignore_ascii_case("true"));
-
-            let service_message = service_error.err().message().unwrap_or(formatted.as_str());
-            if Self::is_retention_denial(service_message) {
-                return Error::GovernanceDenied {
-                    path: path.to_string(),
-                    version_id: requested_version.map(ToString::to_string),
-                };
-            }
-
-            if matches!(code, Some("AccessDenied") | Some("Forbidden")) || status == 403 {
-                return Error::Auth(formatted);
-            }
-
-            if is_delete_marker {
-                return Error::DeleteMarker {
-                    path: path.to_string(),
-                    version_id: version_header
-                        .or(requested_version)
-                        .unwrap_or("unknown")
-                        .to_string(),
-                };
-            }
-
-            if matches!(code, Some("NoSuchVersion"))
-                || (requested_version.is_some()
-                    && (matches!(code, Some("NoSuchKey") | Some("NotFound")) || status == 404))
-            {
-                return Error::VersionNotFound {
-                    path: path.to_string(),
-                    version_id: requested_version.unwrap_or("unknown").to_string(),
-                };
-            }
-
-            if matches!(code, Some("NoSuchKey") | Some("NotFound")) || status == 404 {
-                return Error::NotFound(path.to_string());
-            }
-        }
-
-        if Self::is_retention_denial(&formatted) {
-            return Error::GovernanceDenied {
-                path: path.to_string(),
-                version_id: requested_version.map(ToString::to_string),
-            };
-        }
-        if formatted.contains("AccessDenied")
-            || formatted.contains("Forbidden")
-            || formatted.contains("Unauthorized")
-        {
-            return Error::Auth(formatted);
-        }
-        if formatted.contains("NoSuchVersion")
-            || (requested_version.is_some()
-                && (formatted.contains("NoSuchKey") || formatted.contains("NotFound")))
-        {
-            return Error::VersionNotFound {
-                path: path.to_string(),
-                version_id: requested_version.unwrap_or("unknown").to_string(),
-            };
-        }
-        if formatted.contains("NoSuchKey") || formatted.contains("NotFound") {
-            return Error::NotFound(path.to_string());
-        }
-        Error::Network(formatted)
     }
 
     fn map_object_lock_write_error<E>(
@@ -3824,8 +3768,7 @@ impl S3Client {
         method: &Method,
         url: &str,
         headers: &HeaderMap,
-        body: &[u8],
-        payload: ControlPayload,
+        body: SignableBody<'_>,
         time: std::time::SystemTime,
     ) -> Result<HeaderMap> {
         let mut settings = SigningSettings::default();
@@ -3836,10 +3779,7 @@ impl S3Client {
             method,
             url,
             headers,
-            match payload {
-                ControlPayload::Body => SignableBody::Bytes(body),
-                ControlPayload::External { .. } => SignableBody::UnsignedPayload,
-            },
+            body,
             RequestSigningOptions {
                 region: &self.alias.region,
                 settings,
@@ -4534,7 +4474,7 @@ impl S3Client {
         options: PathUploadOptions<'_>,
         on_progress: impl Fn(u64) + Send,
     ) -> Result<ObjectInfo> {
-        use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+        use aws_sdk_s3::types::CompletedPart;
 
         if options.write.storage_class.is_some() {
             return Err(Error::UnsupportedFeature(
@@ -4564,40 +4504,9 @@ impl S3Client {
         }
         tracing::debug!(file_size, part_size, "Starting multipart upload");
 
-        let mut create_request = apply_object_write_encryption_to_multipart_create_request(
-            self.inner
-                .create_multipart_upload()
-                .bucket(&path.bucket)
-                .key(&path.key),
-            options.write.encryption.as_ref(),
-        );
-        if let Some(attributes) = &options.write.attributes {
-            create_request =
-                apply_object_attributes_to_multipart_create_request(create_request, attributes)?;
-        }
-        if let Some(tags) = &options.write.tags {
-            create_request = create_request.tagging(encode_object_tags(tags));
-        }
-        if checksum_requested {
-            create_request =
-                create_request.checksum_algorithm(aws_sdk_s3::types::ChecksumAlgorithm::Sha256);
-        }
-        create_request =
-            apply_object_lock_to_multipart_create_request(create_request, options.write)?;
-
-        let create_response = create_request.send().await.map_err(|error| {
-            self.map_sdk_failure(&error, || {
-                self.redact_sse_customer_error(
-                    Self::map_transfer_write_error(&error, path, options.write),
-                    destination_sse_customer_key(options.write.encryption.as_ref()),
-                )
-            })
-        })?;
-
-        let upload_id = create_response
-            .upload_id()
-            .ok_or_else(|| Error::General("missing upload id from multipart upload".to_string()))?
-            .to_string();
+        let upload_id = self
+            .start_object_upload(path, options, checksum_requested)
+            .await?;
 
         tracing::debug!(upload_id = %upload_id, "Multipart upload initiated");
 
@@ -4755,70 +4664,16 @@ impl S3Client {
             part_number += 1;
         }
 
-        let completed_upload = CompletedMultipartUpload::builder()
-            .set_parts(Some(completed_parts))
-            .build();
-        let mut complete_request = self
-            .inner
-            .complete_multipart_upload()
-            .bucket(&path.bucket)
-            .key(&path.key)
-            .upload_id(&upload_id)
-            .multipart_upload(completed_upload);
-        complete_request = match options.precondition {
-            ObjectWritePrecondition::None => complete_request,
-            ObjectWritePrecondition::IfAbsent => complete_request.if_none_match("*"),
-            ObjectWritePrecondition::IfMatch(etag) => complete_request.if_match(etag),
-        };
-        let complete_result = complete_request.send().await;
-
-        let complete_response = match complete_result {
-            Ok(response) => response,
-            Err(error) => {
-                tracing::debug!(upload_id = %upload_id, "Attempting to abort multipart upload after completion failure");
-                let primary = if !matches!(options.precondition, ObjectWritePrecondition::None)
-                    && let aws_sdk_s3::error::SdkError::ServiceError(service_error) = &error
-                    && matches!(service_error.raw().status().as_u16(), 409 | 412)
-                {
-                    Error::Conflict(format!("Object changed before upload: {path}"))
-                } else {
-                    self.redact_sse_customer_error(
-                        Self::map_object_request_error(&error, path, None),
-                        destination_sse_customer_key(options.write.encryption.as_ref()),
-                    )
-                };
-                let primary = if has_external_parts {
-                    let state = match &error {
-                        aws_sdk_s3::error::SdkError::ServiceError(service_error)
-                            if matches!(service_error.raw().status().as_u16(), 409 | 412) =>
-                        {
-                            rc_core::DataTransferState::ConfirmedFailure
-                        }
-                        _ => rc_core::DataTransferState::OutcomeUnknown,
-                    };
-                    Error::DataTransfer {
-                        state,
-                        message: "Multipart completion did not return a usable success result"
-                            .to_string(),
-                        source: Some(Box::new(primary)),
-                    }
-                } else {
-                    primary
-                };
-                return Err(self
-                    .abort_multipart_upload_with_error(path, &upload_id, primary)
-                    .await);
-            }
-        };
-
-        tracing::debug!("Multipart upload completed");
-
-        let mut info = ObjectInfo::file(&path.key, file_size as i64);
-        if let Some(etag) = complete_response.e_tag() {
-            info.etag = Some(etag.trim_matches('"').to_string());
-        }
-        info.version_id = complete_response.version_id().map(ToString::to_string);
-        info.last_modified = Some(jiff::Timestamp::now());
+        let info = self
+            .finish_object_upload(
+                path,
+                &upload_id,
+                options,
+                completed_parts,
+                file_size,
+                has_external_parts,
+            )
+            .await?;
 
         if checksum_requested {
             let expected_checksum = composite_sha256_checksum(&part_digests);
@@ -4992,7 +4847,7 @@ impl S3Client {
         file_path: &std::path::Path,
         write: &ObjectWriteOptions,
         precondition: ObjectWritePrecondition<'_>,
-        on_progress: impl Fn(u64) + Send,
+        mut on_progress: impl Fn(u64) + Send,
     ) -> Result<ObjectInfo> {
         validate_attribute_tag_write_options(write)?;
         self.ensure_write_sse_customer_transport(write.encryption.as_ref())?;
@@ -5011,11 +4866,42 @@ impl S3Client {
             write,
             precondition,
         };
+        let mut http;
+        let client = if file_size > 0
+            && let Some(transport) = self.selected_data_transport()?
+            && let Some(staged) = transport.staged_upload()
+        {
+            let file =
+                std::sync::Arc::new(tokio::fs::File::open(file_path).await?.into_std().await);
+            if file.metadata()?.len() != file_size {
+                return Err(Error::Conflict("Upload source length changed".into()));
+            }
+            if let Some(info) = self
+                .put_staged_object(
+                    path,
+                    staged_upload::Source::File(file),
+                    file_size,
+                    options,
+                    staged,
+                    &mut on_progress,
+                )
+                .await?
+            {
+                return Ok(info);
+            }
+            http = self.clone();
+            http.data_transport_mode = rc_core::DataTransportMode::Http;
+            &http
+        } else {
+            self
+        };
         if Self::should_use_multipart(file_size) {
-            self.put_object_multipart_from_path(path, file_path, file_size, options, on_progress)
+            client
+                .put_object_multipart_from_path(path, file_path, file_size, options, on_progress)
                 .await
         } else {
-            self.put_object_single_part_from_path(path, file_path, options, on_progress)
+            client
+                .put_object_single_part_from_path(path, file_path, options, on_progress)
                 .await
         }
     }
@@ -7814,37 +7700,12 @@ impl ObjectStore for S3Client {
 /// External control exchanges retain the host client's TLS and signing policy.
 #[async_trait]
 impl ControlExecutor for S3Client {
-    async fn execute(&self, request: ControlRequest) -> Result<ControlResponse> {
+    async fn execute_headers(&self, request: ControlRequest) -> Result<ControlResponse> {
         if self.alias.anonymous {
             return Err(Error::RequestRejected(
                 "External object control requires an authenticated S3 principal".to_string(),
             ));
         }
-        const MAX_CONTROL_BYTES: usize = 1024 * 1024;
-        if request.body.len() > MAX_CONTROL_BYTES
-            || request.response_limit == 0
-            || request.response_limit > MAX_CONTROL_BYTES
-        {
-            return Err(Error::RequestRejected(
-                "Control envelope exceeds the bounded exchange policy".to_string(),
-            ));
-        }
-        if matches!(request.payload, ControlPayload::External { .. }) && !request.body.is_empty() {
-            return Err(Error::RequestRejected(
-                "An external payload control request must have an empty HTTPS body".to_string(),
-            ));
-        }
-        let operation_deadline = match request.payload {
-            ControlPayload::Body => None,
-            ControlPayload::External { deadline } => {
-                if deadline <= std::time::Instant::now() {
-                    return Err(Error::RequestRejected(
-                        "The external control operation deadline has elapsed".to_string(),
-                    ));
-                }
-                Some(deadline)
-            }
-        };
         let url = self.external_control_url(&request.path, &request.query)?;
         let mut headers = request.headers;
         for name in [
@@ -7882,11 +7743,7 @@ impl ControlExecutor for S3Client {
         );
         headers.insert(
             "x-amz-content-sha256",
-            HeaderValue::from_str(&match request.payload {
-                ControlPayload::Body => Self::sha256_hash(&request.body),
-                ControlPayload::External { .. } => "UNSIGNED-PAYLOAD".to_string(),
-            })
-            .map_err(|_| Error::RequestRejected("Invalid payload digest".to_string()))?,
+            HeaderValue::from_static("UNSIGNED-PAYLOAD"),
         );
         if headers.values().any(|value| value.to_str().is_err()) {
             return Err(Error::RequestRejected(
@@ -7898,75 +7755,33 @@ impl ControlExecutor for S3Client {
                 &request.method,
                 url.as_str(),
                 &headers,
-                &request.body,
-                request.payload,
+                SignableBody::UnsignedPayload,
                 std::time::SystemTime::now(),
             )
             .await?;
-        let client = if operation_deadline.is_some() {
-            self.external_http_client
-                .get_or_try_init(|| async {
-                    build_reqwest_client_with_read_policy(
-                        self.alias.insecure,
-                        self.alias.ca_bundle.as_deref(),
-                        self.alias.client_cert.as_deref(),
-                        self.alias.client_key.as_deref(),
-                        self.alias.timeout.as_ref(),
-                        false,
-                    )
-                    .await
-                })
-                .await?
-        } else {
-            &self.xml_http_client
-        };
-        let mut outgoing = client
+        // Only response headers travel over HTTPS. Bound the complete wait,
+        // including connection setup, using the same alias policy as S3.
+        let timeout = self.alias.timeout_config();
+        let mut response = self
+            .xml_http_client
             .request(request.method, url)
             .headers(signed)
-            .body(request.body);
-        if let Some(deadline) = operation_deadline {
-            let remaining = deadline
-                .checked_duration_since(std::time::Instant::now())
-                .filter(|remaining| !remaining.is_zero())
-                .ok_or_else(|| {
-                    Error::RequestRejected(
-                        "The external control operation deadline has elapsed".to_string(),
-                    )
-                })?;
-            outgoing = outgoing.timeout(remaining);
-        }
-        let response = outgoing
+            .timeout(Duration::from_millis(
+                timeout.connect_ms.saturating_add(timeout.read_ms),
+            ))
             .send()
             .await
-            .map_err(|_| Error::Network("External control exchange failed".to_string()))?;
-        let status = response.status();
-        let headers = response.headers().clone();
-        if response
-            .content_length()
-            .is_some_and(|length| length > request.response_limit as u64)
-        {
-            return Err(Error::Network(
-                "External control response exceeds its bound".to_string(),
-            ));
-        }
-        let mut body = Vec::new();
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream
-            .try_next()
-            .await
-            .map_err(|_| Error::Network("External control response was interrupted".to_string()))?
-        {
-            if chunk.len() > request.response_limit.saturating_sub(body.len()) {
-                return Err(Error::Network(
-                    "External control response exceeds its bound".to_string(),
-                ));
-            }
-            body.extend_from_slice(&chunk);
-        }
+            .map_err(|error| {
+                let message = if error.is_timeout() {
+                    "Timed out waiting for the S3 control response"
+                } else {
+                    "External control exchange failed"
+                };
+                Error::Network(message.to_owned())
+            })?;
         Ok(ControlResponse {
-            status,
-            headers,
-            body: Bytes::from(body),
+            status: response.status(),
+            headers: std::mem::take(response.headers_mut()),
         })
     }
 }
@@ -8137,7 +7952,6 @@ mod tests {
             inner: aws_sdk_s3::Client::from_conf(config),
             presign_inner: aws_sdk_s3::Client::from_conf(presign_config),
             xml_http_client,
-            external_http_client: Arc::new(tokio::sync::OnceCell::new()),
             alias,
             session_token: None,
             request_headers,
@@ -8197,7 +8011,6 @@ mod tests {
             inner: aws_sdk_s3::Client::from_conf(config),
             presign_inner: aws_sdk_s3::Client::from_conf(presign_config),
             xml_http_client: reqwest::Client::new(),
-            external_http_client: Arc::new(tokio::sync::OnceCell::new()),
             alias,
             session_token: None,
             request_headers,
@@ -8330,7 +8143,6 @@ mod tests {
             inner: aws_sdk_s3::Client::from_conf(config.clone()),
             presign_inner: aws_sdk_s3::Client::from_conf(config),
             xml_http_client: reqwest::Client::new(),
-            external_http_client: Arc::new(tokio::sync::OnceCell::new()),
             alias,
             session_token: None,
             request_headers: Vec::new(),
@@ -14815,6 +14627,7 @@ mod tests {
     }
 
     enum ExternalBehavior {
+        OutOfOrderFile(tokio::sync::Notify),
         Reject,
         RewriteThenReject(std::path::PathBuf, &'static [u8]),
         PartialReject,
@@ -14830,6 +14643,10 @@ mod tests {
 
     #[async_trait]
     impl ObjectDataTransport for TestExternalTransport {
+        fn staged_upload(&self) -> Option<&dyn data_transport::StagedUploadTransport> {
+            matches!(self.behavior, ExternalBehavior::OutOfOrderFile(_)).then_some(self)
+        }
+
         async fn download(
             &self,
             request: DownloadRequest<'_>,
@@ -14929,6 +14746,79 @@ mod tests {
                 checksum_sha256: request.checksum_sha256.map(ToString::to_string),
             })
         }
+    }
+
+    #[async_trait]
+    impl data_transport::StagedUploadTransport for TestExternalTransport {
+        fn max_part_size(&self) -> u64 {
+            crate::multipart::DEFAULT_PART_SIZE
+        }
+
+        async fn probe(
+            &self,
+            _: &RemotePath,
+            _: &str,
+            _: u64,
+        ) -> data_transport::DataTransportResult<bool> {
+            panic!("forced native upload does not probe")
+        }
+
+        async fn upload_file_part(
+            &self,
+            request: UploadRequest<'_>,
+            _: Arc<std::fs::File>,
+            offset: u64,
+        ) -> data_transport::DataTransportResult<UploadResult> {
+            let ExternalBehavior::OutOfOrderFile(release_first) = &self.behavior else {
+                unreachable!()
+            };
+            let UploadOperation::UploadPart { part_number, .. } = request.operation else {
+                unreachable!()
+            };
+            assert_eq!(offset, (part_number as u64 - 1) * self.max_part_size());
+            match part_number {
+                1 => release_first.notified().await,
+                2 => {}
+                3 => release_first.notify_one(),
+                _ => unreachable!(),
+            }
+            let mut object = ObjectInfo::file(&request.path.key, request.content_length as i64);
+            object.etag = Some(format!("part-{part_number}"));
+            Ok(UploadResult {
+                object,
+                checksum_sha256: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn native_file_upload_refills_free_windows_and_completes_in_part_order() {
+        let (client, replay) = test_s3_client_with_response_sequence(vec![
+            multipart_copy_create_response("native-upload"),
+            multipart_copy_complete_response(),
+        ]);
+        let provider =
+            external_transport(ExternalBehavior::OutOfOrderFile(tokio::sync::Notify::new()));
+        let client = client.with_object_data_transport(rc_core::DataTransportMode::Rdma, provider);
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let len = 2 * crate::multipart::DEFAULT_PART_SIZE + 1;
+        file.as_file().set_len(len).unwrap();
+        let path = RemotePath::new("test", "bucket", "data");
+        let options = ObjectWriteOptions::default();
+        let upload = client.put_object_from_path_with_options(&path, file.path(), &options, |_| {});
+        let object = tokio::time::timeout(Duration::from_secs(5), upload)
+            .await
+            .expect("part 3 must start while part 1 is pending")
+            .unwrap();
+        assert_eq!(object.size_bytes, Some(len as i64));
+        let requests: Vec<_> = replay.actual_requests().collect();
+        assert_eq!(requests.len(), 2);
+        let manifest = std::str::from_utf8(requests[1].body().bytes().unwrap()).unwrap();
+        let positions = ["part-1", "part-2", "part-3"].map(|etag| manifest.find(etag).unwrap());
+        assert!(
+            positions[0] < positions[1] && positions[1] < positions[2],
+            "{manifest}"
+        );
     }
 
     fn external_transport(behavior: ExternalBehavior) -> Arc<TestExternalTransport> {
@@ -15600,8 +15490,7 @@ mod tests {
                     &Method::GET,
                     sdk_request.uri(),
                     &headers,
-                    &[],
-                    ControlPayload::Body,
+                    SignableBody::Bytes(&[]),
                     time,
                 )
                 .await
@@ -15630,58 +15519,42 @@ mod tests {
             path: RemotePath::new("test", "bucket", "key"),
             query: Vec::new(),
             headers: HeaderMap::new(),
-            body: Bytes::new(),
-            payload: ControlPayload::Body,
-            response_limit: 1024,
         };
         assert!(matches!(
-            ControlExecutor::execute(&client, request).await,
+            ControlExecutor::execute_headers(&client, request).await,
             Err(Error::RequestRejected(_))
         ));
         assert_eq!(replay.actual_requests().count(), 0);
     }
 
     #[tokio::test]
-    async fn external_control_rejects_a_body_with_separately_delivered_payload() {
-        let (client, replay) = test_s3_client_with_response_sequence(Vec::new());
+    async fn external_control_honors_alias_timeouts() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listen");
+        let endpoint = format!("https://{}", listener.local_addr().expect("port"));
+        let (mut client, _) = test_s3_client_with_endpoint(&endpoint, None);
+        client.xml_http_client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("loopback HTTP client");
+        client.alias.timeout = Some(rc_core::alias::TimeoutConfig {
+            connect_ms: 150,
+            read_ms: 150,
+        });
         let request = ControlRequest {
-            method: Method::PUT,
+            method: Method::HEAD,
             path: RemotePath::new("test", "bucket", "key"),
             query: Vec::new(),
             headers: HeaderMap::new(),
-            body: Bytes::from_static(b"unexpected control body"),
-            payload: ControlPayload::External {
-                deadline: Instant::now() + Duration::from_secs(30),
-            },
-            response_limit: 1024,
         };
-        assert!(matches!(
-            ControlExecutor::execute(&client, request).await,
-            Err(Error::RequestRejected(_))
-        ));
-        assert_eq!(replay.actual_requests().count(), 0);
-    }
-
-    #[tokio::test]
-    async fn external_control_rejects_an_elapsed_operation_deadline_before_network_io() {
-        let (client, replay) = test_s3_client_with_response_sequence(Vec::new());
-        let request = ControlRequest {
-            method: Method::PUT,
-            path: RemotePath::new("test", "bucket", "key"),
-            query: Vec::new(),
-            headers: HeaderMap::new(),
-            body: Bytes::new(),
-            payload: ControlPayload::External {
-                deadline: Instant::now(),
-            },
-            response_limit: 1024,
-        };
-        assert!(matches!(
-            ControlExecutor::execute(&client, request).await,
-            Err(Error::RequestRejected(_))
-        ));
-        assert_eq!(replay.actual_requests().count(), 0);
-        assert!(client.external_http_client.get().is_none());
+        let (result, connection) = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(client.execute_headers(request), listener.accept())
+        })
+        .await
+        .expect("the alias deadline must end a stalled TLS exchange");
+        assert!(connection.is_ok());
+        assert!(matches!(result, Err(Error::Network(message)) if message.contains("Timed out")));
     }
 
     #[tokio::test]
@@ -15698,10 +15571,7 @@ mod tests {
                         &Method::PUT,
                         "https://objects.example.test/bucket/key",
                         &headers,
-                        &[],
-                        ControlPayload::External {
-                            deadline: Instant::now() + Duration::from_secs(30),
-                        },
+                        SignableBody::UnsignedPayload,
                         std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
                     )
                     .await

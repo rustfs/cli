@@ -1,0 +1,56 @@
+name: Native NIXL client
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'nixl/**'
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'scripts/build-rdma.sh'
+      - '.github/scripts/build-nixl-runtime.sh'
+      - '.github/workflows/nixl.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    env:
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
+      UCX_TLS: tcp,self
+      NIXL_NO_STUBS_FALLBACK: '1'
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: nixl
+      - name: Install native build tools
+        run: |
+          echo "NIXL_PREFIX=$RUNNER_TEMP/nixl" >> "$GITHUB_ENV"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libclang-dev ninja-build python3-dev python3-venv
+          python3 -m venv "$RUNNER_TEMP/native-tools"
+          "$RUNNER_TEMP/native-tools/bin/pip" install meson==1.12.1 pybind11==3.1.0
+          echo "$RUNNER_TEMP/native-tools/bin" >> "$GITHUB_PATH"
+      - name: Cache the UCX and NIXL runtime
+        id: native-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ${{ runner.temp }}/nixl
+          key: nixl-ubuntu-24.04-${{ runner.arch }}-${{ hashFiles('nixl/Cargo.lock', '.github/scripts/build-nixl-runtime.sh') }}
+      - name: Build UCX and the NIXL revision from Cargo.lock
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        run: .github/scripts/build-nixl-runtime.sh
+      - name: Build and test the native client over UCX loopback
+        run: |
+          export LD_LIBRARY_PATH="$NIXL_PREFIX/lib"
+          export NIXL_PLUGIN_DIR="$NIXL_PREFIX/lib/plugins"
+          ./scripts/build-rdma.sh
+          cargo test --locked --manifest-path nixl/Cargo.toml
