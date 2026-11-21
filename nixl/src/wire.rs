@@ -54,16 +54,16 @@ pub(crate) fn field<'a>(headers: &'a HeaderMap, name: &str) -> Result<Option<&'a
 pub(crate) fn receipt(status: StatusCode, headers: &HeaderMap, bytes: u64) -> Result<()> {
     if field(headers, RDMA_REPLY_HEADER)? != Some(status.as_str()) {
         return Err(Error::UnsupportedFeature(
-            "The endpoint did not confirm a RustFS NIXL transfer".into(),
+            "The endpoint did not confirm an RDMA transfer".into(),
         ));
     }
     let moved = field(headers, RDMA_BYTES_TRANSFERRED_HEADER)?
         .unwrap_or("0")
         .parse::<u64>()
-        .map_err(|_| Error::General("Invalid NIXL transfer count".into()))?;
+        .map_err(|_| Error::General("Invalid RDMA transfer count".into()))?;
     if moved != bytes {
         return Err(Error::General(format!(
-            "NIXL transferred {moved} of {bytes} bytes"
+            "RDMA transferred {moved} of {bytes} bytes"
         )));
     }
     Ok(())

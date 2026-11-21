@@ -13,9 +13,9 @@ async fn rustfs_reads_and_writes_the_advertised_host_window() {
     })
     .unwrap();
     let mut source = client.reserve(6).await.unwrap();
-    source.chunk.append(b"upload").unwrap();
+    source.writable().unwrap()[..6].copy_from_slice(b"upload");
     let mut fields = HeaderMap::new();
-    source.bind(&mut fields, 6).unwrap();
+    let exposed = source.expose(&Method::PUT, 6, &mut fields).unwrap();
     let token = RdmaToken::from_headers(
         fields[NIXL_AGENT_HEADER].to_str().unwrap(),
         Some(fields[NIXL_METADATA_HEADER].to_str().unwrap()),
@@ -36,5 +36,7 @@ async fn rustfs_reads_and_writes_the_advertised_host_window() {
         .await
         .unwrap();
     assert_eq!(written, 6);
-    assert_eq!(source.chunk.staged().unwrap(), b"result");
+    let mut source = exposed.finished();
+    source.finish_read(6).unwrap();
+    assert_eq!(source.received().unwrap(), b"result");
 }

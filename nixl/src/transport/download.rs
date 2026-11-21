@@ -48,8 +48,9 @@ impl Transport {
         };
         let window = self.pools.reserve(len as u64).await.map_err(unavailable)?;
         // An empty object still requires a nonempty descriptor.
-        window.bind(&mut headers, len.max(1)).map_err(unavailable)?;
-        let exposed = window.expose();
+        let exposed = window
+            .expose(&Method::GET, len.max(1), &mut headers)
+            .map_err(unavailable)?;
         let (response, exposed) = self
             .exchange(
                 read_request(
@@ -76,7 +77,7 @@ impl Transport {
         }
         if response.status != expected {
             return Err(rejected(Error::General(
-                "Unexpected NIXL GET status".into(),
+                "Unexpected RDMA GET status".into(),
             )));
         }
         wire::receipt(expected, &response.headers, len as u64).map_err(rejected)?;
@@ -86,7 +87,7 @@ impl Transport {
             .is_some_and(|value| value != "0")
         {
             return Err(rejected(Error::General(
-                "NIXL GET returned an HTTP payload".into(),
+                "RDMA GET returned an HTTP payload".into(),
             )));
         }
         if wire::field(&response.headers, "x-amz-version-id").map_err(rejected)?
@@ -107,15 +108,11 @@ impl Transport {
                 != Some(&expected_range)
             {
                 return Err(rejected(Error::General(
-                    "NIXL GET returned a different object range".into(),
+                    "RDMA GET returned a different object range".into(),
                 )));
             }
         }
-        window
-            .chunk
-            .advance(len)
-            .map_err(native_error)
-            .map_err(rejected)?;
+        window.finish_read(len).map_err(rejected)?;
         Ok(window)
     }
 
@@ -126,7 +123,7 @@ impl Transport {
     ) -> DataTransportResult<DownloadResult> {
         if request.options.customer_key.is_some() {
             return Err(unavailable(Error::UnsupportedFeature(
-                "NIXL does not encrypt SSE-C payloads in transit".into(),
+                "RDMA does not encrypt SSE-C payloads in transit".into(),
             )));
         }
         let requested_version = request.options.version_id.as_deref();
@@ -154,7 +151,7 @@ impl Transport {
         let length = request.max_bytes.unwrap_or(total).min(total);
         if length > request.max_receive_bytes {
             return Err(rejected(Error::General(
-                "NIXL object exceeds the receive bound".into(),
+                "RDMA object exceeds the receive bound".into(),
             )));
         }
         let observed_version = wire::field(&head.headers, "x-amz-version-id").map_err(rejected)?;
@@ -178,27 +175,20 @@ impl Transport {
         loop {
             let write = async {
                 if length == total {
-                    checksum.update(current.chunk.staged().map_err(native_error)?);
+                    checksum.update(current.received()?);
                 }
-                let offset = end - current.chunk.len() as u64;
+                let offset = end - current.len() as u64;
                 match &mut target {
-                    Sink::Writer(writer) => {
-                        writer
-                            .write_all(current.chunk.staged().map_err(native_error)?)
-                            .await?
-                    }
+                    Sink::Writer(writer) => writer.write_all(current.received()?).await?,
                     Sink::File(file) => {
                         use std::os::unix::fs::FileExt;
                         let file = file.clone();
                         tokio::task::spawn_blocking(move || {
-                            file.write_all_at(
-                                current.chunk.staged().map_err(native_error)?,
-                                offset,
-                            )?;
+                            file.write_all_at(current.received()?, offset)?;
                             Ok::<_, Error>(())
                         })
                         .await
-                        .map_err(|_| Error::General("NIXL file write was interrupted".into()))??;
+                        .map_err(|_| Error::General("RDMA file write was interrupted".into()))??;
                     }
                 }
                 (request.on_progress)(end, Some(length));

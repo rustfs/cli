@@ -13,7 +13,12 @@ resolver = "3"
 name = "rc"
 path = "src/main.rs"
 
+[features]
+cuobject = ["dep:cuobject", "dep:self_cell"]
+
 [dependencies]
+cuobject = { version = "0.1.0", default-features = false, features = ["client"], optional = true }
+self_cell = { version = "1.2", optional = true }
 rustfs-cli = { path = "../crates/cli" }
 rc-core = { path = "../crates/core" }
 rc-s3 = { path = "../crates/s3" }
