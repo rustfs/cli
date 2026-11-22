@@ -238,15 +238,22 @@ async fn rustfs_declines_a_stale_conditional_get_before_dma() {
 
 #[tokio::test]
 async fn large_get_submits_both_ranges_and_publishes_in_order() {
+    use rustfs_nixl::{
+        NIXL_AGENT_HEADER, NIXL_BUFFER_HEADER, NIXL_METADATA_HEADER, NixlConfig, NixlServer,
+        RdmaToken,
+    };
+
     struct Ranges {
-        second: tokio::sync::Notify,
+        peer: Arc<NixlServer>,
+        payload: Vec<u8>,
+        second_written: tokio::sync::Notify,
         wrong_checksum: bool,
     }
 
     #[async_trait]
     impl ControlExecutor for Ranges {
         async fn execute_headers(&self, request: ControlRequest) -> Result<ControlResponse> {
-            let total = WINDOW + 19;
+            let total = self.payload.len();
             let mut headers = HeaderMap::new();
             headers.insert("etag", HeaderValue::from_static("\"immutable\""));
             if request.method == Method::HEAD {
@@ -273,12 +280,31 @@ async fn large_get_submits_both_ranges_and_publishes_in_order() {
             let (start, end): (usize, usize) = (start.parse().unwrap(), end.parse().unwrap());
             if start == 0 {
                 assert_eq!(end, WINDOW - 1);
-                tokio::time::timeout(std::time::Duration::from_secs(5), self.second.notified())
-                    .await
-                    .expect("the second range must enter before the first completes");
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    self.second_written.notified(),
+                )
+                .await
+                .expect("the second range must finish before the first is written");
             } else {
                 assert_eq!((start, end), (WINDOW, total - 1));
-                self.second.notify_one();
+            }
+            let token = RdmaToken::from_headers(
+                request.headers[NIXL_AGENT_HEADER].to_str().unwrap(),
+                Some(request.headers[NIXL_METADATA_HEADER].to_str().unwrap()),
+                request.headers[NIXL_BUFFER_HEADER].to_str().unwrap(),
+            )
+            .unwrap();
+            let mut staging = self.peer.try_reserve().unwrap();
+            staging.append(&self.payload[start..=end]).unwrap();
+            let (written, _) = self
+                .peer
+                .write_to_client_owned("key", &token, 0, staging)
+                .await
+                .unwrap();
+            assert_eq!(written, (end - start + 1) as u64);
+            if start == WINDOW {
+                self.second_written.notify_one();
             }
             headers.insert(
                 "content-range",
@@ -288,7 +314,7 @@ async fn large_get_submits_both_ranges_and_publishes_in_order() {
             headers.insert(RDMA_REPLY_HEADER, HeaderValue::from_static("206"));
             headers.insert(
                 rustfs_nixl::RDMA_BYTES_TRANSFERRED_HEADER,
-                HeaderValue::from(end - start + 1),
+                HeaderValue::from(written),
             );
             Ok(ControlResponse {
                 status: StatusCode::PARTIAL_CONTENT,
@@ -297,15 +323,30 @@ async fn large_get_submits_both_ranges_and_publishes_in_order() {
         }
     }
 
+    let peer = NixlServer::new(&NixlConfig {
+        agent_name: "rc-ordered-range-peer".into(),
+        chunk_bytes: WINDOW,
+        pool_bytes: WINDOW,
+        ..Default::default()
+    })
+    .unwrap();
     for wrong_checksum in [false, true] {
+        let ranges = Arc::new(Ranges {
+            peer: peer.clone(),
+            payload: (0..=250)
+                .cycle()
+                .take(WINDOW)
+                .chain(*b"second range bytes!")
+                .collect(),
+            second_written: tokio::sync::Notify::new(),
+            wrong_checksum,
+        });
         let transport = Factory::new(RdmaBackend::Nixl)
-            .create(Arc::new(Ranges {
-                second: tokio::sync::Notify::new(),
-                wrong_checksum,
-            }))
+            .create(ranges.clone())
             .unwrap();
         let mut progress = Vec::new();
-        let total = WINDOW as u64 + 19;
+        let total = ranges.payload.len() as u64;
+        let mut output = Vec::with_capacity(ranges.payload.len());
         let result = transport
             .download(
                 DownloadRequest {
@@ -315,7 +356,7 @@ async fn large_get_submits_both_ranges_and_publishes_in_order() {
                     max_receive_bytes: total,
                     on_progress: &mut |written, _| progress.push(written),
                 },
-                &mut tokio::io::sink(),
+                &mut output,
             )
             .await;
         if wrong_checksum {
@@ -324,6 +365,10 @@ async fn large_get_submits_both_ranges_and_publishes_in_order() {
             );
         } else {
             assert_eq!(result.unwrap().bytes_transferred, total);
+            assert!(
+                output == ranges.payload,
+                "downloaded bytes differ from the source object"
+            );
         }
         assert_eq!(progress, [WINDOW as u64, total]);
     }
