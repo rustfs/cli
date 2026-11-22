@@ -129,9 +129,6 @@ impl Window {
         Ok(())
     }
 
-    pub(crate) fn len(&self) -> usize {
-        self.len
-    }
     pub(crate) fn expose(
         self,
         _method: &Method,

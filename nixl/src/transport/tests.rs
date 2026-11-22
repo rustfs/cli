@@ -230,3 +230,76 @@ async fn rustfs_declines_a_stale_conditional_get_before_dma() {
         }
     }
 }
+
+#[tokio::test]
+async fn large_get_submits_both_ranges_and_publishes_in_order() {
+    struct Ranges(tokio::sync::Notify);
+
+    #[async_trait]
+    impl ControlExecutor for Ranges {
+        async fn execute_headers(&self, request: ControlRequest) -> Result<ControlResponse> {
+            let total = WINDOW + 19;
+            let mut headers = HeaderMap::new();
+            headers.insert("etag", HeaderValue::from_static("\"immutable\""));
+            if request.method == Method::HEAD {
+                headers.insert("content-length", HeaderValue::from(total));
+                return Ok(ControlResponse {
+                    status: StatusCode::OK,
+                    headers,
+                });
+            }
+            assert_eq!(request.headers["if-match"], "\"immutable\"");
+            let range = request.headers["range"]
+                .to_str()
+                .unwrap()
+                .strip_prefix("bytes=")
+                .unwrap();
+            let (start, end) = range.split_once('-').unwrap();
+            let (start, end): (usize, usize) = (start.parse().unwrap(), end.parse().unwrap());
+            if start == 0 {
+                assert_eq!(end, WINDOW - 1);
+                tokio::time::timeout(std::time::Duration::from_secs(5), self.0.notified())
+                    .await
+                    .expect("the second range must enter before the first completes");
+            } else {
+                assert_eq!((start, end), (WINDOW, total - 1));
+                self.0.notify_one();
+            }
+            headers.insert(
+                "content-range",
+                format!("bytes {start}-{end}/{total}").parse().unwrap(),
+            );
+            headers.insert("content-length", HeaderValue::from_static("0"));
+            headers.insert(RDMA_REPLY_HEADER, HeaderValue::from_static("206"));
+            headers.insert(
+                rustfs_nixl::RDMA_BYTES_TRANSFERRED_HEADER,
+                HeaderValue::from(end - start + 1),
+            );
+            Ok(ControlResponse {
+                status: StatusCode::PARTIAL_CONTENT,
+                headers,
+            })
+        }
+    }
+
+    let transport = Factory(RdmaBackend::Nixl)
+        .create(Arc::new(Ranges(tokio::sync::Notify::new())))
+        .unwrap();
+    let mut progress = Vec::new();
+    let total = WINDOW as u64 + 19;
+    let result = transport
+        .download(
+            DownloadRequest {
+                path: &RemotePath::new("local", "bucket", "key"),
+                options: &Default::default(),
+                max_bytes: None,
+                max_receive_bytes: total,
+                on_progress: &mut |written, _| progress.push(written),
+            },
+            &mut tokio::io::sink(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.bytes_transferred, total);
+    assert_eq!(progress, [WINDOW as u64, total]);
+}

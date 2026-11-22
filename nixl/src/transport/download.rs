@@ -5,6 +5,33 @@ pub(super) enum Sink<'a> {
     Writer(&'a mut (dyn AsyncWrite + Send + Unpin)),
 }
 
+impl Sink<'_> {
+    async fn write_range(
+        &mut self,
+        mut window: Window,
+        offset: u64,
+        checksum: Option<&mut PayloadChecksumVerifier>,
+    ) -> Result<()> {
+        if let Some(checksum) = checksum {
+            checksum.update(window.received()?);
+        }
+        match self {
+            Self::Writer(writer) => writer.write_all(window.received()?).await?,
+            Self::File(file) => {
+                use std::os::unix::fs::FileExt;
+                let file = file.clone();
+                tokio::task::spawn_blocking(move || {
+                    file.write_all_at(window.received()?, offset)?;
+                    Ok::<_, Error>(())
+                })
+                .await
+                .map_err(|_| Error::General("RDMA file write was interrupted".into()))??;
+            }
+        }
+        Ok(())
+    }
+}
+
 struct Selection<'a> {
     path: &'a RemotePath,
     requested_version: Option<&'a str>,
@@ -33,6 +60,7 @@ impl Transport {
         offset: u64,
         len: usize,
         ranged: bool,
+        window: Window,
     ) -> DataTransportResult<Window> {
         let mut headers = HeaderMap::new();
         headers.insert("if-match", selection.etag.clone());
@@ -46,7 +74,6 @@ impl Transport {
         } else {
             StatusCode::OK
         };
-        let window = self.pools.reserve(len as u64).await.map_err(unavailable)?;
         // An empty object still requires a nonempty descriptor.
         let exposed = window
             .expose(&Method::GET, len.max(1), &mut headers)
@@ -168,44 +195,64 @@ impl Transport {
             observed_version,
         };
         let ranged = length > 0 && (request.max_bytes.is_some() || length > WINDOW as u64);
-        let first = length.min(WINDOW as u64) as usize;
-        let mut current = self.fetch(&selection, 0, first, ranged).await?;
-        let mut end = first as u64;
         let mut checksum = PayloadChecksumVerifier::new(&head.headers).map_err(rejected)?;
+        let mut offset = 0;
         loop {
-            let write = async {
-                if length == total {
-                    checksum.update(current.received()?);
+            let first = (length - offset).min(WINDOW as u64);
+            let next = offset + first;
+            let second = (length - next).min(WINDOW as u64);
+            // Reserve the earlier range first. It can finish and release its window
+            // even if other downloads or a quarantined window leave only one slot.
+            let window = self.pools.reserve(first).await.map_err(|e| {
+                if offset == 0 {
+                    unavailable(e)
+                } else {
+                    rejected(e)
                 }
-                let offset = end - current.len() as u64;
-                match &mut target {
-                    Sink::Writer(writer) => writer.write_all(current.received()?).await?,
-                    Sink::File(file) => {
-                        use std::os::unix::fs::FileExt;
-                        let file = file.clone();
-                        tokio::task::spawn_blocking(move || {
-                            file.write_all_at(current.received()?, offset)?;
-                            Ok::<_, Error>(())
-                        })
-                        .await
-                        .map_err(|_| Error::General("RDMA file write was interrupted".into()))??;
-                    }
-                }
-                (request.on_progress)(end, Some(length));
-                Ok::<_, Error>(())
+            })?;
+            let publish_first = async {
+                let window = self
+                    .fetch(&selection, offset, first as usize, ranged, window)
+                    .await
+                    .map_err(|mut error| {
+                        if offset != 0 {
+                            error.state = DataTransferState::ConfirmedFailure;
+                        }
+                        error
+                    })?;
+                target
+                    .write_range(window, offset, (length == total).then_some(&mut checksum))
+                    .await
+                    .map_err(rejected)?;
+                (request.on_progress)(next, Some(length));
+                Ok(())
             };
-            if end == length {
-                write.await.map_err(rejected)?;
+            if second == 0 {
+                publish_first.await?;
                 break;
             }
-            let size = (length - end).min(WINDOW as u64) as usize;
-            let (written, next) = tokio::join!(write, self.fetch(&selection, end, size, true));
-            written.map_err(rejected)?;
-            current = next.map_err(|mut err| {
-                err.state = DataTransferState::ConfirmedFailure;
-                err
+            let fetch_second = async {
+                let window = self.pools.reserve(second).await.map_err(unavailable)?;
+                self.fetch(&selection, next, second as usize, true, window)
+                    .await
+            };
+            // Settle both control exchanges even when one fails. Only the ordered
+            // consumer updates the checksum, writes bytes and reports progress.
+            let (first_result, second_result) = tokio::join!(publish_first, fetch_second);
+            first_result?;
+            let window = second_result.map_err(|mut error| {
+                error.state = DataTransferState::ConfirmedFailure;
+                error
             })?;
-            end += size as u64;
+            target
+                .write_range(window, next, (length == total).then_some(&mut checksum))
+                .await
+                .map_err(rejected)?;
+            offset = next + second;
+            (request.on_progress)(offset, Some(length));
+            if offset == length {
+                break;
+            }
         }
         if length == total {
             checksum.verify(&head.headers).map_err(rejected)?;
