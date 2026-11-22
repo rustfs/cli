@@ -3,25 +3,19 @@
 use crate::buffer::Buffer;
 use http::{HeaderMap, HeaderValue, Method};
 use rc_core::{Error, Result};
+use rustfs_cuobject_client::{Client, Operation, Window};
 
 pub(super) const TOKEN_HEADER: &str = "x-amz-rdma-token";
 
-#[expect(
-    unsafe_code,
-    reason = "private SDK declarations and native window thread ownership"
-)]
-mod sdk;
-use sdk::ffi;
-
-fn sdk_error(error: cxx::Exception) -> Error {
+fn sdk_error(error: std::io::Error) -> Error {
     Error::General(format!("NVIDIA cuObject: {error}"))
 }
 
 pub(super) fn register(size: usize, count: usize) -> Result<Vec<Buffer>> {
-    let client = ffi::make_client().map_err(sdk_error)?;
+    let client = Client::open().map_err(sdk_error)?;
     (0..count)
         .map(|_| {
-            let raw = ffi::register_window(client.clone(), size).map_err(sdk_error)?;
+            let raw = client.register(size).map_err(sdk_error)?;
             Ok(Buffer::CuObject(HostBuffer {
                 raw,
                 #[cfg(test)]
@@ -32,14 +26,14 @@ pub(super) fn register(size: usize, count: usize) -> Result<Vec<Buffer>> {
 }
 
 pub(super) struct HostBuffer {
-    raw: cxx::UniquePtr<ffi::NativeWindow>,
+    raw: Window,
     #[cfg(test)]
     pub(super) releases: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl HostBuffer {
     pub(super) fn writable(&mut self) -> Result<&mut [u8]> {
-        self.raw.pin_mut().writable().map_err(sdk_error)
+        self.raw.writable().map_err(sdk_error)
     }
 
     pub(super) fn describe(
@@ -48,16 +42,13 @@ impl HostBuffer {
         len: usize,
         headers: &mut HeaderMap,
     ) -> Result<()> {
-        let for_get = match *method {
-            Method::GET => true,
-            Method::PUT => false,
+        let operation = match *method {
+            Method::GET => Operation::Get,
+            Method::PUT => Operation::Put,
             _ => return Err(Error::General("Unsupported cuObject operation".into())),
         };
-        self.raw
-            .pin_mut()
-            .acquire(len, for_get)
-            .map_err(sdk_error)?;
-        let mut value = HeaderValue::from_bytes(self.raw.active_token())
+        let token = self.raw.acquire_token(operation, len).map_err(sdk_error)?;
+        let mut value = HeaderValue::from_bytes(token)
             .map_err(|_| Error::General("Invalid NVIDIA cuObject token".into()))?;
         value.set_sensitive(true);
         headers.insert(TOKEN_HEADER, value);
@@ -67,7 +58,7 @@ impl HostBuffer {
     pub(super) fn release_token(&mut self) -> Result<()> {
         #[cfg(test)]
         let active = !self.raw.active_token().is_empty();
-        self.raw.pin_mut().release_token().map_err(sdk_error)?;
+        self.raw.release_after_completion().map_err(sdk_error)?;
         #[cfg(test)]
         if active {
             self.releases

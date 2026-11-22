@@ -2998,15 +2998,29 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
- "cxx",
- "cxx-build",
  "getrandom 0.4.3",
  "http",
  "rc-core",
  "rc-s3",
  "rustfs-cli",
+ "rustfs-cuobject-client",
  "rustfs-nixl",
  "tokio",
+]
+
+[[package]]
+name = "rustfs-cuobject-client"
+version = "0.1.0"
+dependencies = [
+ "rustfs-cuobject-client-sys",
+]
+
+[[package]]
+name = "rustfs-cuobject-client-sys"
+version = "0.1.0"
+dependencies = [
+ "cxx",
+ "cxx-build",
 ]
 
 [[package]]

@@ -1,6 +1,5 @@
 //! rc with native S3-over-RDMA providers.
-#![deny(unsafe_code)]
-#![cfg_attr(not(feature = "cuobject"), forbid(unsafe_code))]
+#![forbid(unsafe_code)]
 
 mod buffer;
 #[cfg(feature = "cuobject")]

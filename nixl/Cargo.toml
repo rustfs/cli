@@ -8,16 +8,18 @@ publish = false
 
 [workspace]
 resolver = "3"
+members = ["cuobject-client", "cuobject-client-sys"]
+default-members = ["."]
 
 [[bin]]
 name = "rc"
 path = "src/main.rs"
 
 [features]
-cuobject = ["dep:cxx", "dep:cxx-build"]
+cuobject = ["dep:rustfs-cuobject-client"]
 
 [dependencies]
-cxx = { version = "1", optional = true }
+rustfs-cuobject-client = { path = "cuobject-client", features = ["client"], optional = true }
 rustfs-cli = { path = "../crates/cli" }
 rc-core = { path = "../crates/core" }
 rc-s3 = { path = "../crates/s3" }
@@ -27,6 +29,3 @@ base64 = "0.22"
 getrandom = "0.4"
 http = "1"
 tokio = { version = "1", features = ["io-util", "sync", "time"] }
-
-[build-dependencies]
-cxx-build = { version = "1", optional = true }

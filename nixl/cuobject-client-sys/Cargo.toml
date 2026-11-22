@@ -1,0 +1,18 @@
+[package]
+name = "rustfs-cuobject-client-sys"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99.0"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Native bindings to the NVIDIA cuObject client SDK"
+links = "cuobjclient"
+
+[features]
+client = ["dep:cxx", "dep:cxx-build"]
+
+[dependencies]
+cxx = { version = "1", optional = true }
+
+[build-dependencies]
+cxx-build = { version = "1", optional = true }

@@ -104,9 +104,9 @@ Modifying protected files requires:
    - Violation: may cause panic
 
 3. **Using `unsafe` outside the private NVIDIA SDK bridge**
-   - Only the private bridge in `nixl/src/nvidia/sdk.rs`, behind the `cuobject` feature, may declare the C++ interface and the thread ownership of its opaque window. Keep handwritten Rust operations outside this exception.
+   - Only the private bridge in `nixl/cuobject-client-sys/src/sdk.rs`, enabled by the native executable’s `cuobject` feature, may declare the C++ interface and the thread ownership of its opaque window. Keep handwritten Rust operations outside this exception.
    - Native host slices require an exclusive window. Once a token is exposed, retain it with its registration until confirmed completion or proof that DMA never started. Quarantine an uncertain exchange or failed token release for the life of the process.
-   - Keep the lint exception on the bridge. Native builds without `cuobject` must retain `forbid(unsafe_code)`.
+   - Keep the lint exception on the bridge. The native executable and the `rustfs-cuobject-client` library must retain `forbid(unsafe_code)`.
 
 4. **Printing credentials in logs/errors**
    - Includes: access_key, secret_key, Authorization headers
