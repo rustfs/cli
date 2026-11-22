@@ -78,7 +78,11 @@ the process exits.
 When both windows are unavailable for this reason, waiting operations use a
 fresh pool within the process registration budget. Retiring a cuObject pool
 releases its idle registrations. Each quarantined window keeps its own
-registration and the pool's budget reservation.
+registration and the pool's budget reservation. A native registration also
+keeps this reservation if the SDK cannot confirm deregistration.
+For the rest of the process, an ordinary HTTP response without an RDMA
+receipt disables further probes for the same endpoint, backend and operation
+(GET or UploadPart). Concurrent requests share the initial discovery.
 
 RustFS can interpret a declined external PUT as an ordinary empty PUT.
 The client uploads nonempty objects into unpublished multipart parts and

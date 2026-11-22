@@ -43,6 +43,11 @@ pub enum RegisteredControlResponse {
 /// Host-owned HTTPS, credentials, signing, custom headers, and TLS configuration.
 #[async_trait]
 pub trait ControlExecutor: Send + Sync {
+    /// Stable endpoint for sharing provider capability discovery across clients.
+    fn endpoint(&self) -> Option<&str> {
+        None
+    }
+
     /// Read only the status and headers. A declined external GET can return an
     /// ordinary S3 payload of arbitrary size.
     async fn execute_headers(&self, request: ControlRequest) -> Result<ControlResponse>;

@@ -11,11 +11,15 @@ fn sdk_error(error: std::io::Error) -> Error {
     Error::General(format!("NVIDIA cuObject: {error}"))
 }
 
-pub(super) fn register(size: usize, count: usize) -> Result<Vec<Buffer>> {
+pub(super) fn register(
+    size: usize,
+    count: usize,
+    budget: &crate::pool::Budget,
+) -> Result<Vec<Buffer>> {
     let client = Client::open().map_err(sdk_error)?;
     (0..count)
         .map(|_| {
-            let raw = client.register(size).map_err(sdk_error)?;
+            let raw = client.register(size, budget.clone()).map_err(sdk_error)?;
             Ok(Buffer::CuObject(HostBuffer {
                 raw,
                 #[cfg(test)]

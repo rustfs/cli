@@ -7,6 +7,7 @@ impl Transport {
         source: &mut (dyn AsyncRead + Unpin + Send),
     ) -> DataTransportResult<UploadResult> {
         let len = part_len(&request)?;
+        let _probe = self.support.upload_part.enter().await?;
         let mut window = self
             .pools
             .reserve(request.content_length)
@@ -64,6 +65,7 @@ impl StagedUploadTransport for Transport {
         upload_id: &str,
         first_part_bytes: u64,
     ) -> DataTransportResult<bool> {
+        let _probe = self.support.upload_part.enter().await?;
         let mut window = self
             .pools
             .reserve(first_part_bytes)
@@ -92,6 +94,7 @@ impl StagedUploadTransport for Transport {
     ) -> DataTransportResult<UploadResult> {
         use std::os::unix::fs::FileExt;
         let len = part_len(&request)?;
+        let _probe = self.support.upload_part.enter().await?;
         let mut window = self
             .pools
             .reserve(request.content_length)
@@ -146,9 +149,11 @@ impl Transport {
         }
         if !response.headers.contains_key(RDMA_REPLY_HEADER) {
             // A missing receipt permits the S3 fallback but does not prove the window is idle.
+            self.support.upload_part.http_only();
             return Ok(None);
         }
         wire::receipt(StatusCode::OK, &response.headers, len as u64).map_err(unknown)?;
+        self.support.upload_part.supported();
         drop(exposed.finished().map_err(rejected)?);
         let etag = wire::field(&response.headers, "etag")
             .map_err(rejected)?

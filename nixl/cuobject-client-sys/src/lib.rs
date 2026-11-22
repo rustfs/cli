@@ -8,6 +8,7 @@
 )]
 mod sdk;
 
+pub use sdk::RegistrationOwner;
 pub use sdk::ffi::{make_client, register_window};
 pub type ClientHandle = cxx::SharedPtr<sdk::ffi::Client>;
 pub type WindowHandle = cxx::UniquePtr<sdk::ffi::NativeWindow>;

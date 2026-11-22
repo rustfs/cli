@@ -13,9 +13,14 @@ impl Client {
         sys::make_client().map(Self).map_err(io::Error::other)
     }
 
-    /// Registers a host mapping that keeps its native client alive.
-    pub fn register(&self, bytes: usize) -> io::Result<Window> {
-        sys::register_window(self.0.clone(), bytes)
+    /// Keeps the client and its accounting owner alive until the SDK confirms
+    /// deregistration, including when teardown cannot release the mapping.
+    pub fn register(
+        &self,
+        bytes: usize,
+        owner: std::sync::Arc<dyn Send + Sync>,
+    ) -> io::Result<Window> {
+        sys::register_window(self.0.clone(), bytes, sys::RegistrationOwner::new(owner))
             .map(Window)
             .map_err(io::Error::other)
     }

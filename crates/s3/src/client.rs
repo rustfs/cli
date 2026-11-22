@@ -7786,6 +7786,10 @@ impl S3Client {
 /// External control exchanges retain the host client's TLS and signing policy.
 #[async_trait]
 impl ControlExecutor for S3Client {
+    fn endpoint(&self) -> Option<&str> {
+        Some(&self.alias.endpoint)
+    }
+
     async fn execute_registered(
         &self,
         request: ControlRequest,

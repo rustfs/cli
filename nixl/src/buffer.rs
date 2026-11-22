@@ -15,10 +15,15 @@ pub(super) enum Buffer {
     CuObject(crate::nvidia::HostBuffer),
 }
 
-pub(super) fn register(backend: RdmaBackend, size: usize, count: usize) -> Result<Vec<Buffer>> {
+pub(super) fn register(
+    backend: RdmaBackend,
+    size: usize,
+    count: usize,
+    _budget: &crate::pool::Budget,
+) -> Result<Vec<Buffer>> {
     if backend == RdmaBackend::CuObject {
         #[cfg(feature = "cuobject")]
-        return crate::nvidia::register(size, count);
+        return crate::nvidia::register(size, count, _budget);
         #[cfg(not(feature = "cuobject"))]
         return Err(Error::UnsupportedFeature(
             "The cuObject backend is not installed".into(),

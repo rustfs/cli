@@ -12,7 +12,7 @@ const SMALL_WINDOW: usize = 1024 * 1024;
 const WINDOWS_PER_POOL: usize = 2;
 static AGENTS: Semaphore = Semaphore::const_new(8);
 // Keep the exposed registration and its budget, so the retired pool can free its idle buffers.
-type Budget = Arc<SemaphorePermit<'static>>;
+pub(super) type Budget = Arc<SemaphorePermit<'static>>;
 static QUARANTINE: Mutex<Vec<(Buffer, Budget)>> = Mutex::new(Vec::new());
 
 fn window_size(required: u64) -> usize {
@@ -75,13 +75,14 @@ impl Pool {
         let budget = AGENTS
             .try_acquire()
             .map_err(|_| Error::General("RDMA registered memory budget exhausted".into()))?;
-        let buffers = buffer::register(backend, size, WINDOWS_PER_POOL)?;
+        let budget = Arc::new(budget);
+        let buffers = buffer::register(backend, size, WINDOWS_PER_POOL, &budget)?;
         Ok(Arc::new(Self {
             size,
             free: Mutex::new(buffers),
             available: Semaphore::new(WINDOWS_PER_POOL),
             lost: watch::Sender::new(0),
-            budget: Arc::new(budget),
+            budget,
         }))
     }
 

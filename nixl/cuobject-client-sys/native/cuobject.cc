@@ -1,4 +1,4 @@
-#include "native/cuobject.h"
+#include "rustfs-cuobject-client-sys/src/sdk.rs.h"
 #include <cuobjclient.h>
 
 #include <cerrno>
@@ -29,14 +29,15 @@ static void check(cuObjErr_t status, const char *operation) {
 }
 
 struct NativeWindow::Registration {
+    rust::Box<RegistrationOwner> owner;
     std::shared_ptr<Client> client;
     std::size_t size;
     std::uint8_t *data;
     char *token = nullptr;
     bool release_failed = false;
 
-    Registration(std::shared_ptr<Client> owner, std::size_t length)
-        : client(std::move(owner)), size(length) {
+    Registration(std::shared_ptr<Client> sdk_client, std::size_t length, rust::Box<RegistrationOwner> guard)
+        : owner(std::move(guard)), client(std::move(sdk_client)), size(length) {
         if (!client) {
             throw std::invalid_argument("missing cuObject client");
         }
@@ -61,8 +62,8 @@ struct NativeWindow::Registration {
     ~Registration() { munmap(data, size); }
 };
 
-NativeWindow::NativeWindow(std::shared_ptr<Client> client, std::size_t size)
-    : registration_(std::make_unique<Registration>(std::move(client), size)) {}
+NativeWindow::NativeWindow(std::shared_ptr<Client> client, std::size_t size, rust::Box<RegistrationOwner> owner)
+    : registration_(std::make_unique<Registration>(std::move(client), size, std::move(owner))) {}
 
 NativeWindow::~NativeWindow() {
     auto &r = *registration_;
@@ -80,8 +81,8 @@ NativeWindow::~NativeWindow() {
     registration_.release();
 }
 
-std::unique_ptr<NativeWindow> register_window(std::shared_ptr<Client> client, std::size_t size) {
-    return std::make_unique<NativeWindow>(std::move(client), size);
+std::unique_ptr<NativeWindow> register_window(std::shared_ptr<Client> client, std::size_t size, rust::Box<RegistrationOwner> owner) {
+    return std::make_unique<NativeWindow>(std::move(client), size, std::move(owner));
 }
 
 rust::Slice<std::uint8_t> NativeWindow::writable() {

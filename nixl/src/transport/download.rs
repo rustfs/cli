@@ -53,6 +53,31 @@ fn read_request(
     wire::request(method, path, query, headers)
 }
 
+// The caller may retry over HTTP only if both ranges declined before output.
+pub(super) fn merged_ranges<T>(
+    first: DataTransportResult<()>,
+    second: DataTransportResult<T>,
+) -> DataTransportResult<T> {
+    match (first, second) {
+        (Ok(()), Ok(value)) => Ok(value),
+        (Err(first), Err(second)) => {
+            if second.state == DataTransferState::OutcomeUnknown
+                || first.state == DataTransferState::NotAccepted
+            {
+                Err(second)
+            } else {
+                Err(first)
+            }
+        }
+        (Ok(()), Err(mut error)) | (Err(mut error), Ok(_)) => {
+            if error.state == DataTransferState::NotAccepted {
+                error.state = DataTransferState::ConfirmedFailure;
+            }
+            Err(error)
+        }
+    }
+}
+
 impl Transport {
     async fn fetch(
         &self,
@@ -98,6 +123,7 @@ impl Transport {
             // An ordinary successful GET returned the object in its HTTP body.
             // It is safe to try the ordinary reader before publishing any bytes.
             // A missing receipt permits the S3 fallback but does not prove the window is idle.
+            self.support.get.http_only();
             return Err(unavailable(Error::UnsupportedFeature(
                 "The endpoint served GET over HTTP".into(),
             )));
@@ -108,6 +134,7 @@ impl Transport {
             )));
         }
         wire::receipt(expected, &response.headers, len as u64).map_err(rejected)?;
+        self.support.get.supported();
         let mut window = exposed.finished().map_err(rejected)?;
         if wire::field(&response.headers, "content-length")
             .map_err(rejected)?
@@ -153,6 +180,7 @@ impl Transport {
                 "RDMA does not encrypt SSE-C payloads in transit".into(),
             )));
         }
+        let _probe = self.support.get.enter().await?;
         let requested_version = request.options.version_id.as_deref();
         let mut headers = HeaderMap::new();
         if request.options.checksum_mode {
@@ -215,7 +243,7 @@ impl Transport {
                     .fetch(&selection, offset, first as usize, ranged, window)
                     .await
                     .map_err(|mut error| {
-                        if offset != 0 {
+                        if offset != 0 && error.state == DataTransferState::NotAccepted {
                             error.state = DataTransferState::ConfirmedFailure;
                         }
                         error
@@ -239,11 +267,7 @@ impl Transport {
             // Settle both control exchanges even when one fails. Only the ordered
             // consumer updates the checksum, writes bytes and reports progress.
             let (first_result, second_result) = tokio::join!(publish_first, fetch_second);
-            first_result?;
-            let window = second_result.map_err(|mut error| {
-                error.state = DataTransferState::ConfirmedFailure;
-                error
-            })?;
+            let window = merged_ranges(first_result, second_result)?;
             target
                 .write_range(window, next, (length == total).then_some(&mut checksum))
                 .await

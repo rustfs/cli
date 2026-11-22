@@ -15,13 +15,106 @@ use crate::pool::{Exposed, Pools, WINDOW, Window};
 use crate::wire;
 use rc_core::RdmaBackend;
 
-pub(crate) struct Factory(pub(crate) RdmaBackend);
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU8, Ordering};
+use tokio::sync::{Semaphore, SemaphorePermit};
+
+pub(crate) struct Factory {
+    backend: RdmaBackend,
+    endpoints: Mutex<HashMap<String, Arc<EndpointSupport>>>,
+}
+
+impl Factory {
+    pub(crate) fn new(backend: RdmaBackend) -> Self {
+        Self {
+            backend,
+            endpoints: Mutex::default(),
+        }
+    }
+
+    fn support(&self, endpoint: Option<&str>) -> Arc<EndpointSupport> {
+        match endpoint {
+            Some(endpoint) => self
+                .endpoints
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(endpoint.to_owned())
+                .or_default()
+                .clone(),
+            None => Arc::default(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct EndpointSupport {
+    get: Capability,
+    upload_part: Capability,
+}
+
+struct Capability {
+    state: AtomicU8,
+    probe: Semaphore,
+}
+
+impl Default for Capability {
+    fn default() -> Self {
+        Self {
+            state: AtomicU8::new(Self::UNKNOWN),
+            probe: Semaphore::new(1),
+        }
+    }
+}
+
+impl Capability {
+    const UNKNOWN: u8 = 0;
+    const SUPPORTED: u8 = 1;
+    const HTTP_ONLY: u8 = 2;
+
+    // Only the first operation probes. Once a response identifies the
+    // transport, ordinary concurrent transfers need no permit.
+    async fn enter(&self) -> DataTransportResult<Option<SemaphorePermit<'_>>> {
+        let permit = if self.state.load(Ordering::Acquire) == Self::UNKNOWN {
+            self.probe.acquire().await.ok()
+        } else {
+            None
+        };
+        if self.state.load(Ordering::Acquire) == Self::HTTP_ONLY {
+            return Err(unavailable(Error::UnsupportedFeature(
+                "Endpoint served this operation over HTTP".into(),
+            )));
+        }
+        Ok(permit)
+    }
+
+    fn supported(&self) {
+        if self
+            .state
+            .compare_exchange(
+                Self::UNKNOWN,
+                Self::SUPPORTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.probe.close();
+        }
+    }
+
+    fn http_only(&self) {
+        self.state.store(Self::HTTP_ONLY, Ordering::Release);
+        self.probe.close();
+    }
+}
 
 impl ObjectDataTransportFactory for Factory {
     fn create(&self, control: Arc<dyn ControlExecutor>) -> Result<Arc<dyn ObjectDataTransport>> {
         Ok(Arc::new(Transport {
+            support: self.support(control.endpoint()),
             control,
-            pools: Pools::new(self.0),
+            pools: Pools::new(self.backend),
         }))
     }
 }
@@ -29,6 +122,7 @@ impl ObjectDataTransportFactory for Factory {
 struct Transport {
     control: Arc<dyn ControlExecutor>,
     pools: Pools,
+    support: Arc<EndpointSupport>,
 }
 
 fn failed(state: DataTransferState, source: Error) -> DataTransportError {

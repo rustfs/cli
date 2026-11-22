@@ -11,7 +11,7 @@ mod wire;
 use rc_core::RdmaBackend;
 
 fn register(backend: RdmaBackend) {
-    let factory = std::sync::Arc::new(transport::Factory(backend));
+    let factory = std::sync::Arc::new(transport::Factory::new(backend));
     if let Err(error) = rc_s3::data_transport::install_rdma_backend(backend, factory) {
         eprintln!("{error}");
         std::process::exit(error.exit_code());

@@ -36,7 +36,9 @@ async fn download(
         queries: Mutex::default(),
         get_version,
     });
-    let transport = Factory(RdmaBackend::Nixl).create(endpoint.clone()).unwrap();
+    let transport = Factory::new(RdmaBackend::Nixl)
+        .create(endpoint.clone())
+        .unwrap();
     let path = RemotePath::new("test", "bucket", "key");
     let options = rc_core::TransferReadOptions {
         version_id: version_id.map(str::to_owned),
@@ -98,7 +100,7 @@ async fn a_delete_marker_keeps_its_version_and_exit_code() {
         }
     }
 
-    let transport = Factory(RdmaBackend::Nixl)
+    let transport = Factory::new(RdmaBackend::Nixl)
         .create(Arc::new(DeleteMarker))
         .unwrap();
     let path = RemotePath::new("test", "bucket", "key");
@@ -169,7 +171,9 @@ async fn only_proven_conditional_rejections_reuse_the_registered_window() {
         }
     }
     let peer = Arc::new(Peer(Mutex::default()));
-    let transport = Factory(RdmaBackend::Nixl).create(peer.clone()).unwrap();
+    let transport = Factory::new(RdmaBackend::Nixl)
+        .create(peer.clone())
+        .unwrap();
     let path = RemotePath::new("test", "bucket", "key");
     let opts = rc_core::TransferReadOptions::default();
     for i in 1..=20 {
@@ -212,6 +216,7 @@ async fn rustfs_declines_a_stale_conditional_get_before_dma() {
     let transport = Transport {
         control: Arc::new(client),
         pools: Pools::new(RdmaBackend::CuObject),
+        support: Arc::default(),
     };
     for _ in 0..20 {
         let mut headers = HeaderMap::new();
@@ -293,7 +298,7 @@ async fn large_get_submits_both_ranges_and_publishes_in_order() {
     }
 
     for wrong_checksum in [false, true] {
-        let transport = Factory(RdmaBackend::Nixl)
+        let transport = Factory::new(RdmaBackend::Nixl)
             .create(Arc::new(Ranges {
                 second: tokio::sync::Notify::new(),
                 wrong_checksum,
@@ -322,4 +327,174 @@ async fn large_get_submits_both_ranges_and_publishes_in_order() {
         }
         assert_eq!(progress, [WINDOW as u64, total]);
     }
+}
+
+#[tokio::test]
+async fn one_declined_range_cannot_hide_an_unconfirmed_sibling() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Endpoint(AtomicUsize);
+    #[async_trait]
+    impl ControlExecutor for Endpoint {
+        async fn execute_headers(&self, request: ControlRequest) -> Result<ControlResponse> {
+            let mut headers = HeaderMap::new();
+            if request.method == Method::HEAD {
+                headers.insert("etag", HeaderValue::from_static("\"stable\""));
+                headers.insert("content-length", HeaderValue::from(WINDOW + 1));
+                return Ok(ControlResponse {
+                    status: StatusCode::OK,
+                    headers,
+                });
+            }
+            self.0.fetch_add(1, Ordering::Relaxed);
+            if request.headers["range"]
+                .to_str()
+                .unwrap()
+                .starts_with("bytes=0-")
+            {
+                Ok(ControlResponse {
+                    status: StatusCode::PARTIAL_CONTENT,
+                    headers,
+                })
+            } else {
+                Err(Error::Network("control response unavailable".into()))
+            }
+        }
+    }
+    let endpoint = Arc::new(Endpoint(AtomicUsize::new(0)));
+    let transport = Factory::new(RdmaBackend::Nixl)
+        .create(endpoint.clone())
+        .unwrap();
+    let result = transport
+        .download(
+            DownloadRequest {
+                path: &RemotePath::new("local", "bucket", "key"),
+                options: &Default::default(),
+                max_bytes: None,
+                max_receive_bytes: WINDOW as u64 + 1,
+                on_progress: &mut |_, _| {},
+            },
+            &mut tokio::io::sink(),
+        )
+        .await;
+    assert_eq!(endpoint.0.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        result.err().unwrap().state,
+        DataTransferState::OutcomeUnknown
+    );
+}
+
+#[tokio::test]
+async fn ordinary_s3_is_probed_once_per_endpoint_backend_and_operation() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct HttpOnly(AtomicUsize);
+    #[async_trait]
+    impl ControlExecutor for HttpOnly {
+        fn endpoint(&self) -> Option<&str> {
+            Some("https://ordinary.example")
+        }
+        async fn execute_headers(&self, request: ControlRequest) -> Result<ControlResponse> {
+            let mut headers = HeaderMap::new();
+            if request.method == Method::HEAD {
+                headers.insert("etag", HeaderValue::from_static("\"tag\""));
+                headers.insert("content-length", HeaderValue::from_static("0"));
+            } else {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(ControlResponse {
+                status: StatusCode::OK,
+                headers,
+            })
+        }
+    }
+    let factory = Factory::new(RdmaBackend::Nixl);
+    let endpoint = Arc::new(HttpOnly(AtomicUsize::new(0)));
+    let mut readers = tokio::task::JoinSet::new();
+    for _ in 0..20 {
+        let transport = factory.create(endpoint.clone()).unwrap();
+        readers.spawn(async move {
+            let path = RemotePath::new("lab", "bucket", "key");
+            let result = transport
+                .download(
+                    DownloadRequest {
+                        path: &path,
+                        options: &Default::default(),
+                        max_bytes: None,
+                        max_receive_bytes: 1,
+                        on_progress: &mut |_, _| {},
+                    },
+                    &mut tokio::io::sink(),
+                )
+                .await;
+            assert_eq!(
+                result.err().expect("ordinary S3 declined RDMA").state,
+                DataTransferState::NotAccepted
+            );
+        });
+    }
+    while let Some(task) = readers.join_next().await {
+        task.unwrap();
+    }
+    assert_eq!(endpoint.0.load(Ordering::Relaxed), 1);
+    let transport = factory.create(endpoint.clone()).unwrap();
+    let staged = transport.staged_upload().unwrap();
+    let path = RemotePath::new("lab", "bucket", "key");
+    assert!(!staged.probe(&path, "upload", 1).await.unwrap());
+    assert_eq!(
+        staged.probe(&path, "upload", 1).await.unwrap_err().state,
+        DataTransferState::NotAccepted
+    );
+    assert_eq!(endpoint.0.load(Ordering::Relaxed), 2);
+    for fresh in [
+        factory.support(Some("https://other.example")),
+        Factory::new(RdmaBackend::CuObject).support(endpoint.endpoint()),
+    ] {
+        assert!(fresh.get.enter().await.unwrap().is_some());
+    }
+}
+
+#[test]
+fn range_failure_precedence_preserves_uncertainty_and_output_state() {
+    use DataTransferState::{ConfirmedFailure, NotAccepted, OutcomeUnknown};
+    let cases = [
+        (Some(NotAccepted), Some(NotAccepted), NotAccepted),
+        (Some(NotAccepted), Some(ConfirmedFailure), ConfirmedFailure),
+        (Some(ConfirmedFailure), Some(NotAccepted), ConfirmedFailure),
+        (Some(OutcomeUnknown), Some(ConfirmedFailure), OutcomeUnknown),
+        (Some(ConfirmedFailure), Some(OutcomeUnknown), OutcomeUnknown),
+        (Some(OutcomeUnknown), None, OutcomeUnknown),
+        (None, Some(OutcomeUnknown), OutcomeUnknown),
+        (None, Some(NotAccepted), ConfirmedFailure),
+        (Some(NotAccepted), None, ConfirmedFailure),
+    ];
+    for (a, b, state) in cases {
+        let outcome = |s: Option<DataTransferState>| match s {
+            Some(s) => Err(failed(s, Error::General("range failure".into()))),
+            None => Ok(()),
+        };
+        assert_eq!(
+            download::merged_ranges(outcome(a), outcome(b))
+                .unwrap_err()
+                .state,
+            state
+        );
+    }
+}
+
+#[cfg(feature = "cuobject")]
+#[test]
+#[ignore = "requires the NVIDIA cuObject SDK and an RDMA device"]
+fn registration_budget_follows_normal_and_retained_native_mappings() {
+    use rustfs_cuobject_client::{Client, Operation};
+    let client = Client::open().unwrap();
+    let owner = Arc::new(());
+    let available = Arc::downgrade(&owner);
+    let window = client.register(1 << 20, owner.clone()).unwrap();
+    assert!(client.register(0, owner.clone()).is_err());
+    drop(window);
+    assert_eq!(available.strong_count(), 1);
+    let mut exposed = client.register(1 << 20, owner.clone()).unwrap();
+    exposed.acquire_token(Operation::Get, 1).unwrap();
+    drop(exposed);
+    drop(owner);
+    assert_eq!(available.strong_count(), 1);
 }
