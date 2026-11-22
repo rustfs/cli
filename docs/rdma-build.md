@@ -110,3 +110,15 @@ test with the same SDK and device configuration used by the CLI:
 cargo test --locked --manifest-path nixl/Cargo.toml --features cuobject \
   cuobject_token_survives_cancellation_and_timeout -- --ignored
 ```
+
+### Test failed cuObject deregistration
+
+On a Linux RDMA host with the client SDK installed, build the test-only SDK
+override and run the registration lifetime test in its own process.
+
+```sh
+c++ -std=c++17 -fPIC -shared -I"$CUOBJCLIENT_ROOT/include" -I"$CUDA_HOME/include" \
+  nixl/cuobject-client/tests/failed_deregistration.cc -o /tmp/rc-test-failed-deregistration.so
+LD_PRELOAD=/tmp/rc-test-failed-deregistration.so cargo test --manifest-path nixl/Cargo.toml \
+  -p rustfs-cuobject-client --features client --test registration_budget -- --ignored
+```
