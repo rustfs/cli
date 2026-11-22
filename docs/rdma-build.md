@@ -62,11 +62,13 @@ windows. Each completed part frees a window for the next part, and S3 receives
 the completion list in part-number order. A new pool sizes each window to the
 next power of two that fits the requested part or range, with a 1 MiB minimum
 and a 64 MiB maximum. For example, a 4 MiB range registers two 4 MiB windows.
-A client can reuse its existing larger pool for subsequent small requests. File downloads write directly into the temporary
-destination file. A range GET for the next window can proceed while the
-previous window is being written. All requests keep the caller's version selector. Each GET uses
-`If-Match` and checks the version from HEAD before delivering that range. Downloads publish the temporary file
-after verifying the transfer count and any applicable object checksum.
+A client can reuse its existing larger pool for subsequent small requests.
+For large downloads, NIXL and cuObject issue up to two adjacent range GETs
+concurrently. Each request uses the caller's version selector and `If-Match`.
+The CLI checks each response against the version observed by HEAD and the requested range,
+consumes the results in byte order, and writes directly to the destination
+stream or temporary file. File downloads publish the temporary file after
+verifying the transfer count and any applicable object checksum.
 A verified receipt releases the window. A local rejection before sending or
 an authenticated S3 `PreconditionFailed` response to an `If-Match` GET also
 releases it. For the latter, the client requires HTTP 412, a bounded S3
