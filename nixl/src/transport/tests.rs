@@ -233,7 +233,10 @@ async fn rustfs_declines_a_stale_conditional_get_before_dma() {
 
 #[tokio::test]
 async fn large_get_submits_both_ranges_and_publishes_in_order() {
-    struct Ranges(tokio::sync::Notify);
+    struct Ranges {
+        second: tokio::sync::Notify,
+        wrong_checksum: bool,
+    }
 
     #[async_trait]
     impl ControlExecutor for Ranges {
@@ -243,6 +246,13 @@ async fn large_get_submits_both_ranges_and_publishes_in_order() {
             headers.insert("etag", HeaderValue::from_static("\"immutable\""));
             if request.method == Method::HEAD {
                 headers.insert("content-length", HeaderValue::from(total));
+                if self.wrong_checksum {
+                    // SHA-256 of the empty payload, while these two ranges are nonempty.
+                    headers.insert(
+                        "x-amz-checksum-sha256",
+                        HeaderValue::from_static("47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU="),
+                    );
+                }
                 return Ok(ControlResponse {
                     status: StatusCode::OK,
                     headers,
@@ -258,12 +268,12 @@ async fn large_get_submits_both_ranges_and_publishes_in_order() {
             let (start, end): (usize, usize) = (start.parse().unwrap(), end.parse().unwrap());
             if start == 0 {
                 assert_eq!(end, WINDOW - 1);
-                tokio::time::timeout(std::time::Duration::from_secs(5), self.0.notified())
+                tokio::time::timeout(std::time::Duration::from_secs(5), self.second.notified())
                     .await
                     .expect("the second range must enter before the first completes");
             } else {
                 assert_eq!((start, end), (WINDOW, total - 1));
-                self.0.notify_one();
+                self.second.notify_one();
             }
             headers.insert(
                 "content-range",
@@ -282,24 +292,34 @@ async fn large_get_submits_both_ranges_and_publishes_in_order() {
         }
     }
 
-    let transport = Factory(RdmaBackend::Nixl)
-        .create(Arc::new(Ranges(tokio::sync::Notify::new())))
-        .unwrap();
-    let mut progress = Vec::new();
-    let total = WINDOW as u64 + 19;
-    let result = transport
-        .download(
-            DownloadRequest {
-                path: &RemotePath::new("local", "bucket", "key"),
-                options: &Default::default(),
-                max_bytes: None,
-                max_receive_bytes: total,
-                on_progress: &mut |written, _| progress.push(written),
-            },
-            &mut tokio::io::sink(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(result.bytes_transferred, total);
-    assert_eq!(progress, [WINDOW as u64, total]);
+    for wrong_checksum in [false, true] {
+        let transport = Factory(RdmaBackend::Nixl)
+            .create(Arc::new(Ranges {
+                second: tokio::sync::Notify::new(),
+                wrong_checksum,
+            }))
+            .unwrap();
+        let mut progress = Vec::new();
+        let total = WINDOW as u64 + 19;
+        let result = transport
+            .download(
+                DownloadRequest {
+                    path: &RemotePath::new("local", "bucket", "key"),
+                    options: &Default::default(),
+                    max_bytes: None,
+                    max_receive_bytes: total,
+                    on_progress: &mut |written, _| progress.push(written),
+                },
+                &mut tokio::io::sink(),
+            )
+            .await;
+        if wrong_checksum {
+            assert!(
+                matches!(result, Err(error) if matches!(error.source.as_deref(), Some(Error::General(message)) if message.contains("checksum does not match")))
+            );
+        } else {
+            assert_eq!(result.unwrap().bytes_transferred, total);
+        }
+        assert_eq!(progress, [WINDOW as u64, total]);
+    }
 }
