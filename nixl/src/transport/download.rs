@@ -5,6 +5,33 @@ pub(super) enum Sink<'a> {
     Writer(&'a mut (dyn AsyncWrite + Send + Unpin)),
 }
 
+impl Sink<'_> {
+    async fn write_range(
+        &mut self,
+        mut window: Window,
+        offset: u64,
+        checksum: Option<&mut PayloadChecksumVerifier>,
+    ) -> Result<()> {
+        if let Some(checksum) = checksum {
+            checksum.update(window.received()?);
+        }
+        match self {
+            Self::Writer(writer) => writer.write_all(window.received()?).await?,
+            Self::File(file) => {
+                use std::os::unix::fs::FileExt;
+                let file = file.clone();
+                tokio::task::spawn_blocking(move || {
+                    file.write_all_at(window.received()?, offset)?;
+                    Ok::<_, Error>(())
+                })
+                .await
+                .map_err(|_| Error::General("RDMA file write was interrupted".into()))??;
+            }
+        }
+        Ok(())
+    }
+}
+
 struct Selection<'a> {
     path: &'a RemotePath,
     requested_version: Option<&'a str>,
@@ -26,6 +53,31 @@ fn read_request(
     wire::request(method, path, query, headers)
 }
 
+// The caller may retry over HTTP only if both ranges declined before output.
+pub(super) fn merged_ranges<T>(
+    first: DataTransportResult<()>,
+    second: DataTransportResult<T>,
+) -> DataTransportResult<T> {
+    match (first, second) {
+        (Ok(()), Ok(value)) => Ok(value),
+        (Err(first), Err(second)) => {
+            if second.state == DataTransferState::OutcomeUnknown
+                || first.state == DataTransferState::NotAccepted
+            {
+                Err(second)
+            } else {
+                Err(first)
+            }
+        }
+        (Ok(()), Err(mut error)) | (Err(mut error), Ok(_)) => {
+            if error.state == DataTransferState::NotAccepted {
+                error.state = DataTransferState::ConfirmedFailure;
+            }
+            Err(error)
+        }
+    }
+}
+
 impl Transport {
     async fn fetch(
         &self,
@@ -33,6 +85,7 @@ impl Transport {
         offset: u64,
         len: usize,
         ranged: bool,
+        window: Window,
     ) -> DataTransportResult<Window> {
         let mut headers = HeaderMap::new();
         headers.insert("if-match", selection.etag.clone());
@@ -46,10 +99,10 @@ impl Transport {
         } else {
             StatusCode::OK
         };
-        let window = self.pools.reserve(len as u64).await.map_err(unavailable)?;
         // An empty object still requires a nonempty descriptor.
-        window.bind(&mut headers, len.max(1)).map_err(unavailable)?;
-        let exposed = window.expose();
+        let exposed = window
+            .expose(&Method::GET, len.max(1), &mut headers)
+            .map_err(unavailable)?;
         let (response, exposed) = self
             .exchange(
                 read_request(
@@ -69,24 +122,26 @@ impl Transport {
         if !response.headers.contains_key(RDMA_REPLY_HEADER) {
             // An ordinary successful GET returned the object in its HTTP body.
             // It is safe to try the ordinary reader before publishing any bytes.
-            drop(exposed.finished());
+            // A missing receipt permits the S3 fallback but does not prove the window is idle.
+            self.support.get.http_only();
             return Err(unavailable(Error::UnsupportedFeature(
                 "The endpoint served GET over HTTP".into(),
             )));
         }
         if response.status != expected {
             return Err(rejected(Error::General(
-                "Unexpected NIXL GET status".into(),
+                "Unexpected RDMA GET status".into(),
             )));
         }
         wire::receipt(expected, &response.headers, len as u64).map_err(rejected)?;
-        let mut window = exposed.finished();
+        self.support.get.supported();
+        let mut window = exposed.finished().map_err(rejected)?;
         if wire::field(&response.headers, "content-length")
             .map_err(rejected)?
             .is_some_and(|value| value != "0")
         {
             return Err(rejected(Error::General(
-                "NIXL GET returned an HTTP payload".into(),
+                "RDMA GET returned an HTTP payload".into(),
             )));
         }
         if wire::field(&response.headers, "x-amz-version-id").map_err(rejected)?
@@ -107,15 +162,11 @@ impl Transport {
                 != Some(&expected_range)
             {
                 return Err(rejected(Error::General(
-                    "NIXL GET returned a different object range".into(),
+                    "RDMA GET returned a different object range".into(),
                 )));
             }
         }
-        window
-            .chunk
-            .advance(len)
-            .map_err(native_error)
-            .map_err(rejected)?;
+        window.finish_read(len).map_err(rejected)?;
         Ok(window)
     }
 
@@ -126,9 +177,10 @@ impl Transport {
     ) -> DataTransportResult<DownloadResult> {
         if request.options.customer_key.is_some() {
             return Err(unavailable(Error::UnsupportedFeature(
-                "NIXL does not encrypt SSE-C payloads in transit".into(),
+                "RDMA does not encrypt SSE-C payloads in transit".into(),
             )));
         }
+        let _probe = self.support.get.enter().await?;
         let requested_version = request.options.version_id.as_deref();
         let mut headers = HeaderMap::new();
         if request.options.checksum_mode {
@@ -154,7 +206,7 @@ impl Transport {
         let length = request.max_bytes.unwrap_or(total).min(total);
         if length > request.max_receive_bytes {
             return Err(rejected(Error::General(
-                "NIXL object exceeds the receive bound".into(),
+                "RDMA object exceeds the receive bound".into(),
             )));
         }
         let observed_version = wire::field(&head.headers, "x-amz-version-id").map_err(rejected)?;
@@ -171,51 +223,60 @@ impl Transport {
             observed_version,
         };
         let ranged = length > 0 && (request.max_bytes.is_some() || length > WINDOW as u64);
-        let first = length.min(WINDOW as u64) as usize;
-        let mut current = self.fetch(&selection, 0, first, ranged).await?;
-        let mut end = first as u64;
         let mut checksum = PayloadChecksumVerifier::new(&head.headers).map_err(rejected)?;
+        let mut offset = 0;
         loop {
-            let write = async {
-                if length == total {
-                    checksum.update(current.chunk.staged().map_err(native_error)?);
+            let first = (length - offset).min(WINDOW as u64);
+            let next = offset + first;
+            let second = (length - next).min(WINDOW as u64);
+            // Reserve the earlier range first. It can finish and release its window
+            // even if other downloads or a quarantined window leave only one slot.
+            let window = self.pools.reserve(first).await.map_err(|e| {
+                if offset == 0 {
+                    unavailable(e)
+                } else {
+                    rejected(e)
                 }
-                let offset = end - current.chunk.len() as u64;
-                match &mut target {
-                    Sink::Writer(writer) => {
-                        writer
-                            .write_all(current.chunk.staged().map_err(native_error)?)
-                            .await?
-                    }
-                    Sink::File(file) => {
-                        use std::os::unix::fs::FileExt;
-                        let file = file.clone();
-                        tokio::task::spawn_blocking(move || {
-                            file.write_all_at(
-                                current.chunk.staged().map_err(native_error)?,
-                                offset,
-                            )?;
-                            Ok::<_, Error>(())
-                        })
-                        .await
-                        .map_err(|_| Error::General("NIXL file write was interrupted".into()))??;
-                    }
-                }
-                (request.on_progress)(end, Some(length));
-                Ok::<_, Error>(())
+            })?;
+            let publish_first = async {
+                let window = self
+                    .fetch(&selection, offset, first as usize, ranged, window)
+                    .await
+                    .map_err(|mut error| {
+                        if offset != 0 && error.state == DataTransferState::NotAccepted {
+                            error.state = DataTransferState::ConfirmedFailure;
+                        }
+                        error
+                    })?;
+                target
+                    .write_range(window, offset, (length == total).then_some(&mut checksum))
+                    .await
+                    .map_err(rejected)?;
+                (request.on_progress)(next, Some(length));
+                Ok(())
             };
-            if end == length {
-                write.await.map_err(rejected)?;
+            if second == 0 {
+                publish_first.await?;
                 break;
             }
-            let size = (length - end).min(WINDOW as u64) as usize;
-            let (written, next) = tokio::join!(write, self.fetch(&selection, end, size, true));
-            written.map_err(rejected)?;
-            current = next.map_err(|mut err| {
-                err.state = DataTransferState::ConfirmedFailure;
-                err
-            })?;
-            end += size as u64;
+            let fetch_second = async {
+                let window = self.pools.reserve(second).await.map_err(unavailable)?;
+                self.fetch(&selection, next, second as usize, true, window)
+                    .await
+            };
+            // Settle both control exchanges even when one fails. Only the ordered
+            // consumer updates the checksum, writes bytes and reports progress.
+            let (first_result, second_result) = tokio::join!(publish_first, fetch_second);
+            let window = merged_ranges(first_result, second_result)?;
+            target
+                .write_range(window, next, (length == total).then_some(&mut checksum))
+                .await
+                .map_err(rejected)?;
+            offset = next + second;
+            (request.on_progress)(offset, Some(length));
+            if offset == length {
+                break;
+            }
         }
         if length == total {
             checksum.verify(&head.headers).map_err(rejected)?;

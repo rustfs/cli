@@ -1,0 +1,14 @@
+[package]
+name = "rustfs-cuobject-client"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99.0"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "NVIDIA cuObject client registrations and transfer tokens"
+
+[features]
+client = ["dep:rustfs-cuobject-client-sys"]
+
+[dependencies]
+rustfs-cuobject-client-sys = { path = "../cuobject-client-sys", features = ["client"], optional = true }

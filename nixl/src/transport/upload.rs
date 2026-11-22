@@ -7,16 +7,13 @@ impl Transport {
         source: &mut (dyn AsyncRead + Unpin + Send),
     ) -> DataTransportResult<UploadResult> {
         let len = part_len(&request)?;
+        let _probe = self.support.upload_part.enter().await?;
         let mut window = self
             .pools
             .reserve(request.content_length)
             .await
             .map_err(unavailable)?;
-        let dest = window
-            .chunk
-            .spare_mut()
-            .map_err(native_error)
-            .map_err(unavailable)?;
+        let dest = window.writable().map_err(unavailable)?;
         source
             .read_exact(&mut dest[..len])
             .await
@@ -30,7 +27,7 @@ impl Transport {
             != 0
         {
             return Err(rejected(Error::Conflict(
-                "NIXL part source exceeds its declared length".into(),
+                "RDMA part source exceeds its declared length".into(),
             )));
         }
         self.send_part(&request, window)
@@ -41,7 +38,7 @@ impl Transport {
 
 fn declined_part() -> DataTransportError {
     rejected(Error::UnsupportedFeature(
-        "The endpoint did not accept the NIXL part".into(),
+        "The endpoint did not accept the RDMA part".into(),
     ))
 }
 
@@ -51,7 +48,7 @@ fn part_len(request: &UploadRequest<'_>) -> DataTransportResult<usize> {
         .filter(|n| (1..=WINDOW).contains(n))
         .ok_or_else(|| {
             unavailable(Error::UnsupportedFeature(
-                "Part exceeds the registered NIXL window".into(),
+                "Part exceeds the registered RDMA window".into(),
             ))
         })
 }
@@ -68,16 +65,13 @@ impl StagedUploadTransport for Transport {
         upload_id: &str,
         first_part_bytes: u64,
     ) -> DataTransportResult<bool> {
+        let _probe = self.support.upload_part.enter().await?;
         let mut window = self
             .pools
             .reserve(first_part_bytes)
             .await
             .map_err(unavailable)?;
-        window
-            .chunk
-            .append(&[0])
-            .map_err(native_error)
-            .map_err(unavailable)?;
+        window.writable().map_err(unavailable)?[0] = 0;
         let options = rc_core::ObjectWriteOptions::default();
         let request = UploadRequest {
             path,
@@ -100,20 +94,18 @@ impl StagedUploadTransport for Transport {
     ) -> DataTransportResult<UploadResult> {
         use std::os::unix::fs::FileExt;
         let len = part_len(&request)?;
+        let _probe = self.support.upload_part.enter().await?;
         let mut window = self
             .pools
             .reserve(request.content_length)
             .await
             .map_err(unavailable)?;
         let window = tokio::task::spawn_blocking(move || {
-            file.read_exact_at(
-                &mut window.chunk.spare_mut().map_err(native_error)?[..len],
-                offset,
-            )?;
+            file.read_exact_at(&mut window.writable()?[..len], offset)?;
             Ok::<_, Error>(window)
         })
         .await
-        .map_err(|_| rejected(Error::General("NIXL file read was interrupted".into())))?
+        .map_err(|_| rejected(Error::General("RDMA file read was interrupted".into())))?
         .map_err(rejected)?;
         self.send_part(&request, window)
             .await?
@@ -133,17 +125,18 @@ impl Transport {
         } = request.operation
         else {
             return Err(unavailable(Error::UnsupportedFeature(
-                "NIXL writes require an unpublished multipart part".into(),
+                "RDMA writes require an unpublished multipart part".into(),
             )));
         };
         let len = part_len(request)?;
         let mut headers = HeaderMap::new();
-        window.bind(&mut headers, len).map_err(unavailable)?;
+        let exposed = window
+            .expose(&Method::PUT, len, &mut headers)
+            .map_err(unavailable)?;
         let query = vec![
             ("uploadId".into(), upload_id.into()),
             ("partNumber".into(), part_number.to_string()),
         ];
-        let exposed = window.expose();
         let (response, exposed) = self
             .exchange(
                 wire::request(Method::PUT, request.path, query, headers),
@@ -155,15 +148,17 @@ impl Transport {
             return Err(rejected(response.object_error(request.path, None)));
         }
         if !response.headers.contains_key(RDMA_REPLY_HEADER) {
-            drop(exposed.finished());
+            // A missing receipt permits the S3 fallback but does not prove the window is idle.
+            self.support.upload_part.http_only();
             return Ok(None);
         }
         wire::receipt(StatusCode::OK, &response.headers, len as u64).map_err(unknown)?;
-        drop(exposed.finished());
+        self.support.upload_part.supported();
+        drop(exposed.finished().map_err(rejected)?);
         let etag = wire::field(&response.headers, "etag")
             .map_err(rejected)?
             .filter(|e| !e.is_empty())
-            .ok_or_else(|| rejected(Error::General("NIXL UploadPart returned no ETag".into())))?;
+            .ok_or_else(|| rejected(Error::General("RDMA UploadPart returned no ETag".into())))?;
         let mut object = ObjectInfo::file(&request.path.key, len as i64);
         object.etag = Some(etag.into());
         Ok(Some(UploadResult {

@@ -8,12 +8,18 @@ publish = false
 
 [workspace]
 resolver = "3"
+members = ["cuobject-client", "cuobject-client-sys"]
+default-members = ["."]
 
 [[bin]]
 name = "rc"
 path = "src/main.rs"
 
+[features]
+cuobject = ["dep:rustfs-cuobject-client"]
+
 [dependencies]
+rustfs-cuobject-client = { path = "cuobject-client", features = ["client"], optional = true }
 rustfs-cli = { path = "../crates/cli" }
 rc-core = { path = "../crates/core" }
 rc-s3 = { path = "../crates/s3" }

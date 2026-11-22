@@ -1806,6 +1806,10 @@ impl Intercept for CustomHeaderInterceptor {
 impl S3Client {
     /// Create a new S3 client from an alias configuration
     pub async fn new(alias: Alias) -> Result<Self> {
+        let request_headers = global_request_headers();
+        for header in &request_headers {
+            header.validate_transport_name()?;
+        }
         let endpoint = alias.endpoint.clone();
         let region = alias.region.clone();
         let access_key = alias.access_key.clone();
@@ -1865,7 +1869,6 @@ impl S3Client {
         let config = config_loader.load().await;
 
         // Build S3 client with path-style addressing for compatibility
-        let request_headers = global_request_headers();
         let mut s3_config_builder = aws_sdk_s3::config::Builder::from(&config)
             .force_path_style(force_path_style_for_alias(&alias))
             // Improve compatibility with S3-compatible backends by only sending request
@@ -1926,7 +1929,8 @@ impl S3Client {
             (_, Some(transport)) => Ok(Some(transport)),
             (DataTransportMode::Rdma, None) => Err(Error::DataTransfer {
                 state: rc_core::DataTransferState::NotAccepted,
-                message: "This executable has no external object data provider".to_string(),
+                message: "This executable has no provider for the selected RDMA backend"
+                    .to_string(),
                 source: None,
             }),
         }
@@ -7697,10 +7701,8 @@ impl ObjectStore for S3Client {
     }
 }
 
-/// External control exchanges retain the host client's TLS and signing policy.
-#[async_trait]
-impl ControlExecutor for S3Client {
-    async fn execute_headers(&self, request: ControlRequest) -> Result<ControlResponse> {
+impl S3Client {
+    async fn send_external_control(&self, request: ControlRequest) -> Result<reqwest::Response> {
         if self.alias.anonymous {
             return Err(Error::RequestRejected(
                 "External object control requires an authenticated S3 principal".to_string(),
@@ -7762,8 +7764,7 @@ impl ControlExecutor for S3Client {
         // Only response headers travel over HTTPS. Bound the complete wait,
         // including connection setup, using the same alias policy as S3.
         let timeout = self.alias.timeout_config();
-        let mut response = self
-            .xml_http_client
+        self.xml_http_client
             .request(request.method, url)
             .headers(signed)
             .timeout(Duration::from_millis(
@@ -7778,7 +7779,42 @@ impl ControlExecutor for S3Client {
                     "External control exchange failed"
                 };
                 Error::Network(message.to_owned())
-            })?;
+            })
+    }
+}
+
+/// External control exchanges retain the host client's TLS and signing policy.
+#[async_trait]
+impl ControlExecutor for S3Client {
+    fn endpoint(&self) -> Option<&str> {
+        Some(&self.alias.endpoint)
+    }
+
+    async fn execute_registered(
+        &self,
+        request: ControlRequest,
+    ) -> Result<data_transport::RegisteredControlResponse> {
+        let method = request.method.clone();
+        let conditional = request.headers.contains_key("if-match");
+        let mut response = self.send_external_control(request).await?;
+        let status = response.status();
+        let headers = std::mem::take(response.headers_mut());
+        if object_error::dma_precondition_response(&method, conditional, status, &headers)
+            && object_error::has_precondition_error_body(response).await
+        {
+            return Ok(
+                data_transport::RegisteredControlResponse::RejectedBeforeDma(Error::Conflict(
+                    "The S3 endpoint rejected the conditional GET before transferring data".into(),
+                )),
+            );
+        }
+        Ok(data_transport::RegisteredControlResponse::Response(
+            ControlResponse { status, headers },
+        ))
+    }
+
+    async fn execute_headers(&self, request: ControlRequest) -> Result<ControlResponse> {
+        let mut response = self.send_external_control(request).await?;
         Ok(ControlResponse {
             status: response.status(),
             headers: std::mem::take(response.headers_mut()),

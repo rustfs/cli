@@ -10,6 +10,7 @@ on:
       - 'Cargo.lock'
       - 'scripts/build-rdma.sh'
       - '.github/scripts/build-nixl-runtime.sh'
+      - '.github/scripts/build-cuobject-client.sh'
       - '.github/workflows/nixl.yml'
 
 permissions:
@@ -31,11 +32,13 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: nixl
+      - name: Check the cuObject crates without the NVIDIA SDK
+        run: cargo check --locked --manifest-path nixl/Cargo.toml -p rustfs-cuobject-client -p rustfs-cuobject-client-sys
       - name: Install native build tools
         run: |
           echo "NIXL_PREFIX=$RUNNER_TEMP/nixl" >> "$GITHUB_ENV"
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libclang-dev ninja-build python3-dev python3-venv
+          sudo apt-get install -y --no-install-recommends libibverbs-dev librdmacm1t64 libclang-dev ninja-build python3-dev python3-venv
           python3 -m venv "$RUNNER_TEMP/native-tools"
           "$RUNNER_TEMP/native-tools/bin/pip" install meson==1.12.1 pybind11==3.1.0
           echo "$RUNNER_TEMP/native-tools/bin" >> "$GITHUB_PATH"
@@ -54,3 +57,5 @@ jobs:
           export NIXL_PLUGIN_DIR="$NIXL_PREFIX/lib/plugins"
           ./scripts/build-rdma.sh
           cargo test --locked --manifest-path nixl/Cargo.toml
+      - name: Build and test the NVIDIA cuObject client with the real SDK
+        run: .github/scripts/build-cuobject-client.sh

@@ -8,13 +8,18 @@ completion, and abort continue to use the established S3 implementation.
 `rc-core` owns transport selection and business outcome classification.
 `rc-s3::data_transport` owns the optional provider ports, expressed with existing
 S3 read/write options, registered file transfers, and borrowed asynchronous IO.
-The Linux NIXL executable installs an `ObjectDataTransportFactory` before
-calling `rustfs_cli::run()`.
+The Linux native executable registers an `ObjectDataTransportFactory` for
+each compiled RDMA backend before calling `rustfs_cli::run()`. Backend
+selection (`--rdma-backend nixl|cuobject`) and fallback policy are independent.
+Both backends use the same multipart publication, version selection, file IO,
+checksum verification and receipt handling.
 The common launcher preserves command dispatch, output, exit codes, and the
 existing worker-thread configuration.
 
-The provider supplies NIXL agent metadata and a registered buffer description
-to a host-owned `ControlExecutor`. The S3 client signs and sends a bodyless
+The NIXL backend supplies agent metadata and a registered buffer description.
+The NVIDIA backend uses `rustfs-cuobject-client` for registered windows and transfer tokens. Its dependency `rustfs-cuobject-client-sys` builds the C++ bridge and links the NVIDIA client SDK. The window can be reused after
+a verified receipt or proof that DMA never started. An uncertain transfer retains both resources
+within the process registration budget. Both use the host-owned `ControlExecutor`. The S3 client signs and sends a bodyless
 HTTPS request on the shared S3 HTTP client using the alias timeout policy. It returns the status and headers directly,
 including duplicate headers. The provider verifies the RustFS transfer receipt
 and byte count. Credentials, endpoint addressing, custom headers, and TLS

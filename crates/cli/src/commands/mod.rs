@@ -9,8 +9,8 @@ use std::io::{IsTerminal, stderr, stdout};
 use clap::{Parser, Subcommand, ValueEnum};
 use rc_core::config::Defaults;
 use rc_core::{
-    ConfigManager, DataTransportMode, RequestHeader, set_global_data_transport_mode,
-    set_global_request_headers,
+    ConfigManager, DataTransportMode, RdmaBackend, RequestHeader, set_global_data_transport_mode,
+    set_global_rdma_backend, set_global_request_headers,
 };
 
 use crate::exit_code::ExitCode;
@@ -97,6 +97,10 @@ pub struct Cli {
     /// Object data transport: http, auto, or rdma (requires an installed provider)
     #[arg(long, global = true, env = "RC_DATA_TRANSPORT", default_value = "http")]
     pub data_transport: DataTransportMode,
+
+    /// RDMA backend for auto or rdma mode: nixl or cuobject
+    #[arg(long, global = true, env = "RC_RDMA_BACKEND", default_value = "nixl")]
+    pub rdma_backend: RdmaBackend,
 
     /// Maximum multipart parts per object for the destination backend
     #[arg(long, global = true, env = "RC_MAX_PARTS", default_value_t = 10_000,
@@ -371,6 +375,7 @@ pub enum Commands {
 /// Execute the CLI command and return an exit code
 pub async fn execute(cli: Cli) -> ExitCode {
     set_global_data_transport_mode(cli.data_transport);
+    set_global_rdma_backend(cli.rdma_backend);
     set_global_request_headers(cli.request_headers.clone());
     let cli_output_options = GlobalOutputOptions::from_cli(&cli);
     if let Err(error) = rc_core::set_global_multipart_max_parts(cli.max_parts as usize) {
@@ -591,6 +596,57 @@ mod tests {
             .expect("explicit external data transport");
         assert_eq!(cli.data_transport, DataTransportMode::Rdma);
         assert!(Cli::try_parse_from(["rc", "--data-transport", "udp", "alias", "list"]).is_err());
+    }
+    #[test]
+    fn external_transport_headers_cannot_be_supplied_by_the_caller() {
+        for name in [
+            "X-AmZ-RdMa-ToKeN",
+            "x-amz-rdma-reply",
+            "x-amz-rdma-bytes-transferred",
+            "x-rustfs-nixl-agent",
+            "x-rustfs-nixl-metadata",
+            "x-rustfs-nixl-buffer",
+        ] {
+            for mode in ["http", "auto", "rdma"] {
+                assert!(
+                    Cli::try_parse_from([
+                        "rc",
+                        "--data-transport",
+                        mode,
+                        "-H",
+                        &format!("{name}:opaque"),
+                        "alias",
+                        "list"
+                    ])
+                    .is_err(),
+                    "{name} in {mode}"
+                );
+            }
+        }
+        assert!(
+            Cli::try_parse_from(["rc", "-H", "x-amz-meta-format:onnx", "alias", "list"]).is_ok()
+        );
+    }
+
+    #[test]
+    fn rdma_backend_is_independent_of_fallback_policy() {
+        for policy in ["rdma", "auto"] {
+            let args = [
+                "rc",
+                "--data-transport",
+                policy,
+                "--rdma-backend",
+                "cuobject",
+                "alias",
+                "list",
+            ];
+            let cli = Cli::try_parse_from(args).expect("select NVIDIA cuObject");
+            assert_eq!(cli.rdma_backend, RdmaBackend::CuObject);
+            assert_eq!(cli.data_transport, policy.parse().unwrap());
+        }
+        let default = Cli::try_parse_from(["rc", "alias", "list"]).unwrap();
+        assert_eq!(default.rdma_backend, RdmaBackend::Nixl);
+        assert!(Cli::try_parse_from(["rc", "--rdma-backend", "unknown", "alias", "list"]).is_err());
     }
     use clap::Parser;
 
