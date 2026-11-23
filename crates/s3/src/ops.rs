@@ -247,6 +247,11 @@ fn snapshot_report(response: DataUsageInfo) -> Result<UsageReport> {
             if name.is_empty() || report.buckets.iter().any(|bucket| bucket.name == name) {
                 continue;
             }
+            // A named initial scan establishes a pending bucket even when its
+            // progress cannot supply a trustworthy numeric measurement.
+            if !report.unmeasured_buckets.contains(&name) {
+                report.unmeasured_buckets.push(name.clone());
+            }
             let Ok(progress) = serde_json::from_value::<InitialProgress>(value) else {
                 continue;
             };
@@ -659,6 +664,24 @@ mod tests {
                 assert_eq!(report.buckets[0].object_count, 0);
                 assert!(report.initial_statistics.is_empty());
             }
+        }
+    }
+
+    #[test]
+    fn initial_scan_without_numeric_progress_is_pending_even_without_unmeasured_metadata() {
+        for progress in [
+            serde_json::json!({"stage":"enumerating", "updated_at":1000,
+                "sources_observed":1, "sources_total":1}),
+            serde_json::json!({"stage":"scanning", "updated_at":1000,
+                "objects":-1, "size":71, "sources_observed":1, "sources_total":1}),
+        ] {
+            let value = serde_json::json!({"snapshot_view":true, "buckets_usage":{},
+                "initial_scan_progress":{"initial":progress}});
+            let report = snapshot_report(serde_json::from_value(value).expect("wire shape"))
+                .expect("pending scan remains reportable");
+            assert!(report.partial);
+            assert_eq!(report.unmeasured_buckets, ["initial"]);
+            assert!(report.buckets.is_empty());
         }
     }
 

@@ -50,6 +50,9 @@ runs:
         add_pkg() {
           local pkg="$1"
           local existing
+          if [[ "$(dpkg-query -W -f='${Status}' "${pkg}" 2>/dev/null || true)" == "install ok installed" ]]; then
+            return
+          fi
           if ((${#packages[@]} > 0)); then
             for existing in "${packages[@]}"; do
               if [[ "${existing}" == "${pkg}" ]]; then
@@ -109,9 +112,56 @@ runs:
           add_pkg unzip
         fi
 
+        apt_tmp=""
+        trap '[[ -z "${apt_tmp}" ]] || sudo rm -rf "${apt_tmp}"' EXIT
+        prepare_apt() {
+          if [[ -n "${apt_tmp}" ]]; then return; fi
+          apt_tmp="$(mktemp -d)"
+          chmod 755 "${apt_tmp}"
+          mkdir -p "${apt_tmp}/lists/partial"
+          . /etc/os-release
+          case "${ID}" in
+            ubuntu)
+              case "$(dpkg --print-architecture)" in
+                amd64)
+                  apt_archive="http://archive.ubuntu.com/ubuntu"
+                  apt_security="http://security.ubuntu.com/ubuntu"
+                  ;;
+                arm64)
+                  apt_archive="http://ports.ubuntu.com/ubuntu-ports"
+                  apt_security="${apt_archive}"
+                  ;;
+                *) echo "Unsupported Ubuntu architecture" >&2; exit 1 ;;
+              esac
+              apt_keyring="/usr/share/keyrings/ubuntu-archive-keyring.gpg"
+              apt_components="main universe"
+              ;;
+            debian)
+              apt_archive="http://deb.debian.org/debian"
+              apt_security="http://security.debian.org/debian-security"
+              apt_keyring="/usr/share/keyrings/debian-archive-keyring.gpg"
+              apt_components="main"
+              ;;
+            *) echo "Unsupported APT distribution: ${ID}" >&2; exit 1 ;;
+          esac
+          : "${VERSION_CODENAME:?Distribution codename is required}"
+          [[ -f "${apt_keyring}" ]] || { echo "Distribution signing keyring is missing" >&2; exit 1; }
+          {
+            echo "deb [signed-by=${apt_keyring}] ${apt_archive} ${VERSION_CODENAME} ${apt_components}"
+            echo "deb [signed-by=${apt_keyring}] ${apt_archive} ${VERSION_CODENAME}-updates ${apt_components}"
+            echo "deb [signed-by=${apt_keyring}] ${apt_security} ${VERSION_CODENAME}-security ${apt_components}"
+          } > "${apt_tmp}/sources.list"
+          # The runner's unrelated PPAs must not gate basic build tools or
+          # contribute higher-priority packages to this installation.
+          apt_options=(-o "Dir::Etc::sourcelist=${apt_tmp}/sources.list"
+            -o Dir::Etc::sourceparts=- -o "Dir::State::lists=${apt_tmp}/lists"
+            -o APT::Update::Error-Mode=any -o Acquire::Retries=3)
+        }
+
         if ((${#packages[@]} > 0)); then
-          sudo DEBIAN_FRONTEND=noninteractive apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}"
+          prepare_apt
+          sudo DEBIAN_FRONTEND=noninteractive apt-get "${apt_options[@]}" update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get "${apt_options[@]}" install --no-upgrade -y "${packages[@]}"
         fi
 
         if has awscli && ! command -v aws >/dev/null 2>&1; then
@@ -133,12 +183,12 @@ runs:
         if has github-cli && ! command -v gh >/dev/null 2>&1; then
           # Ubuntu's own gh package is not always present on the minimal
           # runner image. Use the upstream GitHub CLI apt repository.
-          sudo mkdir -p -m 755 /etc/apt/keyrings
+          prepare_apt
           curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-            | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg >/dev/null
-          sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
-          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-            | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
-          sudo DEBIAN_FRONTEND=noninteractive apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y gh
+            > "${apt_tmp}/githubcli-archive-keyring.gpg"
+          chmod go+r "${apt_tmp}/githubcli-archive-keyring.gpg"
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=${apt_tmp}/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+            >> "${apt_tmp}/sources.list"
+          sudo DEBIAN_FRONTEND=noninteractive apt-get "${apt_options[@]}" update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get "${apt_options[@]}" install --no-upgrade -y gh
         fi
