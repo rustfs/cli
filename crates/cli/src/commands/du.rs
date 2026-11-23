@@ -58,6 +58,12 @@ struct UsageSuccessOutput {
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
 struct UsageData {
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    bucket_snapshot_at: std::collections::BTreeMap<String, Timestamp>,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    initial_statistics: std::collections::BTreeMap<String, Timestamp>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    unmeasured_buckets: Vec<String>,
     scope: &'static str,
     path: Option<String>,
     source: &'static str,
@@ -276,7 +282,13 @@ fn emit_report(
 
     if report.partial {
         if !formatter.is_json() {
-            formatter.warning("Usage scan is partial; one or more buckets could not be read.");
+            formatter.warning(if !report.initial_statistics.is_empty() {
+                "Initial statistics are incomplete."
+            } else if !report.unmeasured_buckets.is_empty() {
+                "Server statistics are unavailable for one or more buckets."
+            } else {
+                "Usage scan is partial; one or more buckets could not be read."
+            });
         }
         ExitCode::NetworkError
     } else {
@@ -310,6 +322,11 @@ fn scope_snapshot(
     report.scope = request.scope();
     report.path = request.path(alias);
     let Some(bucket_name) = request.bucket.as_deref() else {
+        if report.buckets.is_empty() && !report.unmeasured_buckets.is_empty() {
+            return Err(Error::UnsupportedFeature(
+                "Server usage statistics are pending or unavailable".into(),
+            ));
+        }
         return Ok(report);
     };
 
@@ -319,11 +336,30 @@ fn scope_snapshot(
         .find(|bucket| bucket.name == bucket_name)
         .cloned()
         .ok_or_else(|| {
+            if report.unmeasured_buckets.iter().any(|bucket| bucket == bucket_name) {
+                return Error::UnsupportedFeature(format!("Usage statistics for existing bucket '{alias}/{bucket_name}' are pending or unavailable"));
+            }
             Error::NotFound(format!(
                 "Bucket '{alias}/{bucket_name}' is absent from the server usage snapshot"
             ))
         })?;
     report.buckets = vec![bucket];
+    report
+        .bucket_snapshot_at
+        .retain(|bucket, _| bucket == bucket_name);
+    if let Some(timestamp) = report.bucket_snapshot_at.get(bucket_name) {
+        report.snapshot_at = Some(*timestamp);
+    }
+    report
+        .initial_statistics
+        .retain(|bucket, _| bucket == bucket_name);
+    report.unmeasured_buckets.clear();
+    report.partial = !report.initial_statistics.is_empty();
+    if let Some(timestamp) = report.initial_statistics.get(bucket_name) {
+        report.snapshot_at = Some(*timestamp);
+        report.version_count = None;
+        report.delete_marker_count = None;
+    }
     report.finish();
     Ok(report)
 }
@@ -341,6 +377,9 @@ fn success_output(
         output_type: USAGE_FAMILY,
         status: "success",
         data: UsageData {
+            bucket_snapshot_at: report.bucket_snapshot_at.clone(),
+            initial_statistics: report.initial_statistics.clone(),
+            unmeasured_buckets: report.unmeasured_buckets.clone(),
             scope: report.scope.as_str(),
             path: report.path.clone(),
             source: report.source.as_str(),
@@ -387,6 +426,9 @@ fn age_seconds(now: Timestamp, snapshot: Timestamp) -> u64 {
 fn print_human(report: &UsageReport, now: Timestamp, formatter: &Formatter) {
     formatter.println(&format!("Source: {}", report.source.as_str()));
     formatter.println(&format!("Scope:  {}", report.scope.as_str()));
+    if !report.initial_statistics.is_empty() {
+        formatter.println("State:  initial statistics (partial)");
+    }
     if let Some(path) = &report.path {
         formatter.println(&format!("Path:   {}", formatter.sanitize_text(path)));
     }
@@ -572,6 +614,9 @@ mod tests {
 
     fn snapshot(timestamp: i64) -> UsageReport {
         UsageReport {
+            bucket_snapshot_at: Default::default(),
+            initial_statistics: Default::default(),
+            unmeasured_buckets: Vec::new(),
             source: UsageSource::ServerSnapshot,
             scope: UsageScope::Cluster,
             path: None,
@@ -594,6 +639,48 @@ mod tests {
             partial: false,
             failures: Vec::new(),
         }
+    }
+
+    #[test]
+    fn scoping_a_snapshot_keeps_full_measurements_separate_from_initial_rows() {
+        let mut report = snapshot(100);
+        let first = report.buckets[0].name.clone();
+        report.initial_statistics.insert(
+            "initial".into(),
+            Timestamp::from_second(200).expect("checkpoint time"),
+        );
+        report.push_bucket(UsageBucket {
+            name: "initial".into(),
+            total_bytes: 71,
+            object_count: 7,
+            version_count: None,
+            delete_marker_count: None,
+            incomplete_upload_count: None,
+            incomplete_upload_bytes: None,
+        });
+        let request = |bucket| UsageScanRequest {
+            bucket: Some(bucket),
+            prefix: None,
+            include_versions: false,
+            include_incomplete_uploads: false,
+        };
+        let complete =
+            scope_snapshot(report.clone(), "alias", &request(first)).expect("full bucket");
+        assert!(!complete.partial);
+        assert!(complete.initial_statistics.is_empty());
+        assert_eq!(
+            complete.snapshot_at,
+            Some(Timestamp::from_second(100).expect("full time"))
+        );
+        let initial =
+            scope_snapshot(report, "alias", &request("initial".into())).expect("initial bucket");
+        assert!(initial.partial);
+        assert_eq!(
+            initial.snapshot_at,
+            Some(Timestamp::from_second(200).expect("initial time"))
+        );
+        assert_eq!(initial.version_count, None);
+        assert_eq!(initial.object_count, 7);
     }
 
     #[tokio::test]

@@ -664,6 +664,9 @@
           "enum": ["server_snapshot", "client_scan"]
         },
         "snapshot_at": { "$ref": "#/definitions/nullableTimestamp" },
+        "bucket_snapshot_at": { "type": "object", "additionalProperties": { "$ref": "#/definitions/nullableTimestamp" } },
+        "initial_statistics": { "type": "object", "additionalProperties": { "$ref": "#/definitions/nullableTimestamp" } },
+        "unmeasured_buckets": { "type": "array", "items": { "type": "string" } },
         "snapshot_age_seconds": { "type": ["integer", "null"], "minimum": 0 },
         "stale": { "type": "boolean" },
         "incomplete_upload_count": { "type": ["integer", "null"], "minimum": 0 },
