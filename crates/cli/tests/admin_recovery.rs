@@ -731,8 +731,15 @@ impl DiscardFaultServer {
                             let stream = acceptor.accept(stream).await.unwrap();
                             assert_eq!(stream.get_ref().1.alpn_protocol(), Some(b"h2".as_slice()));
                             let mut connection = h2::server::handshake(stream).await.unwrap();
+                            let mut fault_injected = false;
                             while let Some(request) = connection.accept().await {
-                                let (request, mut response) = request.unwrap();
+                                let (request, mut response) = match request {
+                                    Ok(request) => request,
+                                    Err(error) if fault_injected && error.get_io().is_some_and(|error| matches!(
+                                        error.kind(), std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                                    )) => return,
+                                    Err(error) => panic!("fault server request failed before an expected client disconnect: {error}"),
+                                };
                                 assert_eq!(request.method(), "POST");
                                 assert_eq!(request.uri().path(), "/rustfs/admin/v4/heal/delete-residue/discard");
                                 assert!(request.headers()["authorization"].to_str().unwrap().starts_with("AWS4-HMAC-SHA256 "));
@@ -748,6 +755,7 @@ impl DiscardFaultServer {
                                     extra = connection.accept() => panic!("unexpected stream before fault injection: {extra:?}"),
                                 };
                                 requests.lock().unwrap().push(serde_json::from_slice(&bytes).unwrap());
+                                fault_injected = true;
                                 match fault {
                                     DiscardFault::RefusedStream => response.send_reset(h2::Reason::REFUSED_STREAM),
                                     DiscardFault::LostResponse => return,

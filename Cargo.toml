@@ -59,7 +59,7 @@ jiff = { version = "0.2", features = ["serde"] }
 humansize = "2.1"
 fundu = { version = "2.1.1", default-features = false, features = ["custom"] }
 bytes = "1.11"
-url = "2.5"
+url = "2.5.9"
 futures = "0.3"
 async-trait = "0.1"
 mime_guess = "2.0"

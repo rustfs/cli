@@ -50,7 +50,7 @@ jobs:
 
       - name: Validate RustFS compatibility contract
         run: |
-          python3 -m unittest scripts/tests/test_rustfs_compatibility.py
+          python3 -m unittest scripts/tests/test_rustfs_compatibility.py scripts/tests/test_setup_self_hosted.py
           python3 scripts/rustfs_compatibility.py --check-repository
 
   smoke-compatibility:

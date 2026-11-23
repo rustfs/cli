@@ -140,6 +140,16 @@ pub struct UsageFailure {
 /// Complete or partial usage result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageReport {
+    /// Original complete measurement times, independent of owner fencing.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub bucket_snapshot_at: std::collections::BTreeMap<String, Timestamp>,
+    /// Initial measurements, keyed by bucket and original checkpoint time.
+    /// These rows are partial and never replace complete server measurements.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub initial_statistics: std::collections::BTreeMap<String, Timestamp>,
+    /// Existing buckets for which no usable server measurement is available.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unmeasured_buckets: Vec<String>,
     /// Data source used for the report.
     pub source: UsageSource,
     /// Scope represented by the report.
@@ -172,6 +182,9 @@ impl UsageReport {
     /// Create an empty report that can be populated with bucket rows.
     pub fn empty(source: UsageSource, scope: UsageScope, path: Option<String>) -> Self {
         Self {
+            initial_statistics: Default::default(),
+            bucket_snapshot_at: Default::default(),
+            unmeasured_buckets: Vec::new(),
             source,
             scope,
             path,
