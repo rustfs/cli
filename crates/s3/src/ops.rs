@@ -1,6 +1,6 @@
 //! RustFS operational endpoints and portable S3 usage scanning.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -117,9 +117,9 @@ struct BucketUsageInfo {
     #[serde(default)]
     usage_certification: Option<UsageCertificationTime>,
     #[serde(default)]
-    size: u64,
+    size: Option<u64>,
     #[serde(default, alias = "objectsCount")]
-    objects_count: u64,
+    objects_count: Option<u64>,
     #[serde(default, alias = "versionsCount")]
     versions_count: u64,
     #[serde(default, alias = "deleteMarkersCount")]
@@ -192,40 +192,53 @@ fn snapshot_report(response: DataUsageInfo) -> Result<UsageReport> {
             "Server returned an observational usage view instead of a persisted snapshot".into(),
         ));
     }
-    let bucket_snapshot_at = response
+    let completed_names = response
         .buckets_usage
-        .iter()
-        .filter_map(|(name, bucket)| {
-            bucket
-                .usage_certification
-                .as_ref()
-                .and_then(|value| value.certified_at.into_timestamp())
-                .map(|time| (name.clone(), time))
-        })
-        .collect();
-    let mut buckets = response
-        .buckets_usage
-        .into_iter()
-        .map(|(name, bucket)| UsageBucket {
+        .keys()
+        .cloned()
+        .collect::<HashSet<_>>();
+    let mut unmeasured = if response.snapshot_view {
+        response
+            .unmeasured_buckets
+            .into_iter()
+            .filter(|name| !name.is_empty())
+            .collect::<HashSet<_>>()
+    } else {
+        HashSet::new()
+    };
+    let mut bucket_snapshot_at = BTreeMap::new();
+    let mut buckets = Vec::with_capacity(response.buckets_usage.len());
+    for (name, bucket) in response.buckets_usage {
+        let (Some(size), Some(objects)) = (bucket.size, bucket.objects_count) else {
+            if !name.is_empty() {
+                unmeasured.insert(name);
+            }
+            continue;
+        };
+        if let Some(time) = bucket
+            .usage_certification
+            .as_ref()
+            .and_then(|value| value.certified_at.into_timestamp())
+        {
+            bucket_snapshot_at.insert(name.clone(), time);
+        }
+        unmeasured.remove(&name);
+        buckets.push(UsageBucket {
             name,
-            total_bytes: bucket.size,
-            object_count: bucket.objects_count,
+            total_bytes: size,
+            object_count: objects,
             version_count: Some(bucket.versions_count),
             delete_marker_count: Some(bucket.delete_markers_count),
             incomplete_upload_count: None,
             incomplete_upload_bytes: None,
-        })
-        .collect::<Vec<_>>();
+        });
+    }
     buckets.sort_by(|left, right| left.name.cmp(&right.name));
 
     let mut report = UsageReport {
         initial_statistics: Default::default(),
         bucket_snapshot_at,
-        unmeasured_buckets: if response.snapshot_view {
-            response.unmeasured_buckets
-        } else {
-            Vec::new()
-        },
+        unmeasured_buckets: Vec::new(),
         source: UsageSource::ServerSnapshot,
         scope: rc_core::ops::UsageScope::Cluster,
         path: None,
@@ -244,14 +257,11 @@ fn snapshot_report(response: DataUsageInfo) -> Result<UsageReport> {
     };
     if response.snapshot_view {
         for (name, value) in response.initial_scan_progress {
-            if name.is_empty() || report.buckets.iter().any(|bucket| bucket.name == name) {
+            if name.is_empty() || completed_names.contains(&name) {
                 continue;
             }
-            // A named initial scan establishes a pending bucket even when its
-            // progress cannot supply a trustworthy numeric measurement.
-            if !report.unmeasured_buckets.contains(&name) {
-                report.unmeasured_buckets.push(name.clone());
-            }
+            // A named scan remains pending when its numeric progress is invalid.
+            unmeasured.insert(name.clone());
             let Ok(progress) = serde_json::from_value::<InitialProgress>(value) else {
                 continue;
             };
@@ -274,7 +284,7 @@ fn snapshot_report(response: DataUsageInfo) -> Result<UsageReport> {
                 continue;
             };
             report.initial_statistics.insert(name.clone(), timestamp);
-            report.unmeasured_buckets.retain(|bucket| bucket != &name);
+            unmeasured.remove(&name);
             report.push_bucket(UsageBucket {
                 name,
                 total_bytes: size,
@@ -285,14 +295,16 @@ fn snapshot_report(response: DataUsageInfo) -> Result<UsageReport> {
                 incomplete_upload_bytes: None,
             });
         }
-        report.partial =
-            !report.initial_statistics.is_empty() || !report.unmeasured_buckets.is_empty();
+        report.partial = !report.initial_statistics.is_empty() || !unmeasured.is_empty();
         if !report.initial_statistics.is_empty() {
             report.version_count = None;
             report.delete_marker_count = None;
         }
         report.finish();
     }
+    report.unmeasured_buckets = unmeasured.into_iter().collect();
+    report.unmeasured_buckets.sort();
+    report.partial |= !report.unmeasured_buckets.is_empty();
     Ok(report)
 }
 
@@ -683,6 +695,45 @@ mod tests {
             assert_eq!(report.unmeasured_buckets, ["initial"]);
             assert!(report.buckets.is_empty());
         }
+    }
+
+    #[test]
+    fn incomplete_completed_rows_remain_unmeasured_and_do_not_authorize_initial_fallback() {
+        for row in [
+            serde_json::json!({}),
+            serde_json::json!({"size": 0}),
+            serde_json::json!({"objects_count": 0}),
+        ] {
+            let response = serde_json::json!({"snapshot_view":true,
+                "buckets_usage":{"photos":row}, "unmeasured_buckets":["photos"],
+                "initial_scan_progress":{"photos":{"stage":"scanning", "updated_at":1000,
+                    "objects":7,"size":71,"sources_observed":1,"sources_total":1}}});
+            let report = snapshot_report(serde_json::from_value(response).expect("wire shape"))
+                .expect("pending report");
+            assert!(report.buckets.is_empty());
+            assert!(report.initial_statistics.is_empty());
+            assert_eq!(report.unmeasured_buckets, ["photos"]);
+            assert!(report.partial);
+        }
+    }
+
+    #[test]
+    fn many_initial_buckets_are_deduplicated_without_losing_pending_names() {
+        let progress = (0..10_000).map(|index| (format!("bucket-{index}"), serde_json::json!({
+            "stage":"scanning", "updated_at":1000, "objects":1, "size":1, "sources_observed":1, "sources_total":1
+        }))).collect::<serde_json::Map<_, _>>();
+        let names = progress
+            .keys()
+            .cloned()
+            .chain(["waiting".to_owned(), "waiting".to_owned()])
+            .collect::<Vec<_>>();
+        let response = serde_json::json!({"snapshot_view":true, "buckets_usage":{},
+            "initial_scan_progress":progress, "unmeasured_buckets":names});
+        let report = snapshot_report(serde_json::from_value(response).expect("wire shape"))
+            .expect("large initial namespace");
+        assert_eq!(report.buckets.len(), 10_000);
+        assert_eq!(report.unmeasured_buckets, ["waiting"]);
+        assert_eq!(report.object_count, 10_000);
     }
 
     #[test]
