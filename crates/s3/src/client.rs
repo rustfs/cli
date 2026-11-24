@@ -253,6 +253,19 @@ async fn build_reqwest_client(
     client_key: Option<&str>,
     timeout: Option<&rc_core::alias::TimeoutConfig>,
 ) -> Result<reqwest::Client> {
+    configured_reqwest_builder(insecure, ca_bundle, client_cert, client_key, timeout)
+        .await?
+        .build()
+        .map_err(|e| Error::Network(format!("Failed to build HTTP client: {e}")))
+}
+
+async fn configured_reqwest_builder(
+    insecure: bool,
+    ca_bundle: Option<&str>,
+    client_cert: Option<&str>,
+    client_key: Option<&str>,
+    timeout: Option<&rc_core::alias::TimeoutConfig>,
+) -> Result<reqwest::ClientBuilder> {
     // NOTE: When `insecure = true`, `danger_accept_invalid_certs` disables all TLS
     // certificate verification. Any CA bundle provided will still be added to the
     // trust store but is rendered ineffective for this connection.
@@ -291,10 +304,7 @@ async fn build_reqwest_client(
         builder = builder.use_rustls_tls().identity(identity);
     }
 
-    let client = builder
-        .build()
-        .map_err(|e| Error::Network(format!("Failed to build HTTP client: {e}")))?;
-    Ok(client)
+    Ok(builder)
 }
 
 fn force_path_style_for_alias(alias: &Alias) -> bool {
@@ -1906,7 +1916,12 @@ impl S3Client {
         if client.data_transport_mode != rc_core::DataTransportMode::Http
             && let Some(factory) = data_transport::installed_factory()
         {
-            client.data_transport = Some(factory.create(Arc::new(client.clone()))?);
+            let control = Arc::new(client.clone());
+            client.data_transport = Some(match factory {
+                data_transport::InstalledFactory::Provider(factory) => factory.create(control)?,
+                data_transport::InstalledFactory::TrustedNixl(factory) => factory
+                    .create_with_signer(control.clone(), Arc::new(AliasSigningControl(control)))?,
+            });
         }
         Ok(client)
     }
@@ -3805,6 +3820,16 @@ impl S3Client {
             .await
     }
 
+    fn xml_credentials(&self) -> Credentials {
+        Credentials::new(
+            &self.alias.access_key,
+            &self.alias.secret_key,
+            self.session_token.clone(),
+            None,
+            "s3-xml-client",
+        )
+    }
+
     async fn sign_request_with_body(
         &self,
         method: &Method,
@@ -3817,14 +3842,7 @@ impl S3Client {
             return Ok(headers.clone());
         }
 
-        let credentials = Credentials::new(
-            &self.alias.access_key,
-            &self.alias.secret_key,
-            self.session_token.clone(),
-            None,
-            "s3-xml-client",
-        );
-
+        let credentials = self.xml_credentials();
         let identity = credentials.into();
         let mut signing_settings = options.settings;
         signing_settings.signature_location = SignatureLocation::Headers;
@@ -7702,13 +7720,21 @@ impl ObjectStore for S3Client {
 }
 
 impl S3Client {
-    async fn send_external_control(&self, request: ControlRequest) -> Result<reqwest::Response> {
+    fn registered_control_url(&self, request: &ControlRequest) -> Result<reqwest::Url> {
         if self.alias.anonymous {
             return Err(Error::RequestRejected(
                 "External object control requires an authenticated S3 principal".to_string(),
             ));
         }
-        let url = self.external_control_url(&request.path, &request.query)?;
+        self.external_control_url(&request.path, &request.query)
+    }
+
+    fn external_control_parts(
+        &self,
+        request: ControlRequest,
+        registered_window: bool,
+    ) -> Result<(Method, reqwest::Url, HeaderMap)> {
+        let url = self.registered_control_url(&request)?;
         let mut headers = request.headers;
         for name in [
             "authorization",
@@ -7738,6 +7764,25 @@ impl S3Client {
                 })?,
             );
         }
+        if registered_window
+            && headers.keys().any(|name| {
+                matches!(
+                    name.as_str(),
+                    "authorization"
+                        | "host"
+                        | "content-length"
+                        | "x-amz-content-sha256"
+                        | "x-amz-date"
+                        | "x-amz-security-token"
+                ) || name.as_str().starts_with("x-rustfs-nixl-")
+                    || name.as_str().starts_with("x-amz-rdma-")
+            })
+        {
+            return Err(Error::RequestRejected(
+                "Registered requests cannot override native transfer or authentication headers"
+                    .into(),
+            ));
+        }
         headers.insert(
             "host",
             HeaderValue::from_str(&self.request_host(&url)?)
@@ -7752,24 +7797,36 @@ impl S3Client {
                 "Control request headers must have UTF-8 values".to_string(),
             ));
         }
+        Ok((request.method, url, headers))
+    }
+
+    fn external_control_builder(
+        &self,
+        method: Method,
+        url: reqwest::Url,
+        headers: HeaderMap,
+    ) -> reqwest::RequestBuilder {
+        let timeout = self.alias.timeout_config();
+        self.xml_http_client
+            .request(method, url)
+            .headers(headers)
+            .timeout(Duration::from_millis(
+                timeout.connect_ms.saturating_add(timeout.read_ms),
+            ))
+    }
+
+    async fn send_external_control(&self, request: ControlRequest) -> Result<reqwest::Response> {
+        let (method, url, headers) = self.external_control_parts(request, false)?;
         let signed = self
             .sign_external_control_request_at(
-                &request.method,
+                &method,
                 url.as_str(),
                 &headers,
                 SignableBody::UnsignedPayload,
                 std::time::SystemTime::now(),
             )
             .await?;
-        // Only response headers travel over HTTPS. Bound the complete wait,
-        // including connection setup, using the same alias policy as S3.
-        let timeout = self.alias.timeout_config();
-        self.xml_http_client
-            .request(request.method, url)
-            .headers(signed)
-            .timeout(Duration::from_millis(
-                timeout.connect_ms.saturating_add(timeout.read_ms),
-            ))
+        self.external_control_builder(method, url, signed)
             .send()
             .await
             .map_err(|error| {
@@ -7780,6 +7837,33 @@ impl S3Client {
                 };
                 Error::Network(message.to_owned())
             })
+    }
+}
+
+// Only the executable's explicitly trusted factory receives this alias-bound capability.
+struct AliasSigningControl(Arc<S3Client>);
+
+#[async_trait]
+impl data_transport::NixlSigningControl for AliasSigningControl {
+    async fn http_builder(&self) -> Result<reqwest::ClientBuilder> {
+        let alias = &self.0.alias;
+        configured_reqwest_builder(
+            alias.insecure,
+            alias.ca_bundle.as_deref(),
+            alias.client_cert.as_deref(),
+            alias.client_key.as_deref(),
+            alias.timeout.as_ref(),
+        )
+        .await
+    }
+
+    async fn prepare(&self, request: ControlRequest) -> Result<data_transport::NixlSigningRequest> {
+        let (method, url, headers) = self.0.external_control_parts(request, true)?;
+        Ok(data_transport::NixlSigningRequest {
+            request: self.0.external_control_builder(method, url, headers),
+            credentials: self.0.xml_credentials(),
+            region: self.0.alias.region.clone(),
+        })
     }
 }
 
@@ -15606,6 +15690,57 @@ mod tests {
                 "S3 signature for {key}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn native_control_rejects_reserved_headers_and_anonymous_aliases_before_registration() {
+        use crate::data_transport::NixlSigningControl;
+        let (mut client, _) = test_s3_client_with_response_sequence(Vec::new());
+        client.alias.endpoint = "https://rustfs.example".into();
+        client.alias.insecure = false;
+        let request = |headers| ControlRequest {
+            method: Method::GET,
+            path: RemotePath::new("test", "bucket", "key"),
+            query: vec![],
+            headers,
+        };
+        for name in [
+            "authorization",
+            "x-amz-security-token",
+            "x-rustfs-nixl-agent",
+            "x-amz-rdma-token",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(name, HeaderValue::from_static("override"));
+            assert!(matches!(
+                AliasSigningControl(Arc::new(client.clone()))
+                    .prepare(request(headers))
+                    .await,
+                Err(Error::RequestRejected(_))
+            ));
+        }
+        client.request_headers = vec![RequestHeader::parse("X-Amz-Date: invalid").unwrap()];
+        assert!(matches!(
+            AliasSigningControl(Arc::new(client.clone()))
+                .prepare(request(HeaderMap::new()))
+                .await,
+            Err(Error::RequestRejected(_))
+        ));
+        client.request_headers.clear();
+        client.alias.anonymous = true;
+        assert!(matches!(
+            AliasSigningControl(Arc::new(client.clone()))
+                .prepare(request(HeaderMap::new()))
+                .await,
+            Err(Error::RequestRejected(_))
+        ));
+        client.alias.anonymous = false;
+        assert!(
+            AliasSigningControl(Arc::new(client.clone()))
+                .prepare(request(HeaderMap::new()))
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]

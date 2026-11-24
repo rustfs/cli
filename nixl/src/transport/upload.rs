@@ -13,12 +13,35 @@ impl Transport {
             .reserve(request.content_length)
             .await
             .map_err(unavailable)?;
-        let dest = window.writable().map_err(unavailable)?;
-        source
-            .read_exact(&mut dest[..len])
-            .await
-            .map_err(Error::from)
-            .map_err(rejected)?;
+        match window.buffer() {
+            crate::buffer::Buffer::Nixl(chunk) => {
+                let mut scratch = vec![0; len.min(crate::buffer::STREAM_CHUNK)];
+                let mut offset = 0;
+                while offset < len {
+                    let count = scratch.len().min(len - offset);
+                    let bytes = &mut scratch[..count];
+                    source
+                        .read_exact(bytes)
+                        .await
+                        .map_err(Error::from)
+                        .map_err(rejected)?;
+                    chunk
+                        .write_at(offset, bytes)
+                        .map_err(crate::buffer::nixl_error)
+                        .map_err(rejected)?;
+                    offset += count;
+                }
+            }
+            #[cfg(feature = "cuobject")]
+            crate::buffer::Buffer::CuObject(host) => {
+                let dest = host.writable().map_err(unavailable)?;
+                source
+                    .read_exact(&mut dest[..len])
+                    .await
+                    .map_err(Error::from)
+                    .map_err(rejected)?;
+            }
+        }
         if source
             .read(&mut [0_u8; 1])
             .await
@@ -71,7 +94,7 @@ impl StagedUploadTransport for Transport {
             .reserve(first_part_bytes)
             .await
             .map_err(unavailable)?;
-        window.writable().map_err(unavailable)?[0] = 0;
+        window.buffer().write_at(0, &[0]).map_err(unavailable)?;
         let options = rc_core::ObjectWriteOptions::default();
         let request = UploadRequest {
             path,
@@ -92,7 +115,6 @@ impl StagedUploadTransport for Transport {
         file: Arc<std::fs::File>,
         offset: u64,
     ) -> DataTransportResult<UploadResult> {
-        use std::os::unix::fs::FileExt;
         let len = part_len(&request)?;
         let _probe = self.support.upload_part.enter().await?;
         let mut window = self
@@ -101,7 +123,7 @@ impl StagedUploadTransport for Transport {
             .await
             .map_err(unavailable)?;
         let window = tokio::task::spawn_blocking(move || {
-            file.read_exact_at(&mut window.writable()?[..len], offset)?;
+            window.buffer().read_file(&file, offset, len)?;
             Ok::<_, Error>(window)
         })
         .await
@@ -129,10 +151,7 @@ impl Transport {
             )));
         };
         let len = part_len(request)?;
-        let mut headers = HeaderMap::new();
-        let exposed = window
-            .expose(&Method::PUT, len, &mut headers)
-            .map_err(unavailable)?;
+        let headers = HeaderMap::new();
         let query = vec![
             ("uploadId".into(), upload_id.into()),
             ("partNumber".into(), part_number.to_string()),
@@ -140,7 +159,8 @@ impl Transport {
         let (response, exposed) = self
             .exchange(
                 wire::request(Method::PUT, request.path, query, headers),
-                exposed,
+                window,
+                len,
             )
             .await?;
         if response.status != StatusCode::OK {

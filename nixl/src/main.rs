@@ -2,6 +2,8 @@
 #![forbid(unsafe_code)]
 
 mod buffer;
+#[cfg(test)]
+mod loopback;
 #[cfg(feature = "cuobject")]
 mod nvidia;
 mod pool;
@@ -12,7 +14,11 @@ use rc_core::RdmaBackend;
 
 fn register(backend: RdmaBackend) {
     let factory = std::sync::Arc::new(transport::Factory::new(backend));
-    if let Err(error) = rc_s3::data_transport::install_rdma_backend(backend, factory) {
+    let installed = match backend {
+        RdmaBackend::Nixl => rc_s3::data_transport::install_trusted_nixl_factory(factory),
+        RdmaBackend::CuObject => rc_s3::data_transport::install_rdma_backend(backend, factory),
+    };
+    if let Err(error) = installed {
         eprintln!("{error}");
         std::process::exit(error.exit_code());
     }

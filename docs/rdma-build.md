@@ -61,21 +61,31 @@ File uploads use positional reads directly into two reusable registered
 windows. Each completed part frees a window for the next part, and S3 receives
 the completion list in part-number order. A new pool sizes each window to the
 next power of two that fits the requested part or range, with a 1 MiB minimum
-and a 64 MiB maximum. For example, a 4 MiB range registers two 4 MiB windows.
-A client can reuse its existing larger pool for subsequent small requests.
+and a 64 MiB maximum. A client can reuse its existing larger pool for subsequent
+small requests. For NIXL reads covering an entire 4, 8, or 16 MiB object, the
+client can register four windows for concurrent downloads. If registration fails,
+the transport uses two windows for that size and larger sizes. Uploads and
+other NIXL reads share a limit of two ordinary windows.
 For large downloads, NIXL and cuObject issue up to two adjacent range GETs
 concurrently. Each request uses the caller's version selector and `If-Match`.
 The CLI checks each response against the version observed by HEAD and the requested range,
 consumes the results in byte order, and writes directly to the destination
 stream or temporary file. File downloads publish the temporary file after
-verifying the transfer count and any applicable object checksum.
+verifying the transfer count and any applicable object checksum. NIXL file
+reads and writes use the registered window directly when the CLI does not
+need the bytes for a checksum. For streaming I/O or whole-object checksum
+verification, the CLI uses a bounded local buffer. A checksummed file download
+writes the same bytes it hashes.
+A NIXL registration is sent only to the trusted endpoint of the verified
+HTTPS alias. The SDK signs the window descriptor, submits one request without
+redirects or retries, and keeps the window until it verifies the peer's response.
 A verified receipt releases the window. A local rejection before sending or
 an authenticated S3 `PreconditionFailed` response to an `If-Match` GET also
 releases it. For the latter, the client requires HTTP 412, a bounded S3
 error document and no RDMA response headers. An ambiguous response, a
 missing receipt, cancellation or timeout retains the token and window until
 the process exits.
-When both windows are unavailable for this reason, waiting operations use a
+When all windows in a pool are unavailable for this reason, waiting operations use a
 fresh pool within the process registration budget. Retiring a cuObject pool
 releases its idle registrations. Each quarantined window keeps its own
 registration and the pool's budget reservation. A native registration also

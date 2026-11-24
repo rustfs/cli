@@ -66,6 +66,11 @@ impl PayloadChecksumVerifier {
         Ok(Self { selected: None })
     }
 
+    /// Whether payload bytes are needed to verify the selected whole-object checksum.
+    pub fn needs_payload(&self) -> bool {
+        self.selected.as_ref().is_some_and(|entry| !entry.composite)
+    }
+
     pub fn update(&mut self, bytes: &[u8]) {
         if let Some(selected) = &mut self.selected
             && !selected.composite
@@ -177,6 +182,7 @@ mod tests {
             HeaderValue::from_static("LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ="),
         );
         let mut verifier = PayloadChecksumVerifier::new(&headers).unwrap();
+        assert!(verifier.needs_payload());
         verifier.update(b"he");
         verifier.update(b"llo");
         assert_eq!(
@@ -231,6 +237,7 @@ mod tests {
             HeaderValue::from_static("LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ=-2"),
         );
         let mut verifier = PayloadChecksumVerifier::new(&headers).unwrap();
+        assert!(!verifier.needs_payload());
         verifier.update(b"unrelated data");
         assert_eq!(
             verifier.verify(&headers).unwrap(),
@@ -241,11 +248,10 @@ mod tests {
     #[test]
     fn absent_checksum_retains_an_explicit_result() {
         let headers = HeaderMap::new();
+        let verifier = PayloadChecksumVerifier::new(&headers).unwrap();
+        assert!(!verifier.needs_payload());
         assert_eq!(
-            PayloadChecksumVerifier::new(&headers)
-                .unwrap()
-                .verify(&headers)
-                .unwrap(),
+            verifier.verify(&headers).unwrap(),
             PayloadChecksumStatus::NotDeclared
         );
     }
