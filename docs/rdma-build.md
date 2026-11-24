@@ -71,7 +71,14 @@ concurrently. Each request uses the caller's version selector and `If-Match`.
 The CLI checks each response against the version observed by HEAD and the requested range,
 consumes the results in byte order, and writes directly to the destination
 stream or temporary file. File downloads publish the temporary file after
-verifying the transfer count and any applicable object checksum.
+verifying the transfer count and any applicable object checksum. NIXL file
+reads and writes use the registered window directly when the CLI does not
+need the bytes for a checksum. For streaming I/O or whole-object checksum
+verification, the CLI uses a bounded local buffer. A checksummed file download
+writes the same bytes it hashes.
+A NIXL registration is sent only to the trusted endpoint of the verified
+HTTPS alias. The SDK signs the window descriptor, submits one request without
+redirects or retries, and keeps the window until it verifies the peer's response.
 A verified receipt releases the window. A local rejection before sending or
 an authenticated S3 `PreconditionFailed` response to an `If-Match` GET also
 releases it. For the latter, the client requires HTTP 412, a bounded S3

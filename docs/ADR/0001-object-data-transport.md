@@ -19,11 +19,13 @@ existing worker-thread configuration.
 The NIXL backend supplies agent metadata and a registered buffer description.
 The NVIDIA backend uses `rustfs-cuobject-client` for registered windows and transfer tokens. Its dependency `rustfs-cuobject-client-sys` builds the C++ bridge and links the NVIDIA client SDK. The window can be reused after
 a verified receipt or proof that DMA never started. An uncertain transfer retains both resources
-within the process registration budget. Both use the host-owned `ControlExecutor`. The S3 client signs and sends a bodyless
-HTTPS request on the shared S3 HTTP client using the alias timeout policy. It returns the status and headers directly,
-including duplicate headers. The provider verifies the RustFS transfer receipt
-and byte count. Credentials, endpoint addressing, custom headers, and TLS
-remain in the S3 client.
+within the process registration budget. Both use the host-owned `ControlExecutor`.
+For cuObject, the S3 client signs and sends the bodyless HTTPS request and
+returns the status and headers, including duplicates. For NIXL, the S3 client
+prepares a request bound to the alias endpoint, credentials and TLS policy.
+The NIXL SDK adds the window descriptor, signs and sends the request, and
+checks the peer's receipt and byte count before returning the window.
+Only the executable’s explicitly installed, trusted NIXL adapter receives alias signing material. Ordinary providers receive the `ControlExecutor` interface.
 
 External control requires an authenticated principal and verified HTTPS. Object
 paths and query values use the S3 encoding rules, with canonical path

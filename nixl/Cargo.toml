@@ -23,9 +23,17 @@ rustfs-cuobject-client = { path = "cuobject-client", features = ["client"], opti
 rustfs-cli = { path = "../crates/cli" }
 rc-core = { path = "../crates/core" }
 rc-s3 = { path = "../crates/s3" }
-rustfs-nixl = { git = "https://github.com/rustfs/rustfs", rev = "da6cf7f601f22a486cb18ac5fadf178e601aa6af", features = ["sys"] }
+rustfs-nixl = { git = "https://github.com/rustfs/rustfs", rev = "58d188a5b42ea995901e8ec83c23cb9543e0739e", features = ["client-http"] }
 async-trait = "0.1"
-base64 = "0.22"
 getrandom = "0.4"
 http = "1"
 tokio = { version = "1", features = ["io-util", "sync", "time"] }
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false }
+tempfile = "3"
+aws-credential-types = "1"
+bytes = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }

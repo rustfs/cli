@@ -109,17 +109,47 @@ impl Capability {
     }
 }
 
-impl ObjectDataTransportFactory for Factory {
-    fn create(&self, control: Arc<dyn ControlExecutor>) -> Result<Arc<dyn ObjectDataTransport>> {
-        Ok(Arc::new(Transport {
+impl Factory {
+    fn create_transport(
+        &self,
+        control: Arc<dyn ControlExecutor>,
+        signer: Option<Arc<dyn NixlSigningControl>>,
+    ) -> Arc<dyn ObjectDataTransport> {
+        Arc::new(Transport {
             support: self.support(control.endpoint()),
             control,
+            signed_requests: signer.map(|signer| SignedRequests {
+                signer,
+                http: Default::default(),
+            }),
             pools: Pools::new(self.backend),
-        }))
+        })
     }
 }
 
+impl ObjectDataTransportFactory for Factory {
+    fn create(&self, control: Arc<dyn ControlExecutor>) -> Result<Arc<dyn ObjectDataTransport>> {
+        Ok(self.create_transport(control, None))
+    }
+}
+
+impl TrustedNixlFactory for Factory {
+    fn create_with_signer(
+        &self,
+        control: Arc<dyn ControlExecutor>,
+        signer: Arc<dyn NixlSigningControl>,
+    ) -> Result<Arc<dyn ObjectDataTransport>> {
+        Ok(self.create_transport(control, Some(signer)))
+    }
+}
+
+struct SignedRequests {
+    signer: Arc<dyn NixlSigningControl>,
+    http: tokio::sync::OnceCell<rustfs_nixl::ClientWindowHttp>,
+}
+
 struct Transport {
+    signed_requests: Option<SignedRequests>,
     control: Arc<dyn ControlExecutor>,
     pools: Pools,
     support: Arc<EndpointSupport>,
@@ -146,9 +176,49 @@ fn unknown(source: Error) -> DataTransportError {
 impl Transport {
     async fn exchange(
         &self,
-        request: ControlRequest,
-        exposed: Exposed,
+        mut request: ControlRequest,
+        window: Window,
+        len: usize,
     ) -> DataTransportResult<(ControlResponse, Exposed)> {
+        if window.is_nixl() {
+            let method = request.method.clone();
+            let signed = self.signed_requests.as_ref().ok_or_else(|| {
+                unavailable(Error::UnsupportedFeature(
+                    "This executor cannot prepare native control requests".into(),
+                ))
+            })?;
+            let prepared = signed.signer.prepare(request).await.map_err(unavailable)?;
+            let http = signed
+                .http
+                .get_or_try_init(|| async {
+                    let builder = signed.signer.http_builder().await?;
+                    rustfs_nixl::ClientWindowHttp::new(builder).map_err(crate::buffer::nixl_error)
+                })
+                .await
+                .map_err(unavailable)?;
+            let mut exposed = window
+                .expose(&method, len, &mut HeaderMap::new())
+                .map_err(unavailable)?;
+            let response = exposed
+                .exchange_nixl(http, prepared)
+                .await
+                .map_err(unknown)?;
+            if response.rejected_before_dma {
+                return Err(rejected(Error::Conflict(
+                    "The S3 endpoint rejected the conditional GET before transferring data".into(),
+                )));
+            }
+            return Ok((
+                ControlResponse {
+                    status: response.status,
+                    headers: response.headers,
+                },
+                exposed,
+            ));
+        }
+        let exposed = window
+            .expose(&request.method, len, &mut request.headers)
+            .map_err(unavailable)?;
         match self.control.execute_registered(request).await {
             Ok(RegisteredControlResponse::Response(response)) => Ok((response, exposed)),
             Ok(RegisteredControlResponse::RejectedBeforeDma(error)) => {

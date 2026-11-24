@@ -37,7 +37,7 @@ async fn download(
         get_version,
     });
     let transport = Factory::new(RdmaBackend::Nixl)
-        .create(endpoint.clone())
+        .with_test_peer(endpoint.clone())
         .unwrap();
     let path = RemotePath::new("test", "bucket", "key");
     let options = rc_core::TransferReadOptions {
@@ -172,7 +172,7 @@ async fn only_proven_conditional_rejections_reuse_the_registered_window() {
     }
     let peer = Arc::new(Peer(Mutex::default()));
     let transport = Factory::new(RdmaBackend::Nixl)
-        .create(peer.clone())
+        .with_test_peer(peer.clone())
         .unwrap();
     let path = RemotePath::new("test", "bucket", "key");
     let opts = rc_core::TransferReadOptions::default();
@@ -214,6 +214,7 @@ async fn rustfs_declines_a_stale_conditional_get_before_dma() {
     let client = rc_s3::S3Client::new(alias).await.unwrap();
     let path = RemotePath::new("test", env("RC_TEST_BUCKET"), "known");
     let transport = Transport {
+        signed_requests: None,
         control: Arc::new(client),
         pools: Pools::new(RdmaBackend::CuObject),
         support: Arc::default(),
@@ -221,15 +222,9 @@ async fn rustfs_declines_a_stale_conditional_get_before_dma() {
     for _ in 0..20 {
         let mut headers = HeaderMap::new();
         headers.insert("if-match", HeaderValue::from_static("\"stale\""));
-        let exposed = transport
-            .pools
-            .reserve(4096)
-            .await
-            .unwrap()
-            .expose(&Method::GET, 4096, &mut headers)
-            .unwrap();
+        let window = transport.pools.reserve(4096).await.unwrap();
         let req = wire::request(Method::GET, &path, vec![], headers);
-        match transport.exchange(req, exposed).await {
+        match transport.exchange(req, window, 4096).await {
             Err(error) if matches!(error.source.as_deref(), Some(Error::Conflict(_))) => {}
             _ => panic!("expected an authenticated pre-transfer rejection"),
         }
@@ -342,7 +337,7 @@ async fn large_get_submits_both_ranges_and_publishes_in_order() {
             wrong_checksum,
         });
         let transport = Factory::new(RdmaBackend::Nixl)
-            .create(ranges.clone())
+            .with_test_peer(ranges.clone())
             .unwrap();
         let mut progress = Vec::new();
         let total = ranges.payload.len() as u64;
@@ -407,7 +402,7 @@ async fn one_declined_range_cannot_hide_an_unconfirmed_sibling() {
     }
     let endpoint = Arc::new(Endpoint(AtomicUsize::new(0)));
     let transport = Factory::new(RdmaBackend::Nixl)
-        .create(endpoint.clone())
+        .with_test_peer(endpoint.clone())
         .unwrap();
     let result = transport
         .download(
@@ -455,7 +450,7 @@ async fn ordinary_s3_is_probed_once_per_endpoint_backend_and_operation() {
     let endpoint = Arc::new(HttpOnly(AtomicUsize::new(0)));
     let mut readers = tokio::task::JoinSet::new();
     for _ in 0..20 {
-        let transport = factory.create(endpoint.clone()).unwrap();
+        let transport = factory.with_test_peer(endpoint.clone()).unwrap();
         readers.spawn(async move {
             let path = RemotePath::new("lab", "bucket", "key");
             let result = transport
@@ -480,7 +475,7 @@ async fn ordinary_s3_is_probed_once_per_endpoint_backend_and_operation() {
         task.unwrap();
     }
     assert_eq!(endpoint.0.load(Ordering::Relaxed), 1);
-    let transport = factory.create(endpoint.clone()).unwrap();
+    let transport = factory.with_test_peer(endpoint.clone()).unwrap();
     let staged = transport.staged_upload().unwrap();
     let path = RemotePath::new("lab", "bucket", "key");
     assert!(!staged.probe(&path, "upload", 1).await.unwrap());

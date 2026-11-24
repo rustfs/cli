@@ -12,9 +12,9 @@ pub(crate) const WINDOW: usize = rc_s3::multipart::DEFAULT_PART_SIZE as usize;
 const SMALL_WINDOW: usize = 1024 * 1024;
 const WINDOWS_PER_POOL: usize = 2;
 static AGENTS: Semaphore = Semaphore::const_new(8);
-// Keep the exposed registration and its budget, so the retired pool can free its idle buffers.
+// The SDK retains uncertain NIXL mappings. Both backends keep the pool budget; cuObject also retains its active token here.
 pub(super) type Budget = Arc<SemaphorePermit<'static>>;
-static QUARANTINE: Mutex<Vec<(Buffer, Budget)>> = Mutex::new(Vec::new());
+static QUARANTINE: Mutex<Vec<(Option<Buffer>, Budget)>> = Mutex::new(Vec::new());
 
 fn window_size(required: u64) -> usize {
     let required = required.clamp(SMALL_WINDOW as u64, WINDOW as u64) as usize;
@@ -197,14 +197,12 @@ pub(crate) struct Window {
     len: usize,
 }
 impl Window {
-    pub(crate) fn writable(&mut self) -> Result<&mut [u8]> {
-        self.buffer.as_mut().expect("owned window").writable()
+    pub(crate) fn buffer(&mut self) -> &mut Buffer {
+        self.buffer.as_mut().expect("owned window")
     }
-    pub(crate) fn received(&mut self) -> Result<&[u8]> {
-        let len = self.len;
-        self.writable()?
-            .get(..len)
-            .ok_or_else(|| Error::General("Received length exceeds the registered window".into()))
+
+    pub(crate) fn len(&self) -> usize {
+        self.len
     }
 
     pub(crate) fn finish_read(&mut self, len: usize) -> Result<()> {
@@ -217,29 +215,40 @@ impl Window {
         Ok(())
     }
 
+    pub(crate) fn is_nixl(&self) -> bool {
+        matches!(self.buffer, Some(Buffer::Nixl(_)))
+    }
+
     pub(crate) fn expose(
-        self,
+        mut self,
         _method: &Method,
         len: usize,
-        headers: &mut HeaderMap,
+        _headers: &mut HeaderMap,
     ) -> Result<Exposed> {
-        let mut exposed = Exposed(Some(self));
-        let buffer = exposed.window_mut().buffer.as_mut().expect("owned window");
-        let result = match buffer {
-            Buffer::Nixl {
-                chunk,
-                agent,
-                metadata,
-            } => crate::wire::bind(headers, agent, metadata, chunk.addr(), len),
+        match self.buffer.take().expect("owned window") {
+            Buffer::Nixl(idle) => {
+                let mut exposed = Exposed {
+                    window: Some(self),
+                    transfer: None,
+                };
+                exposed.transfer = Some(idle.begin(len).map_err(buffer::nixl_error)?);
+                Ok(exposed)
+            }
             #[cfg(feature = "cuobject")]
-            Buffer::CuObject(buffer) => buffer.describe(_method, len, headers),
-        };
-        if let Err(error) = result {
-            // The token has not left this process. Release it before reuse.
-            exposed.finished()?;
-            return Err(error);
+            Buffer::CuObject(mut host) => {
+                let result = host.describe(_method, len.max(1), _headers);
+                self.buffer = Some(Buffer::CuObject(host));
+                let exposed = Exposed {
+                    window: Some(self),
+                    transfer: None,
+                };
+                if let Err(error) = result {
+                    exposed.finished()?;
+                    return Err(error);
+                }
+                Ok(exposed)
+            }
         }
-        Ok(exposed)
     }
 }
 
@@ -256,29 +265,57 @@ impl Drop for Window {
     }
 }
 
-pub(crate) struct Exposed(Option<Window>);
+pub(crate) struct Exposed {
+    window: Option<Window>,
+    transfer: Option<rustfs_nixl::ClientWindowTransfer>,
+}
+
 impl Exposed {
     fn window_mut(&mut self) -> &mut Window {
-        self.0.as_mut().expect("owned transfer")
+        self.window.as_mut().expect("owned transfer")
+    }
+
+    pub(crate) async fn exchange_nixl(
+        &mut self,
+        http: &rustfs_nixl::ClientWindowHttp,
+        request: rc_s3::data_transport::NixlSigningRequest,
+    ) -> Result<rustfs_nixl::ClientWindowResponse> {
+        let transfer = self.transfer.take().expect("pending NIXL transfer");
+        let mut response = transfer
+            .exchange(http, request.request, &request.credentials, &request.region)
+            .await
+            .map_err(buffer::nixl_error)?;
+        self.window_mut().buffer = response.window.take().map(Buffer::Nixl);
+        Ok(response)
     }
 
     pub(crate) fn finished(mut self) -> Result<Window> {
-        #[cfg(feature = "cuobject")]
-        if let Some(Buffer::CuObject(host)) = self.window_mut().buffer.as_mut() {
-            host.release_token()?;
+        match self.window_mut().buffer.as_mut() {
+            Some(Buffer::Nixl(_)) => {}
+            #[cfg(feature = "cuobject")]
+            Some(Buffer::CuObject(host)) => host.release_token()?,
+            None => {
+                return Err(Error::General(
+                    "NIXL did not confirm the registered window is idle".into(),
+                ));
+            }
         }
-        Ok(self.0.take().expect("owned transfer"))
+        Ok(self.window.take().expect("owned transfer"))
     }
 }
+
 impl Drop for Exposed {
     fn drop(&mut self) {
-        if let Some(mut window) = self.0.take() {
-            let buffer = window.buffer.take().expect("owned transfer");
+        if let Some(mut window) = self.window.take() {
+            if window.is_nixl() {
+                // The SDK has returned an idle window after checking the peer's response.
+                return;
+            }
             window.pool.lost.send_modify(|lost| *lost += 1);
             QUARANTINE
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .push((buffer, Arc::clone(&window.pool.budget)));
+                .push((window.buffer.take(), Arc::clone(&window.pool.budget)));
         }
     }
 }
@@ -342,7 +379,7 @@ mod tests {
                 None
             };
             if let Some(window) = old.as_mut() {
-                window.writable().unwrap()[0] = 27;
+                window.buffer().write_at(0, &[27]).unwrap();
             }
             let read = pools
                 .reserve_with_capacity(size, 4, WINDOW_WAIT, reject_wide)
@@ -352,7 +389,16 @@ mod tests {
             let baseline = read.pool.clone();
             if let Some(window) = old.as_mut() {
                 assert!(Arc::ptr_eq(&window.pool, &baseline));
-                assert_eq!(window.writable().unwrap()[0], 27);
+                assert_eq!(
+                    window
+                        .buffer()
+                        .received(1)
+                        .unwrap()
+                        .next_chunk()
+                        .unwrap()
+                        .unwrap(),
+                    &[27]
+                );
             }
             drop((old, read));
             let next = pools
@@ -382,7 +428,7 @@ mod tests {
         let pools = Pools::new(RdmaBackend::Nixl);
         let mut old_put = pools.reserve(size).await.unwrap();
         assert_eq!(old_put.pool.capacity, 2);
-        old_put.writable().unwrap()[0] = 37;
+        old_put.buffer().write_at(0, &[37]).unwrap();
         let mut reads = Vec::new();
         for _ in 0..4 {
             reads.push(pools.reserve_read(size, size).await.unwrap());
@@ -392,14 +438,31 @@ mod tests {
                 .iter()
                 .all(|w| w.pool.capacity == 4 && Arc::ptr_eq(&reads[0].pool, &w.pool))
         );
-        let mut addresses: Vec<_> = reads
-            .iter_mut()
-            .map(|w| w.writable().unwrap().as_ptr())
-            .collect();
-        addresses.sort();
-        addresses.dedup();
-        assert_eq!(addresses.len(), 4);
-        assert_eq!(old_put.writable().unwrap()[0], 37);
+        for (index, window) in reads.iter_mut().enumerate() {
+            window.buffer().write_at(0, &[index as u8]).unwrap();
+        }
+        for (index, window) in reads.iter_mut().enumerate() {
+            assert_eq!(
+                window
+                    .buffer()
+                    .received(1)
+                    .unwrap()
+                    .next_chunk()
+                    .unwrap()
+                    .unwrap(),
+                &[index as u8]
+            );
+        }
+        assert_eq!(
+            old_put
+                .buffer()
+                .received(1)
+                .unwrap()
+                .next_chunk()
+                .unwrap()
+                .unwrap(),
+            &[37]
+        );
         assert!(!Arc::ptr_eq(&reads[0].pool, &old_put.pool));
         let expiry = Duration::from_millis(30);
         assert!(
@@ -442,6 +505,29 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires exclusive access to the native registration budget"]
     async fn quota_preserves_existing_buffers_and_quarantine_retires_all_four() {
+        use rc_s3::data_transport::{ControlExecutor, ControlRequest, ControlResponse};
+
+        #[derive(Default)]
+        struct Peer(Mutex<Vec<http::HeaderValue>>);
+        #[async_trait::async_trait]
+        impl ControlExecutor for Peer {
+            async fn execute_headers(&self, request: ControlRequest) -> Result<ControlResponse> {
+                let count = {
+                    let mut seen = self.0.lock().unwrap();
+                    seen.push(request.headers[rustfs_nixl::NIXL_BUFFER_HEADER].clone());
+                    seen.len()
+                };
+                if count == 5 {
+                    return crate::loopback::Receipt(4 << 20)
+                        .execute_headers(request)
+                        .await;
+                }
+                Ok(ControlResponse {
+                    status: http::StatusCode::OK,
+                    headers: HeaderMap::new(),
+                })
+            }
+        }
         let size = 4 << 20;
         let pools = Pools::new(RdmaBackend::Nixl);
         let ordinary = pools.reserve(size).await.unwrap();
@@ -459,15 +545,19 @@ mod tests {
         let mut exposed = Vec::new();
         for _ in 0..4 {
             let window = pools.reserve_read(size, size).await.unwrap();
-            exposed.push(Exposed(Some(window)));
+            exposed.push(
+                window
+                    .expose(&Method::GET, size as usize, &mut HeaderMap::new())
+                    .unwrap(),
+            );
         }
-        let old = Arc::clone(&exposed[0].0.as_ref().unwrap().pool);
+        let old = Arc::clone(&exposed[0].window.as_ref().unwrap().pool);
         assert!(first.upgrade().is_none());
-        let old_addresses: Vec<_> = exposed
-            .iter_mut()
-            .map(|x| x.window_mut().writable().unwrap().as_ptr() as usize)
-            .collect();
-        exposed.pop();
+        let peer = Arc::new(Peer::default());
+        for window in &mut exposed {
+            crate::loopback::transfer(peer.clone(), Method::GET, window).await;
+        }
+        assert!(exposed.pop().unwrap().finished().is_err());
         assert_eq!(*old.lost.borrow(), 1);
         assert!(
             tokio::time::timeout(Duration::from_millis(30), pools.reserve_read(size, size))
@@ -476,9 +566,16 @@ mod tests {
         );
         drop(exposed);
         assert_eq!(*old.lost.borrow(), 4);
-        let mut fresh = pools.reserve_read(size, size).await.unwrap();
+        let fresh = pools.reserve_read(size, size).await.unwrap();
         assert!(!Arc::ptr_eq(&fresh.pool, &old));
-        assert!(!old_addresses.contains(&(fresh.writable().unwrap().as_ptr() as usize)));
+        let mut transfer = fresh
+            .expose(&Method::GET, size as usize, &mut HeaderMap::new())
+            .unwrap();
+        crate::loopback::transfer(peer.clone(), Method::GET, &mut transfer).await;
+        assert!(transfer.finished().is_ok());
+        let seen = peer.0.lock().unwrap();
+        assert_eq!(seen.len(), 5);
+        assert!(!seen[..4].contains(&seen[4]));
         let retained = QUARANTINE.lock().unwrap();
         assert_eq!(
             retained
@@ -529,6 +626,41 @@ mod tests {
         (exposed, None)
     }
 
+    async fn parked_transfer(
+        mut exposed: Exposed,
+        method: Method,
+        started: tokio::sync::oneshot::Sender<()>,
+        release: Arc<tokio::sync::Notify>,
+    ) -> Result<Window> {
+        if exposed.transfer.is_some() {
+            struct WaitingPeer(
+                Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+                Arc<tokio::sync::Notify>,
+            );
+            #[async_trait::async_trait]
+            impl rc_s3::data_transport::ControlExecutor for WaitingPeer {
+                async fn execute_headers(
+                    &self,
+                    req: rc_s3::data_transport::ControlRequest,
+                ) -> Result<rc_s3::data_transport::ControlResponse> {
+                    self.0.lock().unwrap().take().unwrap().send(()).unwrap();
+                    self.1.notified().await;
+                    crate::loopback::Receipt(32).execute_headers(req).await
+                }
+            }
+            crate::loopback::transfer(
+                Arc::new(WaitingPeer(Mutex::new(Some(started)), release)),
+                method,
+                &mut exposed,
+            )
+            .await;
+        } else {
+            started.send(()).unwrap();
+            release.notified().await;
+        }
+        exposed.finished()
+    }
+
     async fn check_window_lifetime(backend: RdmaBackend) {
         let pools = Pools::new(backend);
         let first = pools.reserve(32).await.unwrap();
@@ -549,26 +681,39 @@ mod tests {
         if backend == RdmaBackend::CuObject {
             assert!(headers[crate::nvidia::TOKEN_HEADER].is_sensitive());
         }
-        let exchanging = |exposed: Exposed| async move {
-            std::future::pending::<()>().await;
-            exposed.finished()
-        };
         let (started, ready) = tokio::sync::oneshot::channel();
-        let cancelled = tokio::spawn(async move {
-            started.send(()).unwrap();
-            exchanging(first).await
-        });
+        let release = Arc::new(tokio::sync::Notify::new());
+        let cancelled = tokio::spawn(parked_transfer(
+            first,
+            Method::GET,
+            started,
+            release.clone(),
+        ));
         ready.await.unwrap();
         cancelled.abort();
         assert!(matches!(cancelled.await, Err(e) if e.is_cancelled()));
+        release.notify_one();
         let mut put_headers = HeaderMap::new();
         let second = second.expose(&Method::PUT, 32, &mut put_headers).unwrap();
         let (second, second_releases) = observe(second);
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut waiting_for_peer = Box::pin(parked_transfer(
+            second,
+            Method::PUT,
+            started,
+            release.clone(),
+        ));
+        tokio::select! {
+            _ = &mut waiting_for_peer => panic!("the peer is still holding the response"),
+            result = ready => result.unwrap(),
+        }
         assert!(
-            tokio::time::timeout(Duration::from_millis(1), exchanging(second))
+            tokio::time::timeout(Duration::from_millis(1), waiting_for_peer)
                 .await
                 .is_err()
         );
+        release.notify_one();
         tokio::select! {
             biased;
             result = waiting => assert!(result.unwrap().is_none()),
@@ -582,18 +727,26 @@ mod tests {
                 &put_headers[crate::nvidia::TOKEN_HEADER],
             ] {
                 assert!(retained.iter().any(|(buffer, budget)| Arc::ptr_eq(budget, &old.budget)
-                    && matches!(buffer, Buffer::CuObject(host) if host.holds_token(advertised))));
+                    && matches!(buffer, Some(Buffer::CuObject(host)) if host.holds_token(advertised))));
             }
         }
         let replacement = pools.reserve(3 * SMALL_WINDOW as u64).await.unwrap();
         assert_eq!(replacement.pool.size, 4 * SMALL_WINDOW);
         assert!(!Arc::ptr_eq(&old, &replacement.pool));
         let fresh_pool = replacement.pool.clone();
-        let (completed, completed_releases) = observe(
+        let (mut completed, completed_releases) = observe(
             replacement
                 .expose(&Method::GET, 32, &mut HeaderMap::new())
                 .unwrap(),
         );
+        if backend == RdmaBackend::Nixl {
+            crate::loopback::transfer(
+                Arc::new(crate::loopback::Receipt(32)),
+                Method::GET,
+                &mut completed,
+            )
+            .await;
+        }
         let returned = completed.finished().unwrap();
         if let Some(count) = &completed_releases {
             assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);

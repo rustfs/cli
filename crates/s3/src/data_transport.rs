@@ -40,7 +40,39 @@ pub enum RegisteredControlResponse {
     RejectedBeforeDma(Error),
 }
 
-/// Host-owned HTTPS, credentials, signing, custom headers, and TLS configuration.
+/// Request and signing material for the trusted NIXL adapter installed by the executable.
+/// The adapter signs after adding the registered descriptor and owns the HTTP exchange.
+pub struct NixlSigningRequest {
+    pub request: reqwest::RequestBuilder,
+    pub credentials: aws_credential_types::Credentials,
+    pub region: String,
+}
+
+/// Alias-bound signing authority. Only the explicitly installed NIXL adapter receives this port.
+#[async_trait]
+pub trait NixlSigningControl: Send + Sync {
+    async fn http_builder(&self) -> Result<reqwest::ClientBuilder>;
+    async fn prepare(&self, request: ControlRequest) -> Result<NixlSigningRequest>;
+}
+
+/// A trusted executable integration that needs to sign registered descriptors inside its SDK.
+pub trait TrustedNixlFactory: Send + Sync {
+    fn create_with_signer(
+        &self,
+        control: Arc<dyn ControlExecutor>,
+        signer: Arc<dyn NixlSigningControl>,
+    ) -> Result<Arc<dyn ObjectDataTransport>>;
+}
+
+/// Host-owned HTTPS, signed control requests, custom headers and TLS configuration.
+/// An ordinary provider cannot obtain the alias signing material from this port.
+///
+/// ```compile_fail,E0599
+/// use rc_s3::data_transport::{ControlExecutor, ControlRequest, NixlSigningControl};
+/// async fn prepare(control: &dyn ControlExecutor, request: ControlRequest) {
+///     let _ = control.prepare(request).await;
+/// }
+/// ```
 #[async_trait]
 pub trait ControlExecutor: Send + Sync {
     /// Stable endpoint for sharing provider capability discovery across clients.
@@ -68,13 +100,16 @@ pub trait ObjectDataTransportFactory: Send + Sync {
     fn create(&self, control: Arc<dyn ControlExecutor>) -> Result<Arc<dyn ObjectDataTransport>>;
 }
 
-static NIXL_FACTORY: OnceLock<Arc<dyn ObjectDataTransportFactory>> = OnceLock::new();
+#[derive(Clone)]
+pub(crate) enum InstalledFactory {
+    Provider(Arc<dyn ObjectDataTransportFactory>),
+    TrustedNixl(Arc<dyn TrustedNixlFactory>),
+}
 
-static CUOBJECT_FACTORY: OnceLock<Arc<dyn ObjectDataTransportFactory>> = OnceLock::new();
+static NIXL_FACTORY: OnceLock<InstalledFactory> = OnceLock::new();
+static CUOBJECT_FACTORY: OnceLock<InstalledFactory> = OnceLock::new();
 
-fn factory_slot(
-    backend: rc_core::RdmaBackend,
-) -> &'static OnceLock<Arc<dyn ObjectDataTransportFactory>> {
+fn factory_slot(backend: rc_core::RdmaBackend) -> &'static OnceLock<InstalledFactory> {
     match backend {
         rc_core::RdmaBackend::Nixl => &NIXL_FACTORY,
         rc_core::RdmaBackend::CuObject => &CUOBJECT_FACTORY,
@@ -93,12 +128,26 @@ pub fn install_rdma_backend(
     backend: rc_core::RdmaBackend,
     factory: Arc<dyn ObjectDataTransportFactory>,
 ) -> Result<()> {
+    install_factory(backend, InstalledFactory::Provider(factory))
+}
+
+/// Install the executable's trusted signing adapter before running the CLI. This grants
+/// access to alias signing material and shares the one-time NIXL registration slot.
+/// Ordinary providers installed through `install_rdma_backend` receive only `ControlExecutor`.
+pub fn install_trusted_nixl_factory(factory: Arc<dyn TrustedNixlFactory>) -> Result<()> {
+    install_factory(
+        rc_core::RdmaBackend::Nixl,
+        InstalledFactory::TrustedNixl(factory),
+    )
+}
+
+fn install_factory(backend: rc_core::RdmaBackend, factory: InstalledFactory) -> Result<()> {
     factory_slot(backend).set(factory).map_err(|_| {
         Error::Config("An object data transport factory is already installed".to_string())
     })
 }
 
-pub(crate) fn installed_factory() -> Option<Arc<dyn ObjectDataTransportFactory>> {
+pub(crate) fn installed_factory() -> Option<InstalledFactory> {
     factory_slot(rc_core::global_rdma_backend()).get().cloned()
 }
 

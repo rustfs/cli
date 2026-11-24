@@ -1,12 +1,9 @@
 //! RustFS S3-over-NIXL request and response fields.
 
-use http::{HeaderMap, HeaderValue, Method, StatusCode};
+use http::{HeaderMap, Method, StatusCode};
 use rc_core::{Error, RemotePath, Result};
 use rc_s3::data_transport::ControlRequest;
-use rustfs_nixl::{
-    NIXL_AGENT_HEADER, NIXL_BUFFER_HEADER, NIXL_METADATA_HEADER, RDMA_BYTES_TRANSFERRED_HEADER,
-    RDMA_REPLY_HEADER,
-};
+use rustfs_nixl::{RDMA_BYTES_TRANSFERRED_HEADER, RDMA_REPLY_HEADER};
 
 pub(crate) fn request(
     method: Method,
@@ -20,22 +17,6 @@ pub(crate) fn request(
         query,
         headers,
     }
-}
-
-pub(crate) fn bind(
-    headers: &mut HeaderMap,
-    agent: &HeaderValue,
-    metadata: &HeaderValue,
-    address: usize,
-    len: usize,
-) -> Result<()> {
-    let mut buffer = HeaderValue::from_str(&format!("dram:0:{address}:{len}"))
-        .map_err(|_| Error::General("Invalid NIXL buffer description".into()))?;
-    buffer.set_sensitive(true);
-    headers.insert(NIXL_AGENT_HEADER, agent.clone());
-    headers.insert(NIXL_METADATA_HEADER, metadata.clone());
-    headers.insert(NIXL_BUFFER_HEADER, buffer);
-    Ok(())
 }
 
 pub(crate) fn field<'a>(headers: &'a HeaderMap, name: &str) -> Result<Option<&'a str>> {

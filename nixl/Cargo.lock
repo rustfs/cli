@@ -1593,6 +1593,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 
 [[package]]
+name = "httpdate"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
+
+[[package]]
 name = "humansize"
 version = "2.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1624,6 +1630,7 @@ dependencies = [
  "http",
  "http-body",
  "httparse",
+ "httpdate",
  "itoa",
  "pin-project-lite",
  "smallvec",
@@ -2606,6 +2613,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "quick-xml"
+version = "0.42.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "41b1177fdf999d2321d3fb46ff47159d9c1fb9ad66a4879f8c50a0b504615e9b"
+dependencies = [
+ "memchr",
+ "serde",
+]
+
+[[package]]
 name = "quinn"
 version = "0.11.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2788,7 +2805,7 @@ dependencies = [
  "http-body-util",
  "jiff",
  "md-5 0.10.6",
- "quick-xml",
+ "quick-xml 0.41.0",
  "rc-core",
  "reqwest",
  "serde",
@@ -2975,7 +2992,7 @@ dependencies = [
  "indicatif",
  "jiff",
  "mime_guess",
- "quick-xml",
+ "quick-xml 0.41.0",
  "rc-core",
  "rc-s3",
  "serde",
@@ -2997,14 +3014,20 @@ name = "rustfs-cli-nixl"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "aws-credential-types",
+ "bytes",
  "getrandom 0.4.3",
  "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "rc-core",
  "rc-s3",
+ "reqwest",
  "rustfs-cli",
  "rustfs-cuobject-client",
  "rustfs-nixl",
+ "tempfile",
  "tokio",
 ]
 
@@ -3026,13 +3049,20 @@ dependencies = [
 [[package]]
 name = "rustfs-nixl"
 version = "1.0.5"
-source = "git+https://github.com/rustfs/rustfs?rev=da6cf7f601f22a486cb18ac5fadf178e601aa6af#da6cf7f601f22a486cb18ac5fadf178e601aa6af"
+source = "git+https://github.com/rustfs/rustfs?rev=58d188a5b42ea995901e8ec83c23cb9543e0739e#58d188a5b42ea995901e8ec83c23cb9543e0739e"
 dependencies = [
+ "aws-credential-types",
+ "aws-sigv4",
  "base64-simd",
  "bytes",
+ "libc",
  "memmap2",
  "nixl-sys",
  "parking_lot 0.13.0",
+ "quick-xml 0.42.0",
+ "reqwest",
+ "rustix",
+ "serde",
  "thiserror",
  "tokio",
  "tracing",
