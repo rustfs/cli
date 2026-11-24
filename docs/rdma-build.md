@@ -61,8 +61,11 @@ File uploads use positional reads directly into two reusable registered
 windows. Each completed part frees a window for the next part, and S3 receives
 the completion list in part-number order. A new pool sizes each window to the
 next power of two that fits the requested part or range, with a 1 MiB minimum
-and a 64 MiB maximum. For example, a 4 MiB range registers two 4 MiB windows.
-A client can reuse its existing larger pool for subsequent small requests.
+and a 64 MiB maximum. A client can reuse its existing larger pool for subsequent
+small requests. For NIXL reads covering an entire 4, 8, or 16 MiB object, the
+client can register four windows for concurrent downloads. If registration fails,
+the transport uses two windows for that size and larger sizes. Uploads and
+other NIXL reads share a limit of two ordinary windows.
 For large downloads, NIXL and cuObject issue up to two adjacent range GETs
 concurrently. Each request uses the caller's version selector and `If-Match`.
 The CLI checks each response against the version observed by HEAD and the requested range,
@@ -75,7 +78,7 @@ releases it. For the latter, the client requires HTTP 412, a bounded S3
 error document and no RDMA response headers. An ambiguous response, a
 missing receipt, cancellation or timeout retains the token and window until
 the process exits.
-When both windows are unavailable for this reason, waiting operations use a
+When all windows in a pool are unavailable for this reason, waiting operations use a
 fresh pool within the process registration budget. Retiring a cuObject pool
 releases its idle registrations. Each quarantined window keeps its own
 registration and the pool's budget reservation. A native registration also

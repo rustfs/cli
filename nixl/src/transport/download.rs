@@ -231,7 +231,7 @@ impl Transport {
             let second = (length - next).min(WINDOW as u64);
             // Reserve the earlier range first. It can finish and release its window
             // even if other downloads or a quarantined window leave only one slot.
-            let window = self.pools.reserve(first).await.map_err(|e| {
+            let window = self.pools.reserve_read(first, total).await.map_err(|e| {
                 if offset == 0 {
                     unavailable(e)
                 } else {
@@ -260,7 +260,11 @@ impl Transport {
                 break;
             }
             let fetch_second = async {
-                let window = self.pools.reserve(second).await.map_err(unavailable)?;
+                let window = self
+                    .pools
+                    .reserve_read(second, total)
+                    .await
+                    .map_err(unavailable)?;
                 self.fetch(&selection, next, second as usize, true, window)
                     .await
             };

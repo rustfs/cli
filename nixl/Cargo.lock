@@ -3026,7 +3026,7 @@ dependencies = [
 [[package]]
 name = "rustfs-nixl"
 version = "1.0.5"
-source = "git+https://github.com/rustfs/rustfs?rev=b86624520c99de06d9e36b971520a7071ca54b4c#b86624520c99de06d9e36b971520a7071ca54b4c"
+source = "git+https://github.com/rustfs/rustfs?rev=da6cf7f601f22a486cb18ac5fadf178e601aa6af#da6cf7f601f22a486cb18ac5fadf178e601aa6af"
 dependencies = [
  "base64-simd",
  "bytes",
