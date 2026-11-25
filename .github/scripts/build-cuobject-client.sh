@@ -29,3 +29,4 @@ export LIBRARY_PATH="$CUOBJCLIENT_ROOT/lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
 export NIXL_PLUGIN_DIR="$NIXL_PREFIX/lib/plugins"
 ./scripts/build-rdma.sh --features cuobject
 cargo test --locked --manifest-path nixl/Cargo.toml --features cuobject
+cargo test --locked --manifest-path nixl/Cargo.toml -p rustfs-rdma-client --no-default-features --features cuobject

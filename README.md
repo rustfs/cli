@@ -71,7 +71,7 @@ cd cli
 cargo build --release
 ```
 
-To use RustFS native NIXL/UCX for object transfers, build the [Linux RDMA client](docs/rdma-build.md#rustfs-native-nixlucx).
+For native NIXL/UCX and NVIDIA cuObject transfers, [build the Linux CLI](docs/rdma-build.md#build-the-native-client) or [use the RDMA client in a Rust application](docs/rdma-build.md#embed-the-rust-client).
 
 ## Quick Start
 

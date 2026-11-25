@@ -4,6 +4,7 @@ use rustfs_nixl::{NixlConfig, NixlServer, RdmaToken};
 
 #[tokio::test]
 async fn rustfs_reads_and_writes_the_advertised_host_window() {
+    let _guard = crate::pool::NATIVE_TEST_LOCK.lock().await;
     let client = Pools::default();
     let peer = NixlServer::new(&NixlConfig {
         agent_name: "rc-interop-peer".into(),

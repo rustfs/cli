@@ -16,6 +16,15 @@ checksum verification and receipt handling.
 The common launcher preserves command dispatch, output, exit codes, and the
 existing worker-thread configuration.
 
+The separate native workspace contains the reusable `rustfs-rdma-client`
+library. It implements the provider ports from `rc-s3`; only the launcher
+depends on `rustfs-cli`. Applications use `RdmaProvider::client` with an
+explicit alias and transfer mode. This constructor bypasses the CLI provider
+registry and CLI request headers. Reusing a provider shares endpoint capability
+probes across its clients. Each client creates its window pools on demand.
+The library keeps registered buffers, token ownership and wire fields private.
+Cargo features select the NIXL and NVIDIA native dependencies independently.
+
 The NIXL backend supplies agent metadata and a registered buffer description.
 The NVIDIA backend uses `rustfs-cuobject-client` for registered windows and transfer tokens. Its dependency `rustfs-cuobject-client-sys` builds the C++ bridge and links the NVIDIA client SDK. The window can be reused after
 a verified receipt or proof that DMA never started. An uncertain transfer retains both resources

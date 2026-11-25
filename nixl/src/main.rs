@@ -1,24 +1,21 @@
 //! rc with native S3-over-RDMA providers.
 #![forbid(unsafe_code)]
 
-mod buffer;
-#[cfg(feature = "cuobject")]
-mod nvidia;
-mod pool;
-mod transport;
-mod wire;
-
-use rc_core::RdmaBackend;
+use rustfs_rdma_client::{RdmaBackend, RdmaProvider};
+use std::sync::Arc;
 
 fn register(backend: RdmaBackend) {
-    let factory = std::sync::Arc::new(transport::Factory::new(backend));
-    if let Err(error) = rc_s3::data_transport::install_rdma_backend(backend, factory) {
+    let result = RdmaProvider::new(backend).and_then(|provider| {
+        rc_s3::data_transport::install_rdma_backend(backend, Arc::new(provider))
+    });
+    if let Err(error) = result {
         eprintln!("{error}");
         std::process::exit(error.exit_code());
     }
 }
 
 fn main() {
+    #[cfg(feature = "nixl")]
     register(RdmaBackend::Nixl);
     #[cfg(feature = "cuobject")]
     register(RdmaBackend::CuObject);

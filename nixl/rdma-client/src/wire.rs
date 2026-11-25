@@ -1,12 +1,15 @@
-//! RustFS S3-over-NIXL request and response fields.
+//! RustFS S3-over-RDMA request and response fields.
 
-use http::{HeaderMap, HeaderValue, Method, StatusCode};
+#[cfg(feature = "nixl")]
+use http::HeaderValue;
+use http::{HeaderMap, Method, StatusCode};
 use rc_core::{Error, RemotePath, Result};
 use rc_s3::data_transport::ControlRequest;
-use rustfs_nixl::{
-    NIXL_AGENT_HEADER, NIXL_BUFFER_HEADER, NIXL_METADATA_HEADER, RDMA_BYTES_TRANSFERRED_HEADER,
-    RDMA_REPLY_HEADER,
-};
+#[cfg(feature = "nixl")]
+use rustfs_nixl::{NIXL_AGENT_HEADER, NIXL_BUFFER_HEADER, NIXL_METADATA_HEADER};
+
+pub(crate) const RDMA_REPLY_HEADER: &str = "x-amz-rdma-reply";
+const RDMA_BYTES_TRANSFERRED_HEADER: &str = "x-amz-rdma-bytes-transferred";
 
 pub(crate) fn request(
     method: Method,
@@ -22,6 +25,7 @@ pub(crate) fn request(
     }
 }
 
+#[cfg(feature = "nixl")]
 pub(crate) fn bind(
     headers: &mut HeaderMap,
     agent: &HeaderValue,
@@ -93,5 +97,5 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "nixl"))]
 mod native_test;

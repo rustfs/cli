@@ -11,6 +11,10 @@ pub(crate) const WINDOW: usize = rc_s3::multipart::DEFAULT_PART_SIZE as usize;
 const SMALL_WINDOW: usize = 1024 * 1024;
 const WINDOWS_PER_POOL: usize = 2;
 static AGENTS: Semaphore = Semaphore::const_new(8);
+// Several tests intentionally quarantine registrations for the life of the process.
+// Run independent native scenarios one at a time against the shared registration budget.
+#[cfg(test)]
+pub(crate) static NATIVE_TEST_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
 // Keep the exposed registration and its budget, so the retired pool can free its idle buffers.
 pub(super) type Budget = Arc<SemaphorePermit<'static>>;
 static QUARANTINE: Mutex<Vec<(Buffer, Budget)>> = Mutex::new(Vec::new());
@@ -139,6 +143,7 @@ impl Window {
         let mut exposed = Exposed(Some(self));
         let buffer = exposed.window_mut().buffer.as_mut().expect("owned window");
         let result = match buffer {
+            #[cfg(feature = "nixl")]
             Buffer::Nixl {
                 chunk,
                 agent,
@@ -208,6 +213,7 @@ mod tests {
         assert_eq!(window_size(u64::MAX), WINDOW);
     }
 
+    #[cfg(feature = "nixl")]
     #[tokio::test]
     async fn uncertain_windows_wake_waiters_and_cannot_be_reissued() {
         check_window_lifetime(RdmaBackend::Nixl).await;
@@ -242,6 +248,7 @@ mod tests {
     }
 
     async fn check_window_lifetime(backend: RdmaBackend) {
+        let _guard = NATIVE_TEST_LOCK.lock().await;
         let pools = Pools::new(backend);
         let first = pools.reserve(32).await.unwrap();
         let second = pools.reserve(32).await.unwrap();
