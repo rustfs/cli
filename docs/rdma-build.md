@@ -34,7 +34,7 @@ to the same executable, install the NVIDIA cuObject **client** SDK,
 cuFile development libraries, libibverbs development headers and CUDA headers
 for the target architecture.
 Set `CUOBJCLIENT_ROOT` to the SDK prefix and `CUDA_HOME` to the CUDA toolkit.
-The `rustfs-cuobject-client-sys` crate builds the C++17 adapter against `cuobjclient.h` and links the NVIDIA SDK. The CLI accesses registered windows and tokens through `rustfs-cuobject-client`.
+The `rustfs-cuobject-client-sys` crate builds the C++17 adapter against `cuobjclient.h` and links the NVIDIA SDK. The RDMA provider accesses registered windows and tokens through `rustfs-cuobject-client`.
 The SDK's `libcuobjclient`, `libcufile` and RDMA plugin must be available
 at runtime. Set `CUOBJ_ENV_PATH_JSON` to the NVIDIA client configuration
 that selects the application RDMA device.
@@ -122,3 +122,35 @@ c++ -std=c++17 -fPIC -shared -I"$CUOBJCLIENT_ROOT/include" -I"$CUDA_HOME/include
 LD_PRELOAD=/tmp/rc-test-failed-deregistration.so cargo test --manifest-path nixl/Cargo.toml \
   -p rustfs-cuobject-client --features client --test registration_budget -- --ignored
 ```
+
+## Embed the Rust client
+
+Add the SDK from the CLI repository to your application's `Cargo.toml`.
+Choose `nixl`, `cuobject`, or both. Each feature requires
+the corresponding native libraries described above. The default is `nixl`.
+
+```toml
+[dependencies]
+rustfs-rdma-client = { git = "https://github.com/rustfs/cli", default-features = false, features = ["cuobject"] }
+```
+
+For a local checkout, replace the `git` key with `path = "../cli/nixl/rdma-client"`.
+
+The following function accepts the endpoint configuration and object key from
+the application. Run it on a Tokio runtime. Reuse a provider for clients that
+should share endpoint capability probes, and reuse each client across transfers.
+
+```rust
+use rustfs_rdma_client::{Alias, DataTransportMode, ObjectStore, RdmaBackend, RdmaProvider, RemotePath, Result};
+
+async fn download(alias: Alias, path: &RemotePath) -> Result<Vec<u8>> {
+    let provider = RdmaProvider::new(RdmaBackend::CuObject)?;
+    let client = provider.client(alias, DataTransportMode::Rdma).await?;
+    client.get_object(path).await
+}
+```
+
+`RdmaProvider::new` returns `Error::UnsupportedFeature` for a backend
+omitted from the build. Native memory registration happens on demand during
+transfer. Use `DataTransportMode::Auto` to permit safe HTTP fallback.
+Both backends transfer through SDK-managed host memory.

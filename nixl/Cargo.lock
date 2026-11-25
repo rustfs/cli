@@ -2996,16 +2996,9 @@ dependencies = [
 name = "rustfs-cli-nixl"
 version = "0.1.0"
 dependencies = [
- "async-trait",
- "base64 0.22.1",
- "getrandom 0.4.3",
- "http",
- "rc-core",
  "rc-s3",
  "rustfs-cli",
- "rustfs-cuobject-client",
- "rustfs-nixl",
- "tokio",
+ "rustfs-rdma-client",
 ]
 
 [[package]]
@@ -3036,6 +3029,21 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "rustfs-rdma-client"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "getrandom 0.4.3",
+ "http",
+ "rc-core",
+ "rc-s3",
+ "rustfs-cuobject-client",
+ "rustfs-nixl",
+ "tokio",
 ]
 
 [[package]]

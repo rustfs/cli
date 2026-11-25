@@ -1,11 +1,14 @@
 use super::*;
+#[cfg(feature = "nixl")]
 use std::sync::Mutex;
 
+#[cfg(feature = "nixl")]
 struct VersionedObject {
     queries: Mutex<Vec<Vec<(String, String)>>>,
     get_version: &'static str,
 }
 
+#[cfg(feature = "nixl")]
 #[async_trait]
 impl ControlExecutor for VersionedObject {
     async fn execute_headers(&self, request: ControlRequest) -> Result<ControlResponse> {
@@ -28,15 +31,18 @@ impl ControlExecutor for VersionedObject {
     }
 }
 
+#[cfg(feature = "nixl")]
 async fn download(
     version_id: Option<&str>,
     get_version: &'static str,
 ) -> (DataTransportResult<DownloadResult>, Arc<VersionedObject>) {
+    let _guard = crate::pool::NATIVE_TEST_LOCK.lock().await;
     let endpoint = Arc::new(VersionedObject {
         queries: Mutex::default(),
         get_version,
     });
-    let transport = Factory::new(RdmaBackend::Nixl)
+    let transport = RdmaProvider::new(RdmaBackend::Nixl)
+        .unwrap()
         .create(endpoint.clone())
         .unwrap();
     let path = RemotePath::new("test", "bucket", "key");
@@ -59,6 +65,7 @@ async fn download(
     (result, endpoint)
 }
 
+#[cfg(feature = "nixl")]
 #[tokio::test]
 async fn current_and_explicit_version_keep_the_callers_selector() {
     for selector in [None, Some("v1")] {
@@ -75,6 +82,7 @@ async fn current_and_explicit_version_keep_the_callers_selector() {
     }
 }
 
+#[cfg(feature = "nixl")]
 #[tokio::test]
 async fn replacement_with_the_same_etag_is_detected_before_writing() {
     let (result, _) = download(None, "v2").await;
@@ -100,7 +108,13 @@ async fn a_delete_marker_keeps_its_version_and_exit_code() {
         }
     }
 
-    let transport = Factory::new(RdmaBackend::Nixl)
+    let backend = if cfg!(feature = "nixl") {
+        RdmaBackend::Nixl
+    } else {
+        RdmaBackend::CuObject
+    };
+    let transport = RdmaProvider::new(backend)
+        .unwrap()
         .create(Arc::new(DeleteMarker))
         .unwrap();
     let path = RemotePath::new("test", "bucket", "key");
@@ -128,8 +142,10 @@ async fn a_delete_marker_keeps_its_version_and_exit_code() {
     }
 }
 
+#[cfg(feature = "nixl")]
 #[tokio::test]
 async fn only_proven_conditional_rejections_reuse_the_registered_window() {
+    let _guard = crate::pool::NATIVE_TEST_LOCK.lock().await;
     struct Peer(Mutex<Vec<HeaderValue>>);
     #[async_trait]
     impl ControlExecutor for Peer {
@@ -171,7 +187,8 @@ async fn only_proven_conditional_rejections_reuse_the_registered_window() {
         }
     }
     let peer = Arc::new(Peer(Mutex::default()));
-    let transport = Factory::new(RdmaBackend::Nixl)
+    let transport = RdmaProvider::new(RdmaBackend::Nixl)
+        .unwrap()
         .create(peer.clone())
         .unwrap();
     let path = RemotePath::new("test", "bucket", "key");
@@ -200,6 +217,7 @@ async fn only_proven_conditional_rejections_reuse_the_registered_window() {
 #[tokio::test]
 #[ignore = "requires an NVIDIA RDMA device and an authenticated RustFS object"]
 async fn rustfs_declines_a_stale_conditional_get_before_dma() {
+    let _guard = crate::pool::NATIVE_TEST_LOCK.lock().await;
     let env = |key| {
         std::env::var(key)
             .expect("configure the test endpoint, credentials, CA and existing bucket")
@@ -236,8 +254,10 @@ async fn rustfs_declines_a_stale_conditional_get_before_dma() {
     }
 }
 
+#[cfg(feature = "nixl")]
 #[tokio::test]
 async fn large_get_submits_both_ranges_and_publishes_in_order() {
+    let _guard = crate::pool::NATIVE_TEST_LOCK.lock().await;
     use rustfs_nixl::{
         NIXL_AGENT_HEADER, NIXL_BUFFER_HEADER, NIXL_METADATA_HEADER, NixlConfig, NixlServer,
         RdmaToken,
@@ -341,7 +361,8 @@ async fn large_get_submits_both_ranges_and_publishes_in_order() {
             second_written: tokio::sync::Notify::new(),
             wrong_checksum,
         });
-        let transport = Factory::new(RdmaBackend::Nixl)
+        let transport = RdmaProvider::new(RdmaBackend::Nixl)
+            .unwrap()
             .create(ranges.clone())
             .unwrap();
         let mut progress = Vec::new();
@@ -374,8 +395,10 @@ async fn large_get_submits_both_ranges_and_publishes_in_order() {
     }
 }
 
+#[cfg(feature = "nixl")]
 #[tokio::test]
 async fn one_declined_range_cannot_hide_an_unconfirmed_sibling() {
+    let _guard = crate::pool::NATIVE_TEST_LOCK.lock().await;
     use std::sync::atomic::{AtomicUsize, Ordering};
     struct Endpoint(AtomicUsize);
     #[async_trait]
@@ -406,7 +429,8 @@ async fn one_declined_range_cannot_hide_an_unconfirmed_sibling() {
         }
     }
     let endpoint = Arc::new(Endpoint(AtomicUsize::new(0)));
-    let transport = Factory::new(RdmaBackend::Nixl)
+    let transport = RdmaProvider::new(RdmaBackend::Nixl)
+        .unwrap()
         .create(endpoint.clone())
         .unwrap();
     let result = transport
@@ -428,8 +452,10 @@ async fn one_declined_range_cannot_hide_an_unconfirmed_sibling() {
     );
 }
 
+#[cfg(feature = "nixl")]
 #[tokio::test]
 async fn ordinary_s3_is_probed_once_per_endpoint_backend_and_operation() {
+    let _guard = crate::pool::NATIVE_TEST_LOCK.lock().await;
     use std::sync::atomic::{AtomicUsize, Ordering};
     struct HttpOnly(AtomicUsize);
     #[async_trait]
@@ -451,7 +477,7 @@ async fn ordinary_s3_is_probed_once_per_endpoint_backend_and_operation() {
             })
         }
     }
-    let factory = Factory::new(RdmaBackend::Nixl);
+    let factory = RdmaProvider::new(RdmaBackend::Nixl).unwrap();
     let endpoint = Arc::new(HttpOnly(AtomicUsize::new(0)));
     let mut readers = tokio::task::JoinSet::new();
     for _ in 0..20 {
@@ -491,7 +517,10 @@ async fn ordinary_s3_is_probed_once_per_endpoint_backend_and_operation() {
     assert_eq!(endpoint.0.load(Ordering::Relaxed), 2);
     for fresh in [
         factory.support(Some("https://other.example")),
-        Factory::new(RdmaBackend::CuObject).support(endpoint.endpoint()),
+        #[cfg(feature = "cuobject")]
+        RdmaProvider::new(RdmaBackend::CuObject)
+            .unwrap()
+            .support(endpoint.endpoint()),
     ] {
         assert!(fresh.get.enter().await.unwrap().is_some());
     }

@@ -3,11 +3,11 @@
 mod download;
 mod upload;
 
+use crate::wire::RDMA_REPLY_HEADER;
 use async_trait::async_trait;
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use rc_core::{DataTransferState, Error, ObjectInfo, RemotePath, Result};
 use rc_s3::data_transport::*;
-use rustfs_nixl::RDMA_REPLY_HEADER;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -20,17 +20,38 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU8, Ordering};
 use tokio::sync::{Semaphore, SemaphorePermit};
 
-pub(crate) struct Factory {
+/// A native transport factory for one backend. Reuse it across clients to share
+/// endpoint capability probes. Each client owns its registered window pools.
+pub struct RdmaProvider {
     backend: RdmaBackend,
     endpoints: Mutex<HashMap<String, Arc<EndpointSupport>>>,
 }
 
-impl Factory {
-    pub(crate) fn new(backend: RdmaBackend) -> Self {
-        Self {
+impl RdmaProvider {
+    /// Select a compiled backend. Registration is deferred until data transfer.
+    pub fn new(backend: RdmaBackend) -> Result<Self> {
+        let enabled = match backend {
+            RdmaBackend::Nixl => cfg!(feature = "nixl"),
+            RdmaBackend::CuObject => cfg!(feature = "cuobject"),
+        };
+        if !enabled {
+            return Err(Error::UnsupportedFeature(format!(
+                "RDMA backend {backend:?} is not enabled"
+            )));
+        }
+        Ok(Self {
             backend,
             endpoints: Mutex::default(),
-        }
+        })
+    }
+
+    /// Build an S3 client using this provider and the caller's transfer mode.
+    pub async fn client(
+        &self,
+        alias: rc_core::Alias,
+        mode: rc_core::DataTransportMode,
+    ) -> Result<rc_s3::S3Client> {
+        rc_s3::S3Client::new_with_transport_factory(alias, mode, self).await
     }
 
     fn support(&self, endpoint: Option<&str>) -> Arc<EndpointSupport> {
@@ -109,7 +130,7 @@ impl Capability {
     }
 }
 
-impl ObjectDataTransportFactory for Factory {
+impl ObjectDataTransportFactory for RdmaProvider {
     fn create(&self, control: Arc<dyn ControlExecutor>) -> Result<Arc<dyn ObjectDataTransport>> {
         Ok(Arc::new(Transport {
             support: self.support(control.endpoint()),

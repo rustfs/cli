@@ -1806,7 +1806,26 @@ impl Intercept for CustomHeaderInterceptor {
 impl S3Client {
     /// Create a new S3 client from an alias configuration
     pub async fn new(alias: Alias) -> Result<Self> {
-        let request_headers = global_request_headers();
+        let mode = rc_core::global_data_transport_mode();
+        let factory = data_transport::installed_factory();
+        Self::build(alias, global_request_headers(), mode, factory.as_deref()).await
+    }
+
+    /// Create a client with an explicit transport policy, independent of CLI defaults.
+    pub async fn new_with_transport_factory(
+        alias: Alias,
+        mode: rc_core::DataTransportMode,
+        factory: &dyn data_transport::ObjectDataTransportFactory,
+    ) -> Result<Self> {
+        Self::build(alias, Vec::new(), mode, Some(factory)).await
+    }
+
+    async fn build(
+        alias: Alias,
+        request_headers: Vec<RequestHeader>,
+        mode: rc_core::DataTransportMode,
+        factory: Option<&dyn data_transport::ObjectDataTransportFactory>,
+    ) -> Result<Self> {
         for header in &request_headers {
             header.validate_transport_name()?;
         }
@@ -1900,11 +1919,11 @@ impl S3Client {
             alias,
             session_token,
             request_headers,
-            data_transport_mode: rc_core::global_data_transport_mode(),
+            data_transport_mode: mode,
             data_transport: None,
         };
         if client.data_transport_mode != rc_core::DataTransportMode::Http
-            && let Some(factory) = data_transport::installed_factory()
+            && let Some(factory) = factory
         {
             client.data_transport = Some(factory.create(Arc::new(client.clone()))?);
         }

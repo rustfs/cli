@@ -1,0 +1,24 @@
+[package]
+name = "rustfs-rdma-client"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99.0"
+license = "MIT OR Apache-2.0"
+description = "Native S3 object transfers over NIXL/UCX and NVIDIA cuObject"
+publish = false
+
+[features]
+default = ["nixl"]
+nixl = ["dep:rustfs-nixl", "dep:base64", "dep:getrandom"]
+cuobject = ["dep:rustfs-cuobject-client"]
+
+[dependencies]
+rustfs-cuobject-client = { path = "../cuobject-client", features = ["client"], optional = true }
+rc-core = { path = "../../crates/core" }
+rc-s3 = { path = "../../crates/s3" }
+rustfs-nixl = { git = "https://github.com/rustfs/rustfs", rev = "b86624520c99de06d9e36b971520a7071ca54b4c", features = ["sys"], optional = true }
+async-trait = "0.1"
+base64 = { version = "0.22", optional = true }
+getrandom = { version = "0.4", optional = true }
+http = "1"
+tokio = { version = "1", features = ["io-util", "macros", "rt", "sync", "time"] }

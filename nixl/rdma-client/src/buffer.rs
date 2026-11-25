@@ -1,11 +1,15 @@
 //! Backend registrations used by the shared object transfer pipeline.
 
+#[cfg(feature = "nixl")]
 use base64::{Engine, engine::general_purpose::STANDARD};
+#[cfg(feature = "nixl")]
 use http::HeaderValue;
 use rc_core::{Error, RdmaBackend, Result};
+#[cfg(feature = "nixl")]
 use rustfs_nixl::{NixlConfig, NixlServer, StagingChunk};
 
 pub(super) enum Buffer {
+    #[cfg(feature = "nixl")]
     Nixl {
         chunk: StagingChunk,
         agent: HeaderValue,
@@ -21,14 +25,20 @@ pub(super) fn register(
     count: usize,
     _budget: &crate::pool::Budget,
 ) -> Result<Vec<Buffer>> {
-    if backend == RdmaBackend::CuObject {
+    match backend {
         #[cfg(feature = "cuobject")]
-        return crate::nvidia::register(size, count, _budget);
-        #[cfg(not(feature = "cuobject"))]
-        return Err(Error::UnsupportedFeature(
-            "The cuObject backend is not installed".into(),
-        ));
+        RdmaBackend::CuObject => crate::nvidia::register(size, count, _budget),
+        #[cfg(feature = "nixl")]
+        RdmaBackend::Nixl => register_nixl(size, count),
+        #[cfg(not(all(feature = "cuobject", feature = "nixl")))]
+        _ => Err(Error::UnsupportedFeature(format!(
+            "RDMA backend {backend:?} is not enabled"
+        ))),
     }
+}
+
+#[cfg(feature = "nixl")]
+fn register_nixl(size: usize, count: usize) -> Result<Vec<Buffer>> {
     let id = getrandom::u64()
         .map_err(|_| Error::General("Could not generate a NIXL agent ID".into()))?;
     let name = format!("rc-{}-{id:016x}", std::process::id());
@@ -58,6 +68,7 @@ pub(super) fn register(
         .collect()
 }
 
+#[cfg(feature = "nixl")]
 fn nixl_error(error: rustfs_nixl::NixlError) -> Error {
     Error::General(format!("NIXL/UCX: {error}"))
 }
@@ -65,6 +76,7 @@ fn nixl_error(error: rustfs_nixl::NixlError) -> Error {
 impl Buffer {
     pub(super) fn writable(&mut self) -> Result<&mut [u8]> {
         match self {
+            #[cfg(feature = "nixl")]
             Self::Nixl { chunk, .. } => chunk.spare_mut().map_err(nixl_error),
             #[cfg(feature = "cuobject")]
             Self::CuObject(buffer) => buffer.writable(),
